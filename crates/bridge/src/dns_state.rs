@@ -196,7 +196,7 @@ fn superseded_file_name(n: u64) -> String {
 pub fn supersede(state_dir: &Path) -> std::io::Result<()> {
     use std::io::ErrorKind;
 
-    let dir = match util::dir::Dir::open(state_dir, false, None) {
+    let dir = match util::dir::Dir::open(state_dir, false, None, util::dir::Principal::System) {
         Ok(dir) => dir,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),

@@ -14,7 +14,7 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::IO::OVERLAPPED;
 
 use super::{split, Refusal, Refused};
-use util::dir::{Dir, OpenFile};
+use util::dir::{Dir, OpenFile, Principal};
 
 /// What the open handle says about the lock file; the only input to [`vet`].
 #[derive(Clone, Copy, Debug)]
@@ -87,7 +87,7 @@ pub(super) fn open_locked(
     _caller: Caller,
 ) -> io::Result<Option<File>> {
     let (parent, name) = split(path)?;
-    let dir = Dir::open(parent, true, None).map_err(|err| Refused::from_dir_error(path, err))?;
+    let dir = Dir::open(parent, true, None, Principal::System).map_err(|err| Refused::from_dir_error(path, err))?;
     let file = loop {
         if let Some(file) = open_name(&dir, name, path)? {
             break file;

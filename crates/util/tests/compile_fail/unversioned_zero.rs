@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use util::dir::Principal;
 use util::versioned_file::{Obsolete, Role, Schema, VersionedFile, VersionedState};
 
 #[derive(Serialize, Deserialize)]
@@ -22,5 +23,5 @@ impl VersionedState for Config {
 }
 
 fn main() {
-    let _ = VersionedFile::<Config>::new(Path::new("."));
+    let _ = VersionedFile::<Config>::for_process(Path::new("."), Principal::System);
 }

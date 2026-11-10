@@ -55,7 +55,7 @@ fn main() {
             panic!("TOMBSTONE_TEST_ATTACH_KIND is set to a value that is not valid Unicode: {e}")
         }
     };
-    tombstone::attach(kind, &log_dir);
+    tombstone::attach(kind, &log_dir, util::dir::Principal::System);
     plant_after_attach(kind, &log_dir);
 
     // SAFETY: each raise_* deterministically triggers its fault class and

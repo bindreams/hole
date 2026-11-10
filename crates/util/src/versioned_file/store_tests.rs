@@ -1,3 +1,4 @@
+use crate::dir::Principal;
 use crate::versioned_file::fixtures::UpdateShortcuts;
 use crate::versioned_file::UpdateOutcome;
 use std::cell::RefCell;
@@ -139,7 +140,7 @@ fn a_payload_that_would_read_back_corrupt_is_refused_and_leaves_the_file_alone()
 #[skuld::test]
 fn an_integer_wider_than_u64_is_stored_and_read_back() {
     let dir = dir();
-    let file = VersionedFile::<Wide>::new(dir.path());
+    let file = VersionedFile::<Wide>::for_process(dir.path(), Principal::System);
     file.store(&Wide { n: u128::MAX }, &plain()).unwrap();
     match file.load() {
         Loaded::Current { value, .. } => assert_eq!(value, Wide { n: u128::MAX }),
@@ -299,7 +300,7 @@ fn legacy_record_store_and_remove_leave_the_bytes_untouched() {
 fn config_newer_store_is_refused() {
     let dir = dir();
     let original = put_unreadable::<ConfigFile>(&dir, CannotRead::Newer);
-    let file = VersionedFile::<ConfigFile>::new(dir.path());
+    let file = VersionedFile::<ConfigFile>::for_process(dir.path(), Principal::System);
 
     let err = file
         .store(
@@ -327,7 +328,7 @@ fn config_newer_store_is_refused() {
 fn config_corrupt_store_overwrites_as_today() {
     let dir = dir();
     put_unreadable::<ConfigFile>(&dir, CannotRead::Corrupt);
-    let file = VersionedFile::<ConfigFile>::new(dir.path());
+    let file = VersionedFile::<ConfigFile>::for_process(dir.path(), Principal::System);
 
     file.store(
         &ConfigFile {
@@ -351,7 +352,9 @@ fn config_remove_keeps_a_file_it_cannot_read() {
         let dir = dir();
         let original = put_unreadable::<ConfigFile>(&dir, cause);
         assert_eq!(
-            VersionedFile::<ConfigFile>::new(dir.path()).remove().unwrap(),
+            VersionedFile::<ConfigFile>::for_process(dir.path(), Principal::System)
+                .remove()
+                .unwrap(),
             UpdateOutcome::Kept
         );
         assert_eq!(read(&dir, "config.json"), original);
@@ -599,7 +602,7 @@ fn a_failed_prepare_tmp_leaves_no_temp_and_the_original() {
 #[skuld::test]
 fn sync_dir_of_a_directory_succeeds() {
     plain()
-        .sync_dir(&Dir::open(dir().path(), false, None).unwrap())
+        .sync_dir(&Dir::open(dir().path(), false, None, crate::dir::Principal::System).unwrap())
         .unwrap();
 }
 
@@ -681,7 +684,7 @@ mod unix_directory_flush {
 #[skuld::test]
 fn the_directory_flush_tolerates_a_filesystem_without_one_where_it_is_wired() {
     let dir = crate::versioned_file::fixtures::dir();
-    let handle = Dir::open(dir.path(), false, None).unwrap();
+    let handle = Dir::open(dir.path(), false, None, crate::dir::Principal::System).unwrap();
     let os = |code: i32| std::io::Error::from_raw_os_error(code);
 
     super::sync_dir_with(&handle, |_| Err(os(libc::EINVAL))).unwrap();
@@ -693,7 +696,16 @@ fn the_directory_flush_tolerates_a_filesystem_without_one_where_it_is_wired() {
 #[skuld::test]
 fn a_real_directory_without_fsync_is_not_a_failed_flush() {
     // procfs answers a directory fsync with EINVAL.
-    super::sync_dir(&Dir::open(std::path::Path::new("/proc"), false, None).unwrap()).unwrap();
+    super::sync_dir(
+        &Dir::open(
+            std::path::Path::new("/proc"),
+            false,
+            None,
+            crate::dir::Principal::System,
+        )
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 #[skuld::test]

@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::EnvFilter;
-use util::dir::Dir;
+use util::dir::{Dir, Principal};
 
 // Test-only flush mechanism ===========================================================================================
 //
@@ -641,8 +641,9 @@ pub fn init(
     log_filename: &str,
     default_directive: &str,
     owner: Option<(u32, u32)>,
+    principal: Principal,
 ) -> LogGuard {
-    init_multi(log_dir, kind, log_filename, [default_directive], owner)
+    init_multi(log_dir, kind, log_filename, [default_directive], owner, principal)
 }
 
 /// Initialize logging with one or more caller-supplied filter directives
@@ -663,13 +664,14 @@ pub fn init_multi<I>(
     log_filename: &str,
     directives: I,
     owner: Option<(u32, u32)>,
+    principal: Principal,
 ) -> LogGuard
 where
     I: IntoIterator,
     I::Item: AsRef<str>,
 {
     let v: Vec<String> = directives.into_iter().map(|d| d.as_ref().to_string()).collect();
-    init_dual(log_dir, kind, log_filename, &v, &v, owner)
+    init_dual(log_dir, kind, log_filename, &v, &v, owner, principal)
 }
 
 /// Initialize logging with independent file-sink and stderr-sink directives —
@@ -690,12 +692,15 @@ pub fn init_dual(
     file_directives: &[String],
     stderr_directives: &[String],
     owner: Option<(u32, u32)>,
+    principal: Principal,
 ) -> LogGuard {
-    // The log directory sits in the user's profile when the bridge runs elevated on their behalf, so it is
-    // opened once without following a symlink and every step below is by a name inside that handle. The
-    // elevated bridge creates it as root; hand it to the real user so they can read `bridge.log` without
-    // `sudo`. `owner` is `None` for the unprivileged GUI.
-    let dir = match Dir::open(log_dir, true, owner) {
+    // The log directory sits in the user's profile when the bridge runs elevated on their behalf, so it is opened
+    // once, and every step below is by a name inside that handle. `principal` is the running process's privilege,
+    // from the caller (`stepstool::principal`): a privileged process opens it without following a link the
+    // ownership-transition rule does not allow, and an unprivileged one (the GUI, in its own folder) follows every
+    // link the OS would. The elevated bridge creates it as root; hand it to the real user so they can read
+    // `bridge.log` without `sudo`: that is `owner`, `None` where nothing is handed over.
+    let dir = match Dir::open(log_dir, true, owner, principal) {
         Ok(dir) => {
             dir.secure(owner, None)
                 .expect("securing a directory with no mode has no step that can fail");
@@ -780,7 +785,7 @@ pub fn init_dual(
     // (signal-safe context — no chown). It is transient, lives in the
     // user-owned log dir, and is swept on next start, so it is left
     // root-owned on purpose rather than chowned from an unsafe context.
-    tombstone::attach(kind, log_dir);
+    tombstone::attach(kind, log_dir, principal);
 
     LogGuard {
         _file: file_guard,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::dir::testing::{own, plant_link, user_dir, AddDenied, SystemScratch};
+use crate::dir::testing::{dir_symlink, own, plant_link, user_dir, AddDenied, SystemScratch};
 use crate::dir::{Dir, ReadDir};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
@@ -97,7 +97,7 @@ const SYSTEM_SYMLINK: (&str, &str) = (r"C:\Users\All Users", r"C:\ProgramData");
 fn a_junction_the_system_owns_in_a_folder_the_system_owns_is_followed() {
     let (through, real) = SYSTEM_JUNCTION;
 
-    let dir = Dir::open(Path::new(through), false, None).unwrap_or_else(|err| {
+    let dir = Dir::open(Path::new(through), false, None, Principal::System).unwrap_or_else(|err| {
         panic!("{through}: {err:?} (a Windows without the compatibility junction `Documents and Settings` cannot run this test)")
     });
 
@@ -108,7 +108,7 @@ fn a_junction_the_system_owns_in_a_folder_the_system_owns_is_followed() {
 fn a_directory_symlink_the_system_owns_in_a_folder_the_system_owns_is_followed() {
     let (through, real) = SYSTEM_SYMLINK;
 
-    let dir = Dir::open(Path::new(through), false, None).unwrap_or_else(|err| {
+    let dir = Dir::open(Path::new(through), false, None, Principal::System).unwrap_or_else(|err| {
         panic!("{through}: {err:?} (a Windows without the compatibility link `All Users` cannot run this test)")
     });
 
@@ -133,7 +133,7 @@ fn a_folder_the_caller_may_pass_through_but_not_read_the_acl_of_is_walked_throug
     let made = temp.join(format!("hole-dir-test-acl-{}", std::process::id()));
     let _remove = RemoveOnDrop(made.clone());
 
-    Dir::open(&made.join("below"), true, None).unwrap();
+    Dir::open(&made.join("below"), true, None, Principal::System).unwrap();
 
     assert!(made.join("below").is_dir());
 }
@@ -146,7 +146,7 @@ fn a_users_junction_to_a_folder_the_same_user_owns_is_followed() {
     user_dir(&real);
     plant_link(&real, &tmp.path().join("link"));
 
-    let dir = Dir::open(&tmp.path().join("link"), false, None).unwrap();
+    let dir = Dir::open(&tmp.path().join("link"), false, None, Principal::System).unwrap();
 
     assert_eq!(super::file_id(dir.file()).unwrap(), file_id(&real));
 }
@@ -157,11 +157,10 @@ fn a_users_directory_symlink_to_a_folder_the_same_user_owns_is_followed() {
     let real = tmp.path().join("real");
     user_dir(&real);
     let link = tmp.path().join("link");
-    std::os::windows::fs::symlink_dir(&real, &link)
-        .expect("creating a symlink needs admin or Developer Mode on Windows; this test does not skip");
+    dir_symlink(&real, &link);
     own(&link);
 
-    let dir = Dir::open(&link, false, None).unwrap();
+    let dir = Dir::open(&link, false, None, Principal::System).unwrap();
 
     assert_eq!(super::file_id(dir.file()).unwrap(), file_id(&real));
 }
@@ -172,11 +171,10 @@ fn a_users_relative_symlink_resolves_from_the_folder_it_is_in() {
     user_dir(&tmp.path().join("a").join("real"));
     user_dir(&tmp.path().join("b"));
     let link = tmp.path().join("b").join("link");
-    std::os::windows::fs::symlink_dir(r"..\a\real", &link)
-        .expect("creating a symlink needs admin or Developer Mode on Windows; this test does not skip");
+    dir_symlink(Path::new(r"..\a\real"), &link);
     own(&link);
 
-    Dir::open(&link.join("made"), true, None).unwrap();
+    Dir::open(&link.join("made"), true, None, Principal::System).unwrap();
 
     assert!(tmp.path().join("a").join("real").join("made").is_dir());
 }
@@ -186,11 +184,10 @@ fn a_relative_symlink_that_ends_on_a_parent_opens_that_folder_for_use() {
     let tmp = tempfile::tempdir().unwrap();
     user_dir(&tmp.path().join("a").join("b"));
     let link = tmp.path().join("a").join("b").join("up");
-    std::os::windows::fs::symlink_dir(r"..", &link)
-        .expect("creating a symlink needs admin or Developer Mode on Windows; this test does not skip");
+    dir_symlink(Path::new(r".."), &link);
     own(&link);
 
-    let dir = Dir::open(&link, false, None).unwrap();
+    let dir = Dir::open(&link, false, None, Principal::System).unwrap();
 
     assert_eq!(super::file_id(dir.file()).unwrap(), file_id(&tmp.path().join("a")));
     dir.write_atomic("state.json".as_ref(), b"x", None, |_| Ok(())).unwrap();
@@ -203,11 +200,10 @@ fn a_relative_symlink_that_ends_on_a_parent_gives_the_rights_asked_for_the_final
     let tmp = tempfile::tempdir().unwrap();
     user_dir(&tmp.path().join("a").join("b"));
     let link = tmp.path().join("a").join("b").join("up");
-    std::os::windows::fs::symlink_dir(r"..", &link)
-        .expect("creating a symlink needs admin or Developer Mode on Windows; this test does not skip");
+    dir_symlink(Path::new(r".."), &link);
     own(&link);
 
-    let dir = Dir::open_for_acl(&link, false).unwrap();
+    let dir = Dir::open_for_acl(&link, false, Principal::System).unwrap();
 
     // A directory flush needs the right to add files; reading the ACL needs `READ_CONTROL`.
     dir.sync().unwrap();
@@ -236,7 +232,7 @@ fn a_folder_that_can_only_be_read_is_read_from() {
     std::fs::write(tmp.path().join("state.json"), b"{}").unwrap();
     let _denied = AddDenied::to(tmp.path());
 
-    let read = ReadDir::open(tmp.path()).and_then(|dir| dir.read_vouched("state.json".as_ref()));
+    let read = ReadDir::open(tmp.path(), Principal::System).and_then(|dir| dir.read_vouched("state.json".as_ref()));
 
     assert_eq!(read.unwrap(), b"{}");
 }
@@ -269,7 +265,7 @@ const ADD_RIGHTS: u32 = FILE_ADD_FILE.0 | FILE_ADD_SUBDIRECTORY.0;
 fn a_directory_opened_for_use_holds_the_add_rights() {
     let tmp = tempfile::tempdir().unwrap();
 
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     assert_eq!(granted_access(dir.file()) & ADD_RIGHTS, ADD_RIGHTS);
 }
@@ -278,7 +274,7 @@ fn a_directory_opened_for_use_holds_the_add_rights() {
 fn a_directory_opened_for_reading_holds_no_add_right() {
     let tmp = tempfile::tempdir().unwrap();
 
-    let dir = ReadDir::open(tmp.path()).unwrap();
+    let dir = ReadDir::open(tmp.path(), Principal::System).unwrap();
 
     assert_eq!(granted_access(dir.file()) & ADD_RIGHTS, 0);
 }
@@ -287,7 +283,7 @@ fn a_directory_opened_for_reading_holds_no_add_right() {
 fn a_read_view_of_a_directory_opened_for_use_holds_the_rights_it_was_opened_with() {
     // The view is for reading, but the handle behind it is a duplicate: what it may do is decided by the type.
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     let view = dir.reader().unwrap();
 
@@ -301,7 +297,7 @@ fn a_users_junction_to_a_folder_the_system_owns_is_refused() {
     plant_link(scratch.root(), &tmp.path().join("link"));
 
     assert_eq!(
-        refusal(Dir::open(&tmp.path().join("link"), false, None)),
+        refusal(Dir::open(&tmp.path().join("link"), false, None, Principal::System)),
         Refusal::Symlink
     );
 }
@@ -313,7 +309,10 @@ fn nothing_is_made_in_a_folder_the_system_owns_through_a_users_junction() {
     plant_link(scratch.root(), &tmp.path().join("link"));
     let through = tmp.path().join("link").join(scratch.name()).join("state");
 
-    assert_eq!(refusal(Dir::open(&through, true, None)), Refusal::Symlink);
+    assert_eq!(
+        refusal(Dir::open(&through, true, None, Principal::System)),
+        Refusal::Symlink
+    );
 
     assert!(
         !scratch.path().exists(),
@@ -328,7 +327,13 @@ fn a_folder_missing_below_a_users_junction_is_made_in_the_users_folder() {
     user_dir(&real);
     plant_link(&real, &tmp.path().join("link"));
 
-    Dir::open(&tmp.path().join("link").join("a").join("b"), true, None).unwrap();
+    Dir::open(
+        &tmp.path().join("link").join("a").join("b"),
+        true,
+        None,
+        Principal::System,
+    )
+    .unwrap();
 
     assert!(real.join("a").join("b").is_dir());
 }
@@ -340,11 +345,10 @@ fn a_users_symlink_to_a_missing_folder_makes_the_folder_in_the_users_tree() {
     user_dir(&base);
     let target = base.join("not-yet").join("deeper");
     let link = tmp.path().join("link");
-    std::os::windows::fs::symlink_dir(&target, &link)
-        .expect("creating a symlink needs admin or Developer Mode on Windows; this test does not skip");
+    dir_symlink(&target, &link);
     own(&link);
 
-    Dir::open(&link, true, None).unwrap();
+    Dir::open(&link, true, None, Principal::System).unwrap();
 
     assert!(target.is_dir());
 }
@@ -358,7 +362,7 @@ fn a_link_met_again_after_its_own_resolution_is_not_a_loop() {
     plant_link(&real, &tmp.path().join("link"));
     plant_link(&tmp.path().join("link").join("sub"), &real.join("again"));
 
-    let dir = Dir::open(&tmp.path().join("link").join("again"), false, None).unwrap();
+    let dir = Dir::open(&tmp.path().join("link").join("again"), false, None, Principal::System).unwrap();
 
     assert_eq!(super::file_id(dir.file()).unwrap(), file_id(&real.join("sub")));
 }
@@ -372,7 +376,19 @@ fn a_loop_of_junctions_is_refused_not_followed_forever() {
     std::fs::remove_dir(&b).unwrap();
     plant_link(&a, &b);
 
-    assert_eq!(refusal(Dir::open(&a, false, None)), Refusal::Symlink);
+    assert_eq!(refusal(Dir::open(&a, false, None, Principal::System)), Refusal::Symlink);
+}
+
+#[skuld::test]
+fn a_users_own_walk_refuses_a_loop_of_junctions_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+    user_dir(&b);
+    plant_link(&b, &a);
+    std::fs::remove_dir(&b).unwrap();
+    plant_link(&a, &b);
+
+    assert_eq!(refusal(Dir::open(&a, false, None, Principal::User)), Refusal::Symlink);
 }
 
 // Name and handle rules -----------------------------------------------------------------------------------------------
@@ -380,7 +396,7 @@ fn a_loop_of_junctions_is_refused_not_followed_forever() {
 #[skuld::test]
 fn a_name_that_would_open_an_alternate_data_stream_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     let err = dir
         .open_file("lock:stream".as_ref(), OpenFile::CreateNew { mode: 0o600 })
@@ -394,7 +410,7 @@ fn a_name_that_would_open_an_alternate_data_stream_is_refused() {
 #[skuld::test]
 fn a_file_opened_through_the_directory_cannot_be_deleted_or_renamed_while_it_is_open() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let _held = dir
         .open_file("lock".as_ref(), OpenFile::CreateNew { mode: 0o600 })
         .unwrap();
@@ -408,7 +424,7 @@ fn a_directory_opened_for_its_acl_can_have_its_acl_read_and_rewritten() {
     use windows::Win32::Security::Authorization::{GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT};
     use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open_for_acl(tmp.path(), false).unwrap();
+    let dir = Dir::open_for_acl(tmp.path(), false, Principal::System).unwrap();
     let handle = HANDLE(dir.file().as_raw_handle());
     let mut dacl = std::ptr::null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -446,7 +462,7 @@ fn a_directory_opened_for_its_acl_can_have_its_acl_read_and_rewritten() {
 #[skuld::test]
 fn write_atomic_replaces_a_file_a_reader_has_open() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     dir.write_atomic("state.json".as_ref(), b"old", None, |_| Ok(()))
         .unwrap();
     let reader = std::fs::File::open(tmp.path().join("state.json")).unwrap();
@@ -466,7 +482,7 @@ fn a_path_longer_than_max_path_is_opened() {
         deep.push("a".repeat(40));
     }
 
-    Dir::open(&deep, true, None).unwrap();
+    Dir::open(&deep, true, None, Principal::System).unwrap();
 
     assert!(deep.as_os_str().len() > 260);
 }
@@ -529,7 +545,7 @@ fn a_failed_legacy_replace_is_returned() {
 #[skuld::test]
 fn the_legacy_replace_replaces_an_existing_file_and_keeps_the_destination_name() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(tmp.path().join("dest"), b"old").unwrap();
     let temp = open_file(&dir.file, "src".as_ref(), OpenFile::CreateNew { mode: 0o600 }).unwrap();
     std::io::Write::write_all(&mut &temp, b"new").unwrap();

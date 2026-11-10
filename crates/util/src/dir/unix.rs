@@ -10,7 +10,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path};
 
 use super::trail::{Owner, Trail};
-use super::{EntryKind, OpenFile, Refusal};
+use super::{AtName, EntryKind, OpenFile, Principal, Refusal};
 
 /// Who is opening: this process's effective uid.
 pub type Caller = u32;
@@ -95,6 +95,16 @@ const SEARCH_ONLY: libc::c_int = libc::O_RDONLY;
 /// The directory `name` in `dir`, for lookup only; see [`SEARCH_ONLY`].
 fn open_dir_at(dir: RawFd, name: &CString) -> io::Result<OwnedFd> {
     open_fd(dir, name, SEARCH_ONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW, 0)
+}
+
+/// The directory the link `name` in `dir` leads to, which the OS resolves: a link that loops is [`Refusal::Symlink`]
+/// and one to a file [`Refusal::NotDirectory`]; one that leads nowhere is not found.
+fn open_dir_through_link(dir: RawFd, name: &CString) -> io::Result<OwnedFd> {
+    open_fd(dir, name, SEARCH_ONLY | libc::O_DIRECTORY, 0).map_err(|err| match err.raw_os_error() {
+        Some(libc::ELOOP) => Refusal::Symlink.into_io_error(),
+        Some(libc::ENOTDIR) => Refusal::NotDirectory.into_io_error(),
+        _ => err,
+    })
 }
 
 /// `dir` again, for use: readable, so that `fchown`, `fchmod` and `fsync` work on it. Through the
@@ -199,6 +209,8 @@ impl Standing {
 struct Walk {
     steps: VecDeque<Step>,
     trail: Trail<u32>,
+    /// Sets the mode of a folder the walk makes.
+    principal: Principal,
 }
 
 /// Hands the folder `name` in `dir`, which the walk just made as the process of uid `maker`, to `uid` (the group is
@@ -248,7 +260,9 @@ fn descend(cur: &Standing, name: &OsStr, create: bool, walk: &mut Walk) -> io::R
             Err(err) if err.kind() == io::ErrorKind::NotFound && create => {
                 walk.trail.create_in(|| cur.owner())?;
                 // SAFETY: `cname` is a valid NUL-terminated string and `cur` an open directory.
-                match check(unsafe { libc::mkdirat(cur.fd.as_raw_fd(), cname.as_ptr(), 0o777) }) {
+                match check(unsafe {
+                    libc::mkdirat(cur.fd.as_raw_fd(), cname.as_ptr(), walk.principal.new_folder_mode())
+                }) {
                     Ok(_) => {
                         // The folder is the maker's on disk. Below a user's link it must be the user's, or the next
                         // walk through the link refuses what this one made.
@@ -265,6 +279,9 @@ fn descend(cur: &Standing, name: &OsStr, create: bool, walk: &mut Walk) -> io::R
             Err(_) => return Err(open_err),
         };
         return match entry.kind() {
+            EntryKind::Symlink if walk.principal.leaves_links_to_the_os() => {
+                open_dir_through_link(cur.fd.as_raw_fd(), &cname).map(|fd| Some(Standing { fd }))
+            }
             EntryKind::Symlink => {
                 let parent = fstat(cur.fd.as_raw_fd())?;
                 walk.trail
@@ -282,10 +299,17 @@ fn descend(cur: &Standing, name: &OsStr, create: bool, walk: &mut Walk) -> io::R
     }
 }
 
-pub(super) fn open_dir(path: &Path, create: bool, owner: Option<(u32, u32)>, caller: Caller) -> io::Result<File> {
+pub(super) fn open_dir(
+    path: &Path,
+    create: bool,
+    owner: Option<(u32, u32)>,
+    principal: Principal,
+    caller: Caller,
+) -> io::Result<File> {
     let mut walk = Walk {
         steps: steps_of(path),
         trail: Trail::new(MAX_LINKS),
+        principal,
     };
     let rooted = matches!(walk.steps.front(), Some(Step::Root));
     let mut cur = Standing {
@@ -323,6 +347,15 @@ pub(super) fn open_dir(path: &Path, create: bool, owner: Option<(u32, u32)>, cal
 // Operations relative to a directory ----------------------------------------------------------------------------------
 
 pub(super) fn open_file(dir: &File, name: &OsStr, how: OpenFile) -> io::Result<File> {
+    open_file_at(dir, name, how, AtName::AsItself)
+}
+
+/// [`OpenFile::Read`] of the file a link at `name` leads to.
+pub(super) fn open_read_through_link(dir: &File, name: &OsStr) -> io::Result<File> {
+    open_file_at(dir, name, OpenFile::Read, AtName::Followed)
+}
+
+fn open_file_at(dir: &File, name: &OsStr, how: OpenFile, at_name: AtName) -> io::Result<File> {
     // `O_NONBLOCK` keeps the open of a FIFO planted at the name from waiting for a peer that never comes; it does
     // nothing to a regular file.
     let (flags, mode) = match how {
@@ -332,8 +365,19 @@ pub(super) fn open_file(dir: &File, name: &OsStr, how: OpenFile) -> io::Result<F
         OpenFile::Append => (libc::O_WRONLY | libc::O_APPEND | libc::O_NONBLOCK, 0),
         OpenFile::CreateAppend { mode } => (libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_EXCL, mode),
     };
-    let file = File::from(open_fd(dir.as_raw_fd(), &cstr(name)?, flags | libc::O_NOFOLLOW, mode)?);
-    if matches!(how, OpenFile::Read) && !file.metadata()?.is_file() {
+    let no_follow = match at_name {
+        AtName::AsItself => libc::O_NOFOLLOW,
+        AtName::Followed => 0,
+    };
+    let file = match open_fd(dir.as_raw_fd(), &cstr(name)?, flags | no_follow, mode) {
+        Ok(fd) => File::from(fd),
+        // `O_NOFOLLOW` on a link at the name: the same refusal Windows gives a link opened as itself.
+        Err(err) if at_name == AtName::AsItself && err.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(Refusal::Symlink.into_io_error());
+        }
+        Err(err) => return Err(err),
+    };
+    if how.requires_regular_file() && !file.metadata()?.is_file() {
         return Err(Refusal::NotRegular.into_io_error());
     }
     Ok(file)

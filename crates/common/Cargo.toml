@@ -36,11 +36,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"]
 tracing-log = "0.2"
 tracing-appender = "0.2"
 os_pipe = "1"
-time = { version = "0.3", features = ["serde-well-known", "formatting", "macros"] }
+time = { version = "0.3", features = ["serde-well-known", "formatting"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
 yaml_serde = "0.10"
 nu-ansi-term = "0.50"
-tempfile = "3"
 tombstone = { path = "../tombstone" }
 util = { path = "../util" }
 # `Dump` impls for the config containers: the `dump!` ladder resolves per
@@ -74,6 +73,7 @@ yaml_serde = "0.10"
 
 [dev-dependencies]
 skuld = { workspace = true }
+tempfile = "3"
 # `util::dir::testing`: the links and folders a test of the walk needs.
 util = { path = "../util", features = ["test-support"] }
 # Compile-fail probes pinning that `Password`/`ServerAddress` cannot grow a

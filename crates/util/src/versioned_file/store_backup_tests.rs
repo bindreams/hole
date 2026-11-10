@@ -77,8 +77,9 @@ fn a_backup_is_logged_only_once_the_publish_after_it_has_succeeded() {
     let dir = dir();
     put(&dir, "decision.json", unreadable_bytes(CannotRead::Newer));
 
-    let result =
-        VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(FailsPublish)).store(&decision("new"), &plain());
+    let result = VersionedFile::<DecisionFile>::new(dir.path())
+        .with_fs(Arc::new(FailsPublish))
+        .store(&decision("new"), &plain());
 
     assert!(result.is_err());
     let after_failure = log.snapshot();
@@ -119,7 +120,8 @@ fn without_a_no_clobber_rename_move_aside_fails_naming_the_file_and_moves_nothin
     let original = unreadable_bytes(CannotRead::Newer);
     put(&dir, "decision.json", original);
 
-    let err = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(NoRename))
+    let err = VersionedFile::<DecisionFile>::new(dir.path())
+        .with_fs(Arc::new(NoRename))
         .move_aside()
         .unwrap_err();
 
@@ -172,7 +174,8 @@ fn a_refused_rename_fails_move_aside_and_leaves_no_backup() {
     let original = unreadable_bytes(CannotRead::Newer);
     put(&dir, "decision.json", original);
 
-    let err = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(RenameRefused))
+    let err = VersionedFile::<DecisionFile>::new(dir.path())
+        .with_fs(Arc::new(RenameRefused))
         .move_aside()
         .unwrap_err();
 
@@ -187,7 +190,8 @@ fn a_refused_rename_fails_remove_and_leaves_no_backup() {
     let original = unreadable_bytes(CannotRead::Newer);
     put(&dir, "decision.json", original);
 
-    let err = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(RenameRefused))
+    let err = VersionedFile::<DecisionFile>::new(dir.path())
+        .with_fs(Arc::new(RenameRefused))
         .remove()
         .unwrap_err();
 

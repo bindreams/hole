@@ -4,10 +4,15 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use util::dir::testing::plant_link;
-use util::dir::Dir;
+use util::dir::{Dir, Principal};
 
 fn writer(dir: &Path, limit: usize) -> DirRotate {
-    DirRotate::new(Dir::open(dir, false, None).unwrap(), "bridge.log".as_ref(), limit, None)
+    DirRotate::new(
+        Dir::open(dir, false, None, Principal::System).unwrap(),
+        "bridge.log".as_ref(),
+        limit,
+        None,
+    )
 }
 
 /// A byte stream in which every position is told apart from its neighbours, so a lost or reordered span shows.
@@ -127,7 +132,7 @@ fn the_active_file_goes_to_the_owner_when_opened_and_after_each_rotation(#[fixtu
     let owner_of = |name: &str| dir.join(name).metadata().unwrap().uid();
 
     let mut w = DirRotate::new(
-        Dir::open(dir, false, None).unwrap(),
+        Dir::open(dir, false, None, Principal::System).unwrap(),
         "bridge.log".as_ref(),
         64,
         Some((foreign, foreign)),
@@ -171,7 +176,7 @@ fn noticing_writer(dir: &Path, limit: usize) -> (DirRotate, Arc<Mutex<Vec<String
     let notices = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&notices);
     let w = DirRotate::with_notice(
-        Dir::open(dir, false, None).unwrap(),
+        Dir::open(dir, false, None, Principal::System).unwrap(),
         "bridge.log".as_ref(),
         limit,
         None,

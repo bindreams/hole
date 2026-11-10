@@ -15,11 +15,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use util::dir::testing::{plant_link, user_dir, SystemScratch};
-use util::dir::Dir;
+use util::dir::{Dir, Principal};
 
 /// Exact type of [`crate::logging::init`]. A regression to a different arity
-/// (e.g. dropping `kind` or the trailing `owner`) fails the assertion below.
-type InitFn = fn(&std::path::Path, &'static str, &str, &str, Option<(u32, u32)>) -> crate::logging::LogGuard;
+/// (e.g. dropping `kind`, `owner` or the trailing `principal`) fails the assertion below.
+type InitFn = fn(&std::path::Path, &'static str, &str, &str, Option<(u32, u32)>, Principal) -> crate::logging::LogGuard;
 
 #[skuld::test]
 fn init_signature_takes_kind() {
@@ -383,7 +383,11 @@ fn cleanup_legacy_daily_logs_removes_only_dated_siblings_of_stem(#[fixture(temp_
     std::fs::write(dir.join("bridge.log.2024-01-01"), b"").expect("seed bridge.log.2024-01-01");
     std::fs::write(dir.join("bridge.log.2024-02-15"), b"").expect("seed bridge.log.2024-02-15");
 
-    super::cleanup_legacy_daily_logs(dir, &Dir::open(dir, false, None).unwrap(), "bridge.log");
+    super::cleanup_legacy_daily_logs(
+        dir,
+        &Dir::open(dir, false, None, Principal::System).unwrap(),
+        "bridge.log",
+    );
 
     assert!(dir.join("bridge.log").exists(), "bridge.log must survive");
     assert!(dir.join("bridge.log.1").exists(), "bridge.log.1 must survive");
@@ -404,7 +408,7 @@ fn cleanup_legacy_daily_logs_removes_only_dated_siblings_of_stem(#[fixture(temp_
     // Exercise the co-located streams case: a second call with a different
     // stem must clean up that stem's dated files without disturbing the
     // already-cleaned set.
-    super::cleanup_legacy_daily_logs(dir, &Dir::open(dir, false, None).unwrap(), "gui.log");
+    super::cleanup_legacy_daily_logs(dir, &Dir::open(dir, false, None, Principal::System).unwrap(), "gui.log");
 
     assert!(
         !dir.join("gui.log.2024-01-01").exists(),
@@ -426,7 +430,11 @@ fn cleanup_legacy_daily_logs_removes_only_inside_the_opened_directory(#[fixture(
     std::fs::write(listed.join("bridge.log.2024-01-01"), b"").expect("seed listed");
     std::fs::write(opened.join("bridge.log.2024-02-02"), b"").expect("seed opened");
 
-    super::cleanup_legacy_daily_logs(&listed, &Dir::open(&opened, false, None).unwrap(), "bridge.log");
+    super::cleanup_legacy_daily_logs(
+        &listed,
+        &Dir::open(&opened, false, None, Principal::System).unwrap(),
+        "bridge.log",
+    );
 
     assert!(
         listed.join("bridge.log.2024-01-01").exists(),
@@ -468,7 +476,11 @@ fn is_legacy_daily_suffix_matches_exactly_one_shape() {
 fn cleanup_legacy_daily_logs_tolerates_a_listing_that_is_not_there(#[fixture(temp_dir)] dir: &Path) {
     let nonexistent = dir.join("does-not-exist");
     // Must not panic.
-    super::cleanup_legacy_daily_logs(&nonexistent, &Dir::open(dir, false, None).unwrap(), "bridge.log");
+    super::cleanup_legacy_daily_logs(
+        &nonexistent,
+        &Dir::open(dir, false, None, Principal::System).unwrap(),
+        "bridge.log",
+    );
 }
 
 // Tests: log crate bridge =============================================================================================
@@ -802,6 +814,37 @@ fn init_dual_through_a_link_to_a_folder_the_system_owns_writes_nothing_there_and
         !stderr.contains(dir.to_string_lossy().as_ref()),
         "the message carries a path: {stderr}"
     );
+}
+
+/// An unprivileged process (the GUI) in its own folder follows every link the OS would, so its log is written below a
+/// user's link into a folder the system owns, where a privileged process writes nothing (the test above).
+#[skuld::test]
+fn init_dual_for_an_unprivileged_process_through_a_users_link_to_a_system_folder_writes_the_log_there(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    let scratch = SystemScratch::new();
+    let log_dir = dir.join("logs");
+    plant_link(scratch.root(), &log_dir);
+    // A name of its own: the test above looks for `test.log` in the same shared folder.
+    let file_name = format!("test-unprivileged-{}.log", std::process::id());
+    let log_file = scratch.root().join(&file_name);
+    let exe = std::env::current_exe().expect("current_exe");
+
+    let out = Command::new(&exe)
+        .env("HOLE_LOGGING_TEST_KIND", "redact_file")
+        .env("HOLE_LOGGING_TEST_LOG_DIR", &log_dir)
+        .env("HOLE_LOGGING_TEST_LOG_FILE", &file_name)
+        .env("HOLE_LOGGING_TEST_PRINCIPAL", "user")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn child");
+
+    let written = log_file.is_file();
+    let _ = std::fs::remove_file(&log_file);
+    assert!(out.status.success(), "{out:?}");
+    assert!(written, "no log file in the folder the link leads to");
 }
 
 #[skuld::test]

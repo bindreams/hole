@@ -14,6 +14,8 @@ harness = false
 
 [dependencies]
 thiserror = "2"
+# `Principal`: `principal()` says which one this process is. Apache-2.0 like this crate.
+util = { path = "../util" }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -29,3 +31,5 @@ windows = { version = "0.62", features = [
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
 tempfile = "3"
+# `runner_is_the_system`: the oracle for `principal()`.
+util = { path = "../util", features = ["test-support"] }

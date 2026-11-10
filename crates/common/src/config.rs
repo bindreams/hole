@@ -1,9 +1,9 @@
 use crate::protocol::ServerTestOutcome;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
-use std::path::Path;
 use thiserror::Error;
 use time::OffsetDateTime;
+use util::versioned_file::{Obsolete, Role, Schema, StoreError, VersionedState};
 
 // Errors ==============================================================================================================
 
@@ -15,20 +15,20 @@ pub enum ConfigError {
     // `serde_json::Error`: its `Display` echoes a fragment of the input near the
     // error, which for a config can include a password (see config_tests.rs).
     // Dropping the source makes a content leak structurally impossible (even via
-    // `Debug`), while classify() + line/column keep the message actionable.
-    #[error("failed to parse config file: {kind} (line {line}, column {column})")]
-    Parse {
-        kind: &'static str,
-        line: usize,
-        column: usize,
-    },
-    #[error("failed to serialize config: {source}")]
-    Serialize { source: serde_json::Error },
-    #[error("failed to create config directory: {source}")]
-    CreateDir { source: std::io::Error },
+    // `Debug`), while the position keeps the message actionable.
+    #[error("failed to parse config file: {failure}")]
+    Parse { failure: ParseFailure },
+    /// The file says it was written by a release newer than this one. `found` is
+    /// `None` for a version too large for a `u32`.
+    #[error(
+        "config file is from a newer release of Hole (file version {}, this release reads up to {supported})",
+        .found.map_or_else(|| "unknown".to_owned(), |v| v.to_string())
+    )]
+    NewerVersion { found: Option<u32>, supported: u32 },
+    /// A save the versioned file refused or could not complete; its text names the file, never the directory.
     #[error("failed to write config file: {source}")]
-    Write { source: std::io::Error },
-    #[error("config saving is disabled: the corrupt config file could not be backed up at startup")]
+    Write { source: StoreError },
+    #[error("config saving is disabled: the config file on disk was left untouched at startup")]
     SaveBlocked,
 }
 
@@ -439,62 +439,9 @@ pub fn is_valid_plugin_name(name: &str) -> bool {
 // Methods =============================================================================================================
 
 impl AppConfig {
-    // Loading lives in `ConfigStore::load` (crate::config_store) — it
-    // quarantines corrupt files instead of returning an error to discard.
-
-    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
-        use std::io::Write;
-
-        let json = serde_json::to_string_pretty(self).map_err(|source| ConfigError::Serialize { source })?;
-
-        // The directory that will hold the config — and the atomic-rename temp.
-        // The rename is only atomic within one filesystem, so the temp must be
-        // created in this same directory.
-        let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
-        if let Some(parent) = dir {
-            ensure_config_dir(parent)?;
-        }
-        let temp_dir = dir.unwrap_or_else(|| Path::new("."));
-
-        // Atomic write: a fresh temp file in the target directory, fully written
-        // and synced, then renamed over the target. A crash or partial write can
-        // never leave a truncated/corrupt config in place.
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".config")
-            .suffix(".tmp")
-            .tempfile_in(temp_dir)
-            .map_err(|source| ConfigError::Write { source })?;
-        tmp.write_all(json.as_bytes())
-            .map_err(|source| ConfigError::Write { source })?;
-        // tempfile creates the temp 0600 on unix (O_EXCL + restrictive mode), and
-        // rename preserves the mode — so the persisted config keeps its plaintext
-        // passwords at 0600, never the umask-default 0644. The 0600 invariant is
-        // guarded by `save_creates_file_with_owner_only_permissions`.
-        tmp.as_file()
-            .sync_all()
-            .map_err(|source| ConfigError::Write { source })?;
-        // persist() renames the temp over `path`. rename does NOT follow a target
-        // symlink (it replaces the link itself), so there is no target-symlink
-        // TOCTOU; the temp's random O_EXCL name in the 0700 dir is unguessable.
-        tmp.persist(path).map_err(|e| ConfigError::Write { source: e.error })?;
-
-        // Best-effort: fsync the directory so the rename is durable across power
-        // loss. The atomic property (no truncated/partial config is ever visible)
-        // already holds without this; only crash-durability of the *rename* needs
-        // it, and a failure here must not fail an otherwise-successful save. Unix
-        // only — Windows has no portable directory fsync.
-        #[cfg(unix)]
-        if let Some(parent) = dir {
-            if let Err(e) = std::fs::File::open(parent).and_then(|d| d.sync_all()) {
-                tracing::warn!(
-                    error = &e as &dyn std::error::Error,
-                    "could not fsync config directory; rename may not survive power loss"
-                );
-            }
-        }
-
-        Ok(())
-    }
+    // Loading and saving live in `ConfigStore` (crate::config_store): it
+    // quarantines corrupt files and leaves a newer one alone, instead of
+    // returning an error to discard.
 
     pub fn selected_entry(&self) -> Option<&ServerEntry> {
         let id = self.selected_server.as_ref()?;
@@ -502,37 +449,25 @@ impl AppConfig {
     }
 }
 
-/// Create the config's leaf directory (e.g. `hole/`). Ancestors like
-/// `~/Library/Application Support/` are system-managed and already exist.
-#[cfg(target_os = "macos")]
-fn ensure_config_dir(parent: &Path) -> Result<(), ConfigError> {
-    use std::fs::{DirBuilder, Permissions};
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+/// `config.json`'s one schema. A file with no `version` is the format that
+/// existed before the file was versioned, and reads as this one.
+impl Schema for AppConfig {
+    const VERSION: u32 = 1;
+    type Prev = Obsolete<0>;
 
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(parent)
-        .map_err(|source| ConfigError::CreateDir { source })?;
-    // Best-effort hardening of a *pre-existing* directory. The 0600 config file
-    // is the load-bearing protection for its plaintext passwords; a directory we
-    // don't own (e.g. left root-owned by an earlier privileged run) can't be
-    // chmod'd by us, but that must not abort the save — if the directory is
-    // genuinely unwritable the temp-file create fails with an accurate write
-    // error instead of a spurious permission error here.
-    if let Err(source) = std::fs::set_permissions(parent, Permissions::from_mode(0o700)) {
-        tracing::warn!(error = &source as &dyn std::error::Error, dir = %parent.display(),
-            "could not tighten config directory permissions; continuing");
+    fn upgrade(prev: Obsolete<0>) -> Self {
+        match prev {}
     }
-    Ok(())
 }
 
-// Generic arm so the crate compiles on Linux, where `xtask` reuses the protocol
-// types/consts. Hole itself only runs on Windows + macOS.
-#[cfg(not(target_os = "macos"))]
-fn ensure_config_dir(parent: &Path) -> Result<(), ConfigError> {
-    std::fs::create_dir_all(parent).map_err(|source| ConfigError::CreateDir { source })
+/// The user's own data: a newer or corrupt file is never destroyed unread, and never blocks a connect.
+impl VersionedState for AppConfig {
+    const FILE_NAME: &'static str = "config.json";
+    const ROLE: Role = Role::Config;
+    const UNVERSIONED_AS: Option<u32> = Some(1);
 }
+
+util::assert_contiguous!(AppConfig);
 
 #[cfg(test)]
 #[path = "config_tests.rs"]

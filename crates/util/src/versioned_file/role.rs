@@ -1,6 +1,7 @@
 //! What a file that cannot be read means, per kind of file.
 
 use super::loaded::{CannotRead, WhyUnreadable};
+use crate::dir::Principal;
 
 /// What a file is for, and so what it means when this release cannot read it.
 ///
@@ -53,6 +54,31 @@ pub enum RemoveOver {
 }
 
 impl Role {
+    /// Whose process handles a file of this role, and so how its folder is walked and the file read. `process` is the
+    /// privilege of the running process: the user's own file (`Config`) is handled as the process is, so a
+    /// privileged process (a GUI run under `sudo` keeps the user's home) walks the user's folder as the system, and what
+    /// its read refuses (a link at the name, a file another account owns) is left in place by the caller, never moved
+    /// aside (`ConfigStore`); every other role is a privileged process's whoever runs it.
+    pub const fn principal(self, process: Principal) -> Principal {
+        match self {
+            Role::Decision => Principal::System,
+            Role::OsRecord => Principal::System,
+            Role::LegacyRecord => Principal::System,
+            Role::Config => process,
+            Role::Claim => Principal::System,
+            Role::Cover => Principal::System,
+        }
+    }
+
+    /// Whether the privilege of the running process changes [`Role::principal`]: a file of such a role is built with
+    /// the process ([`super::VersionedFile::for_process`]), never by a constructor that guesses it.
+    pub const fn depends_on_the_process(self) -> bool {
+        !matches!(
+            (self.principal(Principal::System), self.principal(Principal::User)),
+            (Principal::System, Principal::System) | (Principal::User, Principal::User)
+        )
+    }
+
     pub fn on_store(self, why: CannotRead) -> StoreOver {
         match (self, why) {
             (Role::Decision, CannotRead::Newer) => StoreOver::MoveAside,

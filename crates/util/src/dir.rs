@@ -24,9 +24,9 @@
 //! - Windows: `NtCreateFile` relative to the parent handle with
 //!   `FILE_OPEN_REPARSE_POINT`, which opens a symlink, junction or mount point as
 //!   itself so it can be judged and read (`FSCTL_GET_REPARSE_POINT`). Present in
-//!   every NT version; any other kind of reparse point is refused.
+//!   every NT version; for a [`Principal::System`] walk any other kind of reparse point is refused.
 //!
-//! A link is followed under the ownership-transition rule (see `trail` and
+//! A [`Principal::System`] walk follows a link under the ownership-transition rule (see `trail` and
 //! CONTRIBUTING.md, "Privileged code in folders a user may own"): the walk never
 //! moves from a folder an unprivileged user owns into one somebody else owns.
 //! Links the system owns (unix: root; Windows: SYSTEM, Administrators,
@@ -41,13 +41,23 @@
 //! handle to be a directory the process itself owns (the user can swap the name
 //! after the `mkdirat`) and `fchown`s that handle; Windows sets the owner, which needs
 //! the restore privilege an elevated token holds. The final name of a file operation
-//! is never followed.
+//! is never followed (a [`Principal::User`] read of its own file is the one exception: see "Principal").
 //!
 //! Given an `owner` (unix ids), the final directory must be owned by it or by
 //! this process; any other owner is refused. Windows has no unix ids and does not
 //! check.
 //!
 //! A directory only read from is a [`ReadDir`]: the same walk, no write methods.
+//!
+//! # Principal
+//!
+//! The rules above are for a privileged process in a folder a user may own ([`Principal::System`]). A user's own
+//! process handling the user's own file ([`Principal::User`]) has nothing to defend from the user: its walk follows
+//! every link the OS would, has no ownership-transition rule, and creates and ends anywhere the user may; a read
+//! (through [`ReadDir::read_as`]) follows a link at the name and does not ask who owns the file. The OS resolves every
+//! link, on both platforms (a cloud placeholder, a root-relative target), and a link that leads nowhere is not found,
+//! as it is for the OS's own `mkdir`: the walk does not make its target. A directory
+//! entry that is not a regular file is still refused, a FIFO is still never waited for, and a read still shares delete.
 //!
 //! The refusals are an `InvalidData` [`io::Error`] holding a [`Refusal`]; they
 //! carry no path.
@@ -57,9 +67,10 @@
 //! [`ReadDir::read`], [`Dir::open_file`], [`Dir::link`], [`Dir::rename`],
 //! [`Dir::rename_noreplace`] and [`Dir::unlink`] take single names, and none
 //! follows a symlink at the name: a link is renamed, linked or removed as
-//! itself, and reading or appending through one is an error. [`Dir::stage`]
-//! writes a complete temp file that [`Staged::publish`] renames over a name or
-//! [`Staged::claim`] renames to a free one; [`Dir::write_atomic`] is the two in one.
+//! itself, and reading or appending through one is an error. [`ReadDir::read_as`] of a [`Principal::User`]
+//! directory is the one read that follows it. [`Dir::stage`] writes a complete temp file that
+//! [`Staged::publish`] renames over a name or [`Staged::claim`] renames to a free one; [`Dir::write_atomic`] is the
+//! two in one.
 //! On Windows a file that is read or appended shares everything with other
 //! handles, delete included, and a replace or an unlink has POSIX semantics where
 //! the volume has them (Windows 10 1607, NTFS), so an open reader neither blocks
@@ -90,6 +101,36 @@ use windows as platform;
 
 pub use platform::Caller;
 pub use read_dir::ReadDir;
+
+/// Whose process handles a file, and so what it must defend: see the module doc, "Principal".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Principal {
+    /// A privileged process in a folder a user may own.
+    System,
+    /// The user's own process, on the user's own file.
+    User,
+}
+
+impl Principal {
+    /// Whether the OS resolves every link in the walk and the walk judges none: a walk that has no rule has no
+    /// reason to read a link's target itself.
+    fn leaves_links_to_the_os(self) -> bool {
+        match self {
+            Principal::System => false,
+            Principal::User => true,
+        }
+    }
+
+    /// The mode (before the umask) of a folder a walk makes: the system's as `create_dir_all` makes it, a user's own
+    /// private, as the folders of their own files hold what they would not share. Unix only; Windows has no mode.
+    #[cfg(unix)]
+    fn new_folder_mode(self) -> libc::mode_t {
+        match self {
+            Principal::System => 0o777,
+            Principal::User => 0o700,
+        }
+    }
+}
 
 /// Why a path was not opened as a directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,18 +184,55 @@ pub enum OpenFile {
     CreateNew { mode: u32 },
     /// Open what is there, `NotFound` if nothing. A symlink (Windows: reparse point) is opened as itself, not followed.
     Existing,
-    /// Open what is there to read, `NotFound` if nothing. Never follows a symlink, and never blocks on a FIFO
-    /// (unix): anything that is not a regular file is [`Refusal::NotRegular`]. Shares everything with other
-    /// handles, delete included, so a replace of the file does not wait for the reader.
+    /// Open what is there to read, `NotFound` if nothing. Never follows a symlink (a link at the name is
+    /// [`Refusal::Symlink`]), and never blocks on a FIFO (unix): anything else that is not a regular file is
+    /// [`Refusal::NotRegular`]. Shares everything with other handles, delete included, so a replace of the file does
+    /// not wait for the reader.
     Read,
     /// Open what is there to append to, `NotFound` if nothing: it does not create the file, so that the caller
-    /// knows whether it made it. Never follows a symlink. Shares everything with other handles, delete included,
-    /// so a reader or a rename of the name does not wait for the writer. A FIFO is opened without blocking (unix),
-    /// which fails while nothing reads it.
+    /// knows whether it made it. Never follows a symlink: a link at the name is [`Refusal::Symlink`]. Shares
+    /// everything with other handles, delete included, so a reader or a rename of the name does not wait for the
+    /// writer. A FIFO is opened without blocking (unix), which fails while nothing reads it.
     Append,
     /// Create the file to append to; `AlreadyExists` if the name is taken, by anything. Never follows a symlink.
     /// Unix: created with `mode` (before the umask). Windows ignores `mode`. Shares as [`Self::Append`].
     CreateAppend { mode: u32 },
+}
+
+impl OpenFile {
+    /// Whether what the open reaches must be a regular file: a read of anything else (a FIFO, a device, a link) is
+    /// [`Refusal::NotRegular`] before a byte is read.
+    pub(crate) fn requires_regular_file(self) -> bool {
+        match self {
+            OpenFile::CreateNew { .. } => false,
+            OpenFile::Existing => false,
+            OpenFile::Read => true,
+            OpenFile::Append => false,
+            OpenFile::CreateAppend { .. } => false,
+        }
+    }
+
+    /// Whether the handle may not be a link that was opened as itself (Windows opens a name as itself and says what it
+    /// is afterwards; unix refuses a link at the open).
+    #[cfg(windows)]
+    pub(crate) fn refuses_a_link(self) -> bool {
+        match self {
+            OpenFile::CreateNew { .. } => false,
+            OpenFile::Existing => false,
+            OpenFile::Read => true,
+            OpenFile::Append => true,
+            OpenFile::CreateAppend { .. } => false,
+        }
+    }
+}
+
+/// What an open does with a link at the final name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtName {
+    /// The link is opened as itself, which a read or append then refuses.
+    AsItself,
+    /// The OS follows the link: for a [`Principal::User`] reading their own file.
+    Followed,
 }
 
 /// What a name in a [`Dir`] is, not following a symlink.
@@ -184,20 +262,27 @@ impl FileId {
 /// [`ReadDir`], which has no write methods on any platform.
 pub struct Dir {
     file: File,
+    principal: Principal,
 }
 
 impl Dir {
     /// Opens the directory at `path`, following a link only under the ownership-transition rule (module doc).
-    /// With `create`, a missing component is created relative to its parent's handle (unix: mode
-    /// `0o777` before the umask, as `create_dir_all`). `owner`: see the module doc.
-    pub fn open(path: &Path, create: bool, owner: Option<(u32, u32)>) -> io::Result<Dir> {
-        Self::open_as(path, create, owner, platform::caller())
+    /// With `create`, a missing component is created relative to its parent's handle (unix: mode `0o777` before the
+    /// umask, as `create_dir_all`; for a [`Principal::User`], `0o700`). `owner`: see the module doc.
+    pub fn open(path: &Path, create: bool, owner: Option<(u32, u32)>, principal: Principal) -> io::Result<Dir> {
+        Self::open_as(path, create, owner, principal, platform::caller())
     }
 
     /// [`Self::open`] as `caller`; the seam lets a test claim to be another user.
     #[doc(hidden)]
-    pub fn open_as(path: &Path, create: bool, owner: Option<(u32, u32)>, caller: Caller) -> io::Result<Dir> {
-        platform::open_dir(path, create, owner, caller).map(|file| Dir { file })
+    pub fn open_as(
+        path: &Path,
+        create: bool,
+        owner: Option<(u32, u32)>,
+        principal: Principal,
+        caller: Caller,
+    ) -> io::Result<Dir> {
+        platform::open_dir(path, create, owner, principal, caller).map(|file| Dir { file, principal })
     }
 
     /// The directory's own handle, for an operation on the directory itself (an ACL on Windows).
@@ -234,7 +319,7 @@ impl Dir {
     /// A read-only view of this directory, for what only reads: it holds a duplicate of the handle, so it stays
     /// valid after `self` is dropped, and it has no way to write.
     pub fn reader(&self) -> io::Result<ReadDir> {
-        Ok(ReadDir::from_handle(self.file.try_clone()?))
+        Ok(ReadDir::from_handle(self.file.try_clone()?, self.principal))
     }
 
     /// Gives the file `existing` a second name `new`, which must be free: `AlreadyExists` otherwise. A symlink is
@@ -365,8 +450,8 @@ impl Dir {
     /// [`Self::open`] with the right to read and rewrite the final directory's ACL through [`Self::file`], which
     /// opening for use does not ask for (and which fails where the caller lacks it).
     #[cfg(windows)]
-    pub fn open_for_acl(path: &Path, create: bool) -> io::Result<Dir> {
-        platform::open_dir_with(path, create, platform::ACL_RIGHTS).map(|file| Dir { file })
+    pub fn open_for_acl(path: &Path, create: bool, principal: Principal) -> io::Result<Dir> {
+        platform::open_dir_with(path, create, principal, platform::ACL_RIGHTS).map(|file| Dir { file, principal })
     }
 
     /// Hands the directory itself to `owner` and, if given, sets its mode (unix; `0o700` for a state
@@ -499,7 +584,7 @@ pub fn give_file(file: &File, owner: Option<(u32, u32)>) {
 /// (a stale file, or a link) is unlinked as itself. A name that is not there is `Ok`; one that cannot be unlinked is
 /// an error.
 pub fn make_dir_and_free_name(dir: &Path, name: &OsStr) -> io::Result<()> {
-    match Dir::open(dir, true, None)?.unlink(name) {
+    match Dir::open(dir, true, None, Principal::System)?.unlink(name) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         result => result,
     }
@@ -510,6 +595,12 @@ pub fn make_dir_and_free_name(dir: &Path, name: &OsStr) -> io::Result<()> {
 fn read_whole(dir: &File, name: &OsStr) -> io::Result<Vec<u8>> {
     single_component(name)?;
     platform::read_to_end(platform::open_file(dir, name, OpenFile::Read)?)
+}
+
+/// [`read_whole`] for a link at the name that is followed ([`Principal::User`]).
+fn read_whole_following(dir: &File, name: &OsStr) -> io::Result<Vec<u8>> {
+    single_component(name)?;
+    platform::read_to_end(platform::open_read_through_link(dir, name)?)
 }
 
 /// [`read_whole`] for a file the folder's owner must vouch for ([`trail::may_read`]): refused with

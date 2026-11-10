@@ -2420,6 +2420,7 @@ dependencies = [
  "sha2 0.11.0",
  "skuld",
  "socket2",
+ "stepstool",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -3363,6 +3364,7 @@ dependencies = [
  "skuld",
  "smoltcp",
  "socket2",
+ "stepstool",
  "tar",
  "tempfile",
  "thiserror 2.0.18",
@@ -7308,6 +7310,7 @@ dependencies = [
  "skuld",
  "tempfile",
  "thiserror 2.0.18",
+ "util",
  "windows 0.62.2",
 ]
 

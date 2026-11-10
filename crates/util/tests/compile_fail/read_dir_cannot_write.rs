@@ -4,7 +4,7 @@ use std::path::Path;
 use util::dir::ReadDir;
 
 fn main() {
-    let dir = ReadDir::open(Path::new(".")).unwrap();
+    let dir = ReadDir::open(Path::new("."), util::dir::Principal::System).unwrap();
     let _ = dir.write_atomic("a".as_ref(), b"x", None, |_| Ok(()));
     let _ = dir.unlink("a".as_ref());
     let _ = dir.rename("a".as_ref(), "b".as_ref());

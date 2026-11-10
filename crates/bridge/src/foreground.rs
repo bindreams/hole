@@ -269,7 +269,8 @@ async fn run_inner(
     // uniform and off the runtime worker). The marker is written next to
     // bridge.log, NOT in state_dir.
     let log_dir_sweep = log_dir.to_path_buf();
-    if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
+    if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep, stepstool::principal())).await
+    {
         tracing::warn!(error = &e as &dyn std::error::Error, "crash sweep task panicked");
     }
 

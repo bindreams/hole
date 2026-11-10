@@ -49,7 +49,7 @@ fn sweep_wiring_reports_and_deletes_bridge_marker() {
     let rx = writer.wait_for("native crash detected in previous run");
 
     // This is the exact call the foreground/service entry points make.
-    tombstone::sweep(log_dir.path());
+    tombstone::sweep(log_dir.path(), util::dir::Principal::System);
 
     rx.recv().expect("breadcrumb emitted");
     assert!(!marker.exists(), "marker deleted");

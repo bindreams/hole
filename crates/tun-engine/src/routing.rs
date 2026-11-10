@@ -1816,7 +1816,7 @@ impl SystemRouting {
     /// through `fs`, so a test can fail one.
     #[cfg(test)]
     fn with_record_fs(mut self, fs: std::sync::Arc<dyn util::versioned_file::Fs>) -> Self {
-        self.record_file = Arc::new(state::RouteFile::with_fs(&self.state_dir, fs));
+        self.record_file = Arc::new(state::RouteFile::new(&self.state_dir).with_fs(fs));
         self
     }
 

@@ -40,7 +40,7 @@ impl Schema for V4 {
 
 impl VersionedState for V4 {
     const FILE_NAME: &'static str = "v4.json";
-    const ROLE: Role = Role::Config;
+    const ROLE: Role = Role::Decision;
     const UNVERSIONED_AS: Option<u32> = Some(4);
 }
 

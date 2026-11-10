@@ -4,86 +4,200 @@
 //! to an error — which the GUI discarded (`unwrap_or_default`), so the next
 //! save overwrote the corrupt file, destroying the user's servers and
 //! passwords. `ConfigStore` makes that impossible: a corrupt/unreadable
-//! `config.json` is quarantined to a timestamped `.bak` before defaults are
-//! used, and if quarantine fails, saving is blocked for the session.
+//! `config.json` is moved aside to `config.json.unreadable[.N].bak` before
+//! defaults are used, and if that fails, saving is blocked for the session. A
+//! file from a newer release (#1096) is left where it is and saving is blocked:
+//! this release cannot write it without dropping what it does not know. So is a
+//! file whose read is *refused* ([`ConfigRecovery::Refused`]): a refusal says this process may not read it, not that
+//! it is damaged, so it is neither moved aside nor overwritten. And so is a folder that does not open
+//! ([`ConfigRecovery::FolderNotOpened`]): nothing was read and nothing can be moved.
+//!
+//! The file is a [`VersionedFile`] of role `Role::Config`: the user's own file, handled as the process that loads it
+//! is. An unprivileged process in its own folder follows every link the OS would and reads what it finds. A
+//! privileged one (a GUI run under `sudo`) walks the folder and reads the file as the system does, so a link at the
+//! name, a file another account owns or anything that is not a regular file is refused, and the file is left in place
+//! with defaults in memory and saving blocked. The load is one [`VersionedFile::update`] that reads the file and,
+//! when it is corrupt or fails to read, moves it aside.
 
 use crate::config::{AppConfig, ConfigError};
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use time::OffsetDateTime;
 use tracing::{error, warn};
+use util::dir::{Dir, Principal, Refusal};
+use util::parse_error::ParseFailure;
+use util::versioned_file::{Change, Loaded, Observed, Placement, Schema, StoreError, UpdateOutcome, VersionedFile};
 
-/// What happened when the config file could not be loaded.
+/// What happened when the config file could not be loaded, and what became of it.
 #[derive(Debug)]
-pub struct ConfigRecovery {
-    /// The config file that failed to load.
-    pub path: PathBuf,
-    /// Why it failed.
-    pub error: ConfigError,
-    /// Where the file was quarantined, or the error that prevented it.
-    pub backup: Result<PathBuf, io::Error>,
+pub enum ConfigRecovery {
+    /// Corrupt or unreadable; moved aside to `backup`, and saving works.
+    Quarantined {
+        path: PathBuf,
+        error: ConfigError,
+        backup: PathBuf,
+    },
+    /// Corrupt or unreadable, and could not be moved aside: saving is blocked so the file is never overwritten.
+    QuarantineFailed {
+        path: PathBuf,
+        error: ConfigError,
+        failure: io::Error,
+    },
+    /// The folder of `path` could not be opened (a file in its place, a link the walk refuses, no right to it), so
+    /// nothing was read and nothing can be moved: defaults, and saving is blocked.
+    FolderNotOpened { path: PathBuf, failure: io::Error },
+    /// The read was refused (a link at the name, a file another account owns, not a regular file): nothing was read and
+    /// nothing is moved, so the file is exactly where it was; defaults, and saving is blocked.
+    Refused { path: PathBuf, refusal: Refusal },
+    /// From a newer release (`found` is `None` for a version too large for a `u32`): left where it is, and saving is
+    /// blocked.
+    LeftInPlace { path: PathBuf, found: Option<u32> },
 }
 
-/// Owns the config path and the load-time recovery state. All GUI saves go
-/// through [`ConfigStore::save`] so a failed quarantine blocks destructive
-/// writes for the whole session.
+impl ConfigRecovery {
+    /// The config file that failed to load.
+    pub fn path(&self) -> &Path {
+        match self {
+            ConfigRecovery::Quarantined { path, .. } => path,
+            ConfigRecovery::QuarantineFailed { path, .. } => path,
+            ConfigRecovery::FolderNotOpened { path, .. } => path,
+            ConfigRecovery::Refused { path, .. } => path,
+            ConfigRecovery::LeftInPlace { path, .. } => path,
+        }
+    }
+
+    /// Whether saving is blocked for the session: the file is still at its name and a write would destroy it.
+    fn blocks_saving(&self) -> bool {
+        match self {
+            ConfigRecovery::Quarantined { .. } => false,
+            ConfigRecovery::QuarantineFailed { .. } => true,
+            ConfigRecovery::FolderNotOpened { .. } => true,
+            ConfigRecovery::Refused { .. } => true,
+            ConfigRecovery::LeftInPlace { .. } => true,
+        }
+    }
+
+    fn log(&self) {
+        match self {
+            ConfigRecovery::Quarantined { path, error, backup } => error!(
+                path = %path.display(), error = error as &dyn std::error::Error, backup = %backup.display(),
+                "config file unreadable; quarantined to backup, starting with defaults"
+            ),
+            ConfigRecovery::QuarantineFailed { path, error, failure } => error!(
+                path = %path.display(), error = error as &dyn std::error::Error, backup_error = failure as &dyn std::error::Error,
+                "config file unreadable and backup failed; saving disabled for this session"
+            ),
+            ConfigRecovery::FolderNotOpened { path, failure } => error!(
+                path = %path.display(), error = failure as &dyn std::error::Error,
+                "config folder could not be opened; starting with defaults, saving disabled for this session"
+            ),
+            ConfigRecovery::Refused { path, refusal } => error!(
+                path = %path.display(), error = refusal as &dyn std::error::Error,
+                "config file refused; left untouched, starting with defaults, saving disabled for this session"
+            ),
+            ConfigRecovery::LeftInPlace { path, found } => error!(
+                path = %path.display(),
+                error = &ConfigError::NewerVersion { found: *found, supported: AppConfig::VERSION } as &dyn std::error::Error,
+                "config file is from a newer release; left untouched, starting with defaults, saving disabled for this session"
+            ),
+        }
+    }
+}
+
+/// What one read of `config.json` found, taken inside the update that moves a file this release cannot read aside.
+enum Found {
+    Config(AppConfig),
+    Absent,
+    Newer(Option<u32>),
+    Refused(Refusal),
+    Corrupt(ParseFailure),
+    Unreadable(io::Error),
+}
+
+impl Found {
+    /// What to do with the file now, and what was found.
+    fn of(observed: &Observed<AppConfig>) -> (Change<AppConfig>, Found) {
+        match &observed.loaded {
+            Loaded::Current { value, .. } => (Change::Keep, Found::Config(value.clone())),
+            Loaded::Absent => (Change::Keep, Found::Absent),
+            // `AppConfig`'s chain floors at version 0, which is not a version: nothing decodes as obsolete.
+            Loaded::Obsolete { found, .. } => unreachable!("config.json read as obsolete version {found}"),
+            Loaded::Newer { found, .. } => (Change::Keep, Found::Newer(*found)),
+            // `ParseFailure` is category and position only: never the serde error, whose Display echoes content.
+            Loaded::Corrupt { failure, .. } => (Change::MoveAside, Found::Corrupt(*failure)),
+            // A refusal says this process may not read the file, not that it is damaged: it stays where it is.
+            Loaded::Unreadable { error, .. } => match Refusal::from_error(error) {
+                Some(refusal) => (Change::Keep, Found::Refused(*refusal)),
+                None => (Change::MoveAside, Found::Unreadable(copy_of(error))),
+            },
+        }
+    }
+}
+
+/// A copy of `error`, which `Loaded` lends and `ConfigError::Read` owns: the OS code (which may sit inside a wrapper
+/// that names the NTSTATUS), else the kind. An `io::Error` cannot be cloned, and any other payload is not a type this
+/// can rebuild. Never a refusal: [`Found::of`] leaves the file of one where it is.
+fn copy_of(error: &io::Error) -> io::Error {
+    debug_assert!(Refusal::from_error(error).is_none(), "a refusal is not copied");
+    match util::error::raw_os_error(error) {
+        Some(code) => io::Error::from_raw_os_error(code),
+        None => io::Error::from(error.kind()),
+    }
+}
+
+/// Owns the config file and the load-time recovery state. All GUI saves go
+/// through [`ConfigStore::save`] so a file that could not be preserved blocks
+/// destructive writes for the whole session.
 pub struct ConfigStore {
-    path: PathBuf,
-    /// Set when quarantine failed: the corrupt file is still at `path` and
-    /// writing would destroy it.
+    file: VersionedFile<AppConfig>,
+    /// Set when the file is, or may be, still at its name (it could not be moved aside, it is from a newer release,
+    /// its read was refused, or its folder did not open): writing would destroy it. See
+    /// [`ConfigRecovery::blocks_saving`].
     save_blocked: bool,
 }
 
 impl ConfigStore {
-    /// Load `path`, quarantining a corrupt/unreadable file to a `.bak`.
+    /// Load `config.json` from `dir`, moving a corrupt/unreadable file aside to a `.bak`.
     ///
-    /// Missing file → defaults, no recovery (first launch). `now` becomes the
-    /// timestamp in the backup name; production passes
-    /// `OffsetDateTime::now_utc()`.
-    pub fn load(path: PathBuf, now: OffsetDateTime) -> (Self, AppConfig, Option<ConfigRecovery>) {
-        let (config, recovery) = match fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str(&contents) {
-                Ok(config) => (config, None),
-                Err(e) => {
-                    let backup = quarantine(&path, Some(&contents), now);
-                    let recovery = ConfigRecovery {
-                        path: path.clone(),
-                        // Same leak-safe shape as `parse_kind`'s rationale: never
-                        // carry the serde error (its Display echoes config content).
-                        error: ConfigError::Parse {
-                            kind: crate::config::parse_kind(&e),
-                            line: e.line(),
-                            column: e.column(),
-                        },
-                        backup,
-                    };
-                    (AppConfig::default(), Some(recovery))
-                }
-            },
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (AppConfig::default(), None),
-            Err(e) => {
-                let backup = quarantine(&path, None, now);
-                let recovery = ConfigRecovery {
-                    path: path.clone(),
-                    error: ConfigError::Read { source: e },
-                    backup,
+    /// Missing file → defaults, no recovery (first launch). A file from a newer
+    /// release, a read the process was refused, or a folder that does not open → defaults, nothing moved, saving
+    /// blocked.
+    pub fn load(dir: &Path, principal: Principal) -> (Self, AppConfig, Option<ConfigRecovery>) {
+        let file = VersionedFile::<AppConfig>::for_process(dir, principal);
+        let path = file.path().to_path_buf();
+        let mut found = None;
+        let outcome = file.update(&ConfigPlacement, |observed| {
+            let (change, what) = Found::of(observed);
+            found = Some(what);
+            (change, ())
+        });
+        let (config, recovery) = match (found, outcome) {
+            (Some(Found::Config(config)), _) => (config, None),
+            (Some(Found::Absent), _) => (AppConfig::default(), None),
+            (Some(Found::Newer(found)), _) => (AppConfig::default(), Some(ConfigRecovery::LeftInPlace { path, found })),
+            (Some(Found::Refused(refusal)), _) => {
+                (AppConfig::default(), Some(ConfigRecovery::Refused { path, refusal }))
+            }
+            (Some(Found::Corrupt(failure)), moved) => {
+                let error = ConfigError::Parse { failure };
+                (AppConfig::default(), moved_aside(path, error, moved))
+            }
+            (Some(Found::Unreadable(source)), moved) => {
+                let error = ConfigError::Read { source };
+                (AppConfig::default(), moved_aside(path, error, moved))
+            }
+            // The folder did not open, so nothing was read.
+            (None, Err(failure)) => {
+                let recovery = ConfigRecovery::FolderNotOpened {
+                    path,
+                    failure: io_of(failure),
                 };
                 (AppConfig::default(), Some(recovery))
             }
+            (None, Ok(_)) => unreachable!("an update that read nothing succeeded"),
         };
 
         if let Some(r) = &recovery {
-            match &r.backup {
-                Ok(bak) => error!(
-                    path = %r.path.display(), error = &r.error as &dyn std::error::Error, backup = %bak.display(),
-                    "config file unreadable; quarantined to backup, starting with defaults"
-                ),
-                Err(bak_err) => error!(
-                    path = %r.path.display(), error = &r.error as &dyn std::error::Error, backup_error = bak_err as &dyn std::error::Error,
-                    "config file unreadable and backup failed; saving disabled for this session"
-                ),
-            }
+            r.log();
         }
 
         // Config load is the first site in any process that holds a server
@@ -91,123 +205,73 @@ impl ConfigStore {
         // one — including the recovery `error!` above's successors.
         crate::logging::redact_arm::arm_config(&config);
 
-        let save_blocked = matches!(&recovery, Some(r) if r.backup.is_err());
-        (Self { path, save_blocked }, config, recovery)
+        let save_blocked = recovery.as_ref().is_some_and(ConfigRecovery::blocks_saving);
+        (Self { file, save_blocked }, config, recovery)
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        self.file.path()
     }
 
-    /// Save `config`, unless a failed quarantine blocked saving.
+    /// Save `config`, unless a file that could not be preserved (or read, or reached) blocked saving.
     ///
-    /// Not a synchronization point: concurrent saves are serialized by the
-    /// caller — every GUI site holds the `AppState::config` mutex across
-    /// this call.
+    /// Not a synchronization point beyond the file's own lock: concurrent saves
+    /// are serialized by the caller — every GUI site holds the
+    /// `AppState::config` mutex across this call.
     pub fn save(&self, config: &AppConfig) -> Result<(), ConfigError> {
         if self.save_blocked {
             return Err(ConfigError::SaveBlocked);
         }
-        // The clippy ban routes everyone else here; this is the seam itself.
-        #[allow(clippy::disallowed_methods)]
-        config.save(&self.path)
+        self.file
+            .update(&ConfigPlacement, |_| (Change::Store(config.clone()), ()))
+            .map(|((), _)| ())
+            .map_err(|source| ConfigError::Write { source })
     }
 }
 
-/// Timestamp embedded in backup names. Dashes instead of colons — colons are
-/// invalid in Windows file names.
-const BACKUP_TS_FORMAT: &[time::format_description::BorrowedFormatItem<'static>] =
-    time::macros::format_description!("[year]-[month]-[day]T[hour]-[minute]-[second]Z");
-
-fn backup_path(path: &Path, now: OffsetDateTime, counter: u32) -> PathBuf {
-    debug_assert!(path.file_name().is_some(), "config path must name a file: {path:?}");
-    let ts = now.format(BACKUP_TS_FORMAT).expect("static format, in-range timestamp");
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let suffix = if counter == 1 {
-        String::new()
-    } else {
-        format!("-{counter}")
-    };
-    path.with_file_name(format!("{name}.{ts}{suffix}.bak"))
-}
-
-/// Move the file at `path` aside to a timestamped sibling `.bak`.
-///
-/// Prefers an atomic `rename`: one step, and it preserves the original
-/// file's permissions (the config holds plaintext passwords; macOS `save()`
-/// enforces 0600). If rename fails and the contents are known (the file was
-/// readable but unparsable), falls back to writing a fresh backup and
-/// best-effort removing the original — on Windows a file held open by
-/// another process refuses the rename but still allows new siblings.
-fn quarantine(path: &Path, contents: Option<&str>, now: OffsetDateTime) -> Result<PathBuf, io::Error> {
-    // The exists()-probe → rename pair is not atomic, and on unix a rename
-    // would silently overwrite an existing destination — the probe is what
-    // protects older backups. That is sound because nothing else creates
-    // `config.json.*.bak` siblings: the webview engine shares this directory
-    // but never writes backup-named files, and the single-instance lock
-    // (held before setup) makes Hole itself sequential. `exists()` mapping
-    // stat errors to `false` is the safe direction — the rename/create_new
-    // below is authoritative and fails cleanly.
-    let mut counter = 1;
-    let bak = loop {
-        let candidate = backup_path(path, now, counter);
-        if !candidate.exists() {
-            break candidate;
-        }
-        counter += 1;
-    };
-
-    let rename_err = match fs::rename(path, &bak) {
-        Ok(()) => return Ok(bak),
-        Err(e) => e,
-    };
-    let Some(contents) = contents else {
-        return Err(rename_err);
-    };
-    warn!(
-        error = &rename_err as &dyn std::error::Error,
-        "rename to backup failed; attempting copy fallback"
-    );
-
-    // `create_new` is an atomic claim of the name, so this loop is race-free.
-    loop {
-        let candidate = backup_path(path, now, counter);
-        match open_create_new(&candidate) {
-            Ok(mut file) => {
-                use std::io::Write;
-                if let Err(e) = file.write_all(contents.as_bytes()) {
-                    let _ = fs::remove_file(&candidate);
-                    return Err(e);
-                }
-                if let Err(e) = fs::remove_file(path) {
-                    warn!(
-                        path = %path.display(), error = &e as &dyn std::error::Error,
-                        "backed up corrupt config by copy, but could not remove the original; \
-                         it may be re-quarantined on next start"
-                    );
-                }
-                return Ok(candidate);
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => counter += 1,
-            Err(e) => return Err(e),
-        }
+/// What the move aside of a corrupt or unreadable file came to.
+fn moved_aside(
+    path: PathBuf,
+    error: ConfigError,
+    moved: Result<((), UpdateOutcome), StoreError>,
+) -> Option<ConfigRecovery> {
+    match moved {
+        Ok(((), UpdateOutcome::MovedAside(backup))) => Some(ConfigRecovery::Quarantined { path, error, backup }),
+        // The file was gone by the time it was moved: nothing is at the name, nothing was lost.
+        Ok(((), UpdateOutcome::Absent)) => None,
+        Ok(((), other)) => unreachable!("a move aside came to {other:?}"),
+        Err(failure) => Some(ConfigRecovery::QuarantineFailed {
+            path,
+            error,
+            failure: io_of(failure),
+        }),
     }
 }
 
-/// The backup holds plaintext passwords — match `save()`'s 0600 on unix.
-#[cfg(unix)]
-fn open_create_new(path: &Path) -> io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
+/// The I/O error of a [`StoreError`] that a move aside or an open of the folder returns: neither stores, so neither
+/// refuses a store or fails to encode.
+fn io_of(error: StoreError) -> io::Error {
+    match error {
+        StoreError::Io(source) => source,
+        other => unreachable!("a move aside or an open of the folder failed with {other:?}"),
+    }
 }
 
-#[cfg(not(unix))]
-fn open_create_new(path: &Path) -> io::Result<fs::File> {
-    fs::OpenOptions::new().write(true).create_new(true).open(path)
+/// Where `config.json` is written: a folder of the user's own, private because the file holds plaintext passwords.
+struct ConfigPlacement;
+
+impl Placement for ConfigPlacement {
+    // The staged file is sealed `0600` (unix), and that is the load-bearing protection: a folder this process does not
+    // own cannot be chmod'd, and that must not fail the save.
+    fn prepare_dir(&self, dir: &Dir) -> io::Result<()> {
+        if let Err(source) = dir.secure(None, Some(0o700)) {
+            warn!(
+                error = &source as &dyn std::error::Error,
+                "could not tighten config directory permissions; continuing"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

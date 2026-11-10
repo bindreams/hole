@@ -115,6 +115,44 @@ fn blocks_connect_takes_the_cell_of_its_cause() {
     }
 }
 
+/// Only the user's own data follows the privilege of the process that handles it (a user's own, or a privileged one
+/// such as a GUI run under `sudo`); every other role is a privileged process's whoever runs it.
+#[skuld::test]
+fn the_principal_of_each_role_is_exactly_this() {
+    use crate::dir::Principal::{System, User};
+
+    // (role, its principal when the process is System, when the process is User)
+    let table = [
+        (Role::Decision, System, System),
+        (Role::OsRecord, System, System),
+        (Role::LegacyRecord, System, System),
+        (Role::Config, System, User),
+        (Role::Claim, System, System),
+        (Role::Cover, System, System),
+    ];
+
+    for (role, as_system, as_user) in table {
+        assert_eq!(role.principal(System), as_system, "{role:?} in a privileged process");
+        assert_eq!(role.principal(User), as_user, "{role:?} in an unprivileged process");
+    }
+}
+
+/// A file of a role the process's privilege changes cannot be built without saying which process: that is the one role
+/// whose two principals differ.
+#[skuld::test]
+fn only_the_config_role_depends_on_the_privilege_of_the_process() {
+    for (role, depends) in [
+        (Role::Decision, false),
+        (Role::OsRecord, false),
+        (Role::LegacyRecord, false),
+        (Role::Config, true),
+        (Role::Claim, false),
+        (Role::Cover, false),
+    ] {
+        assert_eq!(role.depends_on_the_process(), depends, "{role:?}");
+    }
+}
+
 /// The `Claim` role's cells, written out by hand.
 #[skuld::test]
 fn claim_role_cells_match_the_spec_table() {

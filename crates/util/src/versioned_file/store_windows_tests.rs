@@ -240,7 +240,7 @@ fn the_directory_flush_tolerates_a_volume_without_one_where_it_is_wired() {
     let dir = dir();
     let os = |code: u32| io::Error::from_raw_os_error(code as i32);
 
-    let handle = Dir::open(dir.path(), false, None).unwrap();
+    let handle = Dir::open(dir.path(), false, None, crate::dir::Principal::System).unwrap();
 
     sync_dir_with(&handle, |_| Err(os(ERROR_INVALID_FUNCTION.0))).unwrap();
     let err = sync_dir_with(&handle, |_| Err(os(ERROR_IO_DEVICE.0))).unwrap_err();

@@ -119,7 +119,7 @@ fn lockdown_state_is_written_through_a_users_link_to_the_users_folder() {
 use util::dir::testing::{planted_name_is_not_read, PlantedName, Reader};
 
 fn write_state(dir: &std::path::Path, name: &str, json: &[u8]) {
-    util::dir::Dir::open(dir, true, None)
+    util::dir::Dir::open(dir, true, None, util::dir::Principal::System)
         .unwrap()
         .write_atomic(std::ffi::OsStr::new(name), json, None, |_| Ok(()))
         .unwrap();

@@ -137,12 +137,14 @@ impl<S: VersionedState> VersionedFile<S> {
     /// generation is the one that goes with the bytes: a read outside the lock could pair old bytes with a generation
     /// bumped for a write not yet published.
     ///
-    /// A file the folder's owner cannot vouch for (a second name a user planted) is `Unreadable`. A directory that is
-    /// not there is an absent file; one that cannot be opened (a link in its path that [`Dir`] does not follow) is a
-    /// read that failed, as is a name that holds anything but a regular file.
+    /// For a system file ([`super::Role::principal`]) a file the folder's owner cannot vouch for (a second name a user
+    /// planted) is `Unreadable`, and so is a link at the name; a user's own file (`Role::Config`) is read through a
+    /// link and with no question of whose it is. A directory that is not there is an absent file; one that cannot be
+    /// opened (a link in its path that [`Dir`] does not follow for that principal) is a read that failed, as is a
+    /// name that holds anything but a regular file.
     pub fn observe(&self) -> Observed<S> {
         let held = generation::lock(&self.path);
-        let loaded = match ReadDir::open(&self.dir) {
+        let loaded = match ReadDir::open(&self.dir, self.principal()) {
             Ok(dir) => self.read_through(&dir),
             Err(err) => Loaded::from_read(Err(err), || Some(UnreadableKind::Directory)),
         };
@@ -156,14 +158,18 @@ impl<S: VersionedState> VersionedFile<S> {
     /// (the file is [`Loaded::Absent`]), or could not be examined.
     fn read_through(&self, dir: &ReadDir) -> Loaded<S> {
         let name = self.file_name();
-        Loaded::from_read(self.fs.read(dir, name), || match self.fs.kind_of(dir, name) {
-            Ok(Some(EntryKind::Symlink | EntryKind::Directory | EntryKind::Other)) => Some(UnreadableKind::NotAFile),
-            Ok(Some(EntryKind::File)) => Some(UnreadableKind::File),
-            // The name is gone: the read failed on a file that was removed meanwhile.
-            Ok(None) => None,
-            Err(err) => {
-                tracing::debug!(file = %name.to_string_lossy(), kind = ?err.kind(), "the name of a state file that failed to read could not be examined");
-                Some(UnreadableKind::Unprobed)
+        Loaded::from_read(self.fs.read(dir, name), || {
+            match self.fs.kind_of(dir, name) {
+                Ok(Some(EntryKind::Symlink | EntryKind::Directory | EntryKind::Other)) => {
+                    Some(UnreadableKind::NotAFile)
+                }
+                Ok(Some(EntryKind::File)) => Some(UnreadableKind::File),
+                // The name is gone: the read failed on a file that was removed meanwhile.
+                Ok(None) => None,
+                Err(err) => {
+                    tracing::debug!(file = %name.to_string_lossy(), kind = ?err.kind(), "the name of a state file that failed to read could not be examined");
+                    Some(UnreadableKind::Unprobed)
+                }
             }
         })
     }
@@ -185,7 +191,8 @@ impl<S: VersionedState> VersionedFile<S> {
     /// attempt that then fails or does nothing has still moved it, so a reader that compared generations cannot
     /// mistake it for no write.
     ///
-    /// The directory is opened once without following a symlink and every step names a file inside that handle.
+    /// The directory is opened once, following a link only as the file's principal may ([`super::Role::principal`]), and
+    /// every step names a file inside that handle.
     ///
     /// On Windows the replace and its failure modes are described in the module doc. A non-finite `Option<f64>` is
     /// stored, and read back, as `None`; a plain float is refused with [`StoreError::Encode`].
@@ -321,9 +328,9 @@ impl<S: VersionedState> VersionedFile<S> {
     fn open_dir(&self, place: &dyn Placement, create: bool) -> io::Result<Dir> {
         #[cfg(windows)]
         if place.open_for_acl() {
-            return Dir::open_for_acl(&self.dir, create);
+            return Dir::open_for_acl(&self.dir, create, self.principal());
         }
-        Dir::open(&self.dir, create, place.owner())
+        Dir::open(&self.dir, create, place.owner(), self.principal())
     }
 }
 

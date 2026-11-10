@@ -234,7 +234,8 @@ fn a_remove_after_the_directory_is_swapped_removes_inside_the_opened_directory()
         swapped: Default::default(),
     };
 
-    let removal = VersionedFile::<DecisionFile>::with_fs(&root.path().join("state"), std::sync::Arc::new(fs))
+    let removal = VersionedFile::<DecisionFile>::new(&root.path().join("state"))
+        .with_fs(std::sync::Arc::new(fs))
         .remove()
         .unwrap();
 
@@ -254,7 +255,8 @@ fn a_move_aside_after_the_directory_is_swapped_moves_inside_the_opened_directory
         swapped: Default::default(),
     };
 
-    let removal = VersionedFile::<DecisionFile>::with_fs(&root.path().join("state"), std::sync::Arc::new(fs))
+    let removal = VersionedFile::<DecisionFile>::new(&root.path().join("state"))
+        .with_fs(std::sync::Arc::new(fs))
         .remove()
         .unwrap();
 
@@ -274,7 +276,8 @@ fn a_store_with_a_backup_after_the_directory_is_swapped_writes_inside_the_opened
         swapped: Default::default(),
     };
 
-    VersionedFile::<DecisionFile>::with_fs(&root.path().join("state"), std::sync::Arc::new(fs))
+    VersionedFile::<DecisionFile>::new(&root.path().join("state"))
+        .with_fs(std::sync::Arc::new(fs))
         .store(&decision("new"), &DefaultPlacement::default())
         .unwrap();
 

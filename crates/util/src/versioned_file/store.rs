@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{frame, CannotRead, Chain, ChainError, VersionedState};
-use crate::dir::{Dir, EntryKind, ReadDir, Staged};
+use crate::dir::{Dir, EntryKind, Principal, ReadDir, Staged};
 use crate::parse_error::ParseFailure;
 
 /// The file-system calls the type makes, so a test can fail or hold one
@@ -27,9 +27,10 @@ pub trait Fs: Send + Sync {
         dir.rename_noreplace(from, to)
     }
 
-    /// The vouched read: a file the folder's owner cannot vouch for is refused (`Refusal::ForeignFile`).
+    /// The read for the directory's [`Principal`]: a system file the folder's owner cannot vouch for is refused
+    /// (`Refusal::ForeignFile`); a user's own file is read through a link at the name.
     fn read(&self, dir: &ReadDir, name: &OsStr) -> io::Result<Vec<u8>> {
-        dir.read_vouched(name)
+        dir.read_as(name)
     }
 
     /// What the name holds, asked once after a read of it failed.
@@ -53,9 +54,12 @@ impl Fs for StdFs {}
 /// What differs per file about where and how it is written, and is not the
 /// type's business: the directory's owner, the file's owner and ACL.
 ///
-/// The directory is opened once, without following a symlink, and every step
-/// goes through that handle ([`Dir`]): the state directory may belong to the
-/// user whose privileged writer this is, so no step is a path.
+/// The directory is opened once, following a link only as the file's principal
+/// may ([`Role::principal`](super::Role::principal)), and every step goes
+/// through that handle ([`Dir`]): the state directory may belong to the user
+/// whose privileged writer this is, so no step is a path. The vouched read, the
+/// refusal of a link at the name and the ownership-transition rule are for a
+/// system file; a user's own (`Role::Config`) has none of them.
 pub trait Placement {
     fn owner(&self) -> Option<(u32, u32)> {
         None
@@ -208,13 +212,31 @@ pub struct VersionedFile<S: VersionedState> {
     pub(super) dir: PathBuf,
     pub(super) path: PathBuf,
     pub(super) fs: Arc<dyn Fs>,
+    /// The running process's privilege, which decides how a user's own file (`Role::Config`) is handled.
+    pub(super) process: Principal,
     _schema: PhantomData<fn() -> S>,
 }
 
 impl<S: VersionedState> VersionedFile<S> {
     /// `dir` may be empty (the parent of a bare file name): that is the
     /// current directory.
+    ///
+    /// Not for a role the process's privilege changes ([`super::Role::depends_on_the_process`]): [`Self::for_process`]
+    /// builds such a file. The check is a const assert that runs where `new` is instantiated for the type, so `cargo
+    /// build` and `cargo test` fail on it and a bare `cargo check` (clippy included) does not.
     pub fn new(dir: &Path) -> Self {
+        const {
+            assert!(
+                !S::ROLE.depends_on_the_process(),
+                "this role's file is built by `VersionedFile::for_process`"
+            )
+        };
+        Self::for_process(dir, Principal::System)
+    }
+
+    /// This file handled by a process of privilege `process` ([`Role::principal`]). Only the user's own file
+    /// (`Role::Config`) depends on it; for a file of any other role it changes nothing.
+    pub fn for_process(dir: &Path, process: Principal) -> Self {
         const { assert_unversioned_as_valid::<S>() };
         let dir = if dir.as_os_str().is_empty() {
             Path::new(".")
@@ -225,14 +247,20 @@ impl<S: VersionedState> VersionedFile<S> {
             dir: dir.to_path_buf(),
             path: dir.join(S::FILE_NAME),
             fs: Arc::new(StdFs),
+            process,
             _schema: PhantomData,
         }
     }
 
-    /// A file whose reads, links and publishes go through `fs`.
+    /// Whose process handles this file: its role's principal under this process's privilege.
+    pub(super) fn principal(&self) -> Principal {
+        S::ROLE.principal(self.process)
+    }
+
+    /// This file with its reads, links and publishes going through `fs`.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn with_fs(dir: &Path, fs: Arc<dyn Fs>) -> Self {
-        Self { fs, ..Self::new(dir) }
+    pub fn with_fs(self, fs: Arc<dyn Fs>) -> Self {
+        Self { fs, ..self }
     }
 
     pub fn path(&self) -> &Path {

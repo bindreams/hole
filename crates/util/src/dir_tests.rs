@@ -1,17 +1,9 @@
-use super::testing::{plant_link, user_dir, SystemScratch};
+use super::testing::{file_link, plant_link, user_dir, SystemScratch};
 use super::*;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 // Fixtures ------------------------------------------------------------------------------------------------------------
-
-/// A symlink to the file `target` at `link`, of the kind an unprivileged user can plant.
-fn plant_file_symlink(target: &Path, link: &Path) {
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link).unwrap();
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(target, link).unwrap();
-}
 
 fn names(dir: &Path) -> Vec<OsString> {
     let mut found: Vec<_> = std::fs::read_dir(dir)
@@ -40,7 +32,7 @@ fn name(s: &str) -> OsString {
 #[skuld::test]
 fn an_existing_directory_opens() {
     let tmp = tempfile::tempdir().unwrap();
-    Dir::open(tmp.path(), false, None).unwrap();
+    Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 }
 
 #[skuld::test]
@@ -48,7 +40,9 @@ fn a_missing_directory_is_not_created_unless_asked() {
     let tmp = tempfile::tempdir().unwrap();
     let missing = tmp.path().join("a").join("b");
 
-    let err = Dir::open(&missing, false, None).err().expect("nothing to open");
+    let err = Dir::open(&missing, false, None, Principal::System)
+        .err()
+        .expect("nothing to open");
 
     assert_eq!(err.kind(), io::ErrorKind::NotFound);
     assert!(names(tmp.path()).is_empty());
@@ -59,7 +53,7 @@ fn missing_components_are_created_when_asked() {
     let tmp = tempfile::tempdir().unwrap();
     let deep = tmp.path().join("a").join("b").join("c");
 
-    Dir::open(&deep, true, None).unwrap();
+    Dir::open(&deep, true, None, Principal::System).unwrap();
 
     assert!(deep.is_dir());
 }
@@ -69,7 +63,7 @@ fn a_directory_that_exists_is_opened_not_recreated_when_asked_to_create() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("kept"), b"x").unwrap();
 
-    Dir::open(tmp.path(), true, None).unwrap();
+    Dir::open(tmp.path(), true, None, Principal::System).unwrap();
 
     assert_eq!(std::fs::read(tmp.path().join("kept")).unwrap(), b"x");
 }
@@ -83,7 +77,7 @@ fn a_link_to_a_folder_the_system_owns_as_the_last_component_is_refused() {
 
     for create in [false, true] {
         assert_eq!(
-            refusal(Dir::open(&link, create, None)),
+            refusal(Dir::open(&link, create, None, Principal::System)),
             Refusal::Symlink,
             "create {create}"
         );
@@ -100,7 +94,11 @@ fn nothing_is_made_through_a_link_to_a_folder_the_system_owns_as_a_parent_compon
 
     // Both the state directory and a missing directory below it.
     for path in [below.join("state"), below.join("state").join("deeper")] {
-        assert_eq!(refusal(Dir::open(&path, true, None)), Refusal::Symlink, "{path:?}");
+        assert_eq!(
+            refusal(Dir::open(&path, true, None, Principal::System)),
+            Refusal::Symlink,
+            "{path:?}"
+        );
     }
     assert!(!scratch.path().exists(), "something was made in the system's folder");
 }
@@ -112,7 +110,11 @@ fn a_file_where_a_directory_belongs_is_refused() {
     std::fs::write(&file, b"").unwrap();
 
     for path in [file.clone(), file.join("below")] {
-        assert_eq!(refusal(Dir::open(&path, true, None)), Refusal::NotDirectory, "{path:?}");
+        assert_eq!(
+            refusal(Dir::open(&path, true, None, Principal::System)),
+            Refusal::NotDirectory,
+            "{path:?}"
+        );
     }
 }
 
@@ -122,7 +124,7 @@ fn a_relative_path_is_resolved_from_the_current_directory() {
     let cwd = std::env::current_dir().unwrap();
     assert!(cwd.is_absolute());
     let relative = PathBuf::from(".");
-    Dir::open(&relative, false, None).unwrap();
+    Dir::open(&relative, false, None, Principal::System).unwrap();
 }
 
 #[skuld::test]
@@ -134,10 +136,15 @@ fn the_system_temp_dir_is_reachable_but_a_link_in_it_leads_only_to_the_users_fol
     plant_link(&mine, &tmp.path().join("to-mine"));
     plant_link(SystemScratch::new().root(), &tmp.path().join("to-the-system"));
 
-    Dir::open(tmp.path(), false, None).unwrap();
-    Dir::open(&tmp.path().join("to-mine"), false, None).unwrap();
+    Dir::open(tmp.path(), false, None, Principal::System).unwrap();
+    Dir::open(&tmp.path().join("to-mine"), false, None, Principal::System).unwrap();
     assert_eq!(
-        refusal(Dir::open(&tmp.path().join("to-the-system"), false, None)),
+        refusal(Dir::open(
+            &tmp.path().join("to-the-system"),
+            false,
+            None,
+            Principal::System
+        )),
         Refusal::Symlink
     );
 }
@@ -205,11 +212,16 @@ fn a_chain_of_as_many_links_as_the_os_allows_in_a_path_is_walked() {
     // The OS agrees that the path is fine.
     assert!(std::fs::metadata(&start).unwrap().is_dir());
 
-    let dir = Dir::open(&start, false, None).unwrap();
+    let dir = Dir::open(&start, false, None, Principal::System).unwrap();
 
     assert_eq!(
         FileId::of(dir.file()).unwrap(),
-        FileId::of(Dir::open(&path.join("real"), false, None).unwrap().file()).unwrap()
+        FileId::of(
+            Dir::open(&path.join("real"), false, None, Principal::System)
+                .unwrap()
+                .file()
+        )
+        .unwrap()
     );
 }
 
@@ -220,7 +232,10 @@ fn a_chain_of_one_more_link_than_the_os_allows_is_refused() {
     // The OS refuses the path too.
     assert!(std::fs::metadata(&start).is_err());
 
-    assert_eq!(refusal(Dir::open(&start, false, None)), Refusal::Symlink);
+    assert_eq!(
+        refusal(Dir::open(&start, false, None, Principal::System)),
+        Refusal::Symlink
+    );
 }
 
 #[skuld::test]
@@ -228,7 +243,10 @@ fn links_that_each_name_the_next_twice_are_refused_and_not_walked_in_exponential
     let (_tmp, path) = tempdir_with_no_link_in_its_path();
     let start = branching_chain(&path, 40);
 
-    assert_eq!(refusal(Dir::open(&start, true, None)), Refusal::Symlink);
+    assert_eq!(
+        refusal(Dir::open(&start, true, None, Principal::System)),
+        Refusal::Symlink
+    );
 }
 
 // Folders made below a user's link ------------------------------------------------------------------------------------
@@ -273,7 +291,7 @@ fn every_folder_made_below_a_users_link_is_given_to_the_links_owner() {
     let tmp = tempfile::tempdir().unwrap();
     let path = two_levels_below_a_users_link(tmp.path());
 
-    Dir::open(&path, true, None).unwrap();
+    Dir::open(&path, true, None, Principal::System).unwrap();
 
     let profile = owner_of(&tmp.path().join("profile"));
     assert_eq!(owner_of(&tmp.path().join("profile").join("hole")), profile);
@@ -288,13 +306,13 @@ fn a_second_walk_through_a_users_link_accepts_the_folders_the_first_walk_made() 
     let tmp = tempfile::tempdir().unwrap();
     let path = two_levels_below_a_users_link(tmp.path());
 
-    Dir::open(&path, true, None).unwrap();
+    Dir::open(&path, true, None, Principal::System).unwrap();
 
-    Dir::open(&path, true, None).unwrap();
-    Dir::open(&path, false, None).unwrap();
+    Dir::open(&path, true, None, Principal::System).unwrap();
+    Dir::open(&path, false, None, Principal::System).unwrap();
     // And a folder below the ones made before.
-    Dir::open(&path.join("deeper"), true, None).unwrap();
-    Dir::open(&path.join("deeper"), true, None).unwrap();
+    Dir::open(&path.join("deeper"), true, None, Principal::System).unwrap();
+    Dir::open(&path.join("deeper"), true, None, Principal::System).unwrap();
 }
 
 // open_file / id_of / unlink ==========================================================================================
@@ -302,7 +320,7 @@ fn a_second_walk_through_a_users_link_accepts_the_folders_the_first_walk_made() 
 #[skuld::test]
 fn open_file_creates_then_reopens_and_the_two_are_the_same_file() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     let created = dir
         .open_file(&name("lock"), OpenFile::CreateNew { mode: 0o600 })
@@ -317,7 +335,7 @@ fn open_file_creates_then_reopens_and_the_two_are_the_same_file() {
 #[skuld::test]
 fn creating_over_a_taken_name_fails_with_already_exists() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(tmp.path().join("taken"), b"theirs").unwrap();
 
     let err = dir
@@ -332,7 +350,7 @@ fn creating_over_a_taken_name_fails_with_already_exists() {
 #[skuld::test]
 fn a_missing_name_is_not_found_and_has_no_id() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     let err = dir.open_file(&name("absent"), OpenFile::Existing).err().unwrap();
 
@@ -364,7 +382,7 @@ fn lstat_owner(path: &Path) -> Option<(u32, u32)> {
 #[skuld::test]
 fn owner_of_says_the_owner_of_a_file() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(tmp.path().join("f"), b"x").unwrap();
 
     assert_eq!(dir.owner_of(&name("f")).unwrap(), lstat_owner(&tmp.path().join("f")));
@@ -373,7 +391,7 @@ fn owner_of_says_the_owner_of_a_file() {
 #[skuld::test]
 fn owner_of_says_none_for_an_absent_name() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     assert_eq!(dir.owner_of(&name("absent")).unwrap(), None);
 }
@@ -383,9 +401,9 @@ fn owner_of_says_none_for_an_absent_name() {
 #[skuld::test]
 fn owner_of_refuses_a_link() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(tmp.path().join("target"), b"x").unwrap();
-    plant_file_symlink(&tmp.path().join("target"), &tmp.path().join("link"));
+    file_link(&tmp.path().join("target"), &tmp.path().join("link"));
 
     let err = dir.owner_of(&name("link")).unwrap_err();
     assert_eq!(Refusal::from_error(&err), Some(&Refusal::NotRegular), "{err:?}");
@@ -396,7 +414,7 @@ fn owner_of_refuses_a_link() {
 #[skuld::test]
 fn owner_of_refuses_a_file_with_a_second_name() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(tmp.path().join("f"), b"x").unwrap();
     std::fs::hard_link(tmp.path().join("f"), tmp.path().join("second")).unwrap();
 
@@ -407,7 +425,7 @@ fn owner_of_refuses_a_file_with_a_second_name() {
 #[skuld::test]
 fn unlink_removes_the_name_and_not_what_a_symlink_points_at() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let victim = tmp.path().join("victim");
     std::fs::write(&victim, b"keep").unwrap();
     let file_target = tmp.path().join("target-dir");
@@ -424,7 +442,7 @@ fn unlink_removes_the_name_and_not_what_a_symlink_points_at() {
 #[skuld::test]
 fn a_name_that_is_not_one_file_name_is_refused_by_every_operation() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     for bad in ["", ".", "..", "a/b", "a\\b", "/abs"] {
         let bad = name(bad);
@@ -453,7 +471,7 @@ fn a_name_that_is_not_one_file_name_is_refused_by_every_operation() {
 #[skuld::test]
 fn write_atomic_creates_and_then_replaces_the_file_and_leaves_no_temp() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     dir.write_atomic(&name("state.json"), b"first", None, |_| Ok(()))
         .unwrap();
@@ -468,7 +486,7 @@ fn write_atomic_creates_and_then_replaces_the_file_and_leaves_no_temp() {
 #[skuld::test]
 fn write_atomic_runs_protect_on_the_temp_before_the_rename_and_a_failure_leaves_the_old_file() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     dir.write_atomic(&name("state.json"), b"old", None, |_| Ok(())).unwrap();
     let mut seen_name = None;
 
@@ -493,7 +511,7 @@ fn write_atomic_runs_protect_on_the_temp_before_the_rename_and_a_failure_leaves_
 #[skuld::test]
 fn write_atomic_does_not_follow_a_symlink_at_the_final_name() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let victim = tmp.path().join("victim");
     std::fs::write(&victim, b"keep").unwrap();
     #[cfg(unix)]
@@ -513,7 +531,7 @@ fn write_atomic_does_not_follow_a_symlink_at_the_final_name() {
 #[skuld::test]
 fn write_atomic_replaces_a_hard_link_by_name_and_leaves_the_other_name_alone() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let victim = tmp.path().join("victim");
     std::fs::write(&victim, b"keep").unwrap();
     std::fs::hard_link(&victim, tmp.path().join("state.json")).unwrap();
@@ -528,7 +546,7 @@ fn write_atomic_replaces_a_hard_link_by_name_and_leaves_the_other_name_alone() {
 
 /// The whole file `file` in `dir`, read the way a privileged state reader opens its folder.
 fn read_vouched(dir: &Path, file: &OsStr) -> io::Result<Vec<u8>> {
-    ReadDir::open(dir)?.read_vouched(file)
+    ReadDir::open(dir, Principal::System)?.read_vouched(file)
 }
 
 #[skuld::test]
@@ -561,11 +579,11 @@ fn read_vouched_does_not_read_through_a_symlink_at_the_name() {
     // A file that exists and is readable: what a link to it must not be read as.
     let target = tmp.path().join("theirs.json");
     std::fs::write(&target, b"{\"theirs\":true}").unwrap();
-    plant_file_symlink(&target, &state.join("bridge-x.json"));
+    file_link(&target, &state.join("bridge-x.json"));
 
-    let result = read_vouched(&state, &name("bridge-x.json"));
+    let err = read_vouched(&state, &name("bridge-x.json")).expect_err("read through a symlink");
 
-    assert!(result.is_err(), "read through a symlink: {result:?}");
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::Symlink), "{err:?}");
 }
 
 #[skuld::test]
@@ -614,6 +632,182 @@ fn read_vouched_reads_a_second_name_for_a_file_unless_the_runner_is_the_system()
     }
 }
 
+// Principal::User =====================================================================================================
+
+#[skuld::test]
+fn a_users_own_walk_follows_a_link_to_a_folder_the_system_owns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = SystemScratch::new();
+    let link = tmp.path().join("state");
+    plant_link(scratch.root(), &link);
+
+    for create in [false, true] {
+        assert!(
+            Dir::open(&link, create, None, Principal::User).is_ok(),
+            "create {create}"
+        );
+        assert!(ReadDir::open(&link, Principal::User).is_ok());
+    }
+    assert!(Dir::open(&link.join(scratch.name()), true, None, Principal::User).is_ok());
+    assert!(
+        scratch.path().is_dir(),
+        "the user's own walk makes a folder below the link"
+    );
+}
+
+/// What the user's own read of `file` in `dir` gives.
+fn read_as_user(dir: &Path, file: &OsStr) -> io::Result<Vec<u8>> {
+    ReadDir::open(dir, Principal::User)?.read_as(file)
+}
+
+#[skuld::test]
+fn a_users_own_read_goes_through_a_symlink_at_the_name_and_a_system_read_does_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let target = tmp.path().join("dotfiles-config.json");
+    std::fs::write(&target, b"{\"mine\":true}").unwrap();
+    file_link(&target, &state.join("config.json"));
+
+    assert_eq!(read_as_user(&state, &name("config.json")).unwrap(), b"{\"mine\":true}");
+    assert!(ReadDir::open(&state, Principal::System)
+        .unwrap()
+        .read_as(&name("config.json"))
+        .is_err());
+}
+
+#[skuld::test]
+fn a_users_own_read_of_a_dangling_symlink_is_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    file_link(&tmp.path().join("nowhere.json"), &tmp.path().join("config.json"));
+
+    assert_eq!(
+        kind(read_as_user(tmp.path(), &name("config.json"))),
+        Some(io::ErrorKind::NotFound)
+    );
+}
+
+#[skuld::test]
+fn a_users_own_read_of_a_directory_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("config.json")).unwrap();
+
+    assert!(read_as_user(tmp.path(), &name("config.json")).is_err());
+}
+
+#[skuld::test]
+fn a_users_own_read_of_a_file_in_a_folder_the_system_owns_is_read_and_the_system_read_refuses_it() {
+    // The files a test makes belong to its runner: the system's, when it is elevated. The folder is then the system's
+    // and the file is given to a user, which the system's read does not vouch for.
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("config.json");
+    std::fs::write(&file, b"{\"mine\":true}").unwrap();
+    super::testing::own(&file);
+
+    assert_eq!(
+        read_as_user(tmp.path(), &name("config.json")).unwrap(),
+        b"{\"mine\":true}"
+    );
+    if super::testing::runner_is_the_system() {
+        let err = ReadDir::open(tmp.path(), Principal::System)
+            .unwrap()
+            .read_as(&name("config.json"))
+            .expect_err("the folder's owner cannot vouch for a user's file");
+        assert_eq!(Refusal::from_error(&err), Some(&Refusal::ForeignFile), "{err:?}");
+    }
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn a_users_own_read_of_a_fifo_at_the_name_is_refused_and_does_not_block() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let fifo = std::ffi::CString::new(tmp.path().join("config.json").as_os_str().as_bytes()).unwrap();
+    // SAFETY: `fifo` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    let err = read_as_user(tmp.path(), &name("config.json")).expect_err("a FIFO is not a file to read");
+
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::NotRegular), "{err:?}");
+}
+
+/// The OS follows a directory link whose target is root-relative, naming no drive (it is on the link's own volume); a user's own walk
+/// goes where the OS goes, and a system walk, which judges every link itself, does not follow what it cannot read.
+#[cfg(windows)]
+#[skuld::test]
+fn a_users_own_walk_follows_a_link_with_no_drive_in_its_target_and_a_system_walk_refuses_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    user_dir(&real);
+    let target = real.to_str().unwrap().split_once(':').unwrap().1;
+    let link = tmp.path().join("state");
+    testing::dir_symlink(Path::new(target), &link);
+
+    let dir = Dir::open(&link, false, None, Principal::User).unwrap();
+
+    let expected = Dir::open(&real, false, None, Principal::User).unwrap();
+    assert_eq!(FileId::of(dir.file()).unwrap(), FileId::of(expected.file()).unwrap());
+    assert_eq!(
+        refusal(Dir::open(&link, false, None, Principal::System)),
+        Refusal::Symlink
+    );
+}
+
+/// A link that leads nowhere is the OS's answer, not the walk's to complete: as for the OS's own `mkdir`, a walk that
+/// is asked to create stops at it with not-found and does not make its target.
+#[skuld::test]
+fn a_users_own_walk_that_creates_stops_at_a_link_that_leads_nowhere() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("not-yet").join("deeper");
+    let link = tmp.path().join("state");
+    plant_link(&target, &link);
+
+    let err = Dir::open(&link, true, None, Principal::User)
+        .err()
+        .expect("the link leads nowhere");
+
+    assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err:?}");
+    assert!(!tmp.path().join("not-yet").exists());
+}
+
+/// What a directory reads as is fixed when it is opened: a reader taken from it reads the same way, and nothing on a
+/// system directory follows a link at the name.
+#[skuld::test]
+fn a_reader_taken_from_a_dir_reads_as_the_principal_the_dir_was_opened_for() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("dotfiles-config.json");
+    std::fs::write(&target, b"{\"mine\":true}").unwrap();
+    file_link(&target, &tmp.path().join("config.json"));
+
+    let as_user = Dir::open(tmp.path(), false, None, Principal::User)
+        .unwrap()
+        .reader()
+        .unwrap();
+    let as_system = Dir::open(tmp.path(), false, None, Principal::System)
+        .unwrap()
+        .reader()
+        .unwrap();
+
+    assert_eq!(as_user.read_as(&name("config.json")).unwrap(), b"{\"mine\":true}");
+    assert!(as_system.read_as(&name("config.json")).is_err());
+}
+
+#[skuld::test]
+fn only_a_read_requires_a_regular_file() {
+    let required: Vec<_> = [
+        OpenFile::CreateNew { mode: 0o600 },
+        OpenFile::Existing,
+        OpenFile::Read,
+        OpenFile::Append,
+        OpenFile::CreateAppend { mode: 0o600 },
+    ]
+    .into_iter()
+    .filter(|how| how.requires_regular_file())
+    .collect();
+
+    assert_eq!(required, [OpenFile::Read]);
+}
+
 // open_file: CreateAppend and Append ----------------------------------------------------------------------------------
 
 const LOG: &str = "log";
@@ -625,7 +819,7 @@ fn create_append() -> OpenFile {
 #[skuld::test]
 fn append_adds_to_the_end_of_a_file_without_truncating() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     let mut first = dir.open_file(&name(LOG), create_append()).unwrap();
     first.write_all(b"one\n").unwrap();
@@ -639,7 +833,7 @@ fn append_adds_to_the_end_of_a_file_without_truncating() {
 #[skuld::test]
 fn append_does_not_create_a_file() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     assert_eq!(
         kind(dir.open_file(&name(LOG), OpenFile::Append)),
@@ -651,7 +845,7 @@ fn append_does_not_create_a_file() {
 #[skuld::test]
 fn create_append_creates_only_a_free_name() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(tmp.path().join(LOG), b"theirs").unwrap();
 
     assert_eq!(
@@ -664,10 +858,10 @@ fn create_append_creates_only_a_free_name() {
 #[skuld::test]
 fn append_does_not_follow_a_symlink_at_the_name() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let target = tmp.path().join("secret");
     std::fs::write(&target, b"theirs").unwrap();
-    plant_file_symlink(&target, &tmp.path().join(LOG));
+    file_link(&target, &tmp.path().join(LOG));
 
     assert!(dir.open_file(&name(LOG), OpenFile::Append).is_err());
     assert!(dir.open_file(&name(LOG), create_append()).is_err());
@@ -679,7 +873,7 @@ fn append_does_not_follow_a_symlink_at_the_name() {
 fn append_to_a_fifo_with_no_reader_fails_and_does_not_wait_for_one() {
     use std::os::unix::ffi::OsStrExt;
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let fifo = std::ffi::CString::new(tmp.path().join(LOG).as_os_str().as_bytes()).unwrap();
     // SAFETY: `fifo` is a valid NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
@@ -691,7 +885,7 @@ fn append_to_a_fifo_with_no_reader_fails_and_does_not_wait_for_one() {
 fn an_appended_file_can_be_renamed_by_anyone_who_shares_delete() {
     // The log writer keeps its file open while a reader or a scanner looks at it.
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let mut open = dir.open_file(&name(LOG), create_append()).unwrap();
     open.write_all(b"x").unwrap();
 
@@ -734,7 +928,7 @@ fn append_line(dir: &Dir, owner: Option<(u32, u32)>, line: &str) -> io::Result<(
 #[skuld::test]
 fn a_log_that_is_not_there_is_created_and_the_next_open_continues_it() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     append_line(&dir, None, "one\n").unwrap();
     append_line(&dir, None, "two\n").unwrap();
@@ -746,7 +940,7 @@ fn a_log_that_is_not_there_is_created_and_the_next_open_continues_it() {
 #[skuld::test]
 fn a_log_the_owner_owns_is_continued() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(tmp.path().join(LOG), b"before\n").unwrap();
 
     append_line(&dir, this_owner(), "after\n").unwrap();
@@ -757,7 +951,7 @@ fn a_log_the_owner_owns_is_continued() {
 #[skuld::test]
 fn another_name_of_a_file_is_replaced_and_the_file_is_left_alone() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let victim = tmp.path().join("victim");
     std::fs::write(&victim, b"theirs\n").unwrap();
     let before = std::fs::metadata(&victim).unwrap();
@@ -782,7 +976,7 @@ fn another_name_of_the_owners_own_file_is_replaced_and_the_file_is_left_alone() 
     // The owner's file, not a stranger's: a name the user planted for it must still not make the writer change it.
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let victim = tmp.path().join("victim");
     std::fs::write(&victim, b"theirs\n").unwrap();
     std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o640)).unwrap();
@@ -803,10 +997,10 @@ fn another_name_of_the_owners_own_file_is_replaced_and_the_file_is_left_alone() 
 #[skuld::test]
 fn a_symlink_at_the_name_is_replaced_and_what_it_points_at_is_left_alone() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let target = tmp.path().join("secret");
     std::fs::write(&target, b"theirs\n").unwrap();
-    plant_file_symlink(&target, &tmp.path().join(LOG));
+    file_link(&target, &tmp.path().join(LOG));
 
     append_line(&dir, another_owner(), "log\n").unwrap();
 
@@ -823,7 +1017,7 @@ fn a_symlink_at_the_name_is_replaced_and_what_it_points_at_is_left_alone() {
 fn a_fifo_at_the_name_is_replaced_and_does_not_block_the_open() {
     use std::os::unix::ffi::OsStrExt;
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let fifo = std::ffi::CString::new(tmp.path().join(LOG).as_os_str().as_bytes()).unwrap();
     // SAFETY: `fifo` is a valid NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
@@ -836,7 +1030,7 @@ fn a_fifo_at_the_name_is_replaced_and_does_not_block_the_open() {
 #[skuld::test]
 fn a_directory_at_the_name_is_an_error_and_is_left_alone() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::create_dir(tmp.path().join(LOG)).unwrap();
 
     assert!(append_line(&dir, None, "log\n").is_err());
@@ -848,7 +1042,7 @@ fn a_directory_at_the_name_is_an_error_and_is_left_alone() {
 fn a_continued_log_keeps_its_mode() {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     append_line(&dir, this_owner(), "one\n").unwrap();
     std::fs::set_permissions(tmp.path().join(LOG), std::fs::Permissions::from_mode(0o640)).unwrap();
 
@@ -875,7 +1069,7 @@ fn append_while_the_name_changes(dir: &Dir, swap: impl FnOnce()) -> io::Result<(
 #[skuld::test]
 fn a_name_that_becomes_a_symlink_while_it_is_opened_is_replaced_and_what_it_points_at_is_left_alone() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let target = tmp.path().join("secret");
     std::fs::write(
         &target, b"theirs
@@ -891,7 +1085,7 @@ fn a_name_that_becomes_a_symlink_while_it_is_opened_is_replaced_and_what_it_poin
 
     append_while_the_name_changes(&dir, || {
         std::fs::remove_file(tmp.path().join(LOG)).unwrap();
-        plant_file_symlink(&target, &tmp.path().join(LOG));
+        file_link(&target, &tmp.path().join(LOG));
     })
     .unwrap();
 
@@ -912,7 +1106,7 @@ fn a_name_that_becomes_a_symlink_while_it_is_opened_is_replaced_and_what_it_poin
 fn a_name_that_becomes_a_fifo_while_it_is_opened_is_replaced() {
     use std::os::unix::ffi::OsStrExt;
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(
         tmp.path().join(LOG),
         b"before
@@ -938,7 +1132,7 @@ fn a_name_that_becomes_a_fifo_while_it_is_opened_is_replaced() {
 #[skuld::test]
 fn a_name_that_becomes_a_directory_while_it_is_opened_is_an_error_and_is_left_alone() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(
         tmp.path().join(LOG),
         b"before
@@ -960,7 +1154,7 @@ fn a_name_that_becomes_a_directory_while_it_is_opened_is_an_error_and_is_left_al
 #[skuld::test]
 fn link_gives_the_file_a_second_name_and_never_replaces_one() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(tmp.path().join("a"), b"a").unwrap();
     std::fs::write(tmp.path().join("taken"), b"theirs").unwrap();
 
@@ -979,7 +1173,7 @@ fn link_gives_the_file_a_second_name_and_never_replaces_one() {
 #[skuld::test]
 fn rename_moves_a_file_over_the_name_it_is_given_and_by_name_only() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(tmp.path().join("active"), b"new").unwrap();
     std::fs::write(tmp.path().join("old"), b"old").unwrap();
 
@@ -996,7 +1190,7 @@ fn rename_moves_a_file_over_the_name_it_is_given_and_by_name_only() {
 #[skuld::test]
 fn rename_noreplace_moves_to_a_free_name_and_never_replaces() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(tmp.path().join("from"), b"from").unwrap();
     std::fs::write(tmp.path().join("taken"), b"theirs").unwrap();
 
@@ -1017,7 +1211,7 @@ fn rename_noreplace_moves_to_a_free_name_and_never_replaces() {
 #[skuld::test]
 fn sync_flushes_a_directory() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     // A volume with no directory flush answers an error the caller reads; the temp dir is on one that has it.
     dir.sync().unwrap();
@@ -1028,7 +1222,7 @@ fn sync_flushes_a_directory() {
 #[skuld::test]
 fn a_staged_file_is_invisible_under_its_name_until_published() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     dir.write_atomic(&name("state.json"), b"old", None, |_| Ok(())).unwrap();
 
     let staged = dir.stage(&name("state.json"), b"new", None, |_| Ok(())).unwrap();
@@ -1042,7 +1236,7 @@ fn a_staged_file_is_invisible_under_its_name_until_published() {
 #[skuld::test]
 fn a_staged_file_that_is_dropped_leaves_nothing_and_the_old_file_alone() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     dir.write_atomic(&name("state.json"), b"old", None, |_| Ok(())).unwrap();
 
     drop(dir.stage(&name("state.json"), b"new", None, |_| Ok(())).unwrap());
@@ -1054,7 +1248,7 @@ fn a_staged_file_that_is_dropped_leaves_nothing_and_the_old_file_alone() {
 #[skuld::test]
 fn claiming_publishes_a_free_name_and_loses_to_a_taken_one() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     dir.stage(&name("marker"), b"first", None, |_| Ok(()))
         .unwrap()
@@ -1072,7 +1266,7 @@ fn claiming_publishes_a_free_name_and_loses_to_a_taken_one() {
 #[skuld::test]
 fn a_claim_never_gives_the_file_a_second_name() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let mut seen = None;
 
     dir.stage(&name("marker"), b"first", None, |_| Ok(()))
@@ -1086,7 +1280,7 @@ fn a_claim_never_gives_the_file_a_second_name() {
 #[skuld::test]
 fn a_failed_protect_leaves_no_staged_file() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     let err = dir
         .stage(&name("state.json"), b"x", None, |_| Err(io::Error::other("no")))
@@ -1108,7 +1302,7 @@ fn a_temp_file_that_cannot_be_removed_is_logged_with_its_name() {
             .finish(),
     );
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let mut staged = dir.stage(&name("state.json"), b"new", None, |_| Ok(())).unwrap();
     // Closed first: Windows does not delete a name while a handle that does not share delete is open.
     drop(staged.temp.take());
@@ -1134,7 +1328,7 @@ fn a_temp_file_that_is_already_gone_is_not_logged() {
             .finish(),
     );
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let mut staged = dir.stage(&name("state.json"), b"new", None, |_| Ok(())).unwrap();
     drop(staged.temp.take());
     dir.unlink(&staged.temp_name.clone()).unwrap();
@@ -1148,7 +1342,7 @@ fn a_temp_file_that_is_already_gone_is_not_logged() {
 fn link_and_rename_work_for_a_name_of_every_length() {
     // Windows reads the new name out of a buffer sized by its length; a short name is the edge.
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(tmp.path().join("source"), b"x").unwrap();
 
     for len in 1..=40 {
@@ -1182,7 +1376,7 @@ fn link_and_rename_work_for_a_name_of_every_length() {
 #[skuld::test]
 fn unlink_refuses_a_directory_and_leaves_it() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::create_dir(tmp.path().join("sub")).unwrap();
 
     let err = dir.unlink(&name("sub")).unwrap_err();
@@ -1196,7 +1390,7 @@ fn unlink_frees_the_name_at_once_even_while_a_reader_holds_the_file() {
     // A reader that shares delete, as `std` opens: on Windows a delete that waits for the last handle leaves
     // the name unusable, and a new file cannot take it.
     let tmp = tempfile::tempdir().unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     std::fs::write(tmp.path().join("state.json"), b"old").unwrap();
     let reader = std::fs::File::open(tmp.path().join("state.json")).unwrap();
 

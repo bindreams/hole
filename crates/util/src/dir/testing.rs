@@ -25,6 +25,18 @@ pub fn user_dir(path: &Path) {
     own(path);
 }
 
+/// A symlink to the file `target` at `link`, of the kind an unprivileged user can plant. Windows needs
+/// `SeCreateSymbolicLinkPrivilege` for it: an elevated token, or Developer Mode.
+pub fn file_link(target: &Path, link: &Path) {
+    platform::file_link(target, link);
+}
+
+/// A symlink to the directory `target` (which may be relative to the folder `link` is in) at `link`, of the kind an
+/// unprivileged user can plant. Windows needs `SeCreateSymbolicLinkPrivilege` for it, as for [`file_link`].
+pub fn dir_symlink(target: &Path, link: &Path) {
+    platform::dir_symlink(target, link);
+}
+
 /// A link to the directory `target` at `link`, owned by an unprivileged principal: unix a symlink,
 /// Windows a junction.
 pub fn plant_link(target: &Path, link: &Path) {
@@ -281,9 +293,9 @@ mod platform {
         unsafe { libc::geteuid() == 0 }
     }
 
-    pub(super) fn file_link(target: &Path, link: &Path) {
-        std::os::unix::fs::symlink(target, link).unwrap();
-    }
+    /// A unix symlink is one kind whatever it points at.
+    pub(super) use self::link as file_link;
+    pub(super) use self::link as dir_symlink;
 
     pub(super) fn fifo(at: &Path) {
         use std::os::unix::ffi::OsStrExt;
@@ -356,7 +368,19 @@ mod platform {
     }
 
     pub(super) fn file_link(target: &Path, link: &Path) {
-        std::os::windows::fs::symlink_file(target, link).unwrap();
+        std::os::windows::fs::symlink_file(target, link).unwrap_or_else(|e| {
+            panic!(
+                "this test needs the privilege to create symlinks (on Windows an elevated token or Developer Mode): {e}"
+            )
+        });
+    }
+
+    pub(super) fn dir_symlink(target: &Path, link: &Path) {
+        std::os::windows::fs::symlink_dir(target, link).unwrap_or_else(|e| {
+            panic!(
+                "this test needs the privilege to create symlinks (on Windows an elevated token or Developer Mode): {e}"
+            )
+        });
     }
 
     pub(super) fn link(target: &Path, link: &Path) {

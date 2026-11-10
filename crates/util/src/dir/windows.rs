@@ -23,8 +23,9 @@ use windows::Wdk::Storage::FileSystem::{
     NTCREATEFILE_CREATE_OPTIONS,
 };
 use windows::Win32::Foundation::{
-    LocalFree, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_SUCCESS, HANDLE, HLOCAL,
-    NTSTATUS, OBJECT_ATTRIBUTE_FLAGS, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+    LocalFree, ERROR_CANT_RESOLVE_FILENAME, ERROR_DIRECTORY, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+    ERROR_NOT_SUPPORTED, ERROR_SUCCESS, HANDLE, HLOCAL, NTSTATUS, OBJECT_ATTRIBUTE_FLAGS, OBJ_CASE_INSENSITIVE,
+    UNICODE_STRING,
 };
 use windows::Win32::Security::Authorization::{GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT};
 use windows::Win32::Security::{
@@ -43,7 +44,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 
 use super::trail::{Owner, Trail};
-use super::{EntryKind, OpenFile, Refusal};
+use super::{AtName, EntryKind, OpenFile, Principal, Refusal};
 
 mod link;
 use link::{Sid, Step};
@@ -157,6 +158,15 @@ fn kind_from(handle: &File) -> io::Result<EntryKind> {
     } else {
         EntryKind::File
     })
+}
+
+/// Whether `handle` is a file on a disk that is not a directory: not a pipe, a device or a directory.
+fn is_regular(handle: &File) -> io::Result<bool> {
+    // SAFETY: the handle is open for the call.
+    if unsafe { GetFileType(HANDLE(handle.as_raw_handle())) } != FILE_TYPE_DISK {
+        return Ok(false);
+    }
+    Ok(info(handle)?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0)
 }
 
 // Owners --------------------------------------------------------------------------------------------------------------
@@ -298,7 +308,17 @@ struct Rights {
 /// `name` in `root` (an absolute NT path when `root` is `None`) as a directory, opened as itself with `rights`; and
 /// whether its owner can be read, which is not so when the open had to do without `READ_CONTROL`.
 fn open_walked(root: Option<&File>, name: &[u16], rights: Rights) -> io::Result<(File, bool)> {
-    let open = |wanted| nt_open(root, name, wanted, SHARE_ALL, FILE_OPEN, options(OPEN_AS_ITSELF));
+    open_walked_with(root, name, rights, options(OPEN_AS_ITSELF))
+}
+
+/// [`open_walked`] with `flags`: what an open of a link is, as itself or followed by the OS.
+fn open_walked_with(
+    root: Option<&File>,
+    name: &[u16],
+    rights: Rights,
+    flags: NTCREATEFILE_CREATE_OPTIONS,
+) -> io::Result<(File, bool)> {
+    let open = |wanted| nt_open(root, name, wanted, SHARE_ALL, FILE_OPEN, flags);
     match open(rights.wanted) {
         Err(err) if rights.owner_optional && err.kind() == io::ErrorKind::PermissionDenied => {
             open(FILE_ACCESS_RIGHTS(rights.wanted.0 & !READ_CONTROL.0)).map(|file| (file, false))
@@ -359,6 +379,7 @@ impl Standing {
 /// What the walk has left to do, what it has followed, and the directories it is inside of.
 struct Walk {
     steps: VecDeque<Step>,
+    principal: Principal,
     trail: Trail<Sid>,
     /// From the root to the directory the walk stands in, which is the last.
     stack: Vec<Standing>,
@@ -421,6 +442,47 @@ fn follow(walk: &mut Walk, link: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// The directory the link `name` in `here` leads to, which the OS resolves: for a [`Principal::User`], whose walk goes
+/// where the OS goes (a cloud placeholder, a root-relative target, whatever else it follows) and judges nothing. A link
+/// that loops is [`Refusal::Symlink`] and one to a file [`Refusal::NotDirectory`]; one that leads nowhere is not
+/// found, whether or not the walk is to create: the OS's own `CreateDirectory` does not make its target either.
+fn through_link(here: &Standing, name: &[u16], rights: Rights, last: bool) -> io::Result<Standing> {
+    let (file, owner_readable) = open_walked_with(
+        Some(&here.file),
+        name,
+        rights,
+        options(&[FILE_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT]),
+    )
+    .map_err(|err| match crate::error::raw_os_error(&err) {
+        Some(code) if code == ERROR_CANT_RESOLVE_FILENAME.0 as i32 => Refusal::Symlink.into_io_error(),
+        Some(code) if code == ERROR_DIRECTORY.0 as i32 => Refusal::NotDirectory.into_io_error(),
+        _ => err,
+    })?;
+    Ok(Standing {
+        file,
+        owner_readable,
+        entry: Entry::Name(name.to_vec()),
+        complete: last,
+    })
+}
+
+/// Meets the link `name` in the directory the walk stands in: a walk that leaves links to the OS has it resolve this
+/// one ([`through_link`]); any other judges it and puts what it points at in front of its steps (`Ok(None)`), whose
+/// link handle `open_link` gives.
+fn meet_link(
+    walk: &mut Walk,
+    name: &[u16],
+    rights: Rights,
+    last: bool,
+    open_link: impl FnOnce(&File) -> io::Result<File>,
+) -> io::Result<Option<Standing>> {
+    if walk.principal.leaves_links_to_the_os() {
+        return through_link(walk.here(), name, rights, last).map(Some);
+    }
+    let link = open_link(&walk.here().file)?;
+    follow(walk, &link).map(|()| None)
+}
+
 /// Opens the directory `name` in the directory the walk stands in (a missing one is created when `create`), or
 /// makes progress towards it: `Ok(Some(next))` is the directory; `Ok(None)` is a followed link whose target was
 /// put in front of the walk's steps.
@@ -437,7 +499,7 @@ fn descend(walk: &mut Walk, name: &OsStr, create: bool, rights: Rights, last: bo
                         entry: Entry::Name(name),
                         complete: last,
                     })),
-                    EntryKind::Symlink => follow(walk, &handle).map(|()| None),
+                    EntryKind::Symlink => meet_link(walk, &name, rights, last, |_| Ok(handle)),
                     _ => Err(Refusal::NotDirectory.into_io_error()),
                 };
             }
@@ -474,16 +536,16 @@ fn descend(walk: &mut Walk, name: &OsStr, create: bool, rights: Rights, last: bo
             }
             Ok(None) => return Err(open_err),
             Ok(Some(EntryKind::Symlink)) => {
-                let link = nt_open(
-                    Some(cur),
-                    &name,
-                    access(&[FILE_READ_ATTRIBUTES, READ_CONTROL]),
-                    SHARE_ALL,
-                    FILE_OPEN,
-                    options(OPEN_AS_ITSELF),
-                )?;
-                follow(walk, &link)?;
-                return Ok(None);
+                return meet_link(walk, &name, rights, last, |cur| {
+                    nt_open(
+                        Some(cur),
+                        &name,
+                        access(&[FILE_READ_ATTRIBUTES, READ_CONTROL]),
+                        SHARE_ALL,
+                        FILE_OPEN,
+                        options(OPEN_AS_ITSELF),
+                    )
+                });
             }
             Ok(Some(EntryKind::Directory)) => return Err(open_err),
             Ok(Some(EntryKind::File | EntryKind::Other)) => return Err(Refusal::NotDirectory.into_io_error()),
@@ -514,15 +576,27 @@ fn give_made_folder(parent: &File, name: &[u16], made: &File, sid: &[u8]) -> io:
     set_owner(&again, sid)
 }
 
-pub(super) fn open_dir(path: &Path, create: bool, _owner: Option<(u32, u32)>, _caller: Caller) -> io::Result<File> {
-    open_dir_with(path, create, FILE_ACCESS_RIGHTS(0))
+pub(super) fn open_dir(
+    path: &Path,
+    create: bool,
+    _owner: Option<(u32, u32)>,
+    principal: Principal,
+    _caller: Caller,
+) -> io::Result<File> {
+    open_dir_with(path, create, principal, FILE_ACCESS_RIGHTS(0))
 }
 
 /// [`open_dir`] with `extra` rights on the final directory.
-pub(super) fn open_dir_with(path: &Path, create: bool, extra: FILE_ACCESS_RIGHTS) -> io::Result<File> {
+pub(super) fn open_dir_with(
+    path: &Path,
+    create: bool,
+    principal: Principal,
+    extra: FILE_ACCESS_RIGHTS,
+) -> io::Result<File> {
     walk_to(
         path,
         create,
+        principal,
         Rights {
             wanted: access(&[dir_rights(true), extra]),
             // An ACL the caller asked to read and rewrite is not optional.
@@ -533,8 +607,8 @@ pub(super) fn open_dir_with(path: &Path, create: bool, extra: FILE_ACCESS_RIGHTS
 
 /// The final directory opened to look names up in, which asks no right to add to it: a folder whose ACL a machine
 /// tightened is still one a reader can read from.
-pub(super) fn open_dir_read(path: &Path) -> io::Result<File> {
-    walk_to(path, false, lookup_rights())
+pub(super) fn open_dir_read(path: &Path, principal: Principal) -> io::Result<File> {
+    walk_to(path, false, principal, lookup_rights())
 }
 
 fn lookup_rights() -> Rights {
@@ -545,7 +619,7 @@ fn lookup_rights() -> Rights {
 }
 
 /// Walks `path`; `last` is what its final directory is opened with.
-fn walk_to(path: &Path, create: bool, last: Rights) -> io::Result<File> {
+fn walk_to(path: &Path, create: bool, principal: Principal, last: Rights) -> io::Result<File> {
     let rights_for = |is_last| match is_last {
         true => last,
         false => lookup_rights(),
@@ -553,6 +627,7 @@ fn walk_to(path: &Path, create: bool, last: Rights) -> io::Result<File> {
     let (root, names) = split(path)?;
     let mut walk = Walk {
         steps: names.into_iter().map(Step::Name).collect(),
+        principal,
         trail: Trail::new(MAX_LINKS),
         stack: Vec::new(),
     };
@@ -610,23 +685,38 @@ fn reopen_complete(walk: &Walk, end: Standing, rights: FILE_ACCESS_RIGHTS) -> io
 // Operations relative to a directory ----------------------------------------------------------------------------------
 
 pub(super) fn open_file(dir: &File, name: &OsStr, how: OpenFile) -> io::Result<File> {
-    open_file_with(dir, name, how, FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0)
+    open_file_with(
+        dir,
+        name,
+        how,
+        AtName::AsItself,
+        FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+    )
 }
 
-fn open_file_with(dir: &File, name: &OsStr, how: OpenFile, rights: u32) -> io::Result<File> {
-    let own_file = [
-        FILE_NON_DIRECTORY_FILE,
-        FILE_OPEN_FOR_BACKUP_INTENT,
-        FILE_OPEN_REPARSE_POINT,
-    ];
+/// [`OpenFile::Read`] of the file a link at `name` leads to.
+pub(super) fn open_read_through_link(dir: &File, name: &OsStr) -> io::Result<File> {
+    open_file_with(dir, name, OpenFile::Read, AtName::Followed, FILE_GENERIC_READ.0)
+}
+
+fn open_file_with(dir: &File, name: &OsStr, how: OpenFile, at_name: AtName, rights: u32) -> io::Result<File> {
+    // `FILE_OPEN_REPARSE_POINT` opens a link as itself; without it the OS follows one.
+    let own_file = match at_name {
+        AtName::AsItself => options(&[
+            FILE_NON_DIRECTORY_FILE,
+            FILE_OPEN_FOR_BACKUP_INTENT,
+            FILE_OPEN_REPARSE_POINT,
+        ]),
+        AtName::Followed => options(&[FILE_NON_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT]),
+    };
     // `FILE_APPEND_DATA` without `FILE_WRITE_DATA`: every write lands at the end.
     let append = FILE_APPEND_DATA.0 | FILE_READ_ATTRIBUTES.0;
     let (rights, share, disposition, flags) = match how {
-        OpenFile::CreateNew { .. } => (rights, SHARE_NO_DELETE, FILE_CREATE, options(&own_file)),
+        OpenFile::CreateNew { .. } => (rights, SHARE_NO_DELETE, FILE_CREATE, own_file),
         OpenFile::Existing => (rights, SHARE_NO_DELETE, FILE_OPEN, options(OPEN_AS_ITSELF)),
-        OpenFile::Read => (FILE_GENERIC_READ.0, SHARE_ALL, FILE_OPEN, options(&own_file)),
-        OpenFile::Append => (append, SHARE_ALL, FILE_OPEN, options(&own_file)),
-        OpenFile::CreateAppend { .. } => (append, SHARE_ALL, FILE_CREATE, options(&own_file)),
+        OpenFile::Read => (FILE_GENERIC_READ.0, SHARE_ALL, FILE_OPEN, own_file),
+        OpenFile::Append => (append, SHARE_ALL, FILE_OPEN, own_file),
+        OpenFile::CreateAppend { .. } => (append, SHARE_ALL, FILE_CREATE, own_file),
     };
     let file = nt_open(
         Some(dir),
@@ -636,9 +726,13 @@ fn open_file_with(dir: &File, name: &OsStr, how: OpenFile, rights: u32) -> io::R
         disposition,
         flags,
     )?;
-    // Opened as itself, a symlink is the link and not what it points at: it is not a file to read or append to.
-    if matches!(how, OpenFile::Read | OpenFile::Append) && kind_from(&file)? == EntryKind::Symlink {
+    // Opened as itself, a symlink is the link and not what it points at: it is not a file to read or append to. A
+    // followed name never is one, and a cloud placeholder it reaches carries the reparse attribute and is a file.
+    if at_name == AtName::AsItself && how.refuses_a_link() && kind_from(&file)? == EntryKind::Symlink {
         return Err(Refusal::Symlink.into_io_error());
+    }
+    if how.requires_regular_file() && !is_regular(&file)? {
+        return Err(Refusal::NotRegular.into_io_error());
     }
     Ok(file)
 }
@@ -663,6 +757,7 @@ pub(super) fn create_temp(dir: &File, name: &OsStr) -> io::Result<File> {
         dir,
         name,
         OpenFile::CreateNew { mode: 0o600 },
+        AtName::AsItself,
         FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | DELETE.0 | WRITE_DAC.0,
     )
 }

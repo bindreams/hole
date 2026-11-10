@@ -1,3 +1,4 @@
+use crate::dir::Principal;
 use crate::versioned_file::fixtures::UpdateShortcuts;
 use std::io;
 use std::sync::Arc;
@@ -104,12 +105,12 @@ fn a_version_above_u32_max_is_newer_even_for_a_schema_at_u32_max() {
     let dir = dir();
     put(&dir, "max-version.json", br#"{"version":4294967296,"value":"x"}"#);
     assert!(matches!(
-        VersionedFile::<MaxVersionFile>::new(dir.path()).load(),
+        VersionedFile::<MaxVersionFile>::for_process(dir.path(), Principal::System).load(),
         Loaded::Newer { .. }
     ));
     put(&dir, "max-version.json", br#"{"version":4294967295,"value":"x"}"#);
     assert!(matches!(
-        VersionedFile::<MaxVersionFile>::new(dir.path()).load(),
+        VersionedFile::<MaxVersionFile>::for_process(dir.path(), Principal::System).load(),
         Loaded::Current { found: u32::MAX, .. }
     ));
 }
@@ -134,7 +135,7 @@ fn a_version_above_u32_max_is_refused_by_a_config_store() {
     let dir = dir();
     let bytes = br#"{"version":18446744073709551616,"value":"future"}"#;
     let path = put(&dir, "config.json", bytes);
-    let err = VersionedFile::<ConfigFile>::new(dir.path())
+    let err = VersionedFile::<ConfigFile>::for_process(dir.path(), Principal::System)
         .store(&ConfigFile { value: "mine".into() }, &DefaultPlacement::default())
         .expect_err("a newer config is never overwritten");
     assert!(
@@ -217,7 +218,7 @@ fn unknown_fields_are_ignored_at_top_level_and_nested() {
 fn an_unversioned_file_reads_as_the_declared_version() {
     let dir = dir();
     put(&dir, "unversioned.json", br#"{"value":"v"}"#);
-    match VersionedFile::<UnversionedConfig>::new(dir.path()).load() {
+    match VersionedFile::<UnversionedConfig>::for_process(dir.path(), Principal::System).load() {
         Loaded::Current { value, found } => {
             assert_eq!(found, 1);
             assert_eq!(value.value, "v");
@@ -277,7 +278,7 @@ fn load_maps_io_failure_to_unreadable_never_corrupt() {
         "note.json",
         br#"{"version":3,"title":"t","tags":[],"pinned":false}"#,
     );
-    let file = VersionedFile::<NoteV3>::with_fs(dir.path(), Arc::new(DeniedFs));
+    let file = VersionedFile::<NoteV3>::new(dir.path()).with_fs(Arc::new(DeniedFs));
     match file.load() {
         Loaded::Unreadable { error: e, .. } => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
         other => panic!("{other:?}"),
@@ -299,7 +300,7 @@ fn a_failed_read_logs_the_error_text() {
     let dir = dir();
     put(&dir, "note.json", b"{}");
 
-    let loaded = VersionedFile::<NoteV3>::with_fs(dir.path(), Arc::new(Fails)).load();
+    let loaded = VersionedFile::<NoteV3>::new(dir.path()).with_fs(Arc::new(Fails)).load();
 
     assert!(matches!(loaded, Loaded::Unreadable { .. }), "{loaded:?}");
     let log = log.snapshot();
@@ -339,7 +340,7 @@ fn load_of_a_held_file_carries_the_ntstatus_in_the_error_and_the_log() {
 #[skuld::test]
 fn io_failed_read_is_not_cannot_read() {
     let dir = dir();
-    let file = VersionedFile::<NoteV3>::with_fs(dir.path(), Arc::new(DeniedFs));
+    let file = VersionedFile::<NoteV3>::new(dir.path()).with_fs(Arc::new(DeniedFs));
     assert_eq!(file.load().cannot_read(), None);
 }
 

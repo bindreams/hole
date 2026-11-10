@@ -8,7 +8,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use super::{split, Refusal, Refused};
-use util::dir::{Dir, FileId, OpenFile};
+use util::dir::{Dir, FileId, OpenFile, Principal};
 
 /// What `fstat` says about the opened lock file; the only input to [`vet`].
 #[derive(Clone, Copy, Debug)]
@@ -168,7 +168,8 @@ pub(super) fn open_locked_with(
 ) -> io::Result<Option<Locked>> {
     let (parent, name) = split(path)?;
     // Everything below goes through this handle, never through `path` again.
-    let dir = Dir::open_as(parent, true, owner, euid).map_err(|err| Refused::from_dir_error(path, err))?;
+    let dir =
+        Dir::open_as(parent, true, owner, Principal::System, euid).map_err(|err| Refused::from_dir_error(path, err))?;
     loop {
         let Some(Opened { file, created }) = open_name(&dir, name, path)? else {
             continue;

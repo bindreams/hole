@@ -51,8 +51,10 @@ async fn main() -> anyhow::Result<()> {
     // bridge. Best-effort: a dir-resolution failure here must not block
     // plugin startup, so attach/sweep are skipped on Err.
     if let Ok(crash_dir) = galoshes::embedded::runtime_dir() {
-        tombstone::sweep(&crash_dir);
-        tombstone::attach("galoshes", &crash_dir);
+        // Root under the bridge, the user under any other SIP003 client: the process's privilege decides.
+        let principal = stepstool::principal();
+        tombstone::sweep(&crash_dir, principal);
+        tombstone::attach("galoshes", &crash_dir, principal);
     }
 
     let env = PluginEnv::from_env().map_err(|e| anyhow::anyhow!("failed to parse SIP003u environment: {e}"))?;

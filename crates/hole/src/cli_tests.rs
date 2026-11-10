@@ -3,6 +3,32 @@ use clap::Parser;
 use skuld::temp_dir;
 use std::path::Path;
 
+// Elevation hint ======================================================================================================
+
+#[skuld::test]
+fn the_elevation_hint_says_nothing_to_an_elevated_process() {
+    assert_eq!(elevation_hint_for(stepstool::Privilege::Privileged), "");
+}
+
+#[skuld::test]
+fn the_elevation_hint_tells_an_unprivileged_process_to_re_run_elevated() {
+    let hint = elevation_hint_for(stepstool::Privilege::Unprivileged);
+
+    assert!(hint.contains("needs elevated privileges"), "{hint}");
+    assert!(hint.contains("re-run"), "{hint}");
+    assert!(!hint.contains("could not"), "{hint}");
+}
+
+/// A privilege that could not be read is not "elevated": the process may well need the same advice, so the hint says
+/// it could not tell and still names the way to elevate.
+#[skuld::test]
+fn the_elevation_hint_says_when_the_privilege_could_not_be_determined() {
+    let hint = elevation_hint_for(stepstool::Privilege::Unreadable);
+
+    assert!(hint.contains("could not be determined"), "{hint}");
+    assert!(hint.contains("re-run"), "{hint}");
+}
+
 // Elevated-run owner resolution (#572) ================================================================================
 
 #[skuld::test]

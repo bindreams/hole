@@ -228,7 +228,7 @@ fn find_staged_terminates_through_a_directory_symlink_cycle() {
     let sub = root.path().join("sub");
     std::fs::create_dir_all(&sub).unwrap();
     // sub/loop -> root: descending into `loop` re-enters root → a cycle.
-    std::os::windows::fs::symlink_dir(root.path(), sub.join("loop")).unwrap();
+    util::dir::testing::dir_symlink(root.path(), &sub.join("loop"));
 
     let missing = extract::find_staged(root.path(), "does-not-exist.exe");
     assert!(missing.is_err(), "absent name must error (not recurse forever)");

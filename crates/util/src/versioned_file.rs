@@ -82,7 +82,8 @@ pub trait VersionedState: Schema + serde::Serialize {
 
     /// What a file with no `version` key reads as. `None`: such a file is
     /// corrupt. Only for a file that existed before it was versioned. Must be
-    /// in `1..=VERSION`: [`VersionedFile::new`] does not build otherwise.
+    /// in `1..=VERSION`: a build of [`VersionedFile::new`] or [`VersionedFile::for_process`] for it fails otherwise (a
+    /// bare `cargo check` does not evaluate the assert).
     const UNVERSIONED_AS: Option<u32> = None;
 }
 

@@ -43,6 +43,8 @@ cosca = { workspace = true }
 hole-common = { path = "../common" }
 tombstone = { path = "../tombstone" }
 util = { path = "../util" }
+# `principal()`: the running process's privilege, which the crash-marker sweep opens the log directory as.
+stepstool = { path = "../stepstool" }
 tun-engine = { path = "../tun-engine" }
 file-lock = { path = "../file-lock" }
 dump = { path = "../dump" }

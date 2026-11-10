@@ -212,7 +212,7 @@ fn scenario_log_bridge_to_file() {
     // The redirect would eat the libtest-mimic per-test result lines; we
     // need its diagnostics if the child fails.
     unsafe { std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1") };
-    let guard = super::init(log_dir, "test", "test.log", "info", None);
+    let guard = super::init(log_dir, "test", "test.log", "info", None, util::dir::Principal::System);
     log::info!("from-log-crate-bridge-test");
     // Drop the guard explicitly so the `tracing_appender::NonBlocking`
     // worker thread flushes its in-flight events to disk before the
@@ -443,7 +443,14 @@ fn scenario_redact_file() {
         let (uid, gid) = v.split_once(':').expect("uid:gid");
         (uid.parse().expect("uid"), gid.parse().expect("gid"))
     });
-    let guard = super::init(log_dir, "test", "test.log", "info", owner);
+    // `HOLE_LOGGING_TEST_PRINCIPAL=user`: an unprivileged process in its own folder; otherwise a privileged one.
+    let principal = match std::env::var("HOLE_LOGGING_TEST_PRINCIPAL").as_deref() {
+        Ok("user") => util::dir::Principal::User,
+        _ => util::dir::Principal::System,
+    };
+    // `HOLE_LOGGING_TEST_LOG_FILE=<name>`: a name of the test's own, for a test that writes in a folder others share.
+    let file_name = std::env::var("HOLE_LOGGING_TEST_LOG_FILE").unwrap_or_else(|_| "test.log".to_owned());
+    let guard = super::init(log_dir, "test", &file_name, "info", owner, principal);
     util::redact::arm(REDACT_TOKEN, [REDACT_ADDR.to_string()]);
     // A third-party-shaped line: no Hole site authored it, nothing about it
     // is `ServerAddress`-typed, and it still must not reach the file.

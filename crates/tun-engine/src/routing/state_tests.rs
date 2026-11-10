@@ -186,7 +186,7 @@ impl util::versioned_file::Fs for DeniedRead {
 
 /// A record that is readable bytes on disk, whose read fails.
 fn file_whose_reads_fail(dir: &Path) -> RouteFile {
-    RouteFile::with_fs(dir, std::sync::Arc::new(DeniedRead))
+    RouteFile::new(dir).with_fs(std::sync::Arc::new(DeniedRead))
 }
 
 /// A failed read is treated like a newer or corrupt record.

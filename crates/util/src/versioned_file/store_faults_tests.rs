@@ -55,7 +55,7 @@ fn decision_store_never_exposes_an_absent_file() {
         let dir = dir();
         let original = unreadable_bytes(cause);
         put(&dir, "decision.json", original);
-        let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(FailsPublish));
+        let file = VersionedFile::<DecisionFile>::new(dir.path()).with_fs(Arc::new(FailsPublish));
 
         let err = file.store(&decision("new"), &plain()).unwrap_err();
 
@@ -95,7 +95,7 @@ fn a_failed_unlink_of_the_backup_returns_the_publish_error_and_keeps_the_backup(
     let dir = dir();
     let original = unreadable_bytes(CannotRead::Newer);
     put(&dir, "decision.json", original);
-    let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(FailsPublishAndUnlink));
+    let file = VersionedFile::<DecisionFile>::new(dir.path()).with_fs(Arc::new(FailsPublishAndUnlink));
 
     let err = file.store(&decision("new"), &plain()).unwrap_err();
 
@@ -118,7 +118,7 @@ fn decision_store_aborts_untouched_when_the_backup_link_fails() {
         let dir = dir();
         let original = unreadable_bytes(cause);
         put(&dir, "decision.json", original);
-        let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(FailsLink));
+        let file = VersionedFile::<DecisionFile>::new(dir.path()).with_fs(Arc::new(FailsLink));
 
         let err = file.store(&decision("new"), &plain()).unwrap_err();
 
@@ -134,7 +134,7 @@ fn store_is_atomic_under_a_failed_rename() {
     let dir = dir();
     let old = br#"{"version":3,"title":"old","tags":[],"pinned":false}"#;
     put(&dir, "note.json", old);
-    let file = VersionedFile::<NoteV3>::with_fs(dir.path(), Arc::new(FailsPublish));
+    let file = VersionedFile::<NoteV3>::new(dir.path()).with_fs(Arc::new(FailsPublish));
 
     let new = NoteV3 {
         title: "new".to_string(),

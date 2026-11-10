@@ -7,7 +7,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::dir::ReadDir;
+use crate::dir::{Principal, ReadDir};
 use crate::versioned_file::fixtures::{
     dir, names, put, unreadable_bytes, ClaimFile, ConfigFile, CoverFile, DecisionFile, DroppedFile, LegacyRecordFile,
     OsRecordFile,
@@ -76,15 +76,16 @@ struct Case<S: VersionedState> {
 }
 
 impl<S: Valued> Case<S> {
-    fn new(state: State) -> Self {
+    fn new(state: State, process: Principal) -> Self {
         let dir = dir();
         let original = state.bytes();
         if let Some(bytes) = original {
             put(&dir, S::FILE_NAME, bytes);
         }
+        let file = VersionedFile::<S>::for_process(dir.path(), process);
         let file = match state {
-            State::IoFailed => VersionedFile::<S>::with_fs(dir.path(), Arc::new(DeniedRead)),
-            _ => VersionedFile::<S>::new(dir.path()),
+            State::IoFailed => file.with_fs(Arc::new(DeniedRead)),
+            _ => file,
         };
         Self { dir, file, original }
     }
@@ -141,9 +142,9 @@ enum Then {
 
 const UNREADABLE: [State; 3] = [State::Newer, State::Corrupt, State::IoFailed];
 
-fn store_over_unreadable<S: Valued>(expected: [Then; 3]) {
+fn store_over_unreadable<S: Valued>(process: Principal, expected: [Then; 3]) {
     for (state, then) in UNREADABLE.into_iter().zip(expected) {
-        let case = Case::<S>::new(state);
+        let case = Case::<S>::new(state, process);
         let got = case.change(Change::Store(S::with("new")));
         let what = format!("{} over {state:?}", S::FILE_NAME);
         match then {
@@ -196,9 +197,9 @@ fn store_over_unreadable<S: Valued>(expected: [Then; 3]) {
     }
 }
 
-fn remove_over_unreadable<S: Valued>(expected: [Then; 3]) {
+fn remove_over_unreadable<S: Valued>(process: Principal, expected: [Then; 3]) {
     for (state, then) in UNREADABLE.into_iter().zip(expected) {
-        let case = Case::<S>::new(state);
+        let case = Case::<S>::new(state, process);
         let got = case.change(Change::Remove);
         let what = format!("{} over {state:?}", S::FILE_NAME);
         match then {
@@ -227,22 +228,28 @@ use Then::{BackedUp, Kept, MovedAside, Overwritten, Refused, Removed};
 
 #[skuld::test]
 fn a_store_over_a_file_the_role_cannot_read_does_what_the_role_says() {
-    store_over_unreadable::<DecisionFile>([BackedUp, BackedUp, BackedUp]);
-    store_over_unreadable::<OsRecordFile>([Refused, Refused, Refused]);
-    store_over_unreadable::<LegacyRecordFile>([Refused, Refused, Refused]);
-    store_over_unreadable::<ConfigFile>([Refused, Overwritten, BackedUp]);
-    store_over_unreadable::<ClaimFile>([Refused, Refused, Refused]);
-    store_over_unreadable::<CoverFile>([BackedUp, BackedUp, BackedUp]);
+    store_over_unreadable::<DecisionFile>(Principal::System, [BackedUp, BackedUp, BackedUp]);
+    store_over_unreadable::<OsRecordFile>(Principal::System, [Refused, Refused, Refused]);
+    store_over_unreadable::<LegacyRecordFile>(Principal::System, [Refused, Refused, Refused]);
+    // The user's own file is handled as the process is, so both are walked and read.
+    for process in [Principal::System, Principal::User] {
+        store_over_unreadable::<ConfigFile>(process, [Refused, Overwritten, BackedUp]);
+    }
+    store_over_unreadable::<ClaimFile>(Principal::System, [Refused, Refused, Refused]);
+    store_over_unreadable::<CoverFile>(Principal::System, [BackedUp, BackedUp, BackedUp]);
 }
 
 #[skuld::test]
 fn a_remove_over_a_file_the_role_cannot_read_does_what_the_role_says() {
-    remove_over_unreadable::<DecisionFile>([MovedAside, MovedAside, MovedAside]);
-    remove_over_unreadable::<OsRecordFile>([Kept, Kept, Kept]);
-    remove_over_unreadable::<LegacyRecordFile>([Kept, Kept, Kept]);
-    remove_over_unreadable::<ConfigFile>([Kept, Kept, MovedAside]);
-    remove_over_unreadable::<ClaimFile>([Removed, Removed, Removed]);
-    remove_over_unreadable::<CoverFile>([MovedAside, MovedAside, Kept]);
+    remove_over_unreadable::<DecisionFile>(Principal::System, [MovedAside, MovedAside, MovedAside]);
+    remove_over_unreadable::<OsRecordFile>(Principal::System, [Kept, Kept, Kept]);
+    remove_over_unreadable::<LegacyRecordFile>(Principal::System, [Kept, Kept, Kept]);
+    // The user's own file is handled as the process is, so both are walked and read.
+    for process in [Principal::System, Principal::User] {
+        remove_over_unreadable::<ConfigFile>(process, [Kept, Kept, MovedAside]);
+    }
+    remove_over_unreadable::<ClaimFile>(Principal::System, [Removed, Removed, Removed]);
+    remove_over_unreadable::<CoverFile>(Principal::System, [MovedAside, MovedAside, Kept]);
 }
 
 // What no role decides ------------------------------------------------------------------------------------------------
@@ -255,12 +262,12 @@ const ALL: [State; 5] = [
     State::IoFailed,
 ];
 
-fn role_independent<S: Valued>() {
+fn role_independent<S: Valued>(process: Principal) {
     for state in ALL {
         let what = format!("{} {state:?}", S::FILE_NAME);
 
         // Keep writes nothing, over anything.
-        let case = Case::<S>::new(state);
+        let case = Case::<S>::new(state, process);
         let before = case.names();
         let generation = case.file.observe().generation;
         assert!(
@@ -271,7 +278,7 @@ fn role_independent<S: Valued>() {
         assert_eq!(case.file.observe().generation, generation, "{what}: keep");
 
         // MoveAside moves, whatever the role and whatever the file holds.
-        let case = Case::<S>::new(state);
+        let case = Case::<S>::new(state, process);
         let got = case.change(Change::MoveAside);
         match state {
             State::Absent => assert!(matches!(got, Ok(UpdateOutcome::Absent)), "{what}: move aside {got:?}"),
@@ -289,14 +296,14 @@ fn role_independent<S: Valued>() {
     // A file the role can read, or none, is replaced or removed with no backup.
     for state in [State::Absent, State::Current] {
         let what = format!("{} {state:?}", S::FILE_NAME);
-        let case = Case::<S>::new(state);
+        let case = Case::<S>::new(state, process);
         assert!(
             matches!(case.change(Change::Store(S::with("new"))), Ok(UpdateOutcome::Stored)),
             "{what}"
         );
         assert_eq!(case.names(), [S::FILE_NAME], "{what}: store");
 
-        let case = Case::<S>::new(state);
+        let case = Case::<S>::new(state, process);
         let got = case.change(Change::Remove);
         match state {
             State::Absent => assert!(matches!(got, Ok(UpdateOutcome::Absent)), "{what}: {got:?}"),
@@ -308,12 +315,14 @@ fn role_independent<S: Valued>() {
 
 #[skuld::test]
 fn keep_move_aside_and_a_readable_file_mean_the_same_for_every_role() {
-    role_independent::<DecisionFile>();
-    role_independent::<OsRecordFile>();
-    role_independent::<LegacyRecordFile>();
-    role_independent::<ConfigFile>();
-    role_independent::<ClaimFile>();
-    role_independent::<CoverFile>();
+    role_independent::<DecisionFile>(Principal::System);
+    role_independent::<OsRecordFile>(Principal::System);
+    role_independent::<LegacyRecordFile>(Principal::System);
+    for process in [Principal::System, Principal::User] {
+        role_independent::<ConfigFile>(process);
+    }
+    role_independent::<ClaimFile>(Principal::System);
+    role_independent::<CoverFile>(Principal::System);
 }
 
 /// A version the chain's floor dropped on purpose is neither protected nor an error.

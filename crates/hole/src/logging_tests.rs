@@ -32,7 +32,7 @@ impl Drop for DisableRedirectGuard {
 fn init_creates_log_directory(#[fixture(temp_dir)] dir: &Path) {
     let _g = DisableRedirectGuard::new();
     let log_dir = dir.join("logs");
-    let _guard = init(&log_dir);
+    let _guard = init(&log_dir, util::dir::Principal::User);
     assert!(log_dir.exists());
 }
 
@@ -40,7 +40,7 @@ fn init_creates_log_directory(#[fixture(temp_dir)] dir: &Path) {
 fn init_returns_guard(#[fixture(temp_dir)] dir: &Path) {
     let _g = DisableRedirectGuard::new();
     let log_dir = dir.join("logs");
-    let guard = init(&log_dir);
+    let guard = init(&log_dir, util::dir::Principal::User);
     // Guard should be valid (not panic on drop)
     drop(guard);
 }

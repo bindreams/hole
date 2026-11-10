@@ -1,7 +1,7 @@
 //! Which links a [`super::Dir`] walk follows, and where it may end.
 //!
-//! A privileged process walks a path whose folders a user may own, so a link in it can be the
-//! user's. The rule is systemd's `chase()` with `CHASE_SAFE`: a walk never moves from a folder an
+//! A privileged process ([`super::Principal::System`]) walks a path whose folders a user may own, so a link in it can be the
+//! user's. A [`super::Principal::User`] walk has no rule: the OS resolves every link it meets, on both platforms. The rule is systemd's `chase()` with `CHASE_SAFE`: a walk never moves from a folder an
 //! unprivileged user owns into one somebody else owns. systemd's own check lets any step away from
 //! a privileged folder pass, and a user's link planted in a privileged one (`/tmp`) then leads
 //! anywhere: the check never sees the link's owner, and an absolute target restarts at a
@@ -17,7 +17,8 @@
 //!   makes is given to that user at once, so that the next walk through the link finds it theirs.
 //! - The walk follows at most the number of links the OS itself follows in one path ([`Trail::new`]).
 //!
-//! The final name of a file operation is not a step of the walk and is never followed.
+//! The final name of a file operation is not a step of the walk and is never followed by a privileged process; a
+//! user's own read of its own file ([`super::ReadDir::read_as`]) follows it.
 
 use std::io;
 

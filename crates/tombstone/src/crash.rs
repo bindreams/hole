@@ -88,7 +88,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::sync::OnceLock;
 
-use util::dir::{Dir, ReadDir};
+use util::dir::{Dir, Principal, ReadDir};
 
 // # The log directory
 //
@@ -97,8 +97,9 @@ use util::dir::{Dir, ReadDir};
 // name, a FIFO, the directory itself renamed and a link put at its path. The crate therefore opens it once,
 // through `util::dir::Dir`, which judges every link on the way, and from then on names a file only by its single
 // name *inside that handle*. `attach` holds the `Dir` for the life of the process; the handler creates the marker
-// and the dump relative to it. `sweep` opens its own, reads each marker through a `ReadDir` (a symlink is an
-// error, a FIFO is never waited for) and removes the name through `Dir::unlink`.
+// and the dump relative to it. `sweep` opens its own, reads each marker through a `ReadDir` as the process's
+// principal reads (a privileged one: a symlink is an error; an unprivileged one reads through it; a FIFO is never
+// waited for) and removes the name through `Dir::unlink`.
 //
 // What a name that is already taken becomes: the handler creates exclusively, so it never writes through, truncates
 // or replaces an entry it did not make. `attach` therefore picks a name that is free at that moment (`-1`, `-2`
@@ -185,16 +186,17 @@ impl HandlerState {
     }
 
     /// The state for the marker of process `pid` in `log_dir`, which is created if missing. The directory is
-    /// opened without following a link the ownership-transition rule does not allow (see `util::dir`).
-    fn open(kind: &'static str, pid: u32, log_dir: &Path) -> std::io::Result<HandlerState> {
-        let dir = Dir::open(log_dir, true, None)?;
+    /// opened as `principal` walks it: a privileged process does not follow a link the ownership-transition rule
+    /// does not allow (see `util::dir`).
+    fn open(kind: &'static str, pid: u32, log_dir: &Path, principal: Principal) -> std::io::Result<HandlerState> {
+        let dir = Dir::open(log_dir, true, None, principal)?;
         let name = free_marker_name(&dir, kind, pid)?;
         Ok(HandlerState::new(kind, Some(dir), &name))
     }
 
     /// [`Self::open`] for this process; a directory that cannot be opened gives a state that writes no marker.
-    fn open_or_none(kind: &'static str, log_dir: &Path) -> HandlerState {
-        HandlerState::open(kind, std::process::id(), log_dir).unwrap_or_else(|e| {
+    fn open_or_none(kind: &'static str, log_dir: &Path, principal: Principal) -> HandlerState {
+        HandlerState::open(kind, std::process::id(), log_dir, principal).unwrap_or_else(|e| {
             // The error carries no path: a refusal names what it refused, an OS error its code.
             tracing::warn!(
                 error = &e as &dyn std::error::Error,
@@ -209,8 +211,8 @@ impl HandlerState {
 /// can plant in the log directory (`crates/bridge/src/dir_writers_tests.rs`). An `Err` is a log directory that was
 /// not opened; a name that is taken is not an error, as in the handler.
 #[cfg(feature = "test-support")]
-pub fn write_marker_for(kind: &'static str, pid: u32, log_dir: &Path) -> std::io::Result<()> {
-    let state = HandlerState::open(kind, pid, log_dir)?;
+pub fn write_marker_for(kind: &'static str, pid: u32, log_dir: &Path, principal: Principal) -> std::io::Result<()> {
+    let state = HandlerState::open(kind, pid, log_dir, principal)?;
     let rec = MarkerRecord {
         kind,
         pid,
@@ -711,8 +713,10 @@ fn parse_hex(s: &str) -> u64 {
 /// `log_dir` must be user-readable even for the elevated bridge (the marker
 /// inherits its perms). It is created if missing and opened once, here, for the life of
 /// the process (see "The log directory" above); a directory that cannot be opened leaves the handler
-/// attached and writing no marker.
-pub fn attach(kind: &'static str, log_dir: &Path) {
+/// attached and writing no marker. `principal` is the running process's privilege, from the caller: the
+/// ownership-transition walk is a privileged process's, and an unprivileged one in its own folder follows every
+/// link the OS would.
+pub fn attach(kind: &'static str, log_dir: &Path, principal: Principal) {
     // Idempotent: a second attach (e.g. init_multi called twice in a
     // process) is a no-op once the handler is set.
     if CRASH_HANDLER.get().is_some() {
@@ -725,7 +729,8 @@ pub fn attach(kind: &'static str, log_dir: &Path) {
     // attach is always called with the same process's kind + log_dir. The
     // directory is opened and the marker's name chosen NOW (allocation is fine
     // on the happy path) so on_crash does ZERO allocation. See review S3.
-    let state_ref: &'static HandlerState = HANDLER_STATE.get_or_init(|| HandlerState::open_or_none(kind, log_dir));
+    let state_ref: &'static HandlerState =
+        HANDLER_STATE.get_or_init(|| HandlerState::open_or_none(kind, log_dir, principal));
 
     let event = Box::new(MarkerCrashEvent { state: state_ref });
     // SAFETY: crash-handler requires the closure/handler to be valid; our
@@ -857,12 +862,14 @@ unsafe impl crash_handler::CrashEvent for MarkerCrashEvent {
 /// the marker (leaving any sibling `.dmp`). Best-effort; tolerant of
 /// malformed/partial markers.
 ///
-/// The directory is opened once, without following a link the ownership-transition rule does not allow, and every
-/// marker is read and removed by its name inside that handle (see "The log directory" above): a symlink at a
-/// marker name is reported unreadable and removed as itself, a FIFO is never waited for, and so is a marker the
-/// directory's owner cannot vouch for (`ReadDir::read_vouched`).
-pub fn sweep(log_dir: &Path) {
-    let dir = match Dir::open(log_dir, false, None) {
+/// The directory is opened once, and every marker is read and removed by its name inside that handle (see "The log
+/// directory" above): a symlink at a marker name is removed as itself, a FIFO is never
+/// waited for. `principal` is the running process's privilege, from the caller, and is how a marker is read
+/// (`ReadDir::read_as`): a privileged process does not follow a link the ownership-transition rule does not allow and
+/// refuses a marker the directory's owner cannot vouch for, and an unprivileged one in its own folder follows every
+/// link the OS would and reads what is there.
+pub fn sweep(log_dir: &Path, principal: Principal) {
+    let dir = match Dir::open(log_dir, false, None, principal) {
         Ok(dir) => dir,
         // Missing dir — nothing to report.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
@@ -906,11 +913,7 @@ fn sweep_dir(dir: &Dir, names: impl IntoIterator<Item = OsString>) {
 
 fn report_one(dir: &ReadDir, name: &OsStr) {
     let marker = name.to_string_lossy();
-    let Some(text) = dir
-        .read_vouched(name)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-    else {
+    let Some(text) = dir.read_as(name).ok().and_then(|bytes| String::from_utf8(bytes).ok()) else {
         tracing::error!(
             target: "crash",
             marker = %marker,

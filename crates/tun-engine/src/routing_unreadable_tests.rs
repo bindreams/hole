@@ -387,7 +387,7 @@ fn persisted_with_no_routes() -> state::RouteState {
 fn a_checkpoint_over_a_record_whose_read_fails_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_record(dir.path(), WITH_UNKNOWN_FIELD);
-    let file = state::RouteFile::with_fs(dir.path(), std::sync::Arc::new(DeniedRead));
+    let file = state::RouteFile::new(dir.path()).with_fs(std::sync::Arc::new(DeniedRead));
     let mut persisted = persisted_with_no_routes();
 
     let mut result = Ok(());
@@ -632,7 +632,7 @@ fn teardown_deletes_its_routes_and_leaves_an_unreadable_record_naming_it() {
 fn teardown_leaves_a_record_whose_read_fails_and_names_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_record(dir.path(), WITH_UNKNOWN_FIELD);
-    let file = state::RouteFile::with_fs(dir.path(), Arc::new(DeniedRead));
+    let file = state::RouteFile::new(dir.path()).with_fs(Arc::new(DeniedRead));
     let routes = routes_over(file, vec![RouteId::SplitV4Low]);
 
     let logs = errors_of(|| {

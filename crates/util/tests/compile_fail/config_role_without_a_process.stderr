@@ -1,0 +1,29 @@
+error[E0080]: evaluation panicked: this role's file is built by `VersionedFile::for_process`
+ --> $RUST/core/src/panic.rs
+  |
+  = note: evaluation of `util::versioned_file::VersionedFile::<Config>::new::{constant#0}` failed here
+  |
+ ::: src/versioned_file/store.rs
+  |
+  | /             assert!(
+  | |                 !S::ROLE.depends_on_the_process(),
+  | |                 "this role's file is built by `VersionedFile::for_process`"
+  | |             )
+  | |_____________- in this macro invocation
+
+note: erroneous constant encountered
+ --> src/versioned_file/store.rs
+  |
+  | /         const {
+  | |             assert!(
+  | |                 !S::ROLE.depends_on_the_process(),
+  | |                 "this role's file is built by `VersionedFile::for_process`"
+  | |             )
+  | |         };
+  | |_________^
+
+note: the above error was encountered while instantiating `fn VersionedFile::<Config>::new`
+  --> tests/compile_fail/config_role_without_a_process.rs:24:13
+   |
+24 |     let _ = VersionedFile::<Config>::new(Path::new("."));
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -20,7 +20,9 @@ fn put(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> std::path::PathBuf 
 
 /// `ReadDir::read` of `name` in the folder of `dir`.
 fn read(dir: &tempfile::TempDir, name: &str) -> io::Result<Vec<u8>> {
-    ReadDir::open(dir.path()).unwrap().read(name.as_ref())
+    ReadDir::open(dir.path(), crate::dir::Principal::System)
+        .unwrap()
+        .read(name.as_ref())
 }
 
 /// [`read`] as an unprivileged thread: a reader with backup rights reads through a holder that denies sharing.
@@ -168,7 +170,7 @@ fn a_rename_onto_a_taken_name_keeps_its_kind_and_names_the_status() {
     put(&dir, "from", b"f");
     put(&dir, "to", b"t");
 
-    let err = Dir::open(dir.path(), false, None)
+    let err = Dir::open(dir.path(), false, None, crate::dir::Principal::System)
         .unwrap()
         .rename_noreplace("from".as_ref(), "to".as_ref())
         .unwrap_err();

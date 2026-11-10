@@ -440,7 +440,9 @@ pub fn run(
         // markers left by a previously-crashed bridge. Offloaded to a
         // blocking thread to match the sibling recover_* calls.
         let log_dir_sweep = log_dir.to_path_buf();
-        if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep, stepstool::principal())).await
+        {
             tracing::warn!(error = &e as &dyn std::error::Error, "crash sweep task panicked");
         }
         // The new bridge is authoritative once it has bound: any update marker is

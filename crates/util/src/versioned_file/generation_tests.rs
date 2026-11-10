@@ -35,7 +35,7 @@ impl Fs for FailsPublish {
 #[skuld::test]
 fn generation_moves_before_the_write_even_when_the_write_fails() {
     let dir = dir();
-    let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(FailsPublish));
+    let file = VersionedFile::<DecisionFile>::new(dir.path()).with_fs(Arc::new(FailsPublish));
     let before = file.observe().generation;
 
     assert!(store(&file, "v").is_err(), "guard: the write fails");
@@ -121,7 +121,7 @@ struct ChecksLock {
 impl Fs for ChecksLock {
     fn read(&self, dir: &ReadDir, name: &OsStr) -> io::Result<Vec<u8>> {
         self.held.store(is_locked(&self.path), Ordering::SeqCst);
-        dir.read_vouched(name)
+        dir.read_as(name)
     }
 }
 
@@ -134,7 +134,7 @@ fn observe_reads_under_the_path_lock() {
         path: dir.path().join("decision.json"),
         held: held.clone(),
     };
-    let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(fs));
+    let file = VersionedFile::<DecisionFile>::new(dir.path()).with_fs(Arc::new(fs));
     store(&file, "v").unwrap();
 
     let observed = file.observe();
@@ -154,7 +154,7 @@ fn update_reads_under_the_path_lock() {
         path: dir.path().join("decision.json"),
         held: held.clone(),
     };
-    let file = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(fs));
+    let file = VersionedFile::<DecisionFile>::new(dir.path()).with_fs(Arc::new(fs));
     store(&file, "v").unwrap();
     held.store(false, Ordering::SeqCst);
 
@@ -282,7 +282,7 @@ fn a_remove_over_a_missing_directory_moves_the_generation() {
 fn a_remove_the_role_keeps_moves_the_generation() {
     let dir = dir();
     put(&dir, "cover.json", br#"{"version":1,"value":"v"}"#);
-    let file = VersionedFile::<CoverFile>::with_fs(dir.path(), Arc::new(DeniedRead));
+    let file = VersionedFile::<CoverFile>::new(dir.path()).with_fs(Arc::new(DeniedRead));
 
     let outcome = moves_once(&file, &plain(), |_| (Change::Remove, ())).unwrap();
 
@@ -321,7 +321,9 @@ fn observe_says_a_regular_file_failed_to_read() {
     let dir = dir();
     put(&dir, "decision.json", br#"{"version":1,"value":"v"}"#);
 
-    let observed = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(DeniedRead)).observe();
+    let observed = VersionedFile::<DecisionFile>::new(dir.path())
+        .with_fs(Arc::new(DeniedRead))
+        .observe();
 
     assert_eq!(unreadable_kind(&observed.loaded), UnreadableKind::File);
 }
@@ -343,8 +345,9 @@ fn observe_says_a_name_that_vanished_after_a_failed_read_is_absent() {
     let dir = dir();
     let path = put(&dir, "decision.json", br#"{"version":1,"value":"v"}"#);
 
-    let observed =
-        VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(VanishesAfterFailedRead { path })).observe();
+    let observed = VersionedFile::<DecisionFile>::new(dir.path())
+        .with_fs(Arc::new(VanishesAfterFailedRead { path }))
+        .observe();
 
     assert!(matches!(observed.loaded, Loaded::Absent), "{:?}", observed.loaded);
 }
@@ -367,7 +370,9 @@ fn observe_says_a_name_that_cannot_be_examined_after_a_failed_read_is_unprobed()
     let dir = dir();
     put(&dir, "decision.json", br#"{"version":1,"value":"v"}"#);
 
-    let observed = VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(CannotBeProbed)).observe();
+    let observed = VersionedFile::<DecisionFile>::new(dir.path())
+        .with_fs(Arc::new(CannotBeProbed))
+        .observe();
 
     assert_eq!(unreadable_kind(&observed.loaded), UnreadableKind::Unprobed);
 }
@@ -385,7 +390,9 @@ fn a_failed_probe_of_the_name_is_logged_with_its_kind() {
     let dir = dir();
     put(&dir, "decision.json", br#"{"version":1,"value":"v"}"#);
 
-    VersionedFile::<DecisionFile>::with_fs(dir.path(), Arc::new(CannotBeProbed)).observe();
+    VersionedFile::<DecisionFile>::new(dir.path())
+        .with_fs(Arc::new(CannotBeProbed))
+        .observe();
 
     let log = writer.snapshot();
     assert_eq!(log.matches("DEBUG").count(), 1, "{log}");

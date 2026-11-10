@@ -657,7 +657,15 @@ profile: the state directory, the log directory, the update marker. Every compon
 user's to replace between any two calls, so a path call (`create_dir_all`, `chown`, `rename`, `remove_file`,
 `File::create`) resolves the whole path again and can be sent anywhere. Code that acts in such a folder
 follows these rules, which [`util::dir::Dir`](crates/util/src/dir.rs) implements once; use it, do not
-re-derive them.
+re-derive them. They are the rules of `Principal::System`: a user's own process handling the user's own
+file (`Principal::User`) has nothing to defend from the user, and its walk follows every link the OS would
+(unix itself, up to the kernel's limit; on Windows the OS resolves each one). Which one a process is is its
+own privilege, read once at the entry point by `stepstool::principal()` (a privilege that cannot be read, a failed
+Windows token query, is the system's: the guards stay on) and passed down: the log
+(`logging::init*`), the crash marker (`tombstone::attach` and `sweep`) and `config.json`
+(`ConfigStore::load`) take it from the caller, so a GUI run under `sudo` handles the user's folders as the
+system does. A directory carries the principal it was opened for, and `ReadDir::read_as` reads as it:
+no handle can be asked to follow a link at a name that was not opened for a user.
 
 1. **Walk through handles.** Open the directory once, one component at a time, each relative to the handle
    already held (`openat` on unix, `NtCreateFile` relative to the parent handle on Windows). Every later step
@@ -3319,15 +3327,60 @@ the name reads as `Marker::Indeterminate`, a claim of no cutover.
 ### Config corruption recovery
 
 `ConfigStore` ([crates/common/src/config_store.rs](crates/common/src/config_store.rs))
-is the only door to `config.json` — `AppConfig::save` is clippy-disallowed
-elsewhere, and there is no other loader. On load, a corrupt or unreadable file
-is quarantined to a timestamped sibling (`config.json.<ts>Z.bak`) before
-defaults are used, and the user gets a native dialog naming the backup. If
-quarantine fails (e.g. unwritable directory), saving is blocked for the whole
-session (`ConfigError::SaveBlocked`) so the corrupt file is never overwritten —
-the original data-loss bug (#467) was a save clobbering a file that had failed
-to parse. Saves are atomic (sibling temp file + rename) so a crash mid-save
-cannot produce a corrupt config.
+is the only door to `config.json`: there is no other loader, and a writer of the
+file (`VersionedFile<AppConfig>`) needs a row in the writer table
+(`every_file_that_opens_a_dir_has_a_row`). The file is a
+[`util::versioned_file`](crates/util/src/versioned_file.rs) of role `Role::Config`,
+`{"version": 1, ...}`; a file with no `version` is the format from before it was
+versioned and reads as version 1. What a release that cannot read the file does,
+by cause:
+
+- **Corrupt or unreadable** (`Parse`, `Read`, a read that failed for any reason but a refusal): moved aside to the type's
+  `config.json.unreadable[.N].bak` before defaults are used (the load is one
+  `VersionedFile::update` that reads the file and moves it aside, through the
+  directory handle), and the user gets a native dialog naming the backup. If the move
+  fails (e.g. unwritable directory), saving is blocked for the whole session
+  (`ConfigError::SaveBlocked`, `ConfigRecovery::QuarantineFailed`) so the corrupt file is never
+  overwritten: the original data-loss bug (#467) was a save clobbering a file that had
+  failed to parse.
+- **Read refused** (a link at the name, a file another account owns, not a regular file; for
+  a privileged process, which refuses what a user could have planted): the file is *not* moved aside.
+  A refusal says this process may not read it, not that it is damaged, and a file a user keeps by
+  a link (a dotfiles tool) must survive a launch under `sudo`. Defaults, the file left exactly where it
+  is, saving blocked, and a dialog saying what was found and to start Hole normally
+  (`ConfigRecovery::Refused`). An unprivileged process is refused only a file that is not a regular
+  file.
+- **Folder that does not open** (a file in its place, a link the walk refuses, no right
+  to it): nothing was read, so there is no file to move. Defaults, saving blocked, and a
+  dialog naming the folder (`ConfigRecovery::FolderNotOpened`).
+- **From a newer release** (`version` above this build's): defaults, the file left
+  where it is with no backup, saving blocked for the session, and a dialog saying so
+  (`ConfigRecovery::LeftInPlace`). A release that wrote it may hold fields this one would drop
+  on a save. A file that turns newer after the load is refused by the type's
+  `Role::Config` rule on the next save (`StoreError::Unreadable`).
+- **Corrupt after the load** (a mid-session edit): the next save overwrites it, as
+  before (`Role::Config` store over `Corrupt` is `Overwrite`).
+
+`config.json` is the user's own file handled by the process that loads it
+(`Role::principal(process)`, with the process's `stepstool::principal()` given to `ConfigStore::load`).
+An unprivileged process (`Principal::User`) walks its folder following every link
+the OS would, with no ownership-transition rule, reads the file through a link at its
+name and with no question of whose it is, and a missing folder is made `0700`. A privileged one (a GUI
+run under `sudo`, which keeps the user's home) walks the same folder by the rules of `Principal::System`. A save
+replaces a link at the name; it never writes through it. The rules of
+[Privileged code in folders a user may own](#privileged-code-in-folders-a-user-may-own)
+(a link at the name refused, the vouched read, the ownership-transition rule) are for
+`Principal::System`, as is every other role. No clippy ban routes saves through
+`ConfigStore`: `AppConfig::save` no longer exists, and a new `VersionedFile`
+constructor fails `every_file_that_opens_a_dir_has_a_row`, so the writer-table rows
+(`the GUI config, saved by the user's own GUI` and `... by a privileged GUI`, one per
+principal) are what keep a second door out. A file whose role depends on the process
+(`Role::depends_on_the_process`, today `Config`) is built with `VersionedFile::for_process`,
+never `new`: the build fails if it is not.
+
+Saves go through `VersionedFile::update`: a temp file in the same directory, fully
+written, synced and sealed `0600` (unix) before the rename, so a crash mid-save
+cannot produce a corrupt config; the directory is `0700` on unix, best effort.
 
 ### Native-crash observability (tombstone)
 

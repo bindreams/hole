@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use super::{platform, read_whole, read_whole_vouched, single_component, EntryKind};
+use super::{platform, read_whole, read_whole_following, read_whole_vouched, single_component, EntryKind, Principal};
 
 /// An open directory with no way to write in it: it has no method that adds, replaces, renames or removes a name, so
 /// code that only reads cannot do more, on any platform. Opened by [`ReadDir::open`] or taken from a [`super::Dir`]
@@ -15,20 +15,23 @@ use super::{platform, read_whole, read_whole_vouched, single_component, EntryKin
 /// read. The walk to it is [`super::Dir::open`]'s, with the same judgment of every link.
 pub struct ReadDir {
     file: File,
+    /// Whose process reads, and so how a read treats the file at a name: [`ReadDir::read_as`].
+    principal: Principal,
 }
 
 impl ReadDir {
-    /// Opens the directory at `path`, following a link only under the ownership-transition rule (see the module doc
-    /// of [`super`]). Nothing is created.
-    pub fn open(path: &Path) -> io::Result<ReadDir> {
+    /// Opens the directory at `path`, following a link as `principal` may (see the module doc of [`super`]). Nothing
+    /// is created.
+    pub fn open(path: &Path, principal: Principal) -> io::Result<ReadDir> {
         #[cfg(windows)]
-        return platform::open_dir_read(path).map(Self::from_handle);
+        return platform::open_dir_read(path, principal).map(|file| Self::from_handle(file, principal));
         #[cfg(unix)]
-        return platform::open_dir(path, false, None, platform::caller()).map(Self::from_handle);
+        return platform::open_dir(path, false, None, principal, platform::caller())
+            .map(|file| Self::from_handle(file, principal));
     }
 
-    pub(super) fn from_handle(file: File) -> ReadDir {
-        ReadDir { file }
+    pub(super) fn from_handle(file: File, principal: Principal) -> ReadDir {
+        ReadDir { file, principal }
     }
 
     /// The handle, for a test to ask the OS what it was opened with.
@@ -38,8 +41,8 @@ impl ReadDir {
     }
 
     /// The whole file `name`, read through a handle that shares delete, so a replace of the file does not wait for
-    /// the read. `NotFound` for a missing file. A symlink at the name is an error, not followed; so is anything that
-    /// is not a regular file ([`super::Refusal::NotRegular`], and a FIFO is never waited for).
+    /// the read. `NotFound` for a missing file. A symlink at the name is [`super::Refusal::Symlink`], not followed;
+    /// anything else that is not a regular file is [`super::Refusal::NotRegular`], and a FIFO is never waited for.
     pub fn read(&self, name: &OsStr) -> io::Result<Vec<u8>> {
         read_whole(&self.file, name)
     }
@@ -50,6 +53,17 @@ impl ReadDir {
     /// other file is not. Not for a file that has a second name by design.
     pub fn read_vouched(&self, name: &OsStr) -> io::Result<Vec<u8>> {
         read_whole_vouched(&self.file, name)
+    }
+
+    /// The read of the principal this directory was opened for: [`ReadDir::read_vouched`] for [`Principal::System`], and
+    /// for [`Principal::User`] the file the name leads to, read through a link at the name and with no question of
+    /// whose it is: a user reading their own file. What is not a regular file is [`super::Refusal::NotRegular`], and
+    /// a FIFO is never waited for.
+    pub fn read_as(&self, name: &OsStr) -> io::Result<Vec<u8>> {
+        match self.principal {
+            Principal::System => self.read_vouched(name),
+            Principal::User => read_whole_following(&self.file, name),
+        }
     }
 
     /// What `name` is right now, or `None` if there is nothing. A symlink is itself, not what it points at.

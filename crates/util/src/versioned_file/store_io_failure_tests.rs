@@ -4,6 +4,7 @@
 //! bytes aside first. The seam fails the read while the file stays readable on
 //! disk, so each test can compare what is left with what was there.
 
+use crate::dir::Principal;
 use crate::versioned_file::fixtures::UpdateShortcuts;
 use crate::versioned_file::UpdateOutcome;
 use std::io;
@@ -62,7 +63,7 @@ fn capture() -> (impl tracing::Subscriber + Send + Sync, WaitableWriter) {
 fn unreadable<S: VersionedState>(fs: Arc<dyn Fs>) -> (tempfile::TempDir, VersionedFile<S>) {
     let dir = dir();
     put(&dir, S::FILE_NAME, ORIGINAL);
-    let file = VersionedFile::<S>::with_fs(dir.path(), fs);
+    let file = VersionedFile::<S>::for_process(dir.path(), Principal::System).with_fs(fs);
     (dir, file)
 }
 

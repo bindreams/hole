@@ -1535,7 +1535,8 @@ pub fn installer_user_sid_dir() -> std::path::PathBuf {
 /// The SID the installer left in `dir`, as text. `NotFound` for a missing file or folder.
 #[cfg(target_os = "windows")]
 pub(crate) fn read_installer_user_sid(dir: &Path) -> std::io::Result<String> {
-    let bytes = util::dir::ReadDir::open(dir)?.read_vouched(INSTALLER_USER_SID_FILE.as_ref())?;
+    let bytes =
+        util::dir::ReadDir::open(dir, util::dir::Principal::System)?.read_vouched(INSTALLER_USER_SID_FILE.as_ref())?;
     String::from_utf8(bytes)
         .map(|sid| sid.trim().to_owned())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "the installer SID file is not text"))
@@ -1576,8 +1577,12 @@ pub(crate) fn take_installer_user_sid(dir: &Path) -> Option<String> {
 /// by name through a handle: a link a user planted at the name is replaced and what it leads to is left alone.
 #[cfg(target_os = "windows")]
 pub(crate) fn write_installer_user_sid(dir: &Path, sid: &str) -> std::io::Result<()> {
-    util::dir::Dir::open(dir, true, None)?
-        .write_atomic(INSTALLER_USER_SID_FILE.as_ref(), sid.as_bytes(), None, |_| Ok(()))
+    util::dir::Dir::open(dir, true, None, util::dir::Principal::System)?.write_atomic(
+        INSTALLER_USER_SID_FILE.as_ref(),
+        sid.as_bytes(),
+        None,
+        |_| Ok(()),
+    )
 }
 
 /// Set up IPC access control so that the current interactive user can

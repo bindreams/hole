@@ -38,6 +38,8 @@ socket2 = "0.6"
 sha2 = "0.11"
 tempfile = "3"
 tombstone = { path = "../tombstone" }
+# `principal()`: galoshes runs as root under the bridge and as the user under any other SIP003 client.
+stepstool = { path = "../stepstool" }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

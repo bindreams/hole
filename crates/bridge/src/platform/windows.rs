@@ -371,7 +371,7 @@ where
         // previously-crashed service bridge. Markers land in the service log dir
         // (C:\ProgramData\hole\logs), NOT state_dir.
         let log_dir = self.log_dir.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir)).await {
+        if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir, stepstool::principal())).await {
             tracing::warn!(error = &e as &dyn std::error::Error, "crash sweep task panicked");
         }
     }

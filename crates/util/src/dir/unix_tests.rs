@@ -36,7 +36,7 @@ fn system_link() -> PathBuf {
 fn a_link_the_system_owns_in_a_folder_the_system_owns_is_followed() {
     let link = system_link();
 
-    let dir = Dir::open(&link, false, None).unwrap_or_else(|err| panic!("{link:?}: {err:?}"));
+    let dir = Dir::open(&link, false, None, Principal::System).unwrap_or_else(|err| panic!("{link:?}: {err:?}"));
 
     assert_eq!(
         FileIdOf::of(dir.file()),
@@ -70,7 +70,7 @@ fn a_link_the_runner_owns_to_a_folder_a_user_owns_is_followed() {
     user_dir(&real);
     std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
 
-    let dir = Dir::open(&tmp.path().join("link"), false, None).unwrap();
+    let dir = Dir::open(&tmp.path().join("link"), false, None, Principal::System).unwrap();
 
     assert_eq!(
         FileIdOf::of(dir.file()),
@@ -86,7 +86,7 @@ fn a_users_link_to_a_folder_the_same_user_owns_is_followed() {
     user_dir(&real);
     plant(&real, &tmp.path().join("link"));
 
-    let dir = Dir::open(&tmp.path().join("link"), false, None).unwrap();
+    let dir = Dir::open(&tmp.path().join("link"), false, None, Principal::System).unwrap();
 
     assert_eq!(
         FileIdOf::of(dir.file()),
@@ -100,7 +100,7 @@ fn a_users_link_to_a_folder_the_system_owns_is_refused() {
     plant(Path::new("/etc"), &tmp.path().join("link"));
 
     assert_eq!(
-        refusal(Dir::open(&tmp.path().join("link"), false, None)),
+        refusal(Dir::open(&tmp.path().join("link"), false, None, Principal::System)),
         Refusal::Symlink
     );
 }
@@ -112,7 +112,12 @@ fn a_users_link_to_a_folder_the_system_owns_is_refused_below_the_link_too() {
     plant(Path::new("/etc"), &tmp.path().join("link"));
 
     assert_eq!(
-        refusal(Dir::open(&tmp.path().join("link").join("ssl"), false, None)),
+        refusal(Dir::open(
+            &tmp.path().join("link").join("ssl"),
+            false,
+            None,
+            Principal::System
+        )),
         Refusal::Symlink
     );
 }
@@ -124,7 +129,10 @@ fn nothing_is_made_in_a_folder_the_system_owns_through_a_users_link() {
     plant(scratch.root(), &tmp.path().join("link"));
     let through = tmp.path().join("link").join(scratch.name()).join("state");
 
-    assert_eq!(refusal(Dir::open(&through, true, None)), Refusal::Symlink);
+    assert_eq!(
+        refusal(Dir::open(&through, true, None, Principal::System)),
+        Refusal::Symlink
+    );
 
     assert!(
         !scratch.path().exists(),
@@ -139,7 +147,13 @@ fn a_folder_missing_below_a_users_link_is_made_in_the_users_folder() {
     user_dir(&real);
     plant(&real, &tmp.path().join("link"));
 
-    Dir::open(&tmp.path().join("link").join("a").join("b"), true, None).unwrap();
+    Dir::open(
+        &tmp.path().join("link").join("a").join("b"),
+        true,
+        None,
+        Principal::System,
+    )
+    .unwrap();
 
     assert!(real.join("a").join("b").is_dir());
 }
@@ -152,7 +166,7 @@ fn a_users_link_to_a_missing_folder_makes_the_folder_in_the_users_tree() {
     let target = base.join("not-yet").join("deeper");
     plant(&target, &tmp.path().join("link"));
 
-    Dir::open(&tmp.path().join("link"), true, None).unwrap();
+    Dir::open(&tmp.path().join("link"), true, None, Principal::System).unwrap();
 
     assert!(target.is_dir());
 }
@@ -166,7 +180,12 @@ fn a_users_link_in_a_users_folder_to_the_system_is_refused_after_a_followed_link
     plant(&real, &tmp.path().join("link"));
 
     assert_eq!(
-        refusal(Dir::open(&tmp.path().join("link").join("inner"), false, None)),
+        refusal(Dir::open(
+            &tmp.path().join("link").join("inner"),
+            false,
+            None,
+            Principal::System
+        )),
         Refusal::Symlink
     );
 }
@@ -178,7 +197,13 @@ fn a_followed_relative_link_resolves_from_the_directory_it_sits_in() {
     user_dir(&tmp.path().join("b"));
     plant(Path::new("../a/real"), &tmp.path().join("b").join("link"));
 
-    Dir::open(&tmp.path().join("b").join("link").join("made"), true, None).unwrap();
+    Dir::open(
+        &tmp.path().join("b").join("link").join("made"),
+        true,
+        None,
+        Principal::System,
+    )
+    .unwrap();
 
     assert!(tmp.path().join("a").join("real").join("made").is_dir());
 }
@@ -190,7 +215,7 @@ fn a_followed_absolute_link_resolves_from_the_root() {
     user_dir(&real);
     plant(&real, &tmp.path().join("link"));
 
-    Dir::open(&tmp.path().join("link").join("made"), true, None).unwrap();
+    Dir::open(&tmp.path().join("link").join("made"), true, None, Principal::System).unwrap();
 
     assert!(real.join("made").is_dir());
 }
@@ -205,7 +230,7 @@ fn a_link_met_again_after_its_own_resolution_is_not_a_loop() {
     plant(&real, &tmp.path().join("link"));
     plant(&tmp.path().join("link").join("sub"), &real.join("again"));
 
-    let dir = Dir::open(&tmp.path().join("link").join("again"), false, None).unwrap();
+    let dir = Dir::open(&tmp.path().join("link").join("again"), false, None, Principal::System).unwrap();
 
     assert_eq!(
         FileIdOf::of(dir.file()),
@@ -220,7 +245,7 @@ fn a_link_to_a_path_through_itself_is_a_loop() {
     plant(&tmp.path().join("link").join("deeper"), &tmp.path().join("link"));
 
     assert_eq!(
-        refusal(Dir::open(&tmp.path().join("link"), true, None)),
+        refusal(Dir::open(&tmp.path().join("link"), true, None, Principal::System)),
         Refusal::Symlink
     );
 }
@@ -231,7 +256,37 @@ fn a_loop_of_links_is_refused_not_followed_forever() {
     std::os::unix::fs::symlink("b", tmp.path().join("a")).unwrap();
     std::os::unix::fs::symlink("a", tmp.path().join("b")).unwrap();
 
-    assert_eq!(refusal(Dir::open(&tmp.path().join("a"), true, None)), Refusal::Symlink);
+    assert_eq!(
+        refusal(Dir::open(&tmp.path().join("a"), true, None, Principal::System)),
+        Refusal::Symlink
+    );
+}
+
+#[skuld::test]
+fn a_users_own_walk_makes_every_folder_it_creates_private() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    Dir::open(&tmp.path().join("a").join("b"), true, None, Principal::User).unwrap();
+
+    for private in [tmp.path().join("a"), tmp.path().join("a").join("b")] {
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().mode() & 0o777,
+            0o700,
+            "{private:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_users_own_walk_refuses_a_loop_of_links_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink("b", tmp.path().join("a")).unwrap();
+    std::os::unix::fs::symlink("a", tmp.path().join("b")).unwrap();
+
+    assert_eq!(
+        refusal(Dir::open(&tmp.path().join("a"), true, None, Principal::User)),
+        Refusal::Symlink
+    );
 }
 
 #[skuld::test]
@@ -240,7 +295,13 @@ fn a_parent_component_is_resolved_by_the_directory_in_hand() {
     std::fs::create_dir(tmp.path().join("a")).unwrap();
     std::fs::create_dir(tmp.path().join("b")).unwrap();
 
-    let dir = Dir::open(&tmp.path().join("a").join("..").join("b"), false, None).unwrap();
+    let dir = Dir::open(
+        &tmp.path().join("a").join("..").join("b"),
+        false,
+        None,
+        Principal::System,
+    )
+    .unwrap();
 
     assert_eq!(
         FileIdOf::of(dir.file()),
@@ -271,7 +332,13 @@ fn a_directory_owned_by_neither_the_owner_nor_the_caller_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let me = tmp.path().metadata().unwrap().uid();
 
-    let refused = refusal(Dir::open_as(tmp.path(), false, Some((me + 2, me + 2)), me + 1));
+    let refused = refusal(Dir::open_as(
+        tmp.path(),
+        false,
+        Some((me + 2, me + 2)),
+        Principal::System,
+        me + 1,
+    ));
 
     assert_eq!(refused, Refusal::ForeignOwner { uid: me });
 }
@@ -281,7 +348,7 @@ fn a_directory_owned_by_the_expected_owner_is_accepted() {
     let tmp = tempfile::tempdir().unwrap();
     let me = tmp.path().metadata().unwrap().uid();
 
-    Dir::open_as(tmp.path(), false, Some((me, me)), me + 1).unwrap();
+    Dir::open_as(tmp.path(), false, Some((me, me)), Principal::System, me + 1).unwrap();
 }
 
 #[skuld::test]
@@ -290,7 +357,7 @@ fn a_directory_owned_by_the_caller_is_accepted_for_another_owner() {
     let tmp = tempfile::tempdir().unwrap();
     let me = tmp.path().metadata().unwrap().uid();
 
-    Dir::open_as(tmp.path(), false, Some((me + 2, me + 2)), me).unwrap();
+    Dir::open_as(tmp.path(), false, Some((me + 2, me + 2)), Principal::System, me).unwrap();
 }
 
 #[skuld::test]
@@ -298,7 +365,7 @@ fn no_owner_means_no_ownership_check_on_the_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let me = tmp.path().metadata().unwrap().uid();
 
-    Dir::open_as(tmp.path(), false, None, me + 1).unwrap();
+    Dir::open_as(tmp.path(), false, None, Principal::System, me + 1).unwrap();
 }
 
 #[skuld::test]
@@ -323,7 +390,7 @@ fn secure_sets_the_mode_and_hands_the_directory_to_the_owner_when_the_os_allows(
     let dir_path = tmp.path().join("state");
     let foreign = mine() + 2;
     let allowed = may_chown_to(tmp.path(), foreign);
-    let dir = Dir::open(&dir_path, true, None).unwrap();
+    let dir = Dir::open(&dir_path, true, None, Principal::System).unwrap();
 
     dir.secure(Some((foreign, foreign)), Some(0o700)).unwrap();
 
@@ -337,7 +404,7 @@ fn write_atomic_seals_the_file_to_the_owner_and_to_0600() {
     let tmp = tempfile::tempdir().unwrap();
     let foreign = mine() + 2;
     let allowed = may_chown_to(tmp.path(), foreign);
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     dir.write_atomic("state.json".as_ref(), b"x", Some((foreign, foreign)), |_| Ok(()))
         .unwrap();
@@ -357,7 +424,7 @@ fn a_file_swapped_in_after_the_rename_is_not_touched() {
     std::fs::write(&victim, b"keep").unwrap();
     std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
     let before = std::fs::metadata(&victim).unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let foreign = mine() + 2;
 
     dir.write_atomic_with(
@@ -387,7 +454,7 @@ fn a_symlink_swapped_in_after_the_rename_is_not_followed() {
     std::fs::write(&victim, b"keep").unwrap();
     std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
     let before = std::fs::metadata(&victim).unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
     let foreign = mine() + 2;
 
     dir.write_atomic_with(
@@ -453,7 +520,8 @@ fn a_directory_the_caller_can_search_but_not_read_is_walked_through() {
         std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(mode)).unwrap();
 
         as_unprivileged(tmp.path(), || {
-            let dir = Dir::open(&leaf, false, None).unwrap_or_else(|err| panic!("mode {mode:o}: {err:?}"));
+            let dir =
+                Dir::open(&leaf, false, None, Principal::System).unwrap_or_else(|err| panic!("mode {mode:o}: {err:?}"));
             dir.write_atomic("state.json".as_ref(), b"x", None, |_| Ok(())).unwrap();
         });
 
@@ -470,7 +538,7 @@ fn a_missing_directory_is_created_below_one_the_caller_can_search_but_not_read()
     std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o311)).unwrap();
 
     as_unprivileged(tmp.path(), || {
-        Dir::open(&guarded.join("new").join("deeper"), true, None).unwrap();
+        Dir::open(&guarded.join("new").join("deeper"), true, None, Principal::System).unwrap();
     });
 
     std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -488,8 +556,11 @@ fn a_symlink_below_a_directory_the_caller_can_only_search_is_followed_by_the_sam
     std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o311)).unwrap();
 
     as_unprivileged(tmp.path(), || {
-        assert!(Dir::open(&guarded.join("link"), false, None).is_ok());
-        assert_eq!(refusal(Dir::open(&guarded.join("etc"), false, None)), Refusal::Symlink);
+        assert!(Dir::open(&guarded.join("link"), false, None, Principal::System).is_ok());
+        assert_eq!(
+            refusal(Dir::open(&guarded.join("etc"), false, None, Principal::System)),
+            Refusal::Symlink
+        );
     });
 }
 
@@ -503,7 +574,7 @@ fn owner_of_fails_for_a_name_it_cannot_examine() {
     let _restore = Restore(tmp.path().to_path_buf(), 0o755);
 
     as_unprivileged(tmp.path(), || {
-        let dir = Dir::open(tmp.path(), false, None).unwrap();
+        let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
         // Through the held handle: the directory is no longer searchable, and the handle is still open.
         dir.file()
             .set_permissions(std::fs::Permissions::from_mode(0o600))
@@ -545,7 +616,7 @@ fn the_real_open_refuses_a_directory_of_a_third_party_only_when_the_caller_can_m
     let me = state.metadata().unwrap().uid();
     let made = std::os::unix::fs::chown(&state, Some(me + 7), None).is_ok();
 
-    let opened = Dir::open(&state, false, Some((me + 3, me + 3)));
+    let opened = Dir::open(&state, false, Some((me + 3, me + 3)), Principal::System);
 
     match made {
         true => assert_eq!(refusal(opened), Refusal::ForeignOwner { uid: me + 7 }),
@@ -621,7 +692,7 @@ fn name(text: &str) -> CString {
 /// `give_made_folder` on `hole` in `parent` as a process of uid `maker`, giving to a uid that is neither it nor the
 /// runner's.
 fn give_as(maker: u32, parent: &Path) -> io::Result<()> {
-    let dir = Dir::open(parent, false, None).unwrap();
+    let dir = Dir::open(parent, false, None, Principal::System).unwrap();
     give_made_folder(dir.file().as_raw_fd(), &name("hole"), maker, mine() + 2)
 }
 
@@ -686,7 +757,7 @@ fn a_fifo_swapped_in_at_a_made_folders_name_is_refused_without_waiting_for_a_pee
 fn a_made_folder_that_is_already_the_receivers_needs_no_hand_over() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join("hole")).unwrap();
-    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let dir = Dir::open(tmp.path(), false, None, Principal::System).unwrap();
 
     give_made_folder(dir.file().as_raw_fd(), &name("hole"), mine(), mine()).unwrap();
 }

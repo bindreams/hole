@@ -1,5 +1,5 @@
-//! Every privileged writer into a state directory, held to the same two properties, and the readers of the same names
-//! held to a third (below).
+//! Every privileged writer into a state directory, and the GUI's config written by each principal (the user's own GUI,
+//! and a privileged one such as a GUI run under `sudo`), held to the same two properties, and the readers of the same names held to a third (below).
 //!
 //! These code paths run as root/SYSTEM in folders the interactive user may own, so the user can plant a name and
 //! shape the layout above it:
@@ -21,16 +21,17 @@ use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use hole_common::config_store::{ConfigRecovery, ConfigStore};
 use hole_common::logging::dir_rotate::DirRotate;
 use hole_common::update_marker::{self, MarkerInfo, MARKER_FILE};
 use tun_engine::routing::failclosed::CoverLock;
 use tun_engine::routing::state as route_state;
 use util::dir::testing::{plant_link, user_dir};
-use util::dir::{Dir, Refusal};
+use util::dir::{Dir, Principal, Refusal};
 
 use crate::target::{self, Target};
 use crate::test_support::target_records;
-use util::versioned_file::{CreateOutcome, StoreError};
+use util::versioned_file::{CreateOutcome, StoreError, VersionedState};
 
 mod scan;
 
@@ -82,6 +83,23 @@ impl AtAPlantedName {
             AtAPlantedName::WritesElsewhere if after.holds_another_name => Ok(()),
             AtAPlantedName::WritesElsewhere => Err("succeeded, and wrote nothing under another name".to_owned()),
         }
+    }
+}
+
+/// The GUI's load and save of `config.json` as `principal`: a name the read refuses is left where it is, and the
+/// refusal is the answer; anything else the load reads or moves aside, and the save replaces.
+fn save_config_as(dir: &Path, principal: Principal) -> io::Result<()> {
+    let (store, config, recovery) = ConfigStore::load(dir, principal);
+    match recovery {
+        Some(ConfigRecovery::Refused { refusal, .. }) => Err(io::Error::other(refusal)),
+        Some(ConfigRecovery::FolderNotOpened { failure, .. }) => Err(failure),
+        Some(ConfigRecovery::Quarantined { .. }) | None => store.save(&config).map_err(io::Error::other),
+        Some(other @ ConfigRecovery::QuarantineFailed { .. }) => Err(io::Error::other(format!(
+            "the config could not be moved aside: {other:?}"
+        ))),
+        Some(other @ ConfigRecovery::LeftInPlace { .. }) => Err(io::Error::other(format!(
+            "a planted name is never a newer file: {other:?}"
+        ))),
     }
 }
 
@@ -351,6 +369,24 @@ fn writers() -> Vec<Writer> {
             },
         },
         Writer {
+            name: "the GUI config, saved by the user's own GUI",
+            sources: &["crates/common/src/config_store.rs"],
+            names: &[hole_common::config::AppConfig::FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            // The GUI's own folder, written as the user: a link at the name is read through at the load, then replaced.
+            run: |dir, _| save_config_as(dir, Principal::User),
+        },
+        Writer {
+            name: "the GUI config, saved by a privileged GUI",
+            sources: &[],
+            names: &[hole_common::config::AppConfig::FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            // A GUI run under `sudo` walks the same folder as the system: a link at the name is refused, not read.
+            run: |dir, _| save_config_as(dir, Principal::System),
+        },
+        Writer {
             name: "the target file",
             sources: &["crates/bridge/src/target.rs"],
             names: &[target::STATE_FILE_NAME],
@@ -502,7 +538,7 @@ fn writers() -> Vec<Writer> {
             at_a_planted_name: AtAPlantedName::WritesElsewhere,
             runs_here: true,
             // The marker is the crash handler's, left root-owned on purpose: it takes no owner.
-            run: |dir, _| tombstone::crash::write_marker_for("bridge", CRASH_PID, dir),
+            run: |dir, _| tombstone::crash::write_marker_for("bridge", CRASH_PID, dir, Principal::System),
         },
         Writer {
             name: "the crash marker, swept",
@@ -511,7 +547,7 @@ fn writers() -> Vec<Writer> {
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
             run: |dir, _| {
-                tombstone::sweep(dir);
+                tombstone::sweep(dir, Principal::System);
                 Ok(())
             },
         },
@@ -525,7 +561,7 @@ fn writers() -> Vec<Writer> {
             at_a_planted_name: AtAPlantedName::Replaces,
             runs_here: true,
             run: |dir, owner| {
-                let handle = Dir::open(dir, true, owner)?;
+                let handle = Dir::open(dir, true, owner, Principal::System)?;
                 // More than the limit, so that the file is rotated and opened again.
                 DirRotate::new(handle, OsStr::new(LOG_NAME), 16, owner).write_all(&[b'x'; 40])
             },
@@ -1167,14 +1203,6 @@ const BY_PATH_ALLOWED: &[(&str, &str)] = &[
     ),
     ("crates/util/src/dir/testing.rs", "test fixtures"),
     (
-        "crates/common/src/config.rs",
-        "the GUI's own user config: syncs the folder of the file the user's GUI wrote",
-    ),
-    (
-        "crates/common/src/config_store.rs",
-        "the GUI's own user config, read and written as the user",
-    ),
-    (
         "crates/common/src/logging/logging_test_helpers.rs",
         "test helpers: tee files and the result file of a child test process",
     ),
@@ -1266,7 +1294,7 @@ fn the_by_path_scan_tells_a_read_from_a_comment() {
         ["std::fs::File::open"]
     );
     assert!(by_path_reads("    // `std::fs::read(path)` is what this replaces").is_empty());
-    assert!(by_path_reads("util::dir::ReadDir::open(dir)?.read_vouched(name)").is_empty());
+    assert!(by_path_reads("util::dir::ReadDir::open(dir, Principal::System)?.read_vouched(name)").is_empty());
 }
 
 #[skuld::test]
@@ -1654,7 +1682,12 @@ fn f(s: &S) { tracing::warn!(\"{:?}\", s.dir); }"
         sites(&with_dir("tracing::warn!(\"cannot write {STATE_FILE_NAME}: {e}\");")),
         0
     );
-    assert_eq!(sites(&with_dir("let dir = Dir::open(state_dir, true, owner)?;")), 0);
+    assert_eq!(
+        sites(&with_dir(
+            "let dir = Dir::open(state_dir, true, owner, Principal::System)?;"
+        )),
+        0
+    );
     assert_eq!(
         sites(&with_dir("// tracing::warn!(\"cannot write {state_dir:?}\");")),
         0
@@ -1684,6 +1717,7 @@ const WRITES_A_DIR: &[&str] = &[
     "Dir::open*",
     "make_dir_and_free_name",
     "VersionedFile::new",
+    "VersionedFile::for_process",
     ".append_own_file",
     ".write_atomic",
     ".rename_noreplace",
@@ -1736,7 +1770,7 @@ make_dir_and_free_name(dir, name)?;"
     ));
     assert!(opens_a_dir("VersionedFile::<State>::new(dir)"));
     assert!(opens_a_dir(
-        "let dir = util::dir::Dir::open_as(path, true, owner, caller)?;"
+        "let dir = util::dir::Dir::open_as(path, true, owner, Principal::System, caller)?;"
     ));
     assert!(opens_a_dir("dir.write_atomic(name, bytes, owner, |_| Ok(()))"));
     // A function named as a value, or a type reached through an alias.
@@ -1747,12 +1781,16 @@ make_dir_and_free_name(dir, name)?;"
 let dir = D::open(path, true, None)?;"
     ));
     // Reading a state file writes nothing.
-    assert!(!opens_a_dir("util::dir::ReadDir::open(dir)?.read_vouched(name)"));
+    assert!(!opens_a_dir(
+        "util::dir::ReadDir::open(dir, Principal::System)?.read_vouched(name)"
+    ));
 }
 
 #[skuld::test]
 fn the_scan_tells_code_from_a_comment() {
-    assert!(opens_a_dir("let dir = Dir::open(path, true, None)?;"));
+    assert!(opens_a_dir(
+        "let dir = Dir::open(path, true, None, Principal::System)?;"
+    ));
     assert!(opens_a_dir("dir.append_own_file(&name, 0o644, owner)"));
     assert!(!opens_a_dir("    // goes through `Dir::open` first"));
     assert!(!opens_a_dir("/// see [`Dir::open_as`]"));
@@ -1863,12 +1901,6 @@ const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
         "std::fs::set_permissions",
         1,
         "the install runs once as root, on a file in /Library/PrivilegedHelperTools, which only root can add names to",
-    ),
-    (
-        "crates/common/src/config.rs",
-        "std::fs::set_permissions",
-        1,
-        "the GUI's own user config folder, changed as the user",
     ),
     (
         "crates/hole/src/setup.rs",
@@ -1995,30 +2027,6 @@ const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
         "std::fs::remove_file",
         1,
         "test support: removes the socket of a process the test started",
-    ),
-    (
-        "crates/common/src/config.rs",
-        "std::fs::create_dir_all",
-        1,
-        "the GUI's own user config folder, made as the user",
-    ),
-    (
-        "crates/common/src/config_store.rs",
-        "fs::OpenOptions::new",
-        2,
-        "the GUI's own user config: the backup of a corrupt file, made as the user (only the GUI process uses `ConfigStore`)",
-    ),
-    (
-        "crates/common/src/config_store.rs",
-        "fs::remove_file",
-        2,
-        "the GUI's own user config, written as the user",
-    ),
-    (
-        "crates/common/src/config_store.rs",
-        "fs::rename",
-        1,
-        "the GUI's own user config, written as the user",
     ),
     (
         "crates/common/src/logging/logging_test_helpers.rs",

@@ -476,6 +476,8 @@ fn user_state_dir(home: &std::path::Path) -> std::path::PathBuf {
 
 /// The remedy to append to a failed privileged bridge command, or `""` when
 /// this process is already elevated and elevation is therefore not the answer.
+/// A privilege that could not be read is said so, not taken for elevated: the
+/// advice may still be the answer.
 ///
 /// Every step of an uninstall needs elevation — launchd/SCM, the plist or the
 /// service registration, the pf ruleset and the WFP filters — so an
@@ -487,16 +489,34 @@ fn user_state_dir(home: &std::path::Path) -> std::path::PathBuf {
 /// the product unremovable — the exact failure this whole path exists to
 /// prevent.
 fn elevation_hint() -> &'static str {
-    if stepstool::is_privileged() {
-        return "";
-    }
-    #[cfg(target_os = "windows")]
-    {
-        " — this command needs elevated privileges; re-run it from an Administrator console"
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        " — this command needs elevated privileges; re-run it with sudo"
+    elevation_hint_for(stepstool::privilege())
+}
+
+fn elevation_hint_for(privilege: stepstool::Privilege) -> &'static str {
+    match privilege {
+        stepstool::Privilege::Privileged => "",
+        stepstool::Privilege::Unprivileged => {
+            #[cfg(target_os = "windows")]
+            {
+                " — this command needs elevated privileges; re-run it from an Administrator console"
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                " — this command needs elevated privileges; re-run it with sudo"
+            }
+        }
+        stepstool::Privilege::Unreadable => {
+            #[cfg(target_os = "windows")]
+            {
+                " — this command needs elevated privileges, and whether this process has them could not be \
+                 determined; if it does not, re-run it from an Administrator console"
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                " — this command needs elevated privileges, and whether this process has them could not be \
+                 determined; if it does not, re-run it with sudo"
+            }
+        }
     }
 }
 
@@ -519,8 +539,16 @@ pub(crate) fn dispatch(command: Command) -> ! {
     };
     #[cfg(not(target_os = "macos"))]
     let cli_owner: Option<(u32, u32)> = None;
-    let _cli_log_guard = resolve_cli_log_dir(&command)
-        .map(|d| hole_common::logging::init(&d, "gui-cli", "gui-cli.log", "hole=info", cli_owner));
+    let _cli_log_guard = resolve_cli_log_dir(&command).map(|d| {
+        hole_common::logging::init(
+            &d,
+            "gui-cli",
+            "gui-cli.log",
+            "hole=info",
+            cli_owner,
+            stepstool::principal(),
+        )
+    });
     let code = match command {
         Command::Version => {
             println!("hole {}", hole::version::VERSION);
@@ -710,7 +738,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             );
             #[cfg(not(target_os = "macos"))]
             let log_dir = hole_common::logging::resolve_log_dir(log_dir);
-            let _guard = hole_bridge::logging::init(&log_dir, owner_ids);
+            let _guard = hole_bridge::logging::init(&log_dir, owner_ids, stepstool::principal());
             tracing::info!("hole bridge starting");
 
             // Reclaim ownership of an already-existing user data tree that an

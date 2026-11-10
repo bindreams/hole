@@ -251,7 +251,7 @@ pub fn remove(path: &Path) -> io::Result<()> {
 /// Removes `name` in the folder `dir`, whatever it is, but not what it points at. A link planted on the way to the
 /// folder is refused ([`util::dir::Refusal`]); a missing name or folder is `Ok`, and nothing is created.
 pub(crate) fn remove_name(dir: &Path, name: &std::ffi::OsStr) -> io::Result<()> {
-    let dir = match util::dir::Dir::open(dir, false, None) {
+    let dir = match util::dir::Dir::open(dir, false, None, util::dir::Principal::System) {
         Ok(dir) => dir,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),

@@ -95,16 +95,18 @@ fn launch_gui(show_dashboard: bool) {
 
     // Determine paths
     let config_dir = dirs::config_dir().expect("no config directory found").join("hole");
-    let config_path = config_dir.join("config.json");
     let log_dir = hole_common::logging::resolve_log_dir(None);
 
-    let _log_guard = logging::init(&log_dir);
+    // The process's privilege, read once: a GUI run under `sudo` is privileged and handles the user's folders as the
+    // system does.
+    let principal = stepstool::principal();
+    let _log_guard = logging::init(&log_dir, principal);
 
     // Native-crash observability (bindreams/hole#438): report any crash
     // marker a previously-crashed GUI/foreground-bridge left in this dir.
     // GUI startup is synchronous and pre-event-loop, so sweep inline (no
     // spawn_blocking — there is no runtime worker to protect yet).
-    tombstone::sweep(&log_dir);
+    tombstone::sweep(&log_dir, principal);
 
     // Snapshot the installed image identity now, before any later update can
     // rename it — the self-heal compares against it on a version mismatch.
@@ -178,8 +180,7 @@ fn launch_gui(show_dashboard: bool) {
             // Manage shared state here (instead of pre-`.setup()`) so that
             // `AppState` has access to a real `tauri::AppHandle` for emitting
             // events from commands like `test_server`.
-            let (config_store, config, recovery) =
-                hole_common::config_store::ConfigStore::load(config_path.clone(), time::OffsetDateTime::now_utc());
+            let (config_store, config, recovery) = hole_common::config_store::ConfigStore::load(&config_dir, principal);
             app.manage(AppState::new(config_store, config, app.handle().clone()));
             if let Some(recovery) = recovery {
                 // Non-blocking: `blocking_show` must not run on the main

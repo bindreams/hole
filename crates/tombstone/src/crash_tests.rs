@@ -8,8 +8,8 @@ use crate::crash::{format_marker_into, parse_marker, MarkerRecord};
 fn module_is_linkable() {
     // `attach` and `sweep` are the public surface; reference them so a
     // broken signature fails to compile here rather than at a call site.
-    let _attach: fn(&'static str, &std::path::Path) = crate::attach;
-    let _sweep: fn(&std::path::Path) = crate::sweep;
+    let _attach: fn(&'static str, &std::path::Path, util::dir::Principal) = crate::attach;
+    let _sweep: fn(&std::path::Path, util::dir::Principal) = crate::sweep;
 }
 
 fn sample() -> MarkerRecord<'static> {
@@ -107,6 +107,66 @@ fn write_marker(dir: &std::path::Path, kind: &str, pid: u32) -> std::path::PathB
     path
 }
 
+/// The principal comes from the caller: a privileged sweep does not follow a user's link into a folder the system owns
+/// (it refuses it as a symbolic link, and says so), and an unprivileged one (the GUI, in its own folder) follows it and
+/// sweeps what is there.
+#[skuld::test]
+fn sweep_through_a_users_link_to_a_system_folder_follows_it_only_for_an_unprivileged_process() {
+    let scratch = util::dir::testing::SystemScratch::new();
+    let base = tempfile::tempdir().expect("tempdir");
+    let link = base.path().join("logs");
+    util::dir::testing::plant_link(scratch.root(), &link);
+    // The folder the link leads to is the system's, so a privileged walk may not end in it.
+    let marker = write_marker(scratch.root(), "gui", std::process::id());
+
+    let (subscriber, writer) = make_subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+    crate::sweep(&link, util::dir::Principal::System);
+    let kept_by_a_privileged_sweep = marker.exists();
+    let said = writer.snapshot();
+    // By name: the folder is shared, so the markers of other tests in it are not ours to sweep.
+    let dir = util::dir::Dir::open(&link, false, None, util::dir::Principal::User)
+        .expect("an unprivileged walk follows the link");
+    crate::crash::sweep_dir(&dir, [marker.file_name().unwrap().to_owned()]);
+    let kept_by_an_unprivileged_sweep = marker.exists();
+    let _ = std::fs::remove_file(&marker);
+
+    assert!(kept_by_a_privileged_sweep, "a privileged sweep followed the link");
+    assert!(
+        said.contains("the log directory was not opened") && said.contains(&util::dir::Refusal::Symlink.to_string()),
+        "the privileged sweep must have refused the link as a symbolic link: {said}"
+    );
+    assert!(
+        !kept_by_an_unprivileged_sweep,
+        "an unprivileged sweep did not follow the link"
+    );
+}
+
+/// An unprivileged sweep reads the markers its own process wrote even where the folder belongs to the system (a first
+/// run as an administrator made it): the reader's principal decides what is read, not a rule for privileged readers.
+#[skuld::test]
+fn an_unprivileged_sweep_reports_a_marker_it_owns_in_a_folder_the_system_owns() {
+    let scratch = util::dir::testing::SystemScratch::new();
+    // A name of its own, swept by name: other tests use the same shared folder.
+    let kind = format!("owned-by-a-user-{}", scratch.name().to_string_lossy());
+    let marker = write_marker(scratch.root(), &kind, std::process::id());
+    util::dir::testing::own(&marker);
+    let dir = util::dir::Dir::open(scratch.root(), false, None, util::dir::Principal::User).expect("open the folder");
+
+    let (subscriber, writer) = make_subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+    crate::crash::sweep_dir(&dir, [marker.file_name().unwrap().to_owned()]);
+    let _ = std::fs::remove_file(&marker);
+
+    let said = writer.snapshot();
+    // Only a marker that parsed reports its fields; the unreadable and malformed breadcrumbs carry the name alone.
+    assert!(
+        said.contains("code=0xc0000005"),
+        "the marker was read and reported: {said}"
+    );
+    assert!(!said.contains("marker unreadable"), "{said}");
+}
+
 #[skuld::test]
 async fn sweep_emits_breadcrumb_and_deletes_marker() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -118,7 +178,7 @@ async fn sweep_emits_breadcrumb_and_deletes_marker() {
     // Register the wait BEFORE sweeping so the latch can't be missed.
     let rx = writer.wait_for("native crash detected in previous run");
 
-    crate::sweep(dir.path());
+    crate::sweep(dir.path(), util::dir::Principal::System);
 
     rx.recv().expect("crash breadcrumb emitted");
     let snap = writer.snapshot();
@@ -137,7 +197,7 @@ async fn sweep_reports_multiple_markers() {
     let (subscriber, _writer) = make_subscriber();
     let _g = set_default_in_current_thread(subscriber);
 
-    crate::sweep(dir.path());
+    crate::sweep(dir.path(), util::dir::Principal::System);
 
     // Both markers gone; both pids surfaced.
     let remaining: Vec<_> = std::fs::read_dir(dir.path())
@@ -158,7 +218,7 @@ async fn sweep_leaves_sibling_dmp() {
     let (subscriber, _writer) = make_subscriber();
     let _g = set_default_in_current_thread(subscriber);
 
-    crate::sweep(dir.path());
+    crate::sweep(dir.path(), util::dir::Principal::System);
 
     assert!(dmp.exists(), ".dmp is left for the developer");
 }
@@ -168,7 +228,7 @@ async fn sweep_tolerates_missing_dir() {
     // Best-effort: a nonexistent log_dir must not panic.
     let dir = tempfile::tempdir().expect("tempdir");
     let missing = dir.path().join("does-not-exist");
-    crate::sweep(&missing); // no panic, no-op
+    crate::sweep(&missing, util::dir::Principal::System); // no panic, no-op
 }
 
 #[skuld::test]
@@ -184,7 +244,7 @@ async fn sweep_reports_malformed_marker() {
     let _g = set_default_in_current_thread(subscriber);
 
     let rx = writer.wait_for("marker malformed");
-    crate::sweep(dir.path());
+    crate::sweep(dir.path(), util::dir::Principal::System);
     rx.recv().expect("malformed breadcrumb emitted");
 
     let snap = writer.snapshot();
@@ -201,12 +261,12 @@ async fn sweep_reports_malformed_marker() {
 mod write_marker_signal_safe_tests {
     use crate::crash::{write_marker_signal_safe, HandlerState};
     use std::ffi::OsStr;
-    use util::dir::Dir;
+    use util::dir::{Dir, Principal};
 
     fn state_in(dir: &std::path::Path, name: &str) -> HandlerState {
         HandlerState::new(
             "test",
-            Some(Dir::open(dir, false, None).expect("open")),
+            Some(Dir::open(dir, false, None, Principal::System).expect("open")),
             OsStr::new(name),
         )
     }
@@ -247,7 +307,7 @@ mod write_record_signal_safe_tests {
     use crate::crash::{free_marker_name, write_record_signal_safe, HandlerState, MarkerRecord};
     use std::ffi::OsStr;
     use std::path::Path;
-    use util::dir::Dir;
+    use util::dir::{Dir, Principal};
 
     const NAME: &str = "crash-test-1.marker";
 
@@ -265,7 +325,7 @@ mod write_record_signal_safe_tests {
     fn state_in(dir: &Path) -> HandlerState {
         HandlerState::new(
             "test",
-            Some(Dir::open(dir, false, None).expect("open")),
+            Some(Dir::open(dir, false, None, Principal::System).expect("open")),
             OsStr::new(NAME),
         )
     }
@@ -301,7 +361,7 @@ mod write_record_signal_safe_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let victim = dir.path().join("victim");
         std::fs::write(&victim, "keep").unwrap();
-        super::plant_file_symlink(&victim, &dir.path().join(NAME));
+        util::dir::testing::file_link(&victim, &dir.path().join(NAME));
 
         write_record_signal_safe(&state_in(dir.path()), &rec());
 
@@ -338,10 +398,7 @@ mod write_record_signal_safe_tests {
         let state = state_in(&logs);
 
         std::fs::rename(&logs, root.path().join("logs.moved")).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&victim, &logs).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&victim, &logs).unwrap();
+        util::dir::testing::dir_symlink(&victim, &logs);
         write_record_signal_safe(&state, &rec());
 
         assert_eq!(
@@ -366,7 +423,7 @@ mod write_record_signal_safe_tests {
     #[skuld::test]
     fn the_marker_name_is_the_pid_s_when_free_and_the_next_free_one_otherwise() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let held = Dir::open(dir.path(), false, None).expect("open");
+        let held = Dir::open(dir.path(), false, None, Principal::System).expect("open");
         let name = || free_marker_name(&held, "bridge", 42).unwrap();
 
         assert_eq!(name(), "crash-bridge-42.marker");
@@ -882,7 +939,7 @@ async fn sweep_reports_unreadable_marker() {
     let _g = set_default_in_current_thread(subscriber);
 
     let rx = writer.wait_for("marker unreadable");
-    crate::sweep(dir.path());
+    crate::sweep(dir.path(), util::dir::Principal::System);
     rx.recv().expect("unreadable breadcrumb emitted");
 
     let snap = writer.snapshot();
@@ -895,14 +952,6 @@ async fn sweep_reports_unreadable_marker() {
 // user made it: a symlink to a file of root's, a FIFO. The sweep reads each marker by name inside the directory it
 // opened, never through a link and never waiting on a FIFO, and removes the name itself.
 
-/// A symlink to the file `target`, of the kind an unprivileged user can plant.
-fn plant_file_symlink(target: &std::path::Path, link: &std::path::Path) {
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link).unwrap();
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(target, link).unwrap();
-}
-
 #[skuld::test]
 async fn sweep_does_not_read_through_a_symlink_at_a_marker_name() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -911,12 +960,12 @@ async fn sweep_does_not_read_through_a_symlink_at_a_marker_name() {
     let victim = dir.path().join("victim.txt");
     std::fs::write(&victim, "tombstone-marker v1\nkind=victim\npid=31337\n").unwrap();
     let link = dir.path().join("crash-bridge-5.marker");
-    plant_file_symlink(&victim, &link);
+    util::dir::testing::file_link(&victim, &link);
 
     let (subscriber, writer) = make_subscriber();
     let _g = set_default_in_current_thread(subscriber);
 
-    crate::sweep(dir.path());
+    crate::sweep(dir.path(), util::dir::Principal::System);
 
     // `sweep` logs on this thread before it returns, so the snapshot is complete: waiting for the breadcrumb instead
     // would hang, not fail, on a sweep that reads through the link and says something else.
@@ -942,7 +991,7 @@ async fn sweep_returns_on_a_fifo_at_a_marker_name_and_removes_it() {
     let _g = set_default_in_current_thread(subscriber);
 
     // Returning at all is the assertion: a read that waits for a writer to the FIFO never does.
-    crate::sweep(dir.path());
+    crate::sweep(dir.path(), util::dir::Principal::System);
 
     assert!(writer.snapshot().contains("marker unreadable"), "{}", writer.snapshot());
     assert!(std::fs::symlink_metadata(&fifo).is_err(), "the FIFO is removed");
@@ -994,7 +1043,7 @@ impl Drop for Unvouched {
 async fn sweep_does_not_read_a_marker_the_folders_owner_cannot_vouch_for() {
     let scratch = util::dir::testing::SystemScratch::new();
     let planted = Unvouched::new(&scratch);
-    let dir = util::dir::Dir::open(scratch.root(), false, None).unwrap();
+    let dir = util::dir::Dir::open(scratch.root(), false, None, util::dir::Principal::System).unwrap();
 
     let (subscriber, writer) = make_subscriber();
     let _g = set_default_in_current_thread(subscriber);

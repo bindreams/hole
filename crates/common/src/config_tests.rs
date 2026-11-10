@@ -1,23 +1,25 @@
-// This module tests `AppConfig::save` itself — the clippy ban exists to route
-// production callers through `ConfigStore::save`.
-#![allow(clippy::disallowed_methods)]
-
 use super::*;
+use crate::config_store::ConfigStore;
 use skuld::temp_dir;
 use std::path::Path;
 
-/// Load via the production loader (`ConfigStore`), asserting a clean load —
+/// Load `config.json` from `dir` via the production loader (`ConfigStore`), asserting a clean load —
 /// `AppConfig::load` was removed in #467 (quarantine made it production-dead).
-fn load(path: &Path) -> AppConfig {
-    let now = time::macros::datetime!(2026-06-10 14:23:05 UTC);
-    let (_, config, recovery) = crate::config_store::ConfigStore::load(path.to_path_buf(), now);
+fn load(dir: &Path) -> AppConfig {
+    let (_, config, recovery) = ConfigStore::load(dir, util::dir::Principal::User);
     assert!(recovery.is_none(), "unexpected recovery: {recovery:?}");
     config
 }
 
+/// Save `config` as `config.json` in `dir` through the production door (`ConfigStore::save`).
+fn save(dir: &Path, config: &AppConfig) {
+    let (store, _, _) = ConfigStore::load(dir, util::dir::Principal::User);
+    store.save(config).unwrap();
+}
+
 #[skuld::test]
 fn load_nonexistent_returns_defaults(#[fixture(temp_dir)] dir: &Path) {
-    let config = load(&dir.join("nonexistent.json"));
+    let config = load(dir);
     assert_eq!(config.local_port, 4073);
     assert!(config.servers.is_empty());
     assert!(!config.enabled);
@@ -26,7 +28,6 @@ fn load_nonexistent_returns_defaults(#[fixture(temp_dir)] dir: &Path) {
 
 #[skuld::test]
 fn load_valid_json_roundtrips(#[fixture(temp_dir)] dir: &Path) {
-    let path = dir.join("config.json");
     let original = AppConfig {
         servers: vec![ServerEntry {
             id: "abc-123".to_string(),
@@ -44,8 +45,8 @@ fn load_valid_json_roundtrips(#[fixture(temp_dir)] dir: &Path) {
         enabled: true,
         ..Default::default()
     };
-    original.save(&path).unwrap();
-    let loaded = load(&path);
+    save(dir, &original);
+    let loaded = load(dir);
     assert_eq!(original, loaded);
 }
 
@@ -54,32 +55,32 @@ fn load_valid_json_roundtrips(#[fixture(temp_dir)] dir: &Path) {
 
 // Error labeling + redaction ------------------------------------------------------------------------------------------
 
-#[skuld::test]
-fn save_to_directory_path_reports_write_error(#[fixture(temp_dir)] dir: &Path) {
-    // A path that is itself a directory can't be written as a file: the atomic
-    // rename (persist) fails. macOS/Windows differ in the OS error, but both
-    // land on the Write variant.
-    let path = dir.join("config-as-dir");
-    std::fs::create_dir_all(&path).unwrap();
+/// A save the file system refuses: `config.json` became a directory after the load.
+fn failing_save(dir: &Path) -> ConfigError {
+    let (store, config, _) = ConfigStore::load(dir, util::dir::Principal::User);
+    std::fs::create_dir_all(dir.join("config.json")).unwrap();
+    store.save(&config).unwrap_err()
+}
 
-    let msg = AppConfig::default().save(&path).unwrap_err().to_string();
+#[skuld::test]
+fn a_failed_save_reports_a_write_error(#[fixture(temp_dir)] dir: &Path) {
+    let err = failing_save(dir);
+    assert!(matches!(err, ConfigError::Write { .. }), "{err:?}");
+    let msg = err.to_string();
 
     assert!(
         msg.contains("write"),
         "save failure should read as a write error, got: {msg}"
     );
     assert!(
-        !msg.contains("read"),
+        !msg.contains("read config"),
         "save failure must not be mislabeled as a read error, got: {msg}"
     );
 }
 
 #[skuld::test]
 fn save_error_does_not_leak_path(#[fixture(temp_dir)] dir: &Path) {
-    let path = dir.join("config-as-dir");
-    std::fs::create_dir_all(&path).unwrap();
-
-    let msg = AppConfig::default().save(&path).unwrap_err().to_string();
+    let msg = failing_save(dir).to_string();
 
     assert!(
         !msg.contains(&*dir.to_string_lossy()),
@@ -95,12 +96,11 @@ fn load_error_does_not_leak_content(#[fixture(temp_dir)] dir: &Path) {
     let path = dir.join("config.json");
     std::fs::write(&path, r#"{"local_port": "PLAINTEXT_SECRET_VALUE"}"#).unwrap();
 
-    let now = time::macros::datetime!(2026-06-10 14:23:05 UTC);
-    let (_, _, recovery) = crate::config_store::ConfigStore::load(path.to_path_buf(), now);
-    let msg = recovery
-        .expect("corrupt file must produce a recovery")
-        .error
-        .to_string();
+    let (_, _, recovery) = ConfigStore::load(dir, util::dir::Principal::User);
+    let Some(crate::config_store::ConfigRecovery::Quarantined { error, .. }) = recovery else {
+        panic!("a corrupt file must be quarantined: {recovery:?}");
+    };
+    let msg = error.to_string();
 
     assert!(
         msg.contains("parse"),
@@ -116,39 +116,32 @@ fn load_error_does_not_leak_content(#[fixture(temp_dir)] dir: &Path) {
 fn config_error_labels_match_operation() {
     use std::io::{Error as IoError, ErrorKind};
     let io = || IoError::from(ErrorKind::PermissionDenied);
-    let serde = || serde_json::from_str::<i32>("nope").unwrap_err();
 
     assert!(ConfigError::Read { source: io() }.to_string().contains("read"));
+    let parse = serde_json::from_str::<i32>("nope").unwrap_err();
     assert!(ConfigError::Parse {
-        kind: "syntax error",
-        line: 1,
-        column: 1
+        failure: ParseFailure::from(&parse)
     }
     .to_string()
     .contains("parse"));
-    assert!(ConfigError::Serialize { source: serde() }
-        .to_string()
-        .contains("serialize"));
-    assert!(ConfigError::CreateDir { source: io() }
-        .to_string()
-        .contains("create config directory"));
-    let write = ConfigError::Write { source: io() }.to_string();
+    let write = ConfigError::Write {
+        source: StoreError::Io(io()),
+    }
+    .to_string();
     assert!(write.contains("write") && !write.contains("read"), "{write}");
-}
-
-#[skuld::test]
-fn save_creates_parent_dirs(#[fixture(temp_dir)] dir: &Path) {
-    let path = dir.join("nested").join("deep").join("config.json");
-    AppConfig::default().save(&path).unwrap();
-    assert!(path.exists());
+    let newer = ConfigError::NewerVersion {
+        found: Some(7),
+        supported: 1,
+    }
+    .to_string();
+    assert!(newer.contains("newer") && newer.contains('7'), "{newer}");
 }
 
 #[skuld::test]
 fn save_then_load_is_identity(#[fixture(temp_dir)] dir: &Path) {
-    let path = dir.join("config.json");
     let config = AppConfig::default();
-    config.save(&path).unwrap();
-    let loaded = load(&path);
+    save(dir, &config);
+    let loaded = load(dir);
     assert_eq!(config, loaded);
 }
 
@@ -239,14 +232,13 @@ fn deserialize_without_elevation_prompt_shown_defaults_to_false() {
 
 #[skuld::test]
 fn elevation_prompt_shown_roundtrips(#[fixture(temp_dir)] dir: &Path) {
-    let path = dir.join("config.json");
     let config = AppConfig {
         elevation_prompt_shown: true,
         ..Default::default()
     };
-    config.save(&path).unwrap();
+    save(dir, &config);
 
-    let loaded = load(&path);
+    let loaded = load(dir);
     assert!(loaded.elevation_prompt_shown);
 }
 
@@ -258,7 +250,7 @@ fn save_creates_file_with_owner_only_permissions(#[fixture(temp_dir)] dir: &Path
     use std::os::unix::fs::PermissionsExt;
 
     let path = dir.join("hole").join("config.json");
-    AppConfig::default().save(&path).unwrap();
+    save(&dir.join("hole"), &AppConfig::default());
 
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "config file should be 0600, got {mode:o}");
@@ -270,11 +262,25 @@ fn save_creates_directory_with_owner_only_permissions(#[fixture(temp_dir)] dir: 
     use std::os::unix::fs::PermissionsExt;
 
     let config_dir = dir.join("hole");
-    let path = config_dir.join("config.json");
-    AppConfig::default().save(&path).unwrap();
+    save(&config_dir, &AppConfig::default());
 
     let mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "config dir should be 0700, got {mode:o}");
+}
+
+/// Every folder a save makes on the way to the config directory is private from the start, not only the last one.
+#[cfg(unix)]
+#[skuld::test]
+fn save_makes_every_missing_ancestor_owner_only(#[fixture(temp_dir)] dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let config_dir = dir.join("a").join("b").join("hole");
+    save(&config_dir, &AppConfig::default());
+
+    for folder in [dir.join("a"), dir.join("a").join("b"), config_dir] {
+        let mode = std::fs::metadata(&folder).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{folder:?} should be 0700, got {mode:o}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -287,7 +293,7 @@ fn save_fixes_existing_file_permissions(#[fixture(temp_dir)] dir: &Path) {
     std::fs::write(&path, "{}").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    AppConfig::default().save(&path).unwrap();
+    save(dir, &AppConfig::default());
 
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "config file should be tightened to 0600, got {mode:o}");
@@ -302,8 +308,7 @@ fn save_fixes_existing_directory_permissions(#[fixture(temp_dir)] dir: &Path) {
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let path = config_dir.join("config.json");
-    AppConfig::default().save(&path).unwrap();
+    save(&config_dir, &AppConfig::default());
 
     let mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "config dir should be tightened to 0700, got {mode:o}");
@@ -317,8 +322,8 @@ fn save_preserves_permissions_on_repeated_saves(#[fixture(temp_dir)] dir: &Path)
     let config_dir = dir.join("hole");
     let path = config_dir.join("config.json");
 
-    AppConfig::default().save(&path).unwrap();
-    AppConfig::default().save(&path).unwrap();
+    save(&config_dir, &AppConfig::default());
+    save(&config_dir, &AppConfig::default());
 
     let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     let dir_mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
@@ -434,7 +439,6 @@ fn deserialize_ignores_removed_start_on_login_key() {
 
 #[skuld::test]
 fn new_config_fields_roundtrip(#[fixture(temp_dir)] dir: &Path) {
-    let path = dir.join("config.json");
     let config = AppConfig {
         filters: vec![FilterRule {
             address: "*.example.com".to_string(),
@@ -450,8 +454,8 @@ fn new_config_fields_roundtrip(#[fixture(temp_dir)] dir: &Path) {
         diagnostic_plugin_tap: true, // set to non-default to anchor the roundtrip
         ..Default::default()
     };
-    config.save(&path).unwrap();
-    let loaded = load(&path);
+    save(dir, &config);
+    let loaded = load(dir);
     assert_eq!(config.filters, loaded.filters);
     assert_eq!(config.on_startup, loaded.on_startup);
     assert_eq!(config.theme, loaded.theme);
@@ -509,7 +513,6 @@ fn deserialize_without_dns_field_uses_default() {
 
 #[skuld::test]
 fn dns_config_roundtrips_via_json(#[fixture(temp_dir)] dir: &Path) {
-    let path = dir.join("config.json");
     let config = AppConfig {
         dns: DnsConfig {
             enabled: false,
@@ -519,8 +522,8 @@ fn dns_config_roundtrips_via_json(#[fixture(temp_dir)] dir: &Path) {
         },
         ..Default::default()
     };
-    config.save(&path).unwrap();
-    let loaded = load(&path);
+    save(dir, &config);
+    let loaded = load(dir);
     assert_eq!(config.dns, loaded.dns);
 }
 
@@ -629,23 +632,6 @@ fn plugin_name_shell_metacharacters_rejected() {
     assert!(!is_valid_plugin_name("evil`id`"));
     assert!(!is_valid_plugin_name("evil(1)"));
     assert!(!is_valid_plugin_name("evil{1}"));
-}
-
-#[skuld::test]
-fn save_replaces_existing_file_and_leaves_no_temp(#[fixture(temp_dir)] dir: &Path) {
-    let path = dir.join("config.json");
-    AppConfig::default().save(&path).unwrap();
-    let changed = AppConfig {
-        local_port: 7777,
-        ..Default::default()
-    };
-    changed.save(&path).unwrap();
-
-    // Exactly one file in the dir: no .tmp leftovers.
-    let entries: Vec<_> = std::fs::read_dir(dir).unwrap().collect();
-    assert_eq!(entries.len(), 1);
-    let on_disk: AppConfig = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(on_disk, changed);
 }
 
 // allow_insecure_bootstrap ============================================================================================

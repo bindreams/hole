@@ -2,6 +2,7 @@
 
 use hole_common::logging::LogGuard;
 use std::path::Path;
+use util::dir::Principal;
 
 /// Initialize bridge logging (stderr + size-rotated file).
 ///
@@ -12,8 +13,9 @@ use std::path::Path;
 ///
 /// `owner` (the real user's `(uid, gid)` on macOS) is threaded into
 /// [`hole_common::logging::init_dual`] so the elevated bridge hands `bridge.log`
-/// and its log dir back to the user; `None` off-macOS / for the unprivileged GUI.
-pub fn init(log_dir: &Path, owner: Option<(u32, u32)>) -> LogGuard {
+/// and its log dir back to the user; `None` off-macOS / for the unprivileged GUI. `principal` is the running process's
+/// privilege (`stepstool::principal`).
+pub fn init(log_dir: &Path, owner: Option<(u32, u32)>, principal: Principal) -> LogGuard {
     let (file, stderr) = hole_common::logging::resolve_sink_directives("hole_bridge=info", Some("HOLE_BRIDGE_LOG"));
-    hole_common::logging::init_dual(log_dir, "bridge", "bridge.log", &file, &stderr, owner)
+    hole_common::logging::init_dual(log_dir, "bridge", "bridge.log", &file, &stderr, owner, principal)
 }

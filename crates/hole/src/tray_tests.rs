@@ -146,12 +146,12 @@ fn stop_response_outcomes() {
 #[skuld::test]
 fn persist_intended_enabled_writes_only_on_change(#[fixture(temp_dir)] dir: &Path) {
     let path = dir.join("config.json");
-    let (store, config, _) = ConfigStore::load(path.clone(), time::OffsetDateTime::UNIX_EPOCH);
+    let (store, config, _) = ConfigStore::load(dir, util::dir::Principal::User);
     let config = Mutex::new(config);
 
     persist_intended_enabled(&config, &store, true);
     assert!(config.lock().unwrap().enabled);
-    let (_, reloaded, _) = ConfigStore::load(path.clone(), time::OffsetDateTime::UNIX_EPOCH);
+    let (_, reloaded, _) = ConfigStore::load(dir, util::dir::Principal::User);
     assert!(reloaded.enabled, "the change must reach the disk");
 
     // Unchanged value → no write: delete the file, call with the same
@@ -163,7 +163,7 @@ fn persist_intended_enabled_writes_only_on_change(#[fixture(temp_dir)] dir: &Pat
     // …and a CHANGED value after the delete does write again.
     persist_intended_enabled(&config, &store, false);
     assert!(path.exists());
-    let (_, reloaded, _) = ConfigStore::load(path, time::OffsetDateTime::UNIX_EPOCH);
+    let (_, reloaded, _) = ConfigStore::load(dir, util::dir::Principal::User);
     assert!(!reloaded.enabled);
 }
 
