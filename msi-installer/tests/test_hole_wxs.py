@@ -623,30 +623,6 @@ def test_bridge_uninstall_has_a_rollback_partner(package: ET.Element) -> None:
     )
 
 
-def test_bridge_cas_pass_the_shared_log_dir(package: ET.Element) -> None:
-    """Every `bridge install|release-covers|uninstall` action logs to one place.
-
-    Without --log-dir the CLI's gui-cli.log lands in the profile of whichever
-    account the action runs as, which nobody looking at a failed install knows
-    to open. The path is quoted (ExeCommand is appended to the quoted hole.exe
-    path as one command line) and has no trailing backslash, which would escape
-    the closing quote.
-    """
-    wanted = r' --log-dir "[CommonAppDataFolder]hole\logs"'
-    bridge_cas = {
-        ca_id: ca
-        for ca_id, ca in _ca_map(package).items()
-        if ca.get("ExeCommand", "").split()[:2]
-        in (["bridge", "install"], ["bridge", "release-covers"], ["bridge", "uninstall"])
-    }
-    assert set(bridge_cas) == {"BridgeInstall", "BridgeRelease", "BridgeUninstall", "BridgeUninstallRollback"}, (
-        f"unexpected set of bridge CAs: {sorted(bridge_cas)}"
-    )
-    for ca_id, ca in bridge_cas.items():
-        command = ca.get("ExeCommand", "")
-        assert command.endswith(wanted), f"{ca_id} must end with{wanted!r}, got {command!r}"
-
-
 def test_bridge_release_has_an_override(package: ET.Element) -> None:
     """Return='check' must not be able to make the product unremovable.
 

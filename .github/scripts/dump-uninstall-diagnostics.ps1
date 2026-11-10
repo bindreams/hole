@@ -9,8 +9,8 @@ param(
     [string]$MsiInstallLog
 )
 
-# The MSI's actions pass `--log-dir "[CommonAppDataFolder]hole\logs"`; the SYSTEM
-# profile is where an action that did not (an older package) logs by default.
+# The MSI's actions run as SYSTEM, which logs to ProgramData; the SYSTEM profile
+# is where an action of an older package logged.
 $cliLogDirs = @(
     (Join-Path $env:ProgramData 'hole\logs'),
     (Join-Path $env:SystemRoot 'System32\config\systemprofile\AppData\Local\hole\logs')

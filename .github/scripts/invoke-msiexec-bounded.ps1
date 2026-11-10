@@ -299,7 +299,7 @@ if ($proc.ExitCode -ne 0) {
     }
     # The custom actions' own `hole bridge ...` log (they have no console; the
     # MSI log above records only their exit codes), written to the service log
-    # directory their `--log-dir` names. Printed here so the cause is in the job
+    # directory (the SYSTEM account's). Printed here so the cause is in the job
     # log, not only in an artifact.
     $cliLogDir = Join-Path $env:ProgramData 'hole\logs'
     try {
