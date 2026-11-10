@@ -75,14 +75,11 @@ fn the_os_code_of_a_status_error_is_in_its_source_and_readers_see_through_the_wr
     assert!(is_file_contention(&err), "{err:?}");
 }
 
-/// A file marked for deletion while a handle to it is open stays at its name until that handle closes, and the open
-/// answers `Access is denied` for it: the case the Win32 code alone cannot tell from a real denial. The plain delete
-/// calls remove the name at once on current Windows, so the mark is set through the handle.
-#[skuld::test]
-fn read_of_a_delete_pending_file_names_its_status() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = put(&dir, "pending", b"bytes");
-    let marked = std::fs::OpenOptions::new().access_mode(DELETE.0).open(&path).unwrap();
+/// Marks `path` for deletion through a handle, and returns that handle: the file stays at its name until it closes,
+/// and an open of the name answers `Access is denied`, which the Win32 code alone cannot tell from a real denial. The
+/// plain delete calls remove the name at once on current Windows, so the mark is set through the handle.
+fn delete_pending(path: &std::path::Path) -> std::fs::File {
+    let marked = std::fs::OpenOptions::new().access_mode(DELETE.0).open(path).unwrap();
     let info = FILE_DISPOSITION_INFO { DeleteFile: true };
     // SAFETY: `info` is a valid `FILE_DISPOSITION_INFO` of the size passed.
     unsafe {
@@ -94,14 +91,54 @@ fn read_of_a_delete_pending_file_names_its_status() {
         )
     }
     .unwrap();
+    marked
+}
+
+/// The file at the name is going away, so the read answers `NotFound`, naming the status. The Win32 code of the
+/// status (`Access is denied`) is not carried: a reader of codes would take the gone file for a transient denial.
+#[skuld::test]
+fn read_of_a_delete_pending_file_is_not_found_and_names_its_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let _marked = delete_pending(&put(&dir, "pending", b"bytes"));
 
     let err = read(&dir, "pending").unwrap_err();
 
-    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err:?}");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err:?}");
     // STATUS_DELETE_PENDING
     assert!(err.to_string().contains("NTSTATUS 0xC0000056"), "{err}");
-    assert_eq!(original_code(&err), Some(5), "ERROR_ACCESS_DENIED: {err:?}");
-    assert!(is_file_contention(&err), "{err:?}");
+    assert_eq!(crate::error::raw_os_error(&err), None, "{err:?}");
+    assert!(!is_file_contention(&err), "{err:?}");
+}
+
+/// Only a read asks what the file holds. To every other open the name is still taken, and the OS's error says so: a
+/// lookup, an unlink, an open for existing or appending, a rename or link from the name and a create at the name all
+/// fail with the status, and none answers "nothing there".
+#[skuld::test]
+fn a_delete_pending_name_is_taken_to_everything_but_a_read() {
+    use crate::dir::OpenFile;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _marked = delete_pending(&put(&dir, "pending", b"bytes"));
+    let opened = Dir::open(dir.path(), false, None).unwrap();
+    let name = "pending".as_ref();
+
+    for err in [
+        opened.kind_of(name).unwrap_err(),
+        opened.id_of(name).unwrap_err(),
+        opened.unlink(name).unwrap_err(),
+        opened.open_file(name, OpenFile::Existing).unwrap_err(),
+        opened.open_file(name, OpenFile::Append).unwrap_err(),
+        opened.rename_noreplace(name, "renamed".as_ref()).unwrap_err(),
+        opened.link(name, "linked".as_ref()).unwrap_err(),
+        opened.open_file(name, OpenFile::CreateNew { mode: 0o600 }).unwrap_err(),
+        opened
+            .open_file(name, OpenFile::CreateAppend { mode: 0o600 })
+            .unwrap_err(),
+    ] {
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err:?}");
+        // STATUS_DELETE_PENDING
+        assert!(err.to_string().contains("NTSTATUS 0xC0000056"), "{err}");
+    }
 }
 
 #[skuld::test]
@@ -176,4 +213,18 @@ fn a_rename_onto_a_taken_name_keeps_its_kind_and_names_the_status() {
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err:?}");
     // STATUS_OBJECT_NAME_COLLISION
     assert!(err.to_string().contains("NTSTATUS 0xC0000035"), "{err}");
+}
+
+#[skuld::test]
+fn only_an_open_status_that_says_the_file_is_gone_is_turned_into_not_found() {
+    use windows::Win32::Foundation::{STATUS_ACCESS_DENIED, STATUS_FILE_DELETED};
+
+    let gone = super::open_error(super::error_of(STATUS_FILE_DELETED));
+    assert_eq!(gone.kind(), io::ErrorKind::NotFound, "{gone:?}");
+    assert!(gone.to_string().contains("NTSTATUS 0xC0000123"), "{gone}");
+    assert_eq!(crate::error::raw_os_error(&gone), None, "{gone:?}");
+    assert!(!is_file_contention(&gone), "{gone:?}");
+
+    let denied = super::open_error(super::error_of(STATUS_ACCESS_DENIED));
+    assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied, "{denied:?}");
 }

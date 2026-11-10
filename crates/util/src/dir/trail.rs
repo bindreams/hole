@@ -44,18 +44,19 @@ impl<Id: PartialEq> Owner<Id> {
 }
 
 /// Whether a file `file` owns, with `links` names, in a folder `dir` reads the owner of, may be read by a privileged
-/// reader: one the folder's own user owns (their own file, whatever links it has), or one the system owns that has no
-/// second name. This refuses a second name a user adds, by a hard link, to a file they do not own: the file keeps its
-/// owner and gains a link. It does not refuse a file the system owns that the user moved into the folder, which keeps
-/// its owner and its one link; what a reader of such a file may log is the reader's own rule, not this one. The
-/// folder's owner is read only when the file is a user's.
+/// reader: one the folder's own user owns (their own file, whatever links it has), or one the system owns that has at
+/// most one name. This refuses a second name a user adds, by a hard link, to a file they do not own: the file keeps
+/// its owner and gains a link. A file with no name (an open file a rename has just replaced, or is replacing) has no
+/// planted second name, so it is read: the bytes are what its writer published. It does not refuse a file the system
+/// owns that the user moved into the folder, which keeps its owner and its one link; what a reader of such a file may
+/// log is the reader's own rule, not this one. The folder's owner is read only when the file is a user's.
 pub(super) fn may_read<Id: PartialEq>(
     file: &Owner<Id>,
     links: u64,
     dir: impl FnOnce() -> io::Result<Owner<Id>>,
 ) -> io::Result<bool> {
     match file {
-        Owner::Privileged => Ok(links == 1),
+        Owner::Privileged => Ok(links <= 1),
         Owner::User(owner) => Ok(matches!(dir()?, Owner::User(dir_owner) if &dir_owner == owner)),
     }
 }

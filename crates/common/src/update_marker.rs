@@ -141,6 +141,8 @@ pub fn claim(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -> Re
 /// Through a [`util::dir::ReadDir`], for the GUI and the bridge alike: the bridge reads it as root
 /// or SYSTEM in a log directory a user may own, where a link or a FIFO planted at
 /// the name must be neither followed nor waited for.
+///
+/// On Windows a read inside [`stamp_driver`]'s replace can answer `Marker::Absent` for a marker that exists.
 pub fn read(log_dir: &Path) -> Marker {
     marker_of(marker_file(log_dir).observe().loaded)
 }

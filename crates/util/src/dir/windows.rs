@@ -137,7 +137,7 @@ fn wide(name: &OsStr) -> io::Result<Vec<u16>> {
     Ok(name.encode_wide().collect())
 }
 
-fn info(handle: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+pub(super) fn info(handle: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the handle is open and `info` is a live local, both for the call.
     unsafe { GetFileInformationByHandle(HANDLE(handle.as_raw_handle()), &mut info) }?;
@@ -610,10 +610,24 @@ fn reopen_complete(walk: &Walk, end: Standing, rights: FILE_ACCESS_RIGHTS) -> io
 // Operations relative to a directory ----------------------------------------------------------------------------------
 
 pub(super) fn open_file(dir: &File, name: &OsStr, how: OpenFile) -> io::Result<File> {
-    open_file_with(dir, name, how, FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0)
+    open_file_with(dir, name, how, None)
 }
 
-fn open_file_with(dir: &File, name: &OsStr, how: OpenFile, rights: u32) -> io::Result<File> {
+/// The rights an open that takes its caller's rights uses when the caller names none.
+const DEFAULT_RIGHTS: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0;
+
+/// What [`open_file_with`] asks of the system for one [`OpenFile`].
+struct Opening {
+    /// The rights the variant opens with unless [`OpenFile::takes_caller_rights`] lets the caller name them.
+    own_rights: u32,
+    share: FILE_SHARE_MODE,
+    disposition: NTCREATEFILE_CREATE_DISPOSITION,
+    flags: NTCREATEFILE_CREATE_OPTIONS,
+}
+
+/// [`open_file`] with `caller_rights`: `None` is the variant's own rights. A variant that does not take the caller's
+/// rights panics when given some, rather than opening with something the caller did not ask for.
+fn open_file_with(dir: &File, name: &OsStr, how: OpenFile, caller_rights: Option<u32>) -> io::Result<File> {
     let own_file = [
         FILE_NON_DIRECTORY_FILE,
         FILE_OPEN_FOR_BACKUP_INTENT,
@@ -621,24 +635,57 @@ fn open_file_with(dir: &File, name: &OsStr, how: OpenFile, rights: u32) -> io::R
     ];
     // `FILE_APPEND_DATA` without `FILE_WRITE_DATA`: every write lands at the end.
     let append = FILE_APPEND_DATA.0 | FILE_READ_ATTRIBUTES.0;
-    let (rights, share, disposition, flags) = match how {
-        OpenFile::CreateNew { .. } => (rights, SHARE_NO_DELETE, FILE_CREATE, options(&own_file)),
-        OpenFile::Existing => (rights, SHARE_NO_DELETE, FILE_OPEN, options(OPEN_AS_ITSELF)),
-        OpenFile::Read => (FILE_GENERIC_READ.0, SHARE_ALL, FILE_OPEN, options(&own_file)),
-        OpenFile::Append => (append, SHARE_ALL, FILE_OPEN, options(&own_file)),
-        OpenFile::CreateAppend { .. } => (append, SHARE_ALL, FILE_CREATE, options(&own_file)),
+    let opening = match how {
+        OpenFile::CreateNew { .. } => Opening {
+            own_rights: DEFAULT_RIGHTS,
+            share: SHARE_NO_DELETE,
+            disposition: FILE_CREATE,
+            flags: options(&own_file),
+        },
+        OpenFile::Existing => Opening {
+            own_rights: DEFAULT_RIGHTS,
+            share: SHARE_NO_DELETE,
+            disposition: FILE_OPEN,
+            flags: options(OPEN_AS_ITSELF),
+        },
+        OpenFile::Read => Opening {
+            own_rights: FILE_GENERIC_READ.0,
+            share: SHARE_ALL,
+            disposition: FILE_OPEN,
+            flags: options(&own_file),
+        },
+        OpenFile::Append => Opening {
+            own_rights: append,
+            share: SHARE_ALL,
+            disposition: FILE_OPEN,
+            flags: options(&own_file),
+        },
+        OpenFile::CreateAppend { .. } => Opening {
+            own_rights: append,
+            share: SHARE_ALL,
+            disposition: FILE_CREATE,
+            flags: options(&own_file),
+        },
+    };
+    let rights = match (how.takes_caller_rights(), caller_rights) {
+        (true, given) => given.unwrap_or(opening.own_rights),
+        (false, None) => opening.own_rights,
+        (false, Some(given)) => panic!("{how:?} fixes its own rights, and was given {given:#x}"),
     };
     let file = nt_open(
         Some(dir),
         &wide(name)?,
         FILE_ACCESS_RIGHTS(rights),
-        share,
-        disposition,
-        flags,
-    )?;
-    // Opened as itself, a symlink is the link and not what it points at: it is not a file to read or append to.
-    if matches!(how, OpenFile::Read | OpenFile::Append) && kind_from(&file)? == EntryKind::Symlink {
-        return Err(Refusal::Symlink.into_io_error());
+        opening.share,
+        opening.disposition,
+        opening.flags,
+    )
+    .map_err(|err| match how.gone_is_not_found() {
+        true => status::open_error(err),
+        false => err,
+    })?;
+    if let Some(refusal) = how.refusal_of(|| kind_from(&file))? {
+        return Err(refusal.into_io_error());
     }
     Ok(file)
 }
@@ -663,7 +710,7 @@ pub(super) fn create_temp(dir: &File, name: &OsStr) -> io::Result<File> {
         dir,
         name,
         OpenFile::CreateNew { mode: 0o600 },
-        FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | DELETE.0 | WRITE_DAC.0,
+        Some(DEFAULT_RIGHTS | DELETE.0 | WRITE_DAC.0),
     )
 }
 
@@ -763,8 +810,8 @@ fn set_disposition(handle: &File, posix: bool) -> io::Result<()> {
 }
 
 /// `FILE_RENAME_REPLACE_IF_EXISTS`, and with `FILE_RENAME_POSIX_SEMANTICS`: the target is replaced
-/// even while another handle has it open (that handle keeps the old file). The second needs Windows 10
-/// version 1607 and a volume that supports it (NTFS does).
+/// even while another handle has it open (that handle keeps the old file, which then has no links).
+/// The second needs Windows 10 version 1607 and a volume that supports it (NTFS does).
 const REPLACE: u32 = 0x1;
 const REPLACE_POSIX: u32 = 0x1 | 0x2;
 /// Neither: the target must not exist.

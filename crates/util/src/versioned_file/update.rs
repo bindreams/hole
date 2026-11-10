@@ -140,6 +140,9 @@ impl<S: VersionedState> VersionedFile<S> {
     /// A file the folder's owner cannot vouch for (a second name a user planted) is `Unreadable`. A directory that is
     /// not there is an absent file; one that cannot be opened (a link in its path that [`Dir`] does not follow) is a
     /// read that failed, as is a name that holds anything but a regular file.
+    ///
+    /// A reader in another process must not act on [`Loaded::Absent`] for a file a writer replaces in place: on
+    /// Windows a read inside the replace can answer it for a file that exists (see the module doc).
     pub fn observe(&self) -> Observed<S> {
         let held = generation::lock(&self.path);
         let loaded = match ReadDir::open(&self.dir) {
@@ -154,7 +157,7 @@ impl<S: VersionedState> VersionedFile<S> {
 
     /// One read through `dir`. When it fails, the one look at the name says whether it holds a regular file, nothing
     /// (the file is [`Loaded::Absent`]), or could not be examined.
-    fn read_through(&self, dir: &ReadDir) -> Loaded<S> {
+    pub(super) fn read_through(&self, dir: &ReadDir) -> Loaded<S> {
         let name = self.file_name();
         Loaded::from_read(self.fs.read(dir, name), || match self.fs.kind_of(dir, name) {
             Ok(Some(EntryKind::Symlink | EntryKind::Directory | EntryKind::Other)) => Some(UnreadableKind::NotAFile),

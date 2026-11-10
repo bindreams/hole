@@ -232,3 +232,9 @@ fn the_folders_owner_is_not_read_for_a_file_the_system_owns() {
 fn a_users_file_in_a_folder_whose_owner_cannot_be_read_is_an_error() {
     assert!(super::may_read(&user(1), 1, || Err(io::Error::other("unreadable"))).is_err());
 }
+
+#[skuld::test]
+fn a_file_with_no_name_has_no_planted_second_name_and_is_read() {
+    assert!(may_read(ROOT, 0, ROOT));
+    assert!(may_read(ROOT, 0, user(1)));
+}

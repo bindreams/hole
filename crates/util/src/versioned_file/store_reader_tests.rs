@@ -1,12 +1,16 @@
-//! `load` takes no exclusion: a reader that has the file open never makes a
-//! `store` or a `move_aside` fail.
+//! A reader that takes no lock never makes a `store` or a `move_aside` fail, and is never told the file is unreadable
+//! by the replace. `Absent` is accepted because, on Windows, a read inside a replace can answer it for a file that
+//! exists.
+//!
+//! These are smoke tests: the loader races the writer and meets a replace only by chance. A read of a delete-pending
+//! file is pinned in `dir::windows::status_tests`, and a file with no name in `dir_tests` and `dir::trail_tests`.
 
-use crate::versioned_file::fixtures::UpdateShortcuts;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use super::{DefaultPlacement, VersionedFile};
-use crate::versioned_file::fixtures::{dir, OsRecordFile};
+use crate::dir::ReadDir;
+use crate::versioned_file::fixtures::{dir, OsRecordFile, UpdateShortcuts};
 use crate::versioned_file::Loaded;
 
 /// The writer's whole workload; the loader runs until the writer is done.
@@ -20,9 +24,9 @@ fn record(n: usize) -> OsRecordFile {
     OsRecordFile { value: format!("v{n}") }
 }
 
-/// Runs `write` once per step of `steps` on this thread while another thread
-/// loads the file in a loop, until `write` is done. Returns what `write`
-/// collected, the number of loads, and the loads that were not `Current`.
+/// Runs `write` on this thread while another thread reads the file in a loop
+/// without the in-process lock, until `write` is done. Returns what `write`
+/// collected, the number of loads, and the loads that were neither `Current` nor `Absent`.
 fn while_loading<T>(file: &VersionedFile<OsRecordFile>, write: impl FnOnce() -> T) -> (T, usize, Vec<String>) {
     /// Sets the flag when dropped, so a panicking `write` still stops the loader.
     struct Done<'a>(&'a AtomicBool);
@@ -41,9 +45,10 @@ fn while_loading<T>(file: &VersionedFile<OsRecordFile>, write: impl FnOnce() -> 
         // `move`: a loader that panics drops `loading`, so `recv` below fails
         // the test instead of waiting for a first load that never comes.
         let loader = scope.spawn(move || {
+            let reader = ReadDir::open(&file.dir).expect("the directory opens");
             let (mut loads, mut torn) = (0usize, Vec::new());
             while !written.load(Ordering::Acquire) {
-                match file.load() {
+                match file.read_through(&reader) {
                     Loaded::Current { .. } | Loaded::Absent => {}
                     other => torn.push(format!("{other:?}")),
                 }
@@ -64,8 +69,9 @@ fn while_loading<T>(file: &VersionedFile<OsRecordFile>, write: impl FnOnce() -> 
     })
 }
 
+/// Reads through `read_vouched`, as every state file does, so the vouch runs against the replace.
 #[skuld::test]
-fn a_concurrent_load_never_makes_a_store_fail() {
+fn an_unlocked_reader_never_makes_a_store_fail() {
     let dir = dir();
     let file = VersionedFile::<OsRecordFile>::new(dir.path());
     file.store(&record(0), &DefaultPlacement::default()).unwrap();
@@ -86,14 +92,14 @@ fn a_concurrent_load_never_makes_a_store_fail() {
     );
     assert!(
         torn.is_empty(),
-        "{} loads were not Current; first: {}",
+        "{} loads were neither Current nor Absent; first: {}",
         torn.len(),
         torn[0]
     );
 }
 
 #[skuld::test]
-fn a_concurrent_load_never_makes_a_move_aside_fail() {
+fn an_unlocked_reader_never_makes_a_move_aside_fail() {
     let dir = dir();
     let file = VersionedFile::<OsRecordFile>::new(dir.path());
 
