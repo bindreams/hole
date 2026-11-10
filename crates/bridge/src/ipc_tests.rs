@@ -3493,6 +3493,52 @@ async fn an_outgoing_error_carrying_the_address_is_redacted() {
     assert!(wire.contains(&token), "the outgoing error lost its token: {wire}");
 }
 
+/// A test-server outcome's text reaches a toast like a start failure's, so the same boundary covers it: every variant
+/// that carries text leaves the bridge with the armed address as its token, and the rest are untouched.
+#[skuld::test]
+fn a_test_server_outcome_carrying_the_address_is_redacted() {
+    use hole_common::protocol::ServerTestOutcome as Outcome;
+
+    hole_common::logging::redact_arm::arm_server(&redaction_config().server);
+    let token = hole_common::logging::redact_arm::token_for(REDACT_ENTRY_ID);
+    let leaky = format!("creating connection to {REDACT_ADDR}:443 failed");
+    let redacted = format!("creating connection to {token}:443 failed");
+
+    for (outcome, wanted) in [
+        (
+            Outcome::PluginStartFailed { detail: leaky.clone() },
+            Outcome::PluginStartFailed {
+                detail: redacted.clone(),
+            },
+        ),
+        (
+            Outcome::SentinelMismatch { detail: leaky.clone() },
+            Outcome::SentinelMismatch {
+                detail: redacted.clone(),
+            },
+        ),
+        (
+            Outcome::InternalError { detail: leaky.clone() },
+            Outcome::InternalError {
+                detail: redacted.clone(),
+            },
+        ),
+        (
+            Outcome::Reachable { latency_ms: 5 },
+            Outcome::Reachable { latency_ms: 5 },
+        ),
+        (Outcome::DnsFailed, Outcome::DnsFailed),
+        (Outcome::TcpRefused, Outcome::TcpRefused),
+        (Outcome::TcpTimeout, Outcome::TcpTimeout),
+        (Outcome::TunnelHandshakeFailed, Outcome::TunnelHandshakeFailed),
+        (Outcome::NetworkBlocked, Outcome::NetworkBlocked),
+        (Outcome::ServerCannotReachInternet, Outcome::ServerCannotReachInternet),
+    ] {
+        let case = format!("{outcome:?}");
+        assert_eq!(super::redact_outcome(outcome), wanted, "{case}");
+    }
+}
+
 /// M3 (#1033): `handle_reload` must arm and redact exactly as `handle_start`
 /// does. `reload`'s slow path (`stop()` + `start(config)`) runs precisely
 /// when the incoming server differs from the running one — i.e. exactly

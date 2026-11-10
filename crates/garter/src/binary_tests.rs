@@ -150,7 +150,8 @@ use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
 use crate::binary::{
-    drain_readers_after_exit, end_plugin, shut_plugin_down, supervise_plugin, PluginEnd, PluginTree, Supervised,
+    drain_readers_after_exit, end_plugin, shut_plugin_down, supervise_plugin, take_down_refused_plugin, PluginEnd,
+    PluginTree, Supervised, TakedownError,
 };
 use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
@@ -1773,9 +1774,10 @@ async fn a_refused_root_kill_still_kills_the_tree_and_reaps_and_is_reported() {
         tree.kill_root_fails = true;
         let ended = shut_plugin_down("p", &mut tree, GRACE, finished_reader(), finished_reader()).await;
 
+        // The tree kill took the root down with it, so the stop is confirmed whatever the root kill said.
         assert!(
-            matches!(&ended, Err(cosca::error::Error::Containment { detail }) if detail.contains("root kill")),
-            "{containment:?}: the refusal is reported"
+            matches!(&ended, Err(TakedownError::StopConfirmed(cosca::error::Error::Containment { detail })) if detail.contains("root kill")),
+            "{containment:?}: the refusal is reported, with the root gone"
         );
         // The tree kill took the refused root down with it: the probe sees that, and the root is reaped.
         let mut expected = vec!["terminate", "wait_root_exit_within", "kill_root", "kill_tree"];
@@ -1800,7 +1802,9 @@ async fn a_refused_root_kill_is_reported_ahead_of_a_failed_reap() {
     tree.reap_fails = true;
     let ended = shut_plugin_down("p", &mut tree, GRACE, finished_reader(), finished_reader()).await;
 
-    assert!(matches!(&ended, Err(cosca::error::Error::Containment { detail }) if detail.contains("root kill")));
+    assert!(
+        matches!(&ended, Err(TakedownError::StopConfirmed(cosca::error::Error::Containment { detail })) if detail.contains("root kill"))
+    );
     assert_eq!(
         tree.calls(),
         [
@@ -1835,9 +1839,10 @@ async fn a_refused_root_kill_that_leaves_the_root_alive_is_returned_without_reap
         .await
         .unwrap_or_else(|_| panic!("{containment:?}: the shutdown waits on a root nothing can end"));
 
+        // The root is still running: nothing confirms the plugin stopped.
         assert!(
-            matches!(&ended, Err(cosca::error::Error::Containment { detail }) if detail.contains("root kill")),
-            "{containment:?}: the refusal is returned"
+            matches!(&ended, Err(TakedownError::StopUnconfirmed(cosca::error::Error::Containment { detail })) if detail.contains("root kill")),
+            "{containment:?}: the refusal is returned, with the root alive"
         );
         let mut expected = vec!["terminate", "wait_root_exit_within", "kill_root", "kill_tree"];
         expected.extend(edge_awaited.then_some("wait_tree_drained"));
@@ -2552,4 +2557,213 @@ async fn a_stdout_close_after_readiness_was_decided_logs_no_ignored_failure() {
             "{lines:?}: the end of the stream was logged as a reported failure:\n{log}"
         );
     }
+}
+
+// A take-down's error, as `run` returns it ============================================================================
+
+/// What makes `run` report a stop it could not confirm is the take-down's own word, never the error's text.
+#[skuld::test]
+fn a_takedown_that_left_the_root_alive_is_an_unconfirmed_stop_of_that_plugin() {
+    let unconfirmed = TakedownError::StopUnconfirmed(kill_root_refused()).into_error("wrapper");
+    match &unconfirmed {
+        crate::Error::StopUnconfirmed { plugins, cause } => {
+            assert_eq!(plugins, &["wrapper"]);
+            assert!(matches!(
+                cause.downcast_ref::<cosca::error::Error>(),
+                Some(cosca::error::Error::Containment { .. })
+            ));
+        }
+        other => panic!("got {other:?}"),
+    }
+
+    let confirmed = TakedownError::StopConfirmed(kill_root_refused()).into_error("wrapper");
+    assert!(matches!(confirmed, crate::Error::Cosca(_)), "got {confirmed:?}");
+    assert!(confirmed.stop_confirmed());
+}
+
+// A refused pid sink --------------------------------------------------------------------------------------------------
+
+fn the_sinks_refusal() -> Box<dyn std::error::Error + Send + Sync> {
+    "test: the sink refused".into()
+}
+
+/// A plugin whose identity cannot be recorded is killed at once, with no ask and no grace, and the sink's own error
+/// is what `run` reports.
+#[skuld::test]
+async fn a_refused_pid_sink_kills_the_plugin_at_once_and_is_reported_as_the_sinks_error() {
+    tokio::time::pause();
+    for (containment, edge_awaited) in CONTAINMENTS {
+        let mut tree = drained_tree(containment);
+        let error = take_down_refused_plugin(
+            "ex-ray",
+            &mut tree,
+            the_sinks_refusal(),
+            finished_reader(),
+            finished_reader(),
+        )
+        .await;
+
+        match &error {
+            crate::Error::PidSink { plugin, cause } => {
+                assert_eq!(plugin, "ex-ray");
+                assert_eq!(cause.to_string(), "test: the sink refused");
+            }
+            other => panic!("{containment:?}: got {other:?}"),
+        }
+        assert!(error.stop_confirmed(), "{containment:?}");
+        let mut expected = vec!["kill_root", "kill_tree"];
+        expected.extend(edge_awaited.then_some("wait_tree_drained"));
+        expected.extend(["reap", "disarm"]);
+        assert_eq!(tree.calls(), expected, "{containment:?}: no terminate, no grace");
+    }
+}
+
+/// A refused root kill that the tree kill makes moot leaves no plugin behind: the sink's error is still the result.
+#[skuld::test]
+async fn a_refused_pid_sink_whose_root_kill_is_refused_but_whose_root_is_gone_is_a_confirmed_stop() {
+    tokio::time::pause();
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    tree.kill_root_fails = true;
+
+    let error = take_down_refused_plugin(
+        "p",
+        &mut tree,
+        the_sinks_refusal(),
+        finished_reader(),
+        finished_reader(),
+    )
+    .await;
+
+    assert!(
+        matches!(&error, crate::Error::PidSink { .. }) && error.stop_confirmed(),
+        "got {error:?}"
+    );
+}
+
+/// A refused pid sink over a root nothing can kill is a stop that could not be confirmed, which is louder than the
+/// refusal: the kill's own refusal is its source.
+#[skuld::test]
+async fn a_refused_pid_sink_whose_root_survives_every_kill_is_an_unconfirmed_stop() {
+    tokio::time::pause();
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    tree.root_outlives_grace = true;
+    tree.kill_root_fails = true;
+    tree.root_survives_tree_kill = true;
+    tree.reap_never_completes = true;
+
+    let error = tokio::time::timeout(
+        VIRTUAL_HANG,
+        take_down_refused_plugin(
+            "wrapper",
+            &mut tree,
+            the_sinks_refusal(),
+            finished_reader(),
+            finished_reader(),
+        ),
+    )
+    .await
+    .expect("the take-down waits on a root nothing can end");
+
+    match &error {
+        crate::Error::StopUnconfirmed { plugins, cause } => {
+            assert_eq!(plugins, &["wrapper"]);
+            assert!(
+                matches!(cause.downcast_ref::<cosca::error::Error>(), Some(cosca::error::Error::Containment { detail }) if detail.contains("root kill")),
+                "the kill's refusal is the source: {cause:?}"
+            );
+        }
+        other => panic!("got {other:?}"),
+    }
+    assert!(
+        !tree.calls().contains(&"reap"),
+        "a root that is still running is not reaped"
+    );
+}
+
+/// The refusal is logged at error, with the sink's error.
+#[skuld::test]
+async fn a_refused_pid_sink_is_logged_at_error() {
+    tokio::time::pause();
+    let (subscriber, writer) = subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+    let mut tree = drained_tree(Containment::ProcessGroup);
+
+    take_down_refused_plugin(
+        "ex-ray",
+        &mut tree,
+        the_sinks_refusal(),
+        finished_reader(),
+        finished_reader(),
+    )
+    .await;
+
+    let log = writer.snapshot();
+    assert!(
+        log.lines().any(|l| l.contains("ERROR")
+            && l.contains("pid sink refused the plugin")
+            && l.contains("test: the sink refused")),
+        "{log}"
+    );
+}
+
+/// A root that cannot be watched is reaped before it is killed; when that reap fails the root is not known to have
+/// exited, and nothing was killed: the plugin may still be running.
+#[skuld::test]
+async fn an_unwatchable_root_whose_reap_fails_is_an_unconfirmed_stop() {
+    tokio::time::pause();
+    let mut tree = drained_tree(Containment::ProcessGroup);
+    tree.root_watch_fails = true;
+    tree.reap_fails = true;
+    let shutdown = CancellationToken::new();
+
+    let ended = supervise_plugin(
+        "p",
+        &mut tree,
+        &shutdown,
+        GRACE,
+        finished_reader(),
+        finished_reader(),
+        None,
+    )
+    .await;
+
+    assert!(
+        matches!(&ended, Err(TakedownError::StopUnconfirmed(cosca::error::Error::Containment { detail })) if detail.contains("reap failed")),
+        "got {:?}",
+        ended.as_ref().err()
+    );
+}
+
+/// On every platform a plugin that cannot be spawned fails its `run` with an error that names it and not where it was
+/// looked for. macOS cannot tell a failed `exec` from a child that may run, so there the stop is unconfirmed.
+#[skuld::test]
+async fn a_missing_plugin_fails_its_run_naming_the_plugin_and_not_its_directory() {
+    use std::error::Error as _;
+
+    let dir = tempfile::Builder::new()
+        .prefix("a-recognisable-dir-")
+        .tempdir()
+        .unwrap();
+    let dir_name = dir.path().file_name().unwrap().to_string_lossy().into_owned();
+    let (ready, _ready_rx) = oneshot::channel();
+    #[allow(clippy::disallowed_methods)] // the shutdown root of a run that never starts
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    let error = BinaryPlugin::new(dir.path().join("no-such-plugin"), None)
+        .run(
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+            shutdown,
+            ready,
+        )
+        .await
+        .expect_err("a plugin that cannot be spawned must fail the run");
+
+    let want = match cfg!(target_os = "macos") {
+        true => "plugin 'no-such-plugin' could not be confirmed stopped",
+        false => "could not spawn plugin 'no-such-plugin'",
+    };
+    assert_eq!(error.to_string(), want);
+    assert!(!error.to_string().contains(&dir_name));
+    assert!(error.source().is_some(), "the cause is the source");
 }

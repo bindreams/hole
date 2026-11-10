@@ -1165,7 +1165,42 @@ leaves working DNS + broken routes, not the inverse):
   test harness's teardown. At bridge start it runs before the boot reconcile
   (`boot::recover_then_reconcile`: route recovery, reap, reconcile): the reap
   kills every recorded plugin, so running it after would kill the auto-connect's
-  own. IPC is not served until the boot returns.
+  own. IPC is not served until the boot returns. A plugin whose identity cannot
+  be recorded (a failed write, an identity that cannot be persisted) is refused
+  by the plugin's pid sink, which is fallible: garter takes the child down at
+  once and the connect fails with `ProxyError::PluginUnrecorded`, on every
+  platform, since an unrecorded plugin is one no later reap can find. Garter
+  owns every take-down and hole only reports what it returns. A stop that
+  cannot be confirmed is a separate, louder error (`PluginStopUnconfirmed`), and
+  garter alone decides it (`garter::Error::stop_confirmed`: a refused root kill
+  or a failed reap with the root not known to have exited, a panicked plugin
+  task, the drain bound's abort, a tap's abort of an inner that ignores its stop,
+  each as `StopUnconfirmed` naming the plugins), as it alone decides the sink's
+  refusal (`PidSink`). Ranking among errors is `garter::Error::then` (one rule,
+  `ranks_above`, which the tap's `after_stop` also reads): an
+  unconfirmed stop, then a refused sink, then the first error; a start Hole
+  itself gave up asks the same ranking
+  (`garter::Error::outranks_a_callers_own_error`). `then` logs nothing: an error
+  is logged where it arises or is taken (a member's exit, the ready gate, a
+  stopped inner), so the one it drops is already in the log. Every other chain
+  error, including a plugin's terminal start failure, reaches the start failure
+  as itself (`ProxyError::PluginStartFailed`), and a failure of the port probe
+  as its `io::Error` (`ProxyError::PluginPort`); only a chain that ended with no
+  error and a readiness timeout are text (`ProxyError::Plugin`). The plugin
+  variants' `Display` does not print garter's error. A user reads
+  `ProxyError::user_message`, which adds garter's `Display`, safe to show by
+  `garter::Error`'s contract (it names the plugins and what failed, never a path
+  or a `source()`). Their sources go only to the log. A hop that ends before
+  ready without reporting a failure ends the chain with its own run error
+  (`ChainRunner::run` documents the three cases); the synthesized
+  `StartFailed` "exited before becoming ready" is only for a hop every member of
+  which returned `Ok(())`. A spawn failure is
+  `garter::Error::Spawn` only where cosca's fate says the child is gone
+  (`Reaped`, `Killed`, `Gone`) on a spawn that is not an elevation backend's;
+  any other fate may be a running child, and that is an unconfirmed stop. On
+  macOS cosca reports every failed spawn as `Running`, so a missing or
+  non-executable plugin reads as an unconfirmed stop there until cosca can say
+  more (bindreams/cosca#964).
 - **`bridge-dns.json`** — read-only now. The bridge stopped writing this file
   (DNS confinement is process-scoped WFP state, not a file — see
   [DNS forwarder](#dns-forwarder)); what's left is the evidence-gated upgrade

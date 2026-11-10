@@ -32,6 +32,46 @@ fn parse_env_missing_required_var(#[fixture] env: &skuld::EnvGuard) {
     assert!(result.is_err());
 }
 
+/// A value that does not parse is worded by garter ("could not be parsed"); the parse error is the source.
+#[skuld::test]
+fn parse_env_unparsable_port_names_the_variable_and_chains_the_parse_error(#[fixture] env: &skuld::EnvGuard) {
+    use std::error::Error as _;
+
+    env.set("SS_LOCAL_HOST", "127.0.0.1");
+    env.set("SS_LOCAL_PORT", "not-a-port");
+    env.set("SS_REMOTE_HOST", "example.com");
+    env.set("SS_REMOTE_PORT", "443");
+    env.remove("SS_PLUGIN_OPTIONS");
+
+    let error = PluginEnv::from_env().unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "environment variable 'SS_LOCAL_PORT' missing or invalid: could not be parsed"
+    );
+    let cause = "not-a-port".parse::<u16>().unwrap_err().to_string();
+    assert_eq!(
+        error.source().expect("the parse error is the source").to_string(),
+        cause
+    );
+}
+
+/// A variable that is not set has nothing to chain.
+#[skuld::test]
+fn parse_env_unset_variable_has_no_source(#[fixture] env: &skuld::EnvGuard) {
+    use std::error::Error as _;
+
+    env.remove("SS_LOCAL_HOST");
+
+    let error = PluginEnv::from_env().unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "environment variable 'SS_LOCAL_HOST' missing or invalid: not set"
+    );
+    assert!(error.source().is_none());
+}
+
 #[skuld::test]
 fn parse_env_no_plugin_options(#[fixture] env: &skuld::EnvGuard) {
     env.set("SS_LOCAL_HOST", "0.0.0.0");

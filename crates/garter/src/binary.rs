@@ -25,7 +25,7 @@ pub enum ReadinessMode {
     /// The conservative default for arbitrary / legacy plugins.
     ///
     /// A plugin readied this way cannot report a lost port. If it fails to bind, it exits untyped and the chain
-    /// fails with `Fatal` ("exited before becoming ready"); a chain restarts only a typed `BindConflict`, so it does
+    /// fails with the plugin's own exit error; a chain restarts only a typed `BindConflict`, so it does
     /// not restart this hop on a fresh intermediate port. If another process listens on the port, the probe connects
     /// to that process and reports ready for it. A public `local_port` of 0 cannot be probed at all.
     #[default]
@@ -75,10 +75,17 @@ pub(crate) struct Sip003Env {
 }
 
 /// Callback invoked synchronously when a binary plugin process is spawned.
-/// Receives the child PID immediately after `Command::spawn()` returns,
-/// before any `.await` point. Consumers use this to record PIDs for crash
-/// recovery (e.g. persist to a state file).
-pub type PidSink = Arc<dyn Fn(u32) + Send + Sync>;
+/// Receives the child's identity (pid and start token) immediately after
+/// `Command::spawn()` returns, before any `.await` point. Consumers use this to
+/// record it for crash recovery (e.g. persist to a state file).
+///
+/// The sink can refuse: a plugin whose identity is not recorded is one no later reap can find. On `Err` the plugin is
+/// taken down at once (killed, its tree drained, its root reaped), `ready` is dropped unsent, and
+/// [`BinaryPlugin::run`](ChainPlugin::run) returns [`Error::PidSink`](crate::Error::PidSink) with the sink's error as
+/// its source, or [`Error::StopUnconfirmed`](crate::Error::StopUnconfirmed) when the take-down could not be confirmed.
+/// The refusal is logged at error. A consumer finds its own error type in the source chain.
+pub type PidSink =
+    Arc<dyn Fn(cosca::identity::ProcessId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync>;
 
 /// Sink for a plugin's raw log lines, mirroring [`PidSink`]. Invoked for EVERY
 /// line the child writes to stdout or stderr — including lines the sitrep
@@ -106,57 +113,34 @@ pub struct BinaryPlugin {
     extra_env: Vec<(String, String)>,
 }
 
-/// What a failed plugin spawn tells the user.
+/// The error for a failed spawn of `plugin`.
 ///
-/// cosca reports a failed `exec` on Unix as `MayHaveStarted` even when the program never ran, and its text then talks
-/// about a child that may be running. Where the fate or the errno proves none is left, the cause alone is reported;
-/// otherwise (a child that may run, an elevation backend) cosca's text stays.
-pub(crate) fn spawn_failure_text(error: &cosca::error::Error) -> String {
+/// cosca reports a failed `exec` on Unix as `MayHaveStarted` even when the program never ran. Only a fate saying the
+/// child is gone, on a spawn that is not an elevation backend's, is a confirmed stop ([`Error::Spawn`](crate::Error::Spawn),
+/// caused by the failure itself). Any other fate (`Running`, `Unknown`, or one this does not know) may be a child that
+/// is still running, and so may an elevation backend's whatever its fate says, since the backend is not the program
+/// behind it: that is an unconfirmed stop ([`Error::StopUnconfirmed`](crate::Error::StopUnconfirmed), caused by
+/// cosca's error).
+pub(crate) fn spawn_failure(plugin: &str, error: cosca::error::Error) -> crate::Error {
     use cosca::error::{ChildFate, Error};
     match error {
         Error::MayHaveStarted {
-            fate,
+            fate: ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone,
             wrapper_elevated: false,
             source,
-        } => match fate {
-            ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone => source.to_string(),
-            ChildFate::Running { id: None } if exec_refused_the_program(source) => source.to_string(),
-            ChildFate::Running { .. } | ChildFate::Unknown => error.to_string(),
-            // `ChildFate` is non-exhaustive: a fate this does not know is not one that says nothing is left.
-            _ => error.to_string(),
+        } => crate::Error::Spawn {
+            plugin: plugin.to_owned(),
+            cause: source,
         },
-        _ => error.to_string(),
+        error @ Error::MayHaveStarted { .. } => crate::Error::StopUnconfirmed {
+            plugins: vec![plugin.to_owned()],
+            cause: Box::new(error),
+        },
+        error => crate::Error::Spawn {
+            plugin: plugin.to_owned(),
+            cause: Box::new(error),
+        },
     }
-}
-
-/// The errnos only a refused `exec` returns on macOS: those `execve(2)` and `posix_spawn(2)` document, minus every one
-/// that `kevent` (kqueue(2)), `fcntl(2)` or `sigaction(2)` document, since tokio calls those after a successful spawn.
-/// ENOENT and EACCES are therefore absent: a missing or non-executable plugin keeps cosca's text until cosca can tell
-/// an exec failure from a failed setup.
-#[cfg(target_os = "macos")]
-pub(crate) const REFUSED_BY_EXEC_ONLY: [i32; 8] = [
-    libc::E2BIG,
-    libc::EBADARCH,
-    libc::EIO,
-    libc::ELOOP,
-    libc::ENAMETOOLONG,
-    libc::ENOEXEC,
-    libc::ENOTDIR,
-    libc::ETXTBSY,
-];
-
-/// Whether `cause` is the kernel refusing to `exec` the program, so that it never ran.
-///
-/// On macOS the errno decides: only [`REFUSED_BY_EXEC_ONLY`] counts, any other cause keeps cosca's text. On Linux the
-/// pidfd handshake answers, so `Running` there is not an exec failure.
-#[cfg(target_os = "macos")]
-fn exec_refused_the_program(cause: &cosca::error::Error) -> bool {
-    matches!(cause, cosca::error::Error::Io(e) if e.raw_os_error().is_some_and(|errno| REFUSED_BY_EXEC_ONLY.contains(&errno)))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn exec_refused_the_program(_cause: &cosca::error::Error) -> bool {
-    false
 }
 
 impl BinaryPlugin {
@@ -174,7 +158,7 @@ impl BinaryPlugin {
         }
     }
 
-    /// Set a callback that fires with the child PID immediately after spawn.
+    /// Set a callback that fires with the child's identity immediately after spawn, and may refuse it: see [`PidSink`].
     pub fn pid_sink(mut self, sink: PidSink) -> Self {
         self.pid_sink = Some(sink);
         self
@@ -262,6 +246,77 @@ fn relay_to_sink<'a>(line: &'a str, sink: &Option<LogSink>) -> Cow<'a, str> {
     clean
 }
 
+/// Which of a plugin's streams a plain log reader relays.
+#[derive(Clone, Copy)]
+enum LogStream {
+    /// Relayed at info.
+    Stdout,
+    /// Relayed at warn.
+    Stderr,
+}
+
+/// A plain relay of one of the plugin's streams to tracing and `log_sink`, with no protocol reading.
+fn spawn_log_reader(
+    stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    which: LogStream,
+    plugin: &str,
+    log_sink: Option<LogSink>,
+) -> tokio::task::JoinHandle<()> {
+    let plugin = plugin.to_owned();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stream).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let line = relay_to_sink(&line, &log_sink);
+                    match which {
+                        LogStream::Stdout => tracing::info!(plugin = %plugin, "{line}"),
+                        LogStream::Stderr => tracing::warn!(plugin = %plugin, "{line}"),
+                    }
+                }
+                Ok(None) => break, // EOF
+                Err(e) => {
+                    tracing::debug!(plugin = %plugin, error = &e as &dyn std::error::Error, "log reader error");
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Takes down a plugin whose [`PidSink`] refused its identity, at once and with no grace, and returns the error `run`
+/// returns: [`Error::PidSink`](crate::Error::PidSink) when the take-down confirmed the plugin stopped, the unconfirmed
+/// stop otherwise. The error is the stop's; the refusal is in the log, which it reaches before the take-down starts.
+pub(crate) async fn take_down_refused_plugin(
+    plugin: &str,
+    tree: &mut impl PluginTree,
+    cause: Box<dyn std::error::Error + Send + Sync>,
+    stdout: tokio::task::JoinHandle<()>,
+    stderr: tokio::task::JoinHandle<()>,
+) -> crate::Error {
+    tracing::error!(
+        plugin = %plugin,
+        error = &*cause as &dyn std::error::Error,
+        "the pid sink refused the plugin; killing it"
+    );
+    let refused = || crate::Error::PidSink {
+        plugin: plugin.to_owned(),
+        cause,
+    };
+    match finish_plugin(plugin, tree, false, stdout, stderr).await {
+        Ok(_) => refused(),
+        Err(TakedownError::StopConfirmed(failure)) => {
+            tracing::warn!(
+                plugin = %plugin,
+                error = &failure as &dyn std::error::Error,
+                "the refused plugin is gone, but its take-down failed"
+            );
+            refused()
+        }
+        Err(unconfirmed @ TakedownError::StopUnconfirmed(_)) => unconfirmed.into_error(plugin),
+    }
+}
+
 #[async_trait::async_trait]
 impl ChainPlugin for BinaryPlugin {
     fn name(&self) -> &str {
@@ -322,68 +377,30 @@ impl ChainPlugin for BinaryPlugin {
         // project does not support and does not bridge.
         cmd.contain();
         cmd.nesting(cosca::containment::Nesting::Mark);
-        let mut child = cmd.spawn().map_err(|e| {
-            crate::Error::Chain(format!(
-                "failed to spawn '{}': {}",
-                self.path.display(),
-                spawn_failure_text(&e)
-            ))
-        })?;
+        let mut child = cmd.spawn().map_err(|e| spawn_failure(&self.name, e))?;
 
-        if let Some(sink) = &self.pid_sink {
-            sink(child.id().pid());
-        }
+        let refused = self.pid_sink.as_ref().and_then(|sink| sink(child.id()).err());
 
         let stderr = child.stderr().expect("stderr was piped");
-        let plugin_name = self.name.clone();
-        let log_sink = self.log_sink.clone();
-        let stderr_task = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        let line = relay_to_sink(&line, &log_sink);
-                        tracing::warn!(plugin = %plugin_name, "{line}");
-                    }
-                    Ok(None) => break, // EOF
-                    Err(e) => {
-                        tracing::debug!(plugin = %plugin_name, error = &e as &dyn std::error::Error, "log reader error");
-                        break;
-                    }
-                }
-            }
-        });
+        let stderr_task = spawn_log_reader(stderr, LogStream::Stderr, &self.name, self.log_sink.clone());
+
+        let stdout = child.stdout().expect("stdout was piped");
+        if let Some(cause) = refused {
+            // `ready` is dropped here, unsent: the chain reports the hop's own error.
+            let stdout_task = spawn_log_reader(stdout, LogStream::Stdout, &self.name, self.log_sink.clone());
+            return Err(take_down_refused_plugin(&self.name, &mut child, cause, stdout_task, stderr_task).await);
+        }
 
         // Stdout consumer: in Probe mode it forwards lines to tracing and
         // readiness comes from a separate self-probe task; in ExpectSitrep
         // mode it parses sitrep events and IS the readiness source. Build
         // the right one per `self.readiness`.
-        let stdout = child.stdout().expect("stdout was piped");
         let probes = ReadinessProbes::new(&self.name, &shutdown);
         let (stdout_task, failure) = match self.readiness {
             ReadinessMode::Probe => {
                 // Tier-2: the stdout reader is a pure log passthrough; a
                 // separate self-probe task owns readiness.
-                let plugin_name = self.name.clone();
-                let log_sink = self.log_sink.clone();
-                let log_task = tokio::spawn(async move {
-                    let reader = BufReader::new(stdout);
-                    let mut lines = reader.lines();
-                    loop {
-                        match lines.next_line().await {
-                            Ok(Some(line)) => {
-                                let line = relay_to_sink(&line, &log_sink);
-                                tracing::info!(plugin = %plugin_name, "{line}");
-                            }
-                            Ok(None) => break, // EOF
-                            Err(e) => {
-                                tracing::debug!(plugin = %plugin_name, error = &e as &dyn std::error::Error, "log reader error");
-                                break;
-                            }
-                        }
-                    }
-                });
+                let log_task = spawn_log_reader(stdout, LogStream::Stdout, &self.name, self.log_sink.clone());
 
                 // Self-probe readiness. On a successful connect, report TCP
                 // readiness; once stopped (the chain's shutdown, or the plugin's end), drop
@@ -428,7 +445,7 @@ impl ChainPlugin for BinaryPlugin {
         };
 
         // If the child binds but never readies and is then shut down, the readiness sender is dropped
-        // unsent and the chain synthesizes `Fatal{exited before ready}`.
+        // unsent and the chain reads the hop as ended before ready.
         let supervised = supervise_plugin(
             &self.name,
             &mut child,
@@ -442,7 +459,7 @@ impl ChainPlugin for BinaryPlugin {
         // A probe holds the readiness sender while it polls. It ends here, before `run` returns, so a plugin that
         // exits before ready is seen by the chain as one that dropped its sender.
         probes.end().await;
-        supervised?.outcome(&self.name)
+        supervised.map_err(|e| e.into_error(&self.name))?.outcome(&self.name)
     }
 }
 
@@ -1022,6 +1039,30 @@ pub(crate) enum PluginEnd {
     ShutDown,
 }
 
+/// Why a take-down failed, and whether it still confirmed the plugin stopped.
+#[derive(Debug)]
+pub(crate) enum TakedownError {
+    /// The plugin's root is gone, or was never running: whatever failed (a refused kill the tree's kill made moot, a
+    /// reap), no plugin is left behind.
+    StopConfirmed(cosca::error::Error),
+    /// The root kill was refused, or its reap failed, with the root not known to have exited: the plugin may still be
+    /// running.
+    StopUnconfirmed(cosca::error::Error),
+}
+
+impl TakedownError {
+    /// The error `run` returns for `plugin`.
+    pub(crate) fn into_error(self, plugin: &str) -> crate::Error {
+        match self {
+            TakedownError::StopConfirmed(cause) => crate::Error::Cosca(cause),
+            TakedownError::StopUnconfirmed(cause) => crate::Error::StopUnconfirmed {
+                plugins: vec![plugin.to_owned()],
+                cause: Box::new(cause),
+            },
+        }
+    }
+}
+
 /// How [`supervise_plugin`] ended a plugin, and whether its start had failed.
 pub(crate) struct Supervised {
     pub(crate) end: PluginEnd,
@@ -1089,7 +1130,7 @@ pub(crate) async fn supervise_plugin(
     stdout: tokio::task::JoinHandle<()>,
     stderr: tokio::task::JoinHandle<()>,
     failure: Option<FailureHold>,
-) -> Result<Supervised, cosca::error::Error> {
+) -> Result<Supervised, TakedownError> {
     let end = supervise(plugin, tree, shutdown, failure.as_ref(), grace, stdout, stderr).await;
     let start_failed = failure.is_some_and(FailureHold::deliver);
     Ok(Supervised {
@@ -1118,7 +1159,7 @@ impl Takedown {
         grace: std::time::Duration,
         stdout: tokio::task::JoinHandle<()>,
         stderr: tokio::task::JoinHandle<()>,
-    ) -> Result<PluginEnd, cosca::error::Error> {
+    ) -> Result<PluginEnd, TakedownError> {
         match self {
             Takedown::Shutdown => {
                 // Before anything reaches the plugin, so a stdout it closes in answer is seen as taken down.
@@ -1156,7 +1197,7 @@ async fn supervise(
     grace: std::time::Duration,
     stdout: tokio::task::JoinHandle<()>,
     stderr: tokio::task::JoinHandle<()>,
-) -> Result<PluginEnd, cosca::error::Error> {
+) -> Result<PluginEnd, TakedownError> {
     tokio::select! {
         // An exit seen at the same moment as a take-down request is still an exit.
         biased;
@@ -1205,8 +1246,11 @@ async fn end_exited_plugin(
     tree: &mut impl PluginTree,
     stdout: tokio::task::JoinHandle<()>,
     stderr: tokio::task::JoinHandle<()>,
-) -> Result<PluginEnd, cosca::error::Error> {
-    Ok(PluginEnd::Exited(end_plugin(plugin, tree, stdout, stderr).await?))
+) -> Result<PluginEnd, TakedownError> {
+    let status = end_plugin(plugin, tree, stdout, stderr)
+        .await
+        .map_err(TakedownError::StopConfirmed)?;
+    Ok(PluginEnd::Exited(status))
 }
 
 /// Collects the root's status and, with the root reaped, disarms its handle. Nothing awaits between
@@ -1224,17 +1268,17 @@ async fn end_after_reap(
     stdout: tokio::task::JoinHandle<()>,
     stderr: tokio::task::JoinHandle<()>,
     reaped: Result<std::process::ExitStatus, cosca::error::Error>,
-) -> Result<PluginEnd, cosca::error::Error> {
+) -> Result<PluginEnd, TakedownError> {
     match reaped {
         Ok(status) => {
             end_reaped_plugin(plugin, tree, stdout, stderr).await;
             Ok(PluginEnd::Exited(status))
         }
-        // Nothing was killed, so the output may stay open: the bounded wait still
-        // keeps a failure reported after this return behind what the plugin wrote.
+        // Nothing was killed and the root is not known to have exited, so the output may stay open: the bounded
+        // wait still keeps a failure reported after this return behind what the plugin wrote.
         Err(e) => {
             wait_for_readers(plugin, stdout, stderr).await;
-            Err(e)
+            Err(TakedownError::StopUnconfirmed(e))
         }
     }
 }
@@ -1245,7 +1289,7 @@ async fn shut_down_on_request(
     grace: std::time::Duration,
     stdout: tokio::task::JoinHandle<()>,
     stderr: tokio::task::JoinHandle<()>,
-) -> Result<PluginEnd, cosca::error::Error> {
+) -> Result<PluginEnd, TakedownError> {
     tracing::info!(plugin = %plugin, "shutting down");
     shut_plugin_down(plugin, tree, grace, stdout, stderr).await?;
     Ok(PluginEnd::ShutDown)
@@ -1292,7 +1336,7 @@ async fn end_failed_start(
     grace: std::time::Duration,
     stdout: tokio::task::JoinHandle<()>,
     stderr: tokio::task::JoinHandle<()>,
-) -> Result<PluginEnd, cosca::error::Error> {
+) -> Result<PluginEnd, TakedownError> {
     tracing::info!(plugin = %plugin, "the plugin's start failed; taking it down");
     let exited = watch_root_exit_within(plugin, tree, grace).await;
     let status = finish_plugin(plugin, tree, exited, stdout, stderr).await?;
@@ -1320,14 +1364,17 @@ async fn watch_root_exit_within(plugin: &str, tree: &impl PluginTree, grace: std
 /// A refused root kill (an elevated or setuid wrapper, or on macOS a root launchd holds as a zombie)
 /// is logged at once and returned. The tree is still killed and its output drained, but the root is
 /// reaped only if a probe then finds it exited: a root that survives the tree kill too cannot be
-/// waited for, and the handle is left armed so that dropping it still kills what it can.
+/// waited for, and the handle is left armed so that dropping it still kills what it can. The refusal is
+/// [`TakedownError::StopUnconfirmed`] when that probe does not find the root exited, and
+/// [`TakedownError::StopConfirmed`] when it does. A failed tree kill is only logged: it does not decide whether the root, which is what an
+/// identity record names, stopped.
 pub(crate) async fn shut_plugin_down(
     plugin: &str,
     tree: &mut impl PluginTree,
     grace: std::time::Duration,
     stdout: tokio::task::JoinHandle<()>,
     stderr: tokio::task::JoinHandle<()>,
-) -> Result<std::process::ExitStatus, cosca::error::Error> {
+) -> Result<std::process::ExitStatus, TakedownError> {
     let exited_within_grace = match tree.terminate() {
         Ok(()) => watch_root_exit_within(plugin, tree, grace).await,
         Err(e) => {
@@ -1347,20 +1394,25 @@ async fn finish_plugin(
     exited_within_grace: bool,
     stdout: tokio::task::JoinHandle<()>,
     stderr: tokio::task::JoinHandle<()>,
-) -> Result<std::process::ExitStatus, cosca::error::Error> {
+) -> Result<std::process::ExitStatus, TakedownError> {
     // Still running after the grace, or never asked: either way the root must go.
     let refusal = match if exited_within_grace { Ok(()) } else { tree.kill_root() } {
-        Ok(()) => return end_plugin(plugin, tree, stdout, stderr).await,
+        Ok(()) => {
+            return end_plugin(plugin, tree, stdout, stderr)
+                .await
+                .map_err(TakedownError::StopConfirmed)
+        }
         Err(refusal) => refusal,
     };
     tracing::warn!(plugin = %plugin, error = &refusal as &dyn std::error::Error, "failed to kill the plugin's root");
     drain_readers_after_exit(plugin, tree, stdout, stderr).await;
-    if root_has_exited(plugin, tree).await {
-        if let Err(e) = reap_root(tree).await {
-            tracing::warn!(plugin = %plugin, error = &e as &dyn std::error::Error, "failed to reap the plugin's root");
-        }
+    if !root_has_exited(plugin, tree).await {
+        return Err(TakedownError::StopUnconfirmed(refusal));
     }
-    Err(refusal)
+    if let Err(e) = reap_root(tree).await {
+        tracing::warn!(plugin = %plugin, error = &e as &dyn std::error::Error, "failed to reap the plugin's root");
+    }
+    Err(TakedownError::StopConfirmed(refusal))
 }
 
 /// After the child has exited (or been shut down): kill its process tree, wait for the tree to

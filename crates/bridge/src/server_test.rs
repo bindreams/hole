@@ -402,7 +402,9 @@ async fn maybe_start_plugin(
         ech_doh.as_ref(),
     )
     .await
-    .map_err(|e| ServerTestOutcome::PluginStartFailed { detail: e.to_string() })?;
+    .map_err(|e| ServerTestOutcome::PluginStartFailed {
+        detail: e.user_message(),
+    })?;
 
     // Override the server address to point at the plugin's local port. Uses
     // `set_addr`, not a rebuilt `ServerConfig::new`: for an AEAD-2022 EIH

@@ -117,7 +117,7 @@ impl ChainPlugin for HoldsFailure {
 }
 
 /// What ends the chain from a sibling, or from outside.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cause {
     /// A sibling returns `Ok(())`.
     SiblingExits,
@@ -218,7 +218,7 @@ fn start(
 }
 
 /// How the holder ends, as a row of the table below.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HolderEnd {
     /// Returns an error once the drainer's gate opens.
     Returns,
@@ -318,15 +318,19 @@ async fn run_row(row: Row) -> Result<(), String> {
     if holder_starts == Starts::First && !matches!(stopped_rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)) {
         return Err("a member behind the holder was started".into());
     }
-    // The decided failure is `run`'s result however the chain ended, the drain bound's abort and a sibling's own
-    // error included.
-    match result {
-        Err(crate::Error::StartFailed { plugin, cause })
+    // The decided failure is `run`'s result however the chain ended, a sibling's own error included. A member that
+    // panicked or was aborted at the drain bound has no observed stop, which outranks it: the caller's `ready` has
+    // the failure (checked above) and `run` returns the unconfirmed stop.
+    let stop_unconfirmed = holder_ends != HolderEnd::Returns || cause == Cause::SiblingPanics;
+    match (result, stop_unconfirmed) {
+        (Err(crate::Error::StopUnconfirmed { .. }), true) => Ok(()),
+        (Err(crate::Error::StartFailed { plugin, cause }), false)
             if plugin == "holds-failure" && is_decided_failure(holder_starts, &cause) =>
         {
             Ok(())
         }
-        other => Err(format!("run must return the holder's start failure: {other:?}")),
+        (other, true) => Err(format!("run must report the unconfirmed stop: {other:?}")),
+        (other, false) => Err(format!("run must return the holder's start failure: {other:?}")),
     }
 }
 

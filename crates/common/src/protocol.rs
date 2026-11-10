@@ -405,9 +405,10 @@ pub enum ServerTestOutcome {
     TcpRefused,
     /// Pre-flight TCP connect timed out.
     TcpTimeout,
-    /// `Plugin::start` returned `Err`, OR `wait_started` returned `false`,
-    /// OR the plugin process exited within the wait window. The string
-    /// carries the underlying error message.
+    /// The plugin chain did not come up: a plugin failed to start or exited
+    /// before it was ready, or its stop could not be confirmed (the variant
+    /// name is persisted). `detail` is the user-facing text, `ProxyError::user_message`,
+    /// with the server address redacted; the UI shows it as is.
     PluginStartFailed { detail: String },
     /// Pre-flight passed and `ProxyClientStream::connect` succeeded, but the
     /// shadowsocks server stopped responding without ever closing the stream.

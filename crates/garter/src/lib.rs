@@ -22,7 +22,7 @@ pub mod tracing_test;
 pub use binary::{BinaryPlugin, LogSink, PidSink, ReadinessMode};
 pub use chain::{ChainReady, ChainRunner, Mode};
 pub use counting::{ByteCounters, CountingStream, StreamCounters};
-pub use error::{Error, Result};
+pub use error::{Error, Result, TapStep};
 pub use plugin::ChainPlugin;
 pub use sip003::PluginEnv;
 pub use sip003::{join_plugin_options, parse_plugin_options, split_plugin_options, MalformedOptions, OptionSegment};

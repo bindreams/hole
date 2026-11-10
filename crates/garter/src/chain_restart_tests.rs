@@ -46,6 +46,8 @@ enum Attempt {
     /// Returns, and sends its bind conflict while it is being dropped, as a `BinaryPlugin` does at the end of its
     /// take-down.
     ConflictFromDrop,
+    /// Reports a bind conflict, and when stopped returns an unconfirmed stop, as a plugin whose root kill was refused.
+    ConflictThenUnconfirmedStop,
     /// Reports a fatal failure and returns.
     Fatal,
     /// Binds its listen address for real: readies if it binds, reports the OS's bind conflict if the port is taken.
@@ -202,6 +204,15 @@ impl ChainPlugin for Hop {
                     ready: Some(ready),
                     outcome: Some(bind_conflict(local)),
                 };
+            }
+            Attempt::ConflictThenUnconfirmedStop => {
+                self.rig.push(Event::Conflicted(self.name));
+                let _ = ready.send(Err(bind_conflict(local)));
+                shutdown.cancelled().await;
+                return Err(crate::Error::StopUnconfirmed {
+                    plugins: vec![self.name.to_owned()],
+                    cause: "test: the root kill was refused".into(),
+                });
             }
             Attempt::Fatal => {
                 let _ = ready.send(Err(StartError::Fatal {
@@ -530,6 +541,65 @@ async fn a_failed_attempt_has_returned_before_the_hop_is_restarted() {
             Event::Entered("A"),
             Event::ReadySent("A"),
         ]
+    );
+}
+
+/// A chain runs several hops at once, so the restart line has to say which one lost its port.
+#[skuld::test]
+async fn the_restart_log_line_names_the_plugin_that_lost_its_port() {
+    tokio::time::pause();
+    let (subscriber, writer) = crate::tap_tests::make_debug_subscriber();
+    let _g = crate::tracing_test::set_default_in_current_thread(subscriber);
+    let rig = Rig::new();
+    let runner = ChainRunner::new()
+        .add(rig.steady("A"))
+        .add(rig.hop_that_starts_with("B", vec![Attempt::Conflict { addr: None }]))
+        .with_probe(rig.probe());
+
+    let (told, _) = launch(runner).finish().await;
+
+    told.expect("the chain readies once B finds a port");
+    let log = writer.snapshot();
+    assert!(
+        log.lines()
+            .any(|l| l.contains("INFO") && l.contains("restarting the hop") && l.contains("plugin=\"B\"")),
+        "the restart line does not name B:
+{log}"
+    );
+}
+
+/// An attempt whose stop could not be confirmed may still be running on the port a new one would take: the hop is not
+/// run again, and the chain returns the unconfirmed stop.
+#[skuld::test]
+async fn a_hop_whose_stopped_attempt_is_unconfirmed_is_not_restarted_and_returns_it() {
+    tokio::time::pause();
+    let (subscriber, writer) = crate::tap_tests::make_debug_subscriber();
+    let _g = crate::tracing_test::set_default_in_current_thread(subscriber);
+    let rig = Rig::new();
+    let runner = ChainRunner::new()
+        .add(rig.steady("A"))
+        .add(rig.hop_that_starts_with("B", vec![Attempt::ConflictThenUnconfirmedStop]))
+        .with_probe(rig.probe());
+
+    let (_told, result) = launch(runner).finish().await;
+
+    assert!(
+        matches!(&result, Err(crate::Error::StopUnconfirmed { plugins, .. }) if plugins == &["B"]),
+        "got {result:?}"
+    );
+    assert_eq!(
+        rig.wiring("B").len(),
+        1,
+        "B was run again over a plugin that may still run"
+    );
+    let log = writer.snapshot();
+    assert!(
+        log.lines().any(|l| l.contains("WARN")
+            && l.contains("intermediate port lost")
+            && l.contains("not restarting")
+            && l.contains("plugin 'B' could not be confirmed stopped")),
+        "the unconfirmed stop was not logged with its plugin:
+{log}"
     );
 }
 

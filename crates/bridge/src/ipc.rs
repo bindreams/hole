@@ -14,10 +14,10 @@ use axum::http::StatusCode;
 use axum::Json;
 use hole_common::config::StartupBehavior;
 use hole_common::protocol::{
-    DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig, StartError,
-    StatusResponse, TestServerRequest, TestServerResponse, UpdateApplyRequest, VersionResponse, ROUTE_CANCEL,
-    ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
-    ROUTE_TEST_SERVER, ROUTE_UNBLOCK, ROUTE_UPDATE_APPLY, ROUTE_VERSION,
+    DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig,
+    ServerTestOutcome, StartError, StatusResponse, TestServerRequest, TestServerResponse, UpdateApplyRequest,
+    VersionResponse, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START,
+    ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER, ROUTE_UNBLOCK, ROUTE_UPDATE_APPLY, ROUTE_VERSION,
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -439,7 +439,7 @@ fn wire_cover_presence(p: tun_engine::routing::CoverPresence) -> hole_common::pr
 ///
 /// The address can arrive from outside Hole: garter formats a chain's
 /// `remote_host` — the resolved server — into the error that becomes
-/// `ProxyError::Plugin`, and that string reaches a GUI toast. The registry is
+/// `ProxyError::PluginStartFailed`, whose reason reaches a GUI toast. The registry is
 /// armed by `handle_start` before anything can fail, so a toast reading
 /// `<server:8f2a1c04>` is what the user sees instead.
 fn redact_outgoing(error: StartError) -> StartError {
@@ -448,6 +448,28 @@ fn redact_outgoing(error: StartError) -> StartError {
             message: util::redact::redact_str(&message).into_owned(),
         },
         other => other,
+    }
+}
+
+/// [`redact_outgoing`] for a test-server outcome: its text reaches a toast the same way. Every variant is listed, so a
+/// new one forces a choice.
+fn redact_outcome(outcome: ServerTestOutcome) -> ServerTestOutcome {
+    let redact = |detail: String| util::redact::redact_str(&detail).into_owned();
+    match outcome {
+        ServerTestOutcome::PluginStartFailed { detail } => {
+            ServerTestOutcome::PluginStartFailed { detail: redact(detail) }
+        }
+        ServerTestOutcome::SentinelMismatch { detail } => {
+            ServerTestOutcome::SentinelMismatch { detail: redact(detail) }
+        }
+        ServerTestOutcome::InternalError { detail } => ServerTestOutcome::InternalError { detail: redact(detail) },
+        outcome @ (ServerTestOutcome::Reachable { .. }
+        | ServerTestOutcome::DnsFailed
+        | ServerTestOutcome::TcpRefused
+        | ServerTestOutcome::TcpTimeout
+        | ServerTestOutcome::TunnelHandshakeFailed
+        | ServerTestOutcome::NetworkBlocked
+        | ServerTestOutcome::ServerCannotReachInternet) => outcome,
     }
 }
 
@@ -1328,7 +1350,7 @@ async fn handle_test_server<P: Proxy + 'static, R: Routing + 'static>(
     hole_common::logging::redact_arm::arm_server(&req.entry);
     let mut cfg = TestConfig::production();
     cfg.dns = req.dns;
-    let outcome = run_server_test(&req.entry, &cfg).await;
+    let outcome = redact_outcome(run_server_test(&req.entry, &cfg).await);
     Json(TestServerResponse { outcome })
 }
 

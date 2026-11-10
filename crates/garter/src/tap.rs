@@ -58,7 +58,7 @@
 //!    here follow a report the inner has already made, its one readiness message.
 //!    A start failure the tap has
 //!    reported is also its `run` error, so a runner with no `on_ready` sees the
-//!    chain fail. `Error::Chain` propagates.
+//!    chain fail. The error is an `Error::Tap` for a failed OS call, else `Error::Chain`.
 //! 4. Bind the tap's public listener on `local` (only after step 3, so the
 //!    public bind happens only once the data plane is actually wired
 //!    through), then report the tap's OWN readiness on the `ready` channel
@@ -98,6 +98,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::counting::CountingStream;
+use crate::error::TapStep;
 use crate::plugin::ChainPlugin;
 use crate::port::{os_probe, pick_with, retry_backoff, Probe};
 use crate::sitrep::{PluginReady, StartError, Transports};
@@ -274,15 +275,7 @@ impl ChainPlugin for TapPlugin {
             Ok(Some(addr)) => addr,
             // Shutdown before ready: drop `ready` unsent, as the readiness wait does.
             Ok(None) => return Ok(()),
-            Err(e) => {
-                let _ = ready.send(Err(StartError::Fatal {
-                    detail: format!("tap[{plugin_name}]: alloc inner port: {e}"),
-                    errno: e.raw_os_error(),
-                }));
-                return Err(crate::Error::Chain(format!(
-                    "tap[{plugin_name}]: alloc inner port: {e}"
-                )));
-            }
+            Err(e) => return Err(fail_start(&plugin_name, ready, TapStep::AllocateInnerPort, e)),
         };
 
         // 2. Spawn the inner plugin against `inner_local`.
@@ -321,7 +314,7 @@ impl ChainPlugin for TapPlugin {
             Ok(Ok(Ok(report))) if reports_the_given_address(report.listen, inner_local) => connect_target(inner_local),
             // The inner reported a listener outside the address it was given.
             Ok(Ok(Ok(report))) => {
-                stop_inner(&plugin_name, &inner_stop, inner_handle).await;
+                let stopped = stop_inner(&plugin_name, &inner_stop, inner_handle).await;
                 let detail = format!(
                     "tap[{plugin_name}]: inner reported its listener at {}, not the address {} it was given",
                     report.listen, inner_local
@@ -330,13 +323,13 @@ impl ChainPlugin for TapPlugin {
                     detail: detail.clone(),
                     errno: None,
                 }));
-                return Err(crate::Error::Chain(detail));
+                return Err(after_stop(crate::Error::Chain(detail), stopped));
             }
             // A typed failure the inner reported while still running: the
             // caller sees its class.
             Ok(Ok(Err(e))) => {
-                stop_inner(&plugin_name, &inner_stop, inner_handle).await;
-                return Err(report_inner_failure(&plugin_name, ready, e));
+                let stopped = stop_inner(&plugin_name, &inner_stop, inner_handle).await;
+                return Err(after_stop(report_inner_failure(&plugin_name, ready, e), stopped));
             }
             // The inner dropped `ready` unsent: it is exiting, or it will never report. The
             // readiness budget keeps running while it winds down.
@@ -383,21 +376,19 @@ impl ChainPlugin for TapPlugin {
         let listener = match bound {
             Ok(l) => l,
             Err(e) => {
-                stop_inner(&plugin_name, &inner_stop, inner_handle).await;
+                let stopped = stop_inner(&plugin_name, &inner_stop, inner_handle).await;
                 let _ = ready.send(Err(StartError::from_bind_failure(&e, local)));
-                return Err(crate::Error::Chain(format!("tap[{plugin_name}]: bind {local}: {e}")));
+                return Err(after_stop(tap_error(&plugin_name, TapStep::BindListener, e), stopped));
             }
         };
         let listen_addr = match listener.local_addr() {
             Ok(addr) => addr,
             Err(e) => {
-                stop_inner(&plugin_name, &inner_stop, inner_handle).await;
-                let detail = format!("tap[{plugin_name}]: read the address of the listener on {local}: {e}");
-                let _ = ready.send(Err(StartError::Fatal {
-                    detail: detail.clone(),
-                    errno: e.raw_os_error(),
-                }));
-                return Err(crate::Error::Chain(detail));
+                let stopped = stop_inner(&plugin_name, &inner_stop, inner_handle).await;
+                return Err(after_stop(
+                    fail_start(&plugin_name, ready, TapStep::ReadListenerAddress, e),
+                    stopped,
+                ));
             }
         };
         tracing::info!(
@@ -454,19 +445,17 @@ impl ChainPlugin for TapPlugin {
                     drop(listener);
                     connections.abort_all();
                     while connections.join_next().await.is_some() {}
-                    stop_inner(&plugin_name, &inner_stop, inner_handle).await;
-                    return Err(crate::Error::Chain(format!(
-                        "tap[{plugin_name}]: accept on {listen_addr} failed: {e}"
-                    )));
+                    let stopped = stop_inner(&plugin_name, &inner_stop, inner_handle).await;
+                    return Err(after_stop(
+                        tap_error(&plugin_name, TapStep::AcceptConnection, e),
+                        stopped,
+                    ));
                 }
                 Step::InnerExited(join) => {
                     drop(listener);
                     connections.abort_all();
                     while connections.join_next().await.is_some() {}
-                    return match join {
-                        Ok(result) => result,
-                        Err(je) => Err(crate::Error::Chain(format!("tap[{plugin_name}]: inner task: {je}"))),
-                    };
+                    return join_result(&plugin_name, join);
                 }
             }
         }
@@ -494,39 +483,80 @@ async fn accept_next(
 /// relaying reaches the log before the caller hears of the failure.
 ///
 /// The wait is bounded by [`INNER_STOP_BOUND`], a failure bound on external code: an inner must return once
-/// its token fires, and one that does not is warned about by name and aborted. The chain is still starting, so
-/// no `drain_timeout` runs to end it. The failure being reported is the tap's; how the inner ended is only logged.
-async fn stop_inner(
+/// its token fires, and one that does not is warned about by name and aborted, which is not an observed stop
+/// ([`Error::StopUnconfirmed`](crate::Error::StopUnconfirmed)). Whatever the inner ends with is returned, for the caller
+/// to rank against its own failure with [`after_stop`].
+pub(crate) async fn stop_inner(
     plugin_name: &str,
     inner_stop: &CancellationToken,
     mut inner_handle: AbortOnDropHandle<crate::Result<()>>,
-) {
+) -> Option<crate::Error> {
     inner_stop.cancel();
-    let joined = match tokio::time::timeout(INNER_STOP_BOUND, &mut inner_handle).await {
-        Ok(joined) => joined,
+    let (joined, aborted) = match tokio::time::timeout(INNER_STOP_BOUND, &mut inner_handle).await {
+        Ok(joined) => (joined, false),
         Err(_bound_expired) => {
             tracing::warn!(
                 plugin = %plugin_name,
                 "plugin tap: the inner did not stop within {INNER_STOP_BOUND:?} of being asked to; aborting it"
             );
             inner_handle.abort();
-            inner_handle.await
+            (inner_handle.await, true)
         }
     };
     match joined {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::debug!(
-            plugin = %plugin_name,
-            error = &e as &dyn std::error::Error,
-            "plugin tap: the inner ended with an error while the start failure was being reported"
-        ),
-        Err(je) if je.is_cancelled() => {}
-        Err(je) => tracing::warn!(
-            plugin = %plugin_name,
-            error = &je as &dyn std::error::Error,
-            "plugin tap: the inner task panicked while it was being stopped"
-        ),
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                plugin = %plugin_name,
+                error = &e as &dyn std::error::Error,
+                "plugin tap: the inner ended with an error while the start failure was being reported"
+            );
+            Some(e)
+        }
+        // Only the tap's own abort, above, is a stop bound that expired: a cancel the tap did not issue (the runtime
+        // is shutting down) is a lost task like a panic.
+        Err(je) if aborted && je.is_cancelled() => Some(crate::Error::StopUnconfirmed {
+            plugins: vec![plugin_name.to_owned()],
+            cause: Box::new(crate::Error::Chain(format!(
+                "the inner did not stop within {INNER_STOP_BOUND:?} of being asked to"
+            ))),
+        }),
+        Err(je) => Some(inner_lost(plugin_name, je)),
     }
+}
+
+/// The error a tap returns for `own` once its inner's stop is known: [`Error::then`](crate::Error::then) ranks
+/// `own` against whatever the inner ended with. `own` is logged when the inner's error outranks it, as nothing else has
+/// seen it; the inner's was logged by [`stop_inner`].
+pub(crate) fn after_stop(own: crate::Error, stopped: Option<crate::Error>) -> crate::Error {
+    match stopped {
+        Some(inner) => {
+            if inner.ranks_above(&own) {
+                tracing::warn!(
+                    error = &own as &dyn std::error::Error,
+                    "plugin tap: the start failure was outranked by how its inner ended"
+                );
+            }
+            own.then(inner)
+        }
+        None => own,
+    }
+}
+
+/// An inner whose task ended without returning (it panicked and unwound past its own take-down, or the runtime
+/// cancelled it) may have a child still running.
+fn inner_lost(plugin_name: &str, lost: tokio::task::JoinError) -> crate::Error {
+    let how = if lost.is_cancelled() {
+        "was cancelled"
+    } else {
+        "panicked"
+    };
+    tracing::warn!(
+        plugin = %plugin_name,
+        error = &lost as &dyn std::error::Error,
+        "plugin tap: the inner task {how}"
+    );
+    crate::Error::task_lost(plugin_name, lost)
 }
 
 /// The typed start failure the inner has delivered into `inner_ready_rx`, if any. Read it once the inner has ended or
@@ -536,6 +566,32 @@ fn delivered_start_failure(
     inner_ready_rx: &mut oneshot::Receiver<Result<PluginReady, StartError>>,
 ) -> Option<StartError> {
     inner_ready_rx.try_recv().ok().and_then(Result::err)
+}
+
+/// The error for a tap that failed at `step` with the OS error `cause`.
+fn tap_error(plugin: &str, step: TapStep, cause: io::Error) -> crate::Error {
+    crate::Error::Tap {
+        plugin: plugin.to_owned(),
+        step,
+        cause,
+    }
+}
+
+/// Fails the start at `step` with the OS error `cause`: reports a `Fatal` worded by the tap's error, with `cause`'s
+/// errno, and returns that error.
+fn fail_start(
+    plugin: &str,
+    ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    step: TapStep,
+    cause: io::Error,
+) -> crate::Error {
+    let errno = cause.raw_os_error();
+    let error = tap_error(plugin, step, cause);
+    let _ = ready.send(Err(StartError::Fatal {
+        detail: error.to_string(),
+        errno,
+    }));
+    error
 }
 
 /// Reports the typed failure the inner delivered as the tap's own, and returns the tap's `run` error for it.
@@ -559,16 +615,16 @@ async fn inner_not_ready(
     inner_ready_rx: &mut oneshot::Receiver<Result<PluginReady, StartError>>,
     inner_handle: AbortOnDropHandle<crate::Result<()>>,
 ) -> crate::Result<()> {
-    stop_inner(plugin_name, inner_stop, inner_handle).await;
+    let stopped = stop_inner(plugin_name, inner_stop, inner_handle).await;
     if let Some(typed) = delivered_start_failure(inner_ready_rx) {
-        return Err(report_inner_failure(plugin_name, ready, typed));
+        return Err(after_stop(report_inner_failure(plugin_name, ready, typed), stopped));
     }
     let detail = format!("tap[{plugin_name}]: inner plugin did not bind {inner_local} within {INNER_READY_TIMEOUT:?}");
     let _ = ready.send(Err(StartError::Fatal {
         detail: detail.clone(),
         errno: None,
     }));
-    Err(crate::Error::Chain(detail))
+    Err(after_stop(crate::Error::Chain(detail), stopped))
 }
 
 /// Report an inner start failure on the tap's own `ready`: the inner's typed
@@ -585,11 +641,13 @@ fn report_start_failure(
     let _ = ready.send(Err(err));
 }
 
-fn join_result(plugin_name: &str, join: Result<crate::Result<()>, tokio::task::JoinError>) -> crate::Result<()> {
-    match join {
-        Ok(result) => result,
-        Err(je) => Err(crate::Error::Chain(format!("tap[{plugin_name}]: inner task: {je}"))),
-    }
+/// What the tap returns for an inner that ended: its own result, or an inner task lost (a panic, or a cancel by the
+/// runtime) as an unconfirmed stop.
+pub(crate) fn join_result(
+    plugin_name: &str,
+    join: Result<crate::Result<()>, tokio::task::JoinError>,
+) -> crate::Result<()> {
+    join.unwrap_or_else(|lost| Err(inner_lost(plugin_name, lost)))
 }
 
 /// [`join_result`] for an inner that ended before it was ready, after the tap reported the start failure on `ready`:
@@ -620,18 +678,11 @@ async fn drain_after_shutdown(
         report_start_failure(plugin_name, ready, Some(typed));
         return failed_start_result(plugin_name, join);
     }
-    match join {
-        Err(je) if je.is_cancelled() => Ok(()),
-        join => join_result(plugin_name, join),
-    }
+    join_result(plugin_name, join)
 }
 
 async fn drain_inner(plugin_name: &str, inner_handle: AbortOnDropHandle<crate::Result<()>>) -> crate::Result<()> {
-    match inner_handle.await {
-        Ok(result) => result,
-        Err(je) if je.is_cancelled() => Ok(()),
-        Err(je) => Err(crate::Error::Chain(format!("tap[{plugin_name}]: inner task: {je}"))),
-    }
+    join_result(plugin_name, inner_handle.await)
 }
 
 /// Whether the inner reported the address it was given. A wildcard given ip

@@ -303,6 +303,31 @@ async fn on_ready_fires_with_the_bound_address() {
     handle.abort();
 }
 
+/// A server that does not resolve fails `run` before any plugin starts, naming the server and keeping the lookup's error
+/// as the source. `.invalid` never resolves (RFC 6761).
+#[skuld::test]
+async fn an_unresolvable_server_fails_the_run_naming_it() {
+    use std::error::Error as _;
+
+    let mut env = test_env();
+    env.remote_host = "garter-test.invalid".into();
+    env.remote_port = 443;
+    let runner = ChainRunner::new().add(Box::new(FailingPlugin));
+
+    let result = runner.run(env).await;
+
+    match result {
+        Err(error @ crate::Error::Resolve { .. }) => {
+            assert_eq!(
+                error.to_string(),
+                "could not resolve the server garter-test.invalid:443"
+            );
+            assert!(error.source().is_some(), "a failed lookup keeps its error");
+        }
+        other => panic!("want the resolve failure, got {other:?}"),
+    }
+}
+
 #[skuld::test]
 async fn on_ready_dropped_on_plugin_failure() {
     let (tx, rx) = oneshot::channel();
@@ -314,22 +339,21 @@ async fn on_ready_dropped_on_plugin_failure() {
 
     let handle = tokio::spawn(runner.run(env));
 
-    // The plugin exits before readying, so the chain synthesizes a
-    // process-exit `StartError::Fatal` and sends it through ready_tx.
+    // The plugin exits with an error before readying, so the chain sends the error's own words through ready_tx.
     let outcome = rx.await.expect("the chain should report a start error, not drop");
     match outcome {
-        Err(StartError::Fatal { detail, .. }) => {
-            assert!(
-                detail.contains("exited before becoming ready"),
-                "expected exited-before-ready Fatal, got: {detail}"
-            );
+        Err(StartError::Fatal { detail, errno: None }) => {
+            assert_eq!(detail, "plugin 'failing' exited with code 1");
         }
         other => panic!("expected StartError::Fatal, got {other:?}"),
     }
 
-    // The chain should have returned an error.
+    // The chain returns the plugin's own error.
     let chain_result = handle.await.unwrap();
-    assert!(chain_result.is_err());
+    assert!(
+        matches!(&chain_result, Err(crate::Error::PluginExit { name, code: 1 }) if name == "failing"),
+        "{chain_result:?}"
+    );
 }
 
 /// The chain reports the end-to-end transports as the intersection
@@ -750,18 +774,14 @@ async fn long_running_plugin_survives_past_drain_timeout() {
     tokio::time::resume();
     let result = handle.await.expect("no JoinError");
 
-    match result {
-        Err(crate::Error::Chain(msg)) if msg.contains("drain timeout expired") => {}
-        other => panic!("expected drain-timeout error, got {other:?}"),
-    }
+    // Aborting the plugin ends it by dropping it, which nothing observes: its stop is not confirmed.
+    assert_unconfirmed_with_cause(result, &["stubborn"], is_the_drain_timeout);
 }
 
-/// When a plugin errors — triggering shutdown — and another plugin in the
-/// chain outlives the drain budget, the plugin-level error must take
-/// precedence over the drain-timeout error. The plugin error is the more
-/// diagnostic of the two.
+/// When a plugin errors — triggering shutdown — and another plugin in the chain outlives the drain budget, the
+/// aborted member's unconfirmed stop outranks the plugin-level error, which was logged when it happened.
 #[skuld::test]
-async fn first_error_preserved_across_drain() {
+async fn an_aborted_member_outranks_the_error_that_ended_the_chain() {
     let drain_timeout = std::time::Duration::from_millis(200);
 
     let runner = ChainRunner::new()
@@ -777,10 +797,37 @@ async fn first_error_preserved_across_drain() {
     let handle = tokio::spawn(runner.run(env));
     let result = handle.await.expect("no JoinError");
 
-    match result {
-        Err(crate::Error::PluginExit { code: 1, .. }) => {}
-        other => panic!("expected FailingPlugin's PluginExit error to be preserved, got {other:?}"),
-    }
+    // The stubborn plugin was aborted, so the chain reports that.
+    assert_unconfirmed_with_cause(result, &["stubborn"], is_the_drain_timeout);
+}
+
+/// Every member the drain bound aborts is named.
+#[skuld::test]
+async fn the_drain_bound_names_every_aborted_member() {
+    let cancel = CancellationToken::new();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(StubbornPlugin {
+            name: "stubborn-a".into(),
+        }))
+        .add(Box::new(StubbornPlugin {
+            name: "stubborn-b".into(),
+        }))
+        .on_ready(ready_tx)
+        .cancel_token(cancel.clone())
+        .drain_timeout(std::time::Duration::from_millis(200));
+    let mut env = test_env();
+    env.local_port = free_loopback_port().port();
+    let handle = tokio::spawn(runner.run(env));
+    ready_rx.await.expect("the chain readies").expect("no start failure");
+    cancel.cancel();
+
+    let Err(crate::Error::StopUnconfirmed { mut plugins, .. }) = handle.await.expect("no JoinError") else {
+        panic!("expected an unconfirmed stop");
+    };
+
+    plugins.sort();
+    assert_eq!(plugins, ["stubborn-a", "stubborn-b"]);
 }
 
 /// A single instant-exit plugin: the chain should return `Ok(())` as soon
@@ -877,10 +924,8 @@ async fn external_cancel_concurrent_with_plugin_error_preserves_plugin_error() {
 
     let result = handle.await.expect("no JoinError");
 
-    match result {
-        Err(crate::Error::PluginExit { code: 1, .. }) => {}
-        other => panic!("expected FailingPlugin's PluginExit error to be preserved, got {other:?}"),
-    }
+    // The stubborn plugin was aborted, so the chain reports that.
+    assert_unconfirmed_with_cause(result, &["stubborn"], is_the_drain_timeout);
 }
 
 /// How long a member's take-down takes once it is told to stop: a `BinaryPlugin`'s own two waits (5 s for the root
@@ -986,8 +1031,6 @@ impl ChainPlugin for PanicsWhenAborted {
 #[skuld::test]
 async fn a_member_that_fails_in_the_abort_window_is_recorded() {
     tokio::time::pause();
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let cancel = CancellationToken::new();
     let runner = ChainRunner::new()
         .add(Box::new(PanicsWhenAborted))
@@ -1002,12 +1045,8 @@ async fn a_member_that_fails_in_the_abort_window_is_recorded() {
         .await
         .expect("the chain never ended")
         .unwrap();
-    std::panic::set_hook(previous);
 
-    assert!(
-        matches!(&result, Err(crate::Error::Chain(msg)) if msg.contains("panicked")),
-        "want the panic, got {result:?}"
-    );
+    assert_unconfirmed_with_cause(result, &["panics-when-aborted"], is_a_panic);
 }
 
 // record_exit structured-field tests ==================================================================================
@@ -1086,10 +1125,10 @@ async fn record_exit_logs_killed_for_signal_death() {
     assert!(!snap.contains("exit_code"), "no exit_code field for killed: {snap}");
 }
 
-/// A plugin panic surfaces through `record_exit`'s `JoinError` arm as a
-/// `Chain` error whose message identifies the panic.
+/// A plugin panic surfaces through `record_exit`'s `JoinError` arm as an unconfirmed stop whose cause identifies the
+/// panic: the plugin's child was left to its handle's drop, which nothing observes.
 #[skuld::test]
-async fn plugin_panic_surfaces_as_chain_error() {
+async fn plugin_panic_surfaces_as_an_unconfirmed_stop() {
     let runner = ChainRunner::new()
         .add(Box::new(PanickingPlugin))
         .drain_timeout(std::time::Duration::from_millis(200));
@@ -1097,19 +1136,89 @@ async fn plugin_panic_surfaces_as_chain_error() {
     let mut env = test_env();
     env.local_port = free_loopback_port().port();
 
-    // Suppress the panic's backtrace noise in the test output.
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let result = runner.run(env).await;
-    std::panic::set_hook(prev_hook);
 
-    match result {
-        Err(crate::Error::Chain(msg)) if msg.contains("panicked") => {}
-        other => panic!("expected Chain(\"...panicked...\") error, got {other:?}"),
+    assert_unconfirmed_with_cause(result, &["panicking"], is_a_panic);
+}
+
+/// A plugin that fails to start, then returns an unconfirmed stop when it is taken down.
+struct RefusesToStop;
+
+#[async_trait::async_trait]
+impl ChainPlugin for RefusesToStop {
+    fn name(&self) -> &str {
+        "refuses-to-stop"
+    }
+
+    async fn run(
+        &self,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    ) -> crate::Result<()> {
+        let _ = ready.send(Err(StartError::Fatal {
+            detail: "it failed".into(),
+            errno: None,
+        }));
+        shutdown.cancelled().await;
+        Err(crate::Error::StopUnconfirmed {
+            plugins: vec!["refuses-to-stop".into()],
+            cause: Box::new(crate::Error::Cosca(cosca::error::Error::Io(
+                std::io::ErrorKind::PermissionDenied.into(),
+            ))),
+        })
     }
 }
 
-use crate::chain::{judge, HopFailure, Pending, Readiness, ReadyGate, Verdict};
+type Cause = dyn std::error::Error + Send + Sync + 'static;
+
+fn is_the_drain_timeout(cause: &Cause) -> bool {
+    matches!(cause.downcast_ref::<crate::Error>(), Some(crate::Error::Chain(msg)) if msg == "drain timeout expired")
+}
+
+/// The cause of a plugin task that panicked is the `JoinError` itself.
+fn is_a_panic(cause: &Cause) -> bool {
+    matches!(cause.downcast_ref::<tokio::task::JoinError>(), Some(join) if join.is_panic())
+}
+
+/// Whether `result` is `run` ending on an unconfirmed stop of exactly `plugins`, with a cause `cause_is` accepts.
+fn is_unconfirmed(result: &crate::Result<()>, plugins: &[&str], cause_is: impl FnOnce(&Cause) -> bool) -> bool {
+    matches!(result, Err(crate::Error::StopUnconfirmed { plugins: named, cause })
+        if named == plugins && cause_is(&**cause))
+}
+
+fn assert_unconfirmed_with_cause(result: crate::Result<()>, plugins: &[&str], cause_is: impl FnOnce(&Cause) -> bool) {
+    assert!(
+        is_unconfirmed(&result, plugins, cause_is),
+        "expected an unconfirmed stop of {plugins:?}, got {result:?}"
+    );
+}
+
+/// The start failure the caller hears of must not hide that a member's stop was not confirmed: the unconfirmed stop
+/// is what the chain returns, with its own failure as the cause; the start failure was logged when it happened.
+#[skuld::test]
+async fn an_unconfirmed_stop_outranks_the_start_failure() {
+    let (tx, rx) = oneshot::channel();
+    let runner = ChainRunner::new().add(Box::new(RefusesToStop)).on_ready(tx);
+    let mut env = test_env();
+    env.local_port = free_loopback_port().port();
+
+    let result = runner.run(env).await;
+
+    assert_unconfirmed_with_cause(result, &["refuses-to-stop"], |cause| {
+        matches!(
+            cause.downcast_ref::<crate::Error>(),
+            Some(crate::Error::Cosca(cosca::error::Error::Io(e))) if e.kind() == std::io::ErrorKind::PermissionDenied
+        )
+    });
+    assert!(
+        matches!(rx.await, Ok(Err(StartError::Fatal { .. }))),
+        "the caller is still told"
+    );
+}
+
+use crate::chain::{judge, HopFailure, HopFailureKind, Pending, Readiness, ReadyGate, Verdict};
 use crate::hop::Decision;
 
 fn ready_decision(port: u16) -> Decision {
@@ -1135,7 +1244,10 @@ fn a_start_failure_delivered_before_shutdown_won_the_race_is_judged_a_failure() 
         addr: "127.0.0.1:1080".parse().unwrap(),
     });
     match judge(Ok(decision), &shutdown) {
-        Verdict::Failed(StartError::BindConflict { errno, .. }) => assert_eq!(errno, 98),
+        Verdict::Failed {
+            cause: StartError::BindConflict { errno, .. },
+            kind: HopFailureKind::Reported,
+        } => assert_eq!(errno, 98),
         other => panic!("a delivered StartError must be reported, not discarded; got {other:?}"),
     }
 }
@@ -1148,7 +1260,13 @@ fn judging_a_start_failure_cancels_the_chain() {
     let verdict = judge(Ok(Decision::Failed(fatal())), &shutdown);
 
     assert!(
-        matches!(verdict, Verdict::Failed(StartError::Fatal { .. })),
+        matches!(
+            verdict,
+            Verdict::Failed {
+                cause: StartError::Fatal { .. },
+                kind: HopFailureKind::Reported
+            }
+        ),
         "{verdict:?}"
     );
     assert!(shutdown.is_cancelled(), "a start failure must stop the other plugins");
@@ -1162,7 +1280,7 @@ fn a_hop_that_dropped_its_sender_unsent_is_judged_a_failure() {
     let verdict = judge(Ok(Decision::Dropped), &shutdown);
 
     assert!(
-        matches!(&verdict, Verdict::Failed(StartError::Fatal { detail, .. }) if detail.contains("exited before becoming ready")),
+        matches!(&verdict, Verdict::Failed { cause: StartError::Fatal { detail, .. }, kind: HopFailureKind::EndedBeforeReady } if detail.contains("exited before becoming ready")),
         "{verdict:?}"
     );
     assert!(shutdown.is_cancelled());
@@ -1236,7 +1354,7 @@ fn a_hop_that_ended_without_a_decision_fails_the_start_while_the_chain_runs() {
     let verdict = judge(rx.blocking_recv(), &shutdown);
 
     assert!(
-        matches!(&verdict, Verdict::Failed(StartError::Fatal { detail, .. }) if detail.contains("exited before becoming ready")),
+        matches!(&verdict, Verdict::Failed { cause: StartError::Fatal { detail, .. }, kind: HopFailureKind::EndedBeforeReady } if detail.contains("exited before becoming ready")),
         "{verdict:?}"
     );
     assert!(shutdown.is_cancelled(), "a failed start must cancel the chain");
@@ -1261,6 +1379,11 @@ fn pending(decision: oneshot::Receiver<Decision>) -> Pending {
 /// Whether `result` is `run` ending on `plugin`'s failed start, with a cause `cause_is` accepts.
 fn is_start_failed(result: &crate::Result<()>, plugin: &str, cause_is: impl Fn(&StartError) -> bool) -> bool {
     matches!(result, Err(crate::Error::StartFailed { plugin: p, cause }) if p == plugin && cause_is(cause))
+}
+
+/// What `on_ready` receives for a hop that ended before ready with `error` of its own.
+fn told_as_its_own_error(reported: &Reported, error: &str) -> bool {
+    matches!(reported, Ok(Err(StartError::Fatal { detail, errno: None })) if detail == error)
 }
 
 fn exited_before_ready(cause: &StartError) -> bool {
@@ -1294,12 +1417,111 @@ fn the_gate_holds_a_start_failure_until_released() {
     gate.absorb(Readiness::Failed(HopFailure {
         plugin: "broken".into(),
         cause: fatal(),
+        kind: HopFailureKind::Reported,
     }));
     assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
 
-    let released = gate.release();
+    let released = gate.release(Ok(()));
     assert!(matches!(rx.try_recv(), Ok(Err(StartError::Fatal { .. }))));
-    assert!(matches!(released, Some(HopFailure { plugin, .. }) if plugin == "broken"));
+    assert!(is_start_failed(&released, "broken", |cause| matches!(
+        cause,
+        StartError::Fatal { .. }
+    )));
+}
+
+/// The gate may report another error over a hop's start failure, so the failure is logged as the gate takes it.
+#[skuld::test]
+fn the_gate_logs_a_start_failure_when_it_takes_it() {
+    let (subscriber, writer) = crate::tap_tests::make_debug_subscriber();
+    let _g = crate::tracing_test::set_default_in_current_thread(subscriber);
+    let mut gate = ReadyGate::new(None);
+
+    gate.absorb(Readiness::Failed(HopFailure {
+        plugin: "broken".into(),
+        cause: fatal(),
+        kind: HopFailureKind::Reported,
+    }));
+
+    let log = writer.snapshot();
+    assert!(
+        log.lines()
+            .any(|l| l.contains("WARN") && l.contains("broken") && l.contains("broke")),
+        "the start failure was not logged:
+{log}"
+    );
+}
+
+/// A failure a preempted hop delivers after the loop ended is taken at the release, and logged there: it too may lose
+/// to a stop that was not confirmed.
+#[skuld::test]
+fn the_gate_logs_the_failure_a_preempted_hop_delivered_when_it_takes_it() {
+    let (subscriber, writer) = crate::tap_tests::make_debug_subscriber();
+    let _g = crate::tracing_test::set_default_in_current_thread(subscriber);
+    let mut gate = ReadyGate::new(None);
+    let (hop_tx, unread) = oneshot::channel();
+    gate.absorb(Readiness::Preempted {
+        unread: Some(pending(unread)),
+    });
+    hop_tx.send(Decision::Failed(fatal())).unwrap();
+    assert_eq!(writer.snapshot(), "", "nothing is taken before the release");
+
+    let ended = gate.release(Ok(()));
+
+    assert!(is_start_failed(&ended, "hop", |cause| matches!(
+        cause,
+        StartError::Fatal { .. }
+    )));
+    let log = writer.snapshot();
+    assert!(
+        log.lines()
+            .any(|l| l.contains("WARN") && l.contains("hop") && l.contains("broke")),
+        "the delivered failure was not logged:
+{log}"
+    );
+}
+
+/// What the gate tells the caller and returns for each way a hop failed and each thing the members returned.
+#[skuld::test]
+fn the_gate_ends_each_kind_of_failure_by_what_the_members_returned() {
+    let own_error = || crate::Error::PluginExit {
+        name: "hop".into(),
+        code: 3,
+    };
+    for (kind, drained, run_ends_with_own_error, told_detail) in [
+        (HopFailureKind::Reported, Ok(()), false, "broke"),
+        (HopFailureKind::Reported, Err(own_error()), false, "broke"),
+        (
+            HopFailureKind::EndedBeforeReady,
+            Err(own_error()),
+            true,
+            "plugin 'hop' exited with code 3",
+        ),
+        (HopFailureKind::EndedBeforeReady, Ok(()), false, "broke"),
+    ] {
+        let case = format!("{kind:?}, members returned {drained:?}");
+        let (tx, mut rx) = oneshot::channel();
+        let mut gate = ReadyGate::new(Some(tx));
+        gate.absorb(Readiness::Failed(HopFailure {
+            plugin: "hop".into(),
+            cause: fatal(),
+            kind,
+        }));
+
+        let ended = gate.release(drained);
+
+        match rx.try_recv() {
+            Ok(Err(StartError::Fatal { detail, .. })) => assert_eq!(detail, told_detail, "{case}"),
+            other => panic!("{case}: on_ready got {other:?}"),
+        }
+        if run_ends_with_own_error {
+            assert!(
+                matches!(&ended, Err(crate::Error::PluginExit { name, code: 3 }) if name == "hop"),
+                "{case}: {ended:?}"
+            );
+        } else {
+            assert!(is_start_failed(&ended, "hop", |_| true), "{case}: {ended:?}");
+        }
+    }
 }
 
 /// What the gate hands back does not depend on a caller listening: a chain with no `on_ready` still learns of the
@@ -1310,8 +1532,9 @@ fn the_gate_returns_the_failure_with_no_caller_registered() {
     found.absorb(Readiness::Failed(HopFailure {
         plugin: "found".into(),
         cause: fatal(),
+        kind: HopFailureKind::Reported,
     }));
-    assert!(matches!(found.release(), Some(HopFailure { plugin, .. }) if plugin == "found"));
+    assert!(is_start_failed(&found.release(Ok(())), "found", |_| true));
 
     let mut delivered = ReadyGate::new(None);
     let (hop_tx, unread) = oneshot::channel();
@@ -1319,9 +1542,9 @@ fn the_gate_returns_the_failure_with_no_caller_registered() {
         unread: Some(pending(unread)),
     });
     hop_tx.send(Decision::Failed(fatal())).unwrap();
-    assert!(matches!(delivered.release(), Some(HopFailure { plugin, .. }) if plugin == "hop"));
+    assert!(is_start_failed(&delivered.release(Ok(())), "hop", |_| true));
 
-    assert!(ReadyGate::new(None).release().is_none());
+    assert!(ReadyGate::new(None).release(Ok(())).is_ok());
 }
 
 /// Nothing to report: the sender stays open until the release, so the caller channel does not close early.
@@ -1336,7 +1559,7 @@ fn the_gate_keeps_the_sender_open_when_there_is_nothing_to_report_until_released
     });
     assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
 
-    gate.release();
+    let _ = gate.release(Ok(()));
     assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
 }
 
@@ -1368,7 +1591,7 @@ fn the_gate_reports_what_the_preempted_hop_delivered_by_the_release() {
         } else if hop_drops_it {
             drop(hop_tx);
         }
-        gate.release();
+        let _ = gate.release(Ok(()));
 
         match rx.try_recv() {
             Ok(Err(StartError::Fatal { .. })) => assert!(reported_fatal, "{case}"),
@@ -1386,7 +1609,7 @@ fn the_gate_keeps_the_sender_open_until_released_even_if_nothing_is_left_to_read
     gate.absorb(Readiness::Preempted { unread: None });
     assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
 
-    gate.release();
+    let _ = gate.release(Ok(()));
     assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
 }
 
@@ -1397,7 +1620,7 @@ fn the_gate_keeps_the_sender_open_until_released_even_if_it_never_absorbed_anyth
     let gate = ReadyGate::new(Some(tx));
     assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
 
-    gate.release();
+    let _ = gate.release(Ok(()));
     assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
 }
 
@@ -1616,12 +1839,12 @@ async fn an_exit_before_ready_waits_for_the_other_members_last_line() {
     let outcome = outcome.expect("the chain dropped `ready_tx` unsent");
 
     assert!(
-        matches!(&outcome, Err(StartError::Fatal { detail, .. }) if detail.contains("exited before becoming ready")),
-        "want the synthesized exited-before-ready Fatal, got {outcome:?}"
+        matches!(&outcome, Err(StartError::Fatal { detail, errno: None }) if detail == "plugin 'fails-at-start' exited with code 3"),
+        "want the member's own error as a Fatal, got {outcome:?}"
     );
     assert!(
-        is_start_failed(&result, "fails-at-start", exited_before_ready),
-        "run must return the failed start, got {result:?}"
+        matches!(&result, Err(crate::Error::PluginExit { name, code: 3 }) if name == "fails-at-start"),
+        "run must return the member's own error, got {result:?}"
     );
 }
 
@@ -1666,13 +1889,19 @@ async fn a_start_failure_in_the_first_started_member_leaves_the_next_one_unstart
 
         let result = runner.run(env).await;
 
-        assert!(
-            is_start_failed(&result, "fails-at-start", |cause| matches!(
-                cause,
-                StartError::Fatal { .. }
-            )),
-            "run must return the failed start, got {result:?}"
-        );
+        match how {
+            StartFailure::Typed => assert!(
+                is_start_failed(&result, "fails-at-start", |cause| matches!(
+                    cause,
+                    StartError::Fatal { .. }
+                )),
+                "run must return the failed start, got {result:?}"
+            ),
+            StartFailure::Dropped => assert!(
+                matches!(&result, Err(crate::Error::PluginExit { name, code: 3 }) if name == "fails-at-start"),
+                "run must return the member's own error, got {result:?}"
+            ),
+        }
         assert!(matches!(ready_rx.await, Ok(Err(StartError::Fatal { .. }))));
         assert!(
             !entered.load(Ordering::SeqCst),
@@ -1735,14 +1964,7 @@ async fn a_start_failure_is_delivered_once_the_drain_bound_expires_on_a_member_t
         "want the member's own Fatal, got {outcome:?}"
     );
     let result = handle.await.unwrap();
-    assert!(
-        is_start_failed(
-            &result,
-            "fails-at-start",
-            |cause| matches!(cause, StartError::Fatal { detail, .. } if detail == "member broke")
-        ),
-        "the start failure outranks the drain-timeout error: {result:?}"
-    );
+    assert_unconfirmed_with_cause(result, &["stubborn"], is_the_drain_timeout);
 }
 
 // The caller is released only after every member returned -------------------------------------------------------------
@@ -1859,12 +2081,12 @@ async fn an_exit_that_leaves_ready_open_is_a_failed_start() {
     let (reported, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(ReadyHolderCrash)).await;
 
     assert!(
-        matches!(&reported, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")),
-        "want the synthesized exited-before-ready Fatal, got {reported:?}"
+        told_as_its_own_error(&reported, "plugin 'ready-holder-crash' exited with code 3"),
+        "want the member's own error as a Fatal, got {reported:?}"
     );
     assert!(
-        is_start_failed(&result, "ready-holder-crash", exited_before_ready),
-        "run must return the failed start, got {result:?}"
+        matches!(&result, Err(crate::Error::PluginExit { name, code: 3 }) if name == "ready-holder-crash"),
+        "run must return the member's own error, got {result:?}"
     );
 }
 
@@ -1890,12 +2112,12 @@ async fn a_probe_owned_member_that_exits_before_ready_reports_the_typed_fatal() 
     let (reported, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(ProbeLikeCrash)).await;
 
     assert!(
-        matches!(&reported, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")),
-        "want the synthesized exited-before-ready Fatal, got {reported:?}"
+        told_as_its_own_error(&reported, "plugin 'probe-like-crash' exited with code 3"),
+        "want the member's own error as a Fatal, got {reported:?}"
     );
     assert!(
-        is_start_failed(&result, "probe-like-crash", exited_before_ready),
-        "run must return the failed start, got {result:?}"
+        matches!(&result, Err(crate::Error::PluginExit { name, code: 3 }) if name == "probe-like-crash"),
+        "run must return the member's own error, got {result:?}"
     );
 }
 
@@ -1910,29 +2132,23 @@ async fn a_probe_owned_first_started_member_that_exits_before_ready_reports_the_
     let result = runner.run(env).await;
 
     assert!(
-        matches!(ready_rx.await, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready"))
+        matches!(ready_rx.await, Ok(Err(StartError::Fatal { detail, errno: None })) if detail == "plugin 'probe-like-crash' exited with code 3")
     );
     assert!(
-        is_start_failed(&result, "probe-like-crash", exited_before_ready),
+        matches!(&result, Err(crate::Error::PluginExit { name, code: 3 }) if name == "probe-like-crash"),
         "{result:?}"
     );
 }
 
 #[skuld::test]
 async fn a_member_that_panics_at_start_waits_for_the_other_members_last_line() {
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let (reported, result) = assert_failure_waits_for_the_other_members_last_line(Box::new(PanicsAtStart)).await;
-    std::panic::set_hook(prev_hook);
 
     assert!(
         !matches!(reported, Ok(Ok(_))),
         "a chain whose member panicked is not ready: {reported:?}"
     );
-    assert!(
-        is_start_failed(&result, "panics-at-start", exited_before_ready),
-        "a panic before ready is a failed start, got {result:?}"
-    );
+    assert_unconfirmed_with_cause(result, &["panics-at-start"], is_a_panic);
 }
 
 /// An external cancel before the chain is ready is not a start failure, but the caller's `ready` is still released
@@ -1990,22 +2206,25 @@ fn on_a_multi_thread_runtime_an_exit_before_ready_waits_for_the_other_members_la
         .build()
         .unwrap();
     rt.block_on(async {
-        for failing in [
-            Box::new(ProbeLikeCrash) as Box<dyn ChainPlugin>,
-            Box::new(FailsAtStart {
-                how: StartFailure::Dropped,
-                lingers: false,
-            }),
+        for (failing, own_error) in [
+            (
+                Box::new(ProbeLikeCrash) as Box<dyn ChainPlugin>,
+                "plugin 'probe-like-crash' exited with code 3",
+            ),
+            (
+                Box::new(FailsAtStart {
+                    how: StartFailure::Dropped,
+                    lingers: false,
+                }),
+                "plugin 'fails-at-start' exited with code 3",
+            ),
         ] {
             let mut chain = FailingChain::start(failing, DRAIN);
             chain.until_the_healthy_member_is_stopped().await;
             let (reported, result) = chain.open_the_gate().await;
+            assert!(told_as_its_own_error(&reported, own_error), "{reported:?}");
             assert!(
-                matches!(&reported, Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")),
-                "{reported:?}"
-            );
-            assert!(
-                matches!(&result, Err(crate::Error::StartFailed { cause, .. }) if exited_before_ready(cause)),
+                matches!(&result, Err(crate::Error::PluginExit { code: 3, .. })),
                 "{result:?}"
             );
         }
@@ -2032,15 +2251,13 @@ async fn the_caller_is_released_once_the_drain_bound_expires_on_a_member_that_ig
     let reported = ready_rx
         .await
         .expect("the caller must be released with the failure, not left waiting");
+    // The member's own error is outranked by the stubborn member's unconfirmed stop, which is what the members returned.
     assert!(
-        matches!(&reported, Err(StartError::Fatal { detail, .. }) if detail.contains("exited before becoming ready")),
+        matches!(&reported, Err(StartError::Fatal { detail, errno: None }) if detail == "plugin 'stubborn' could not be confirmed stopped"),
         "{reported:?}"
     );
     let result = handle.await.unwrap();
-    assert!(
-        is_start_failed(&result, "ready-holder-crash", exited_before_ready),
-        "the start failure outranks the drain-timeout error: {result:?}"
-    );
+    assert_unconfirmed_with_cause(result, &["stubborn"], is_the_drain_timeout);
 }
 
 // poll_ready ==========================================================================================================

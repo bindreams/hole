@@ -3191,7 +3191,7 @@ fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
         config.server.plugin = Some("definitely-not-a-real-plugin-binary".into());
         let err = pm.start(&config).await.unwrap_err();
         assert!(
-            matches!(err, ProxyError::Plugin(_)),
+            matches!(err, ProxyError::PluginStartFailed(_)),
             "expected plugin-spawn failure AFTER a successful DoH resolve, got {err:?}"
         );
         assert!(

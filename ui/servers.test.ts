@@ -345,6 +345,14 @@ describe("userMessageFor", () => {
   });
 });
 
+describe("userMessageFor plugin_start_failed", () => {
+  it("shows the bridge's text as it is, with no prefix of its own", async () => {
+    const { userMessageFor } = await import("./servers");
+    const detail = "the plugin chain failed to start: could not spawn plugin 'ex-ray'";
+    expect(userMessageFor({ kind: "plugin_start_failed", detail })).toBe(detail);
+  });
+});
+
 describe("importFromDialog", () => {
   it("asks the backend to open the picker rather than opening one itself", async () => {
     // The picker, the import and the failure dialogs all live in Rust so

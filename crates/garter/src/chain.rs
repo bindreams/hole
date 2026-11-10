@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -190,10 +191,10 @@ impl ChainRunner {
     /// value.
     ///
     /// If the drain budget expires while plugins are still running,
-    /// [`ChainRunner::run`] calls `JoinSet::abort_all` and returns
-    /// `Err(Chain("drain timeout expired"))` — unless a plugin-level error
-    /// was already captured, in which case that error takes precedence, and a start
-    /// failure ([`Error::StartFailed`](crate::Error::StartFailed)) outranks both.
+    /// [`ChainRunner::run`] calls `JoinSet::abort_all`, which ends each by dropping it: nothing observes that its
+    /// child stopped. `run` then returns [`Error::StopUnconfirmed`](crate::Error::StopUnconfirmed) naming the members
+    /// the abort ended, with `Chain("drain timeout expired")` as its cause. A member that returned while the abort took
+    /// effect is not named; if none was dropped, `run` returns what it would have.
     ///
     /// The default is 12 seconds. It must outlast the longest take-down a
     /// plugin may need after a shutdown: a `BinaryPlugin` gives its child 5
@@ -272,9 +273,22 @@ impl ChainRunner {
     ///
     /// Any other start failure (a hop's reported failure, or a hop that ends before it is ready) ends the chain: every
     /// plugin is cancelled, with or without an [`on_ready`](ChainRunner::on_ready) callback, and `run` returns
-    /// [`Error::StartFailed`](crate::Error::StartFailed) with the hop and its typed cause once every plugin has returned.
-    /// It does so whatever the failed hop's own `run` returned, and ahead of another member's exit error and of the
-    /// drain-timeout error. A hop's own exit error is logged when it exits. A shutdown before every hop is ready is not
+    /// the failure once every plugin has returned. What it returns, and what `on_ready` receives, depends on how the hop
+    /// failed:
+    ///
+    /// - A hop that reported a typed failure: [`Error::StartFailed`](crate::Error::StartFailed) with the hop and that
+    ///   failure, ahead of another member's exit error (whatever the hop's own `run` returned, `Ok(())` included).
+    ///   `on_ready` receives the reported failure.
+    /// - A hop that ended before ready without reporting one, and a member returned an error: that error, as the members
+    ///   returned it. `on_ready` receives a [`StartError::Fatal`] worded by the error's `Display`, with no errno.
+    /// - A hop that ended before ready without reporting one, and every member returned `Ok(())`: `StartFailed` with a
+    ///   synthesized `Fatal` ("plugin exited before becoming ready"), which `on_ready` receives too.
+    ///
+    /// In every case a member whose stop could not be confirmed
+    /// ([`Error::StopUnconfirmed`](crate::Error::StopUnconfirmed): a refused root kill, a failed reap, a panic, the
+    /// drain bound) outranks the error reported, and so does a refused pid sink
+    /// ([`Error::PidSink`](crate::Error::PidSink)), in that order. Every hop's own
+    /// exit error is logged when it exits. A shutdown before every hop is ready is not
     /// itself a start failure: `run` returns what its members returned, unless the hop that was starting had delivered a
     /// start failure by the time every member returned, which is then reported as above.
     #[debug_requires(!self.plugins.is_empty(), "chain must have at least one plugin")]
@@ -282,10 +296,17 @@ impl ChainRunner {
         let n = self.plugins.len();
 
         // Resolve remote address
-        let remote_addr: SocketAddr = tokio::net::lookup_host(format!("{}:{}", env.remote_host, env.remote_port))
-            .await?
+        let server = format!("{}:{}", env.remote_host, env.remote_port);
+        let resolved = tokio::net::lookup_host(server.clone())
+            .await
+            .map_err(|cause| crate::Error::Resolve {
+                server: server.clone(),
+                cause: Some(cause),
+            })?;
+        let remote_addr: SocketAddr = resolved
+            .into_iter()
             .next()
-            .ok_or_else(|| crate::Error::Chain(format!("failed to resolve {}:{}", env.remote_host, env.remote_port)))?;
+            .ok_or(crate::Error::Resolve { server, cause: None })?;
         let flow = self.mode.flow(n, env.local_addr(), remote_addr);
 
         // Shared shutdown token. ChainRunner owns its own shutdown scope —
@@ -309,7 +330,7 @@ impl ChainRunner {
             });
         }
 
-        let mut set = tokio::task::JoinSet::new();
+        let mut members = Members::default();
         // `gate` alone owns the caller's `ready` sender, so nothing releases it before the plugins have drained.
         let mut gate = ReadyGate::new(self.ready_tx);
         let mut start = StartSequence::new(self.plugins, self.mode, flow);
@@ -317,7 +338,7 @@ impl ChainRunner {
         {
             start.probe = self.probe;
         }
-        start.launch(&mut set, &shutdown);
+        start.launch(&mut members, &shutdown);
 
         // Phase 1: run unbounded until either all plugins exit naturally or
         // shutdown is requested. Any plugin exit (clean or error) also fires
@@ -336,13 +357,13 @@ impl ChainRunner {
                 biased;
                 decision = await_decision(&mut start.pending), if start.pending.is_some() => {
                     let pending = start.pending.take().expect("the branch is guarded on a pending hop");
-                    match start.advance(pending.plugin, decision, &mut set, &shutdown) {
+                    match start.advance(pending.plugin, decision, &mut members, &shutdown) {
                         Step::Launched => {}
                         Step::Settled(readiness) => gate.absorb(readiness),
                     }
                 }
                 () = shutdown.cancelled() => break,
-                maybe_result = set.join_next() => {
+                maybe_result = members.join_next() => {
                     let Some(result) = maybe_result else { break }; // all plugins exited
                     record_exit(result, &mut first_error, &shutdown);
                 }
@@ -358,7 +379,7 @@ impl ChainRunner {
         // empty `JoinSet` completes the inner `while let` immediately without
         // consuming any of the budget.
         let drain_result = tokio::time::timeout(self.drain_timeout, async {
-            while let Some(result) = set.join_next().await {
+            while let Some(result) = members.join_next().await {
                 record_exit(result, &mut first_error, &shutdown);
             }
         })
@@ -368,30 +389,38 @@ impl ChainRunner {
             Ok(()) => first_error.map_or(Ok(()), Err),
             Err(_timeout) => {
                 tracing::warn!("drain timeout expired, aborting remaining plugins");
-                set.abort_all();
+                members.tasks.abort_all();
                 // Aborting drops each plugin's future, and a plugin may deliver a start failure it decided from
-                // that drop: wait for the drops, so the gate below finds the failure. A task cancelled by the abort
-                // is expected; anything else (an error, a panic) is an exit like any other.
-                while let Some(result) = set.join_next().await {
-                    if matches!(&result, Err(join_err) if join_err.is_cancelled()) {
-                        continue;
+                // that drop: wait for the drops, so the gate below finds the failure. A member the abort cancelled
+                // is one that was dropped; any other (a return, a panic) is an exit like any other, so a member
+                // that finished by itself in the meantime is not named below.
+                let mut aborted = Vec::new();
+                while let Some(result) = members.join_next().await {
+                    match result {
+                        Err(lost) if lost.error.is_cancelled() => aborted.push(lost.plugin),
+                        result => record_exit(result, &mut first_error, &shutdown),
                     }
-                    record_exit(result, &mut first_error, &shutdown);
                 }
-                // A plugin-level error (if captured before drain) is more
-                // diagnostic than the drain-timeout error, so it takes
-                // precedence.
-                Err(first_error.unwrap_or_else(|| crate::Error::Chain("drain timeout expired".into())))
+                // Ending a member by dropping it is not an observed stop: its child may still run. That
+                // outranks every other error.
+                if aborted.is_empty() {
+                    first_error.map_or(Ok(()), Err)
+                } else {
+                    let unconfirmed = crate::Error::StopUnconfirmed {
+                        plugins: aborted,
+                        cause: Box::new(crate::Error::Chain("drain timeout expired".into())),
+                    };
+                    Err(match first_error {
+                        Some(first) => first.then(unconfirmed),
+                        None => unconfirmed,
+                    })
+                }
             }
         };
 
-        // Every plugin has returned (or been given up on at the drain bound):
-        // only now does the caller hear of a start failure, or find the
-        // channel closed.
-        match gate.release() {
-            Some(failure) => Err(failure.into()),
-            None => drained,
-        }
+        // Every plugin has returned (or been given up on at the drain bound): only now does the caller hear of a start
+        // failure, or find the channel closed.
+        gate.release(drained)
     }
 }
 
@@ -410,18 +439,59 @@ pub(crate) enum Readiness {
     Preempted { unread: Option<Pending> },
 }
 
+/// How a hop's start failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HopFailureKind {
+    /// The hop reported a typed failure.
+    Reported,
+    /// The hop ended without reporting: its plugin dropped `ready` unsent, or its task returned without deciding.
+    EndedBeforeReady,
+}
+
 /// A hop's failed start: which hop, and the typed failure it reported or the chain synthesized.
 #[derive(Debug)]
 pub(crate) struct HopFailure {
     pub(crate) plugin: String,
     pub(crate) cause: StartError,
+    pub(crate) kind: HopFailureKind,
 }
 
-impl From<HopFailure> for crate::Error {
-    fn from(failure: HopFailure) -> Self {
-        crate::Error::StartFailed {
-            plugin: failure.plugin,
-            cause: failure.cause,
+impl HopFailure {
+    /// The gate may report another error over this one, so it is logged as the gate takes it, found at the start or
+    /// delivered since.
+    fn log(&self) {
+        tracing::warn!(
+            plugin = %self.plugin,
+            error = &self.cause as &dyn std::error::Error,
+            "plugin failed to start"
+        );
+    }
+}
+
+impl HopFailure {
+    /// What the caller is told once every member has returned `drained`: the `StartError` for `on_ready`, and the error
+    /// `run` ends with. The one place a [`HopFailureKind`] decides either.
+    ///
+    /// A member's error does not hide a stop that was not confirmed, or a refused pid sink: ranking is
+    /// [`Error::then`](crate::Error::then)'s.
+    fn end(self, drained: crate::Result<()>) -> (StartError, crate::Error) {
+        let Self { plugin, cause, kind } = self;
+        let failed = crate::Error::StartFailed {
+            plugin,
+            cause: cause.clone(),
+        };
+        match (kind, drained) {
+            (HopFailureKind::Reported, Err(drained)) => (cause, failed.then(drained)),
+            (HopFailureKind::Reported, Ok(())) => (cause, failed),
+            // The members' error says why the hop ended; the synthesized failure only says that it did.
+            (HopFailureKind::EndedBeforeReady, Err(drained)) => (
+                StartError::Fatal {
+                    detail: drained.to_string(),
+                    errno: None,
+                },
+                drained,
+            ),
+            (HopFailureKind::EndedBeforeReady, Ok(())) => (cause, failed),
         }
     }
 }
@@ -459,7 +529,10 @@ impl ReadyGate {
                     let _ = ready_tx.send(Ok(chain));
                 }
             }
-            Readiness::Failed(error) => self.failure = Some(error),
+            Readiness::Failed(failure) => {
+                failure.log();
+                self.failure = Some(failure);
+            }
             Readiness::Preempted { unread } => self.unread = unread,
         }
     }
@@ -468,18 +541,28 @@ impl ReadyGate {
     /// `RecvError`. The failure is the one the start found, or else the one a preempted hop has delivered since. A
     /// delivered `Ready` is not rescued: `shutdown` is chain-wide and nothing shows the chain is still viable.
     ///
-    /// Returns that failure whether or not a sender was registered.
-    pub(crate) fn release(self) -> Option<HopFailure> {
+    /// Returns what `run` ends with: `drained` (what the members returned) when there is no failure, else what
+    /// [`HopFailure::end`] makes of it, whether or not a sender was registered.
+    pub(crate) fn release(self, drained: crate::Result<()>) -> crate::Result<()> {
         let delivered_since = || {
             let Pending { plugin, mut decision } = self.unread?;
             let cause = decision.try_recv().ok()?.failure()?.clone();
-            Some(HopFailure { plugin, cause })
+            let failure = HopFailure {
+                plugin,
+                cause,
+                kind: HopFailureKind::Reported,
+            };
+            failure.log();
+            Some(failure)
         };
-        let failure = self.failure.or_else(delivered_since);
-        if let (Some(failure), Some(ready_tx)) = (&failure, self.ready_tx) {
-            let _ = ready_tx.send(Err(failure.cause.clone()));
+        let Some(failure) = self.failure.or_else(delivered_since) else {
+            return drained;
+        };
+        let (told, ended) = failure.end(drained);
+        if let Some(ready_tx) = self.ready_tx {
+            let _ = ready_tx.send(Err(told));
         }
-        failure
+        Err(ended)
     }
 }
 
@@ -489,7 +572,7 @@ pub(crate) enum Verdict {
     /// The hop is up: start the next one.
     Ready { given: SocketAddr, report: PluginReady },
     /// The start failed, and the chain was cancelled for it.
-    Failed(StartError),
+    Failed { cause: StartError, kind: HopFailureKind },
     /// The chain was already stopping when the hop was judged: nothing to report.
     Preempted,
 }
@@ -501,7 +584,10 @@ pub(crate) fn judge(decision: Result<Decision, oneshot::error::RecvError>, shutd
     match decision.unwrap_or(Decision::Dropped) {
         Decision::Failed(error) => {
             shutdown.cancel();
-            Verdict::Failed(error)
+            Verdict::Failed {
+                cause: error,
+                kind: HopFailureKind::Reported,
+            }
         }
         Decision::Ready { .. } if shutdown.is_cancelled() => Verdict::Preempted,
         Decision::Ready { given, report } => Verdict::Ready { given, report },
@@ -518,10 +604,13 @@ fn ended_undecided(shutdown: &CancellationToken) -> Verdict {
         return Verdict::Preempted;
     }
     shutdown.cancel();
-    Verdict::Failed(StartError::Fatal {
-        detail: "plugin exited before becoming ready".into(),
-        errno: None,
-    })
+    Verdict::Failed {
+        cause: StartError::Fatal {
+            detail: "plugin exited before becoming ready".into(),
+            errno: None,
+        },
+        kind: HopFailureKind::EndedBeforeReady,
+    }
 }
 
 /// What the start does after a decision.
@@ -589,7 +678,7 @@ impl StartSequence {
     }
 
     /// Launches the hop at `next`; its decision arrives on `pending`.
-    fn launch(&mut self, set: &mut tokio::task::JoinSet<(String, crate::Result<()>)>, shutdown: &CancellationToken) {
+    fn launch(&mut self, members: &mut Members, shutdown: &CancellationToken) {
         debug_assert!(
             self.pending.is_none(),
             "a hop is launched only after the last one decided"
@@ -615,12 +704,10 @@ impl StartSequence {
         let span = tracing::info_span!("plugin", name = %name, position, chain_mode = ?self.mode);
         let token = shutdown.child_token();
         let remote = self.forward_to;
-        set.spawn(async move {
-            let result = run_hop(plugin, placement, remote, token, decided_tx)
-                .instrument(span)
-                .await;
-            (name, result)
-        });
+        members.spawn(
+            name,
+            run_hop(plugin, placement, remote, token, decided_tx).instrument(span),
+        );
     }
 
     /// Takes one hop's `decision` and launches the next hop if the chain is still starting.
@@ -628,12 +715,12 @@ impl StartSequence {
         &mut self,
         plugin: String,
         decision: Result<Decision, oneshot::error::RecvError>,
-        set: &mut tokio::task::JoinSet<(String, crate::Result<()>)>,
+        members: &mut Members,
         shutdown: &CancellationToken,
     ) -> Step {
         // The hop that decided is the one `pending` named; the caller took it out before asking.
         match judge(decision, shutdown) {
-            Verdict::Failed(cause) => Step::Settled(Readiness::Failed(HopFailure { plugin, cause })),
+            Verdict::Failed { cause, kind } => Step::Settled(Readiness::Failed(HopFailure { plugin, cause, kind })),
             Verdict::Preempted => Step::Settled(Readiness::Preempted { unread: None }),
             Verdict::Ready { given, report } => {
                 self.transports &= report.transports;
@@ -648,7 +735,7 @@ impl StartSequence {
                 debug_assert!(given.port() != 0, "an intermediate hop is given a picked port, never 0");
                 self.taken.push(given.port());
                 self.forward_to = given;
-                self.launch(set, shutdown);
+                self.launch(members, shutdown);
                 Step::Launched
             }
         }
@@ -663,15 +750,61 @@ async fn await_decision(pending: &mut Option<Pending>) -> Result<Decision, onesh
     }
 }
 
-/// Shared handler for a single plugin-task exit result. Updates
-/// `first_error` on a first-write-wins basis and fires `shutdown` so the
-/// rest of the chain stops. Called from both Phase 1 and Phase 2 of
+/// A chain's running members: one task per hop, and the name each task id belongs to, so a member that panics or is
+/// aborted is named even though its task returned nothing.
+#[derive(Default)]
+struct Members {
+    tasks: tokio::task::JoinSet<crate::Result<()>>,
+    names: HashMap<tokio::task::Id, String>,
+}
+
+/// A member whose task ended without returning: it panicked, or was aborted.
+pub(crate) struct Lost {
+    plugin: String,
+    error: tokio::task::JoinError,
+}
+
+/// How a member's task ended, as [`record_exit`] reads it.
+pub(crate) type MemberExit = Result<(String, crate::Result<()>), Lost>;
+
+impl Members {
+    fn spawn(&mut self, name: String, member: impl std::future::Future<Output = crate::Result<()>> + Send + 'static) {
+        let id = self.tasks.spawn(member).id();
+        self.names.insert(id, name);
+    }
+
+    /// The name a member task was spawned under; each task ends once.
+    fn name_of(&mut self, id: tokio::task::Id) -> String {
+        self.names
+            .remove(&id)
+            .expect("every member task was named when it was spawned")
+    }
+
+    /// The next member to end, `None` once there are none.
+    async fn join_next(&mut self) -> Option<MemberExit> {
+        Some(match self.tasks.join_next_with_id().await? {
+            Ok((id, returned)) => Ok((self.name_of(id), returned)),
+            Err(error) => Err(Lost {
+                plugin: self.name_of(error.id()),
+                error,
+            }),
+        })
+    }
+}
+
+/// Records `error` after whatever `first_error` already holds (see [`crate::Error::then`]).
+fn keep_first(first_error: &mut Option<crate::Error>, error: crate::Error) {
+    *first_error = Some(match first_error.take() {
+        Some(first) => first.then(error),
+        None => error,
+    });
+}
+
+/// Shared handler for a single plugin-task exit result. Logs the exit, records its error in `first_error` by
+/// [`crate::Error::then`]'s ranking (an unconfirmed stop or a refused pid sink outranks the rest, and the first error
+/// stands among equals), and fires `shutdown` so the rest of the chain stops. Called from both Phase 1 and Phase 2 of
 /// `ChainRunner::run`.
-pub(crate) fn record_exit(
-    result: Result<(String, crate::Result<()>), tokio::task::JoinError>,
-    first_error: &mut Option<crate::Error>,
-    shutdown: &CancellationToken,
-) {
+pub(crate) fn record_exit(result: MemberExit, first_error: &mut Option<crate::Error>, shutdown: &CancellationToken) {
     match result {
         Ok((name, Ok(()))) => {
             tracing::info!(plugin = %name, "exited cleanly");
@@ -691,16 +824,12 @@ pub(crate) fn record_exit(
                 error = &e as &dyn std::error::Error,
                 "exited with error"
             );
-            if first_error.is_none() {
-                *first_error = Some(e);
-            }
+            keep_first(first_error, e);
             shutdown.cancel();
         }
-        Err(join_err) => {
-            tracing::error!(error = &join_err as &dyn std::error::Error, "plugin task panicked");
-            if first_error.is_none() {
-                *first_error = Some(crate::Error::Chain(format!("plugin panicked: {join_err}")));
-            }
+        Err(Lost { plugin, error }) => {
+            tracing::error!(plugin = %plugin, error = &error as &dyn std::error::Error, "plugin task ended without returning");
+            keep_first(first_error, crate::Error::task_lost(&plugin, error));
             shutdown.cancel();
         }
     }

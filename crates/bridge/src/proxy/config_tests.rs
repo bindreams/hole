@@ -555,3 +555,99 @@ fn an_unknown_cipher_name_is_still_a_method_fault() {
         other => panic!("expected InvalidMethod, got {other:?}"),
     }
 }
+
+// A plugin chain's failure reaches the user with its reason -----------------------------------------------------------
+
+/// `Display` names what Hole failed to do and never prints its source; the text a user reads (the toast, `last_error`)
+/// is `user_message`, which adds the reason garter reports.
+#[skuld::test]
+fn a_plugin_chain_failure_reaches_the_toast_with_its_reason() {
+    let err = ProxyError::PluginStartFailed(garter::Error::PluginExit {
+        name: "ex-ray".into(),
+        code: 3,
+    });
+
+    assert_eq!(err.to_string(), "the plugin chain failed to start");
+    assert_eq!(
+        err.user_message(),
+        "the plugin chain failed to start: plugin 'ex-ray' exited with code 3"
+    );
+    match hole_common::protocol::StartError::from(&err) {
+        hole_common::protocol::StartError::Failed { message } => assert_eq!(message, err.user_message()),
+        other => panic!("expected StartError::Failed, got {other:?}"),
+    }
+}
+
+/// A variant with no reason of its own reads as its `Display`.
+#[skuld::test]
+fn an_error_with_no_reason_to_add_reads_as_its_display() {
+    for err in [ProxyError::AlreadyRunning, ProxyError::TunnelRequiresSocks5] {
+        assert_eq!(err.user_message(), err.to_string());
+    }
+}
+
+/// The plugin variants that report a failure of the plugin chain name the plugins in the text a user reads: garter's
+/// `Display`, never its source.
+#[skuld::test]
+fn an_unrecorded_or_unconfirmed_plugin_reaches_the_user_by_name() {
+    let unrecorded = ProxyError::PluginUnrecorded(garter::Error::PidSink {
+        plugin: "ex-ray".into(),
+        cause: "the-sinks-own-text".into(),
+    });
+    assert_eq!(
+        unrecorded.user_message(),
+        "a plugin process could not be recorded, so it was stopped: the pid sink refused plugin 'ex-ray'"
+    );
+
+    let unconfirmed = ProxyError::PluginStopUnconfirmed(garter::Error::StopUnconfirmed {
+        plugins: vec!["ex-ray".into()],
+        cause: "the-kills-own-text".into(),
+    });
+    assert_eq!(
+        unconfirmed.user_message(),
+        "a plugin process could not be confirmed stopped; it may still be running: plugin 'ex-ray' could not be confirmed stopped"
+    );
+}
+
+/// A source is for the log: a path in it must not reach a toast.
+#[skuld::test]
+fn the_text_a_user_reads_never_prints_a_source() {
+    const MARKER: &str = "C:/Users/someone/a-path-marker";
+    let source = || std::io::Error::other(MARKER);
+    let errors = [
+        ProxyError::PluginStartFailed(garter::Error::Io(source())),
+        ProxyError::PluginStartFailed(garter::Error::Cosca(cosca::error::Error::Io(source()))),
+        ProxyError::PluginStartFailed(garter::Error::Spawn {
+            plugin: "ex-ray".into(),
+            cause: Box::new(source()),
+        }),
+        ProxyError::PluginUnrecorded(garter::Error::PidSink {
+            plugin: "ex-ray".into(),
+            cause: Box::new(source()),
+        }),
+        ProxyError::PluginStopUnconfirmed(garter::Error::StopUnconfirmed {
+            plugins: vec!["ex-ray".into()],
+            cause: Box::new(source()),
+        }),
+        ProxyError::PluginPort(source()),
+    ];
+    for err in errors {
+        assert!(!err.user_message().contains(MARKER), "{err:?}: {}", err.user_message());
+        assert!(
+            util::error::chain(&err).any(|link| link.to_string().contains(MARKER)),
+            "{err:?}: the cause is in the chain"
+        );
+    }
+}
+
+/// A failure of the port probe is its own variant, not the runtime's: a TUN-open failure shares no wording with it.
+#[skuld::test]
+fn a_failed_port_probe_reads_as_a_plugin_port_failure() {
+    let err = ProxyError::PluginPort(std::io::Error::other("probe failed"));
+
+    assert_eq!(err.user_message(), "could not reserve a local port for the plugin");
+    match hole_common::protocol::StartError::from(&err) {
+        hole_common::protocol::StartError::Failed { message } => assert_eq!(message, err.user_message()),
+        other => panic!("expected StartError::Failed, got {other:?}"),
+    }
+}

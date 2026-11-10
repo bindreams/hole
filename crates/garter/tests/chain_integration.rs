@@ -169,7 +169,8 @@ async fn pid_sink_fires_once_per_binary_plugin() {
 
     let sink_pids = pids.clone();
     let sink: garter::PidSink = Arc::new(move |pid| {
-        sink_pids.lock().unwrap().push(pid);
+        sink_pids.lock().unwrap().push(pid.pid());
+        Ok(())
     });
 
     // Single-accept echo: this test only awaits `on_ready` and checks pid counts; it does not send any client
@@ -226,6 +227,61 @@ async fn pid_sink_fires_once_per_binary_plugin() {
     let _ = handle.await;
 }
 
+/// A pid sink that refuses a real child: the child is killed before `run` returns, the caller's `ready` hears the
+/// early exit, and `run` reports the sink's own error rather than the exit-before-ready failure that follows from it.
+#[skuld::test]
+async fn a_refusing_pid_sink_kills_the_child_and_fails_the_chain_with_the_sinks_error() {
+    use cosca::identity::Liveness;
+
+    let ids: Arc<Mutex<Vec<cosca::identity::ProcessId>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_ids = ids.clone();
+    let sink: garter::PidSink = Arc::new(move |id| {
+        sink_ids.lock().unwrap().push(id);
+        Err("test: the identity cannot be recorded".into())
+    });
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(mock_plugin_path(), None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .pid_sink(sink),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(15));
+    let env = PluginEnv {
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ANY_PORT,
+        remote_host: "127.0.0.1".into(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+
+    let result = runner.run(env).await;
+
+    match &result {
+        Err(error @ garter::Error::PidSink { plugin, .. }) => {
+            assert_eq!(
+                plugin.as_str(),
+                mock_plugin_path().file_stem().unwrap().to_str().unwrap()
+            );
+            assert!(error.stop_confirmed());
+        }
+        other => panic!("want the sink's error, got {other:?}"),
+    }
+    let name = mock_plugin_path().file_stem().unwrap().to_str().unwrap().to_owned();
+    let wanted = format!("the pid sink refused plugin '{name}'");
+    assert!(
+        matches!(ready_rx.await, Ok(Err(StartError::Fatal { detail, errno: None })) if detail == wanted),
+        "the caller hears the sink's refusal as the reason the hop ended"
+    );
+    let recorded = ids.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert!(
+        !matches!(recorded[0].is_alive(), Liveness::Alive),
+        "the refused child must be gone once `run` returns"
+    );
+}
+
 /// A real child that loses its intermediate port is run again: the chain readies, and the hop's `pid_sink` fires once per
 /// spawn.
 #[skuld::test]
@@ -238,7 +294,10 @@ async fn an_intermediate_binary_plugin_that_loses_its_port_is_restarted() {
 
     let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_pids = pids.clone();
-    let sink: garter::PidSink = Arc::new(move |pid| sink_pids.lock().unwrap().push(pid));
+    let sink: garter::PidSink = Arc::new(move |id| {
+        sink_pids.lock().unwrap().push(id.pid());
+        Ok(())
+    });
 
     let (ready_tx, ready_rx) = oneshot::channel();
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -1885,7 +1944,10 @@ async fn a_shutdown_before_ready_is_not_a_start_failure() {
             plugin.log_sink(Arc::new(move |_line: &str| signal()))
         } else {
             plugin
-                .pid_sink(Arc::new(move |_pid| signal()))
+                .pid_sink(Arc::new(move |_pid| {
+                    signal();
+                    Ok(())
+                }))
                 .env("MOCK_PLUGIN_NO_SITREP", "1")
         };
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -1929,8 +1991,8 @@ async fn a_shutdown_before_ready_is_not_a_start_failure() {
 
 /// A plugin whose readiness a self-probe owns (`Probe`; `Auto` without a supported `hello`; `ExpectSitrep` after an
 /// unknown protocol major handed readiness to the probe) that exits before it is ready is reported to the caller as
-/// the typed `Fatal`, and `run` returns that failed start. The probe task holds the readiness sender, so it must be
-/// gone by the time the plugin's `run` returns.
+/// a `Fatal` worded by the plugin's own exit error, and `run` returns that error. The probe task holds the readiness
+/// sender, so it must be gone by the time the plugin's `run` returns.
 #[skuld::test]
 async fn a_probe_owned_plugin_that_exits_before_ready_reports_the_typed_fatal() {
     use garter::binary::ReadinessMode;
@@ -1964,14 +2026,16 @@ async fn a_probe_owned_plugin_that_exits_before_ready_reports_the_typed_fatal() 
         let run = runner.run(env).await;
         let heard = ready_rx.await;
 
+        // The hop ended before ready with an error of its own: `run` returns it, and `on_ready` is told its words.
+        let name = mock_plugin_path().file_stem().unwrap().to_str().unwrap().to_owned();
+        let wanted = format!("plugin '{name}' exited with code 1");
         let typed = matches!(
             &heard,
-            Ok(Err(StartError::Fatal { detail, .. })) if detail.contains("exited before becoming ready")
+            Ok(Err(StartError::Fatal { detail, errno: None })) if *detail == wanted
         );
         let exit = matches!(
             &run,
-            Err(garter::Error::StartFailed { cause: StartError::Fatal { detail, .. }, .. })
-                if detail.contains("exited before becoming ready")
+            Err(garter::Error::PluginExit { name: exited, code: 1 }) if *exited == name
         );
         if !(typed && exit) {
             wrong.push(format!("{label}: run = {run:?}, on_ready = {heard:?}"));

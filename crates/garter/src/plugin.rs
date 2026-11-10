@@ -31,8 +31,8 @@ pub trait ChainPlugin: Send + Sync {
     ///     - `Err(StartError)` if it fails to start.
     ///
     ///   If the plugin returns from `run` without sending (e.g. it crashed
-    ///   or exited early), dropping `ready` unsent signals the runner to
-    ///   synthesize a process-exit failure. Send readiness BEFORE the
+    ///   or exited early), dropping `ready` unsent signals the runner that the hop ended before it was ready. Send
+    ///   readiness BEFORE the
     ///   long-lived accept loop, not as the return value. A plugin that hands
     ///   `ready` to a task of its own (a readiness probe) must stop and join
     ///   that task before `run` returns: a sender still held then is read as an
@@ -43,7 +43,9 @@ pub trait ChainPlugin: Send + Sync {
     /// caller, when [`ChainRunner::on_ready`](crate::ChainRunner::on_ready) is registered, after every plugin's `run`
     /// has returned, so output a plugin relays while it stops comes first; a plugin that ignores `shutdown` is
     /// waited for at most [`drain_timeout`](crate::ChainRunner::drain_timeout). [`ChainRunner::run`](crate::ChainRunner::run)
-    /// then returns [`Error::StartFailed`](crate::Error::StartFailed), whatever `run` returned here, `Ok(())` included.
+    /// then returns [`Error::StartFailed`](crate::Error::StartFailed) for a failure sent on `ready`, whatever `run`
+    /// returned here, `Ok(())` included. For `ready` dropped unsent it returns the error `run` returned here, and
+    /// `StartFailed` with a synthesized "exited before becoming ready" only when every member returned `Ok(())`.
     ///
     /// The one start failure that does not end the chain is `StartError::BindConflict` from a hop the chain gave
     /// an intermediate port, whatever address it names (a tap reports its inner plugin's). The runner cancels that

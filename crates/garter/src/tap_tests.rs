@@ -749,9 +749,54 @@ async fn a_public_bind_failure_is_typed_by_the_bind_race_rule() {
                 if conflict { "BindConflict" } else { "Fatal" }
             ),
         }
-        assert!(result.is_err(), "{case}: run must fail, got {result:?}");
+        // The tap's own error says which step failed, whatever the bind's class; the OS error is its source.
+        match &result {
+            Err(error @ crate::Error::Tap { plugin, step, cause }) => {
+                assert_eq!(plugin, "counting-stub", "{case}");
+                assert_eq!(*step, crate::TapStep::BindListener, "{case}");
+                assert_eq!(cause.raw_os_error(), errno, "{case}");
+                assert_eq!(
+                    error.to_string(),
+                    "the tap of plugin 'counting-stub' could not bind its listener",
+                    "{case}"
+                );
+            }
+            other => panic!("{case}: run must fail with the tap's bind error, got {other:?}"),
+        }
         assert_eq!(runs.load(Ordering::SeqCst), 1, "{case}: the inner had started");
     }
+}
+
+/// A port pick that fails for a reason that is not a race fails the start before the inner runs: `ready` gets a `Fatal`
+/// worded by the tap's error with the errno kept, and `run` returns that error with the OS error as its source.
+#[skuld::test]
+async fn a_failed_inner_port_pick_is_a_tap_error_and_a_fatal_with_its_words() {
+    tokio::time::pause();
+    // 22 is no port-race errno on either family of OS (see `a_public_bind_failure_is_typed_by_the_bind_race_rule`).
+    let calls = Arc::new(AtomicUsize::new(0));
+    let probe = scripted(vec![Err(io::Error::from_raw_os_error(22))], &calls);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let tap = TapPlugin::wrap_with_probe(Box::new(CountingStub { runs: runs.clone() }), Box::new(probe));
+
+    let (ready, result) = failed_start_of(tap, loopback(), unused_remote()).await;
+
+    let wanted = "the tap of plugin 'counting-stub' could not allocate an inner port";
+    match ready {
+        Ok(Err(StartError::Fatal { detail, errno })) => {
+            assert_eq!(detail, wanted);
+            assert_eq!(errno, Some(22));
+        }
+        other => panic!("want a Fatal, got {other:?}"),
+    }
+    match &result {
+        Err(error @ crate::Error::Tap { step, cause, .. }) => {
+            assert_eq!(*step, crate::TapStep::AllocateInnerPort);
+            assert_eq!(cause.raw_os_error(), Some(22));
+            assert_eq!(error.to_string(), wanted);
+        }
+        other => panic!("want the tap's error, got {other:?}"),
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 0, "the inner never ran");
 }
 
 #[skuld::test]

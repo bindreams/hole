@@ -33,22 +33,25 @@ fn read_env(var: &str) -> crate::Result<String> {
         Err(std::env::VarError::NotPresent) => Err(Error::Env {
             var: var.into(),
             reason: "not set".into(),
+            cause: None,
         }),
         Err(std::env::VarError::NotUnicode(_)) => Err(Error::Env {
             var: var.into(),
             reason: "contains invalid Unicode".into(),
+            cause: None,
         }),
     }
 }
 
 fn read_env_parsed<T: std::str::FromStr>(var: &str) -> crate::Result<T>
 where
-    T::Err: std::fmt::Display,
+    T::Err: std::error::Error + Send + Sync + 'static,
 {
     let val = read_env(var)?;
     val.parse().map_err(|e: T::Err| Error::Env {
         var: var.into(),
-        reason: e.to_string(),
+        reason: "could not be parsed".into(),
+        cause: Some(Box::new(e)),
     })
 }
 
@@ -62,6 +65,7 @@ fn read_env_optional(var: &str) -> crate::Result<Option<String>> {
         Err(std::env::VarError::NotUnicode(_)) => Err(Error::Env {
             var: var.into(),
             reason: "contains invalid Unicode".into(),
+            cause: None,
         }),
     }
 }

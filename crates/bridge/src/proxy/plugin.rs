@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use util::port_alloc;
 
-use super::ProxyError;
+use super::{ProxyError, UnrecordedCause};
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -139,6 +139,22 @@ struct ChainTask {
     cancel: CancellationToken,
 }
 
+impl ChainTask {
+    /// Cancels the chain and waits for it to end, returning what the chain returned. The wait carries no abort and no
+    /// bound: the chain observes its token at every await, and garter bounds its own drain.
+    async fn stop(mut self) -> garter::Result<()> {
+        self.cancel.cancel();
+        match (&mut self.handle).await {
+            Ok(ended) => ended,
+            // A panic in `ChainRunner::run` is garter's bug, not an outcome of the start.
+            Err(e) => match e.try_into_panic() {
+                Ok(payload) => std::panic::resume_unwind(payload),
+                Err(not_a_panic) => panic!("only `ChainTask::drop` aborts the chain's task: {not_a_panic}"),
+            },
+        }
+    }
+}
+
 impl Drop for ChainTask {
     fn drop(&mut self) {
         self.cancel.cancel();
@@ -150,7 +166,10 @@ impl Drop for ChainTask {
 ///
 /// When `state_dir` is `Some`, plugin PIDs are recorded to
 /// `bridge-plugins.json` synchronously at spawn time (via Garter's
-/// `pid_sink` callback), enabling crash recovery on next startup.
+/// `pid_sink` callback), enabling crash recovery on next startup. A child that
+/// cannot be recorded is stopped by garter and the start fails with
+/// [`ProxyError::PluginUnrecorded`] (or [`ProxyError::PluginStopUnconfirmed`]
+/// when the stop could not be confirmed).
 /// When `None`, no state is tracked (used by `server_test` for one-shot
 /// probes that die with the bridge).
 ///
@@ -163,8 +182,8 @@ impl Drop for ChainTask {
 ///
 /// Allocates the handoff port via [`port_alloc::bind_ephemeral`]. The
 /// plugin subprocess binds `local_addr` out-of-process, so its bind
-/// failures arrive as `ProxyError::Plugin` (oneshot timeout / exit before
-/// ready), are converted to `io::Error::other` (non-bind-race), and
+/// failures arrive as a `ProxyError` (a terminal [`ProxyError::PluginStartFailed`], a
+/// timeout or exit before ready), are converted to `io::Error::other` (non-bind-race), and
 /// propagate immediately. `bind_ephemeral`'s in-process probe step (run
 /// before each `op` call) is what catches the Windows excluded-range
 /// race class here, before the subprocess spawn. The residual
@@ -228,22 +247,7 @@ pub async fn start_plugin_chain(
             }
         })
         .await
-        .map_err(|e| {
-            // A cancel-attributed io::Error (from spawn_plugin_runner_at
-            // observing the child token) re-surfaces as Cancelled so the
-            // caller short-circuits cleanly instead of seeing
-            // ProxyError::Plugin("...cancelled").
-            if cancel.is_cancelled() {
-                return ProxyError::Cancelled;
-            }
-            // The chain never became a `PluginChain`, so nothing downstream can
-            // reach its ring. "exited before becoming ready" and "did not become
-            // ready within 30s" carry no detail of their own, and the plugin's
-            // own last lines are the only account of why — emit them here, once,
-            // after every bind retry has had its say.
-            crate::proxy::plugin_log::warn_recent(&log);
-            ProxyError::Plugin(format!("plugin chain start failed: {e}"))
-        })?;
+        .map_err(|e| start_failure(e, &log))?;
 
     Ok(PluginChain {
         task,
@@ -254,39 +258,104 @@ pub async fn start_plugin_chain(
     })
 }
 
-/// Persist a freshly spawned plugin child's identity, so a crashed bridge's
-/// next start can reap it. garter's `PidSink` hands out a bare pid, so the
-/// identity is resolved here by a second read.
-///
-/// Every branch is loud: a record naming a process that could not be resolved
-/// would be skipped by the reap in silence, and the plugin would then be
-/// unrecoverable with no trail.
-fn record_plugin_pid(state_dir: &Path, pid: u32, owner: Option<(u32, u32)>) {
-    match cosca::identity::ProcessId::of(pid) {
-        cosca::identity::Resolved::Found(id) => match id.to_record() {
-            Ok(record) => {
-                if let Err(e) = crate::plugin_state::append_record(state_dir, record, owner) {
-                    tracing::warn!(
-                        pid,
-                        error = &e as &dyn std::error::Error,
-                        "failed to persist plugin PID to state file"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    pid,
-                    error = &e as &dyn std::error::Error,
-                    "plugin identity is not persistable; it will not be recoverable"
-                )
-            }
-        },
-        // The child died before we could look; there is nothing to recover.
-        cosca::identity::Resolved::Gone => tracing::debug!(pid, "plugin exited before its identity could be read"),
-        cosca::identity::Resolved::Unknown => {
-            tracing::warn!(pid, "plugin process could not be assessed; it will not be recoverable")
+/// The [`ProxyError`] a failed start ends with. A typed error that [`proxy_err_to_io_err`] carried is restored as
+/// itself, its builder having emitted the plugin's last lines (see [`start_failure_of`]); any other failure (the port
+/// probe `bind_ephemeral` raised, carried as the `io::Error` it is) emits them here.
+fn start_failure(e: std::io::Error, log: &crate::proxy::plugin_log::PluginLog) -> ProxyError {
+    match into_typed(e) {
+        Ok(typed) => typed,
+        Err(e) => {
+            crate::proxy::plugin_log::warn_recent(log);
+            ProxyError::PluginPort(e)
         }
     }
+}
+
+/// The [`ProxyError`] for a chain that ended without readying, from what the chain itself returned: the one place a
+/// [`garter::Error`] becomes a start failure. A bind conflict on the public port is retried by the caller and so
+/// says nothing; every other failure is explained by the plugin's own last lines, which nothing downstream can reach
+/// for a chain that never became a [`PluginChain`], so they are emitted here.
+fn start_failure_of(ended: garter::Result<()>, log: &crate::proxy::plugin_log::PluginLog) -> ProxyError {
+    use crate::proxy::plugin_log::warn_recent;
+    let Err(error) = ended else {
+        warn_recent(log);
+        return ProxyError::Plugin("plugin exited before becoming ready".into());
+    };
+    match error {
+        // The only retryable start class: a plugin reported it could not bind its listener. `bind_ephemeral` (via
+        // `proxy_err_to_io_err`) retries on a fresh port; the errno is preserved for `bridge.log`.
+        garter::Error::StartFailed {
+            cause: garter::StartError::BindConflict { errno, addr },
+            ..
+        } => ProxyError::BindRace { errno, addr },
+        // Terminal start failure (config error, upstream-dial failure, bare process exit): never retried.
+        error @ garter::Error::StartFailed {
+            cause: garter::StartError::Fatal { .. },
+            ..
+        } => {
+            warn_recent(log);
+            ProxyError::PluginStartFailed(error)
+        }
+        error @ garter::Error::Spawn { .. } => {
+            warn_recent(log);
+            ProxyError::PluginStartFailed(error)
+        }
+        error @ garter::Error::PidSink { .. } => {
+            warn_recent(log);
+            ProxyError::PluginUnrecorded(error)
+        }
+        error @ garter::Error::StopUnconfirmed { .. } => {
+            warn_recent(log);
+            ProxyError::PluginStopUnconfirmed(error)
+        }
+        error @ (garter::Error::Io(_)
+        | garter::Error::PluginExit { .. }
+        | garter::Error::PluginKilled { .. }
+        | garter::Error::Chain(_)
+        | garter::Error::Env { .. }
+        | garter::Error::Tap { .. }
+        | garter::Error::Resolve { .. }
+        | garter::Error::MalformedOptions(_)
+        | garter::Error::Cosca(_)) => {
+            warn_recent(log);
+            ProxyError::PluginStartFailed(error)
+        }
+    }
+}
+
+/// Ends a start that hole itself gave up (it was cancelled, or the plugin was not ready in time): stops the chain and
+/// returns `own`, unless the chain's error outranks an error of the caller's own
+/// ([`garter::Error::outranks_a_callers_own_error`]: a stop it could not confirm, a refused pid sink), which is
+/// reported instead. `own` is built only when it is the answer, so what it emits is not said twice.
+async fn stopped_by_start(
+    task: ChainTask,
+    own: impl FnOnce() -> ProxyError,
+    log: &crate::proxy::plugin_log::PluginLog,
+) -> ProxyError {
+    match task.stop().await {
+        Err(outranking) if outranking.outranks_a_callers_own_error() => start_failure_of(Err(outranking), log),
+        // The chain's other errors were logged by garter as they arose.
+        Ok(()) | Err(_) => own(),
+    }
+}
+
+/// Persist a freshly spawned plugin child's identity, so a crashed bridge's next start can reap it.
+///
+/// A child that cannot be recorded is an error: a record naming no process is skipped by the reap in silence, and
+/// the plugin would be unrecoverable with no trail.
+fn record_plugin_pid(
+    state_dir: &Path,
+    id: cosca::identity::ProcessId,
+    owner: Option<(u32, u32)>,
+) -> Result<(), UnrecordedCause> {
+    let record = id.to_record().map_err(UnrecordedCause::NotPersistable)?;
+    crate::plugin_state::append_record(state_dir, record, owner).map_err(UnrecordedCause::Persist)
+}
+
+/// The pid sink of a recorded plugin: garter refuses a child whose identity cannot be recorded, takes it down, and fails
+/// the chain with [`garter::Error::PidSink`] carrying the [`UnrecordedCause`].
+fn recording_sink(state_dir: PathBuf, owner: Option<(u32, u32)>) -> garter::PidSink {
+    Arc::new(move |id| record_plugin_pid(&state_dir, id, owner).map_err(Into::into))
 }
 
 /// Sourced gate for the plugin tap. The IPC config flag is the primary
@@ -330,9 +399,10 @@ fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
 /// sitrep-reported end-to-end transport set (#414), threaded into the
 /// bridge's UDP-drop policy.
 ///
-/// A plugin `StartError::BindConflict` (the only retryable start class)
-/// maps to [`ProxyError::BindRace`] so the outer `bind_ephemeral` retries
-/// on a fresh port; a `StartError::Fatal` maps to [`ProxyError::Plugin`].
+/// A chain that does not ready ends, and what it returns becomes the failure
+/// ([`start_failure_of`]): a public-port bind conflict (the only retryable
+/// start class) is [`ProxyError::BindRace`], so the outer `bind_ephemeral`
+/// retries on a fresh port.
 #[allow(clippy::too_many_arguments)] // 11 args — bundling into a struct adds more noise than the warning.
 async fn spawn_plugin_runner_at(
     plugin_name: &str,
@@ -352,9 +422,7 @@ async fn spawn_plugin_runner_at(
     plugin = plugin.log_sink(log.sink());
 
     if let Some(dir) = state_dir {
-        let dir = dir.to_path_buf();
-        let sink: garter::PidSink = Arc::new(move |pid| record_plugin_pid(&dir, pid, owner));
-        plugin = plugin.pid_sink(sink);
+        plugin = plugin.pid_sink(recording_sink(dir.to_path_buf(), owner));
     }
 
     // Own scope, not a child of `start_cancel`: the chain outlives the start (see [`PluginChain`]). `start_cancel` is honoured explicitly below while the start is in progress.
@@ -401,7 +469,7 @@ async fn spawn_plugin_runner_at(
     };
 
     // Race readiness against the bridge cancel: if the user cancels the
-    // start mid-spawn, abort the partially-spawned chain and return
+    // start mid-spawn, stop the partially-spawned chain and return
     // ProxyError::Cancelled so the caller short-circuits cleanly instead
     // of waiting up to READINESS_TIMEOUT for a chain it no longer wants.
     // `ready_rx` now yields `Result<ChainReady, StartError>` (per-plugin
@@ -410,7 +478,7 @@ async fn spawn_plugin_runner_at(
     // chain-public listen address + reported transports.
     let chain_ready = tokio::select! {
         biased;
-        _ = start_cancel.cancelled() => return Err(ProxyError::Cancelled),
+        _ = start_cancel.cancelled() => return Err(stopped_by_start(task, || ProxyError::Cancelled, log).await),
         // sync-exception(external-event, CLAUDE.md class 2): READINESS_TIMEOUT is the
         // terminal failure-to-human bound for a plugin subprocess that may never become
         // ready (wedged child); it is NOT intra-process sync. Cooperative cancel via the
@@ -418,20 +486,17 @@ async fn spawn_plugin_runner_at(
         // genuinely-stuck case.
         r = tokio::time::timeout(READINESS_TIMEOUT, ready_rx) => match r {
             Ok(Ok(Ok(chain_ready))) => chain_ready,
-            // The only retryable start class: a plugin reported it could
-            // not bind its listener. Surface as `ProxyError::BindRace` so
-            // `bind_ephemeral` (via `proxy_err_to_io_err`) retries on a
-            // fresh port. The errno is preserved for `bridge.log`.
-            Ok(Ok(Err(garter::StartError::BindConflict { errno, addr }))) => {
-                return Err(ProxyError::BindRace { errno, addr });
+            // The chain says it is not ready, and ends itself: what it returns says why. That is
+            // garter's account of the failure (a start failure, a refused pid sink, a stop it could
+            // not confirm), so this reads no more than that it failed.
+            Ok(Ok(Err(_)) | Err(_)) => return Err(start_failure_of(task.stop().await, log)),
+            Err(_) => {
+                let timed_out = || {
+                    crate::proxy::plugin_log::warn_recent(log);
+                    ProxyError::Plugin("plugin did not become ready within 30s".into())
+                };
+                return Err(stopped_by_start(task, timed_out, log).await);
             }
-            // Terminal start failure (config error, upstream-dial failure,
-            // bare process exit) — never retried.
-            Ok(Ok(Err(garter::StartError::Fatal { detail, .. }))) => {
-                return Err(ProxyError::Plugin(format!("plugin failed to start: {detail}")));
-            }
-            Ok(Err(_)) => return Err(ProxyError::Plugin("plugin exited before becoming ready".into())),
-            Err(_) => return Err(ProxyError::Plugin("plugin did not become ready within 30s".into())),
         },
     };
 
@@ -439,48 +504,35 @@ async fn spawn_plugin_runner_at(
 }
 
 /// Convert a [`ProxyError`] from `spawn_plugin_runner_at` into an
-/// [`io::Error`](std::io::Error) so [`port_alloc::bind_ephemeral`] can classify it.
+/// [`io::Error`](std::io::Error) so [`port_alloc::bind_ephemeral`] can classify it. The `ProxyError` rides inside the
+/// `io::Error` as its payload, so [`into_typed`] restores every variant as itself.
 ///
-/// `spawn_plugin_runner_at` emits exactly three variants:
+/// [`ProxyError::BindRace`] (a plugin's `StartError::BindConflict`) is an `AddrInUse`-kind `io::Error`, so
+/// [`util::retry::is_bind_race`] classifies it as retryable and `bind_ephemeral` allocates a fresh port. This is the
+/// load-bearing case: a plugin that loses its local-port bind race gets retried in-band like the in-process binders,
+/// instead of failing the start. The kind is set directly because `is_bind_race` keys on `ErrorKind`, not on
+/// `raw_os_error` (errno 48 is `AddrInUse` on macOS but garbage on Windows).
 ///
-/// - [`ProxyError::BindRace`] (a plugin's `StartError::BindConflict`)
-///   — synthesized into an `AddrInUse`-kind `io::Error` so
-///   [`util::retry::is_bind_race`] classifies it as retryable and
-///   `bind_ephemeral` allocates a fresh port. This is the load-bearing
-///   case: a plugin that loses its local-port bind race gets retried
-///   in-band like the in-process binders, instead of failing the start.
-/// - [`ProxyError::Plugin`] (subprocess exit before ready, readiness
-///   timeout, fatal start error) — a non-bind-race `io::Error::other`
-///   so `bind_ephemeral` propagates it immediately. These are not bind
-///   races we can in-band classify; the in-process probe step inside
-///   `bind_ephemeral` already catches Windows excluded-range
-///   disagreements before the subprocess spawn (stderr-based
-///   classification of subprocess bind failures is bindreams/hole#304).
-/// - [`ProxyError::Cancelled`] (bridge cancel observed mid-spawn)
-///   — a non-bind-race `io::Error::other`; the outer `start_plugin_chain`
-///   distinguishes it via `cancel.is_cancelled()` to re-emit the
-///   canonical variant.
-///
-/// The `unreachable!` arm is the contract guard for any OTHER variant.
+/// Every other variant is `io::Error::other`, which `bind_ephemeral` propagates at once: a plugin that exits before
+/// ready or never becomes ready is not a bind race we can classify in-band (the in-process probe inside
+/// `bind_ephemeral` already catches Windows excluded-range disagreements before the subprocess spawn; classifying a
+/// subprocess's bind failure from its stderr is bindreams/hole#304).
 fn proxy_err_to_io_err(e: ProxyError) -> std::io::Error {
     match e {
-        ProxyError::BindRace { errno, addr } => {
-            // Synthesize an AddrInUse-kind io::Error DIRECTLY so is_bind_race
-            // (which keys on ErrorKind, not raw_os_error) classifies it on
-            // every OS regardless of the platform-native errno value
-            // (errno 48 is AddrInUse on macOS but garbage on Windows). The
-            // errno is preserved in the message for bridge.log diagnostics.
-            std::io::Error::new(
-                std::io::ErrorKind::AddrInUse,
-                format!("plugin bind conflict on {addr} (errno {errno})"),
-            )
-        }
-        ProxyError::Plugin(msg) => std::io::Error::other(msg),
-        ProxyError::Cancelled => std::io::Error::other("plugin spawn cancelled"),
-        other => {
-            unreachable!("spawn_plugin_runner_at only emits ProxyError::BindRace, ProxyError::Plugin, or ProxyError::Cancelled, got: {other}")
-        }
+        ProxyError::BindRace { .. } => std::io::Error::new(std::io::ErrorKind::AddrInUse, e),
+        other => std::io::Error::other(other),
     }
+}
+
+/// The [`ProxyError`] that [`proxy_err_to_io_err`] carried inside `e`, if it carried one.
+fn into_typed(e: std::io::Error) -> Result<ProxyError, std::io::Error> {
+    if !e.get_ref().is_some_and(|inner| inner.is::<ProxyError>()) {
+        return Err(e);
+    }
+    let inner = e.into_inner().expect("checked: the io::Error holds an inner error");
+    Ok(*inner
+        .downcast::<ProxyError>()
+        .expect("checked: the inner error is a ProxyError"))
 }
 
 /// Why no resolver is pinned, in the words of the reason itself — "no resolver

@@ -32,7 +32,7 @@ export function userMessageFor(o: ServerTestOutcome): string {
     case "tcp_timeout":
       return "No response from the server.";
     case "plugin_start_failed":
-      return `Plugin failed to start: ${o.detail}`;
+      return o.detail;
     case "tunnel_handshake_failed":
       return "Server rejected the connection (wrong password, cipher, or plugin config).";
     case "network_blocked":

@@ -889,7 +889,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Ok(b) => (b.server_ip, b.via),
                 Err(ProxyError::Cancelled) => return Err(self.cancelled_start()),
                 Err(e) => {
-                    self.last_error = Some(e.to_string());
+                    self.last_error = Some(e.user_message());
                     // No IP: this start engaged no cover. The presence is the probe's read at this moment, logged as
                     // measured.
                     warn!(
@@ -1110,7 +1110,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // blocked, not leaked, until a later successful start, a user
                 // stop/cancel, or a bridge restart. A retry reuses this single held
                 // guard and its resolved IP.
-                self.last_error = Some(e.to_string());
+                self.last_error = Some(e.user_message());
                 Err(e)
             }
         }

@@ -76,12 +76,9 @@ async fn a_probe_that_panics_is_warned_about_by_plugin_name() {
         .finish();
     let _g = set_default_in_current_thread(subscriber);
     let probes = ReadinessProbes::new("probed-plugin", &CancellationToken::new());
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     probes.spawn(async { panic!("probe broke") });
 
     probes.end().await;
-    std::panic::set_hook(previous);
 
     let log = writer.snapshot();
     assert!(

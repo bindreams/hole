@@ -59,6 +59,17 @@ pub(crate) fn classify_key_material(e: ServerConfigError) -> KeyMaterialFault {
     }
 }
 
+/// Why a plugin child's identity could not be recorded: the error the plugin's pid sink refuses with, which a start
+/// failure carries in its source chain. `Display` is PII-free: it names what failed, and the cause is the `source()`
+/// ([`StoreError`](util::versioned_file::StoreError) names the file only, never its directory).
+#[derive(Debug, Error)]
+pub enum UnrecordedCause {
+    #[error("its record could not be written")]
+    Persist(#[source] util::versioned_file::StoreError),
+    #[error("its identity cannot be persisted")]
+    NotPersistable(#[source] cosca::error::Error),
+}
+
 #[derive(Debug, Error)]
 pub enum ProxyError {
     #[error("invalid cipher method: {0}")]
@@ -102,6 +113,25 @@ pub enum ProxyError {
     WintunLoad { path: PathBuf, message: String },
     #[error("plugin error: {0}")]
     Plugin(String),
+    /// A plugin child's identity could not be recorded, so no reap after a crash could find it. The plugin was
+    /// stopped and the start failed. The source is garter's [`PidSink`](garter::Error::PidSink), which carries an
+    /// [`UnrecordedCause`].
+    #[error("a plugin process could not be recorded, so it was stopped")]
+    PluginUnrecorded(#[source] garter::Error),
+    /// The plugin chain ended before it was ready, for a reason garter reports that Hole does not tell apart (a
+    /// plugin's terminal start failure, the plugin exited or was killed, an environment or option fault, a spawn
+    /// failure). The source is garter's error, whose `Display` a user reads through [`ProxyError::user_message`], safe
+    /// to show by [`garter::Error`]'s contract.
+    #[error("the plugin chain failed to start")]
+    PluginStartFailed(#[source] garter::Error),
+    /// A plugin's stop could not be confirmed (see [`garter::Error::StopUnconfirmed`]): a plugin Hole cannot reap may
+    /// still be running. The source is garter's error, which names the plugins.
+    #[error("a plugin process could not be confirmed stopped; it may still be running")]
+    PluginStopUnconfirmed(#[source] garter::Error),
+    /// The local port the plugin chain needs could not be reserved: the probe `bind_ephemeral` runs raised an I/O
+    /// error. The source is that error, for the log.
+    #[error("could not reserve a local port for the plugin")]
+    PluginPort(#[source] std::io::Error),
     /// Plugin options a SIP003 parser rejects. Refused rather than forwarded:
     /// ex-ray fails fatally on the same string rather than silently
     /// discarding it, so refusing here isn't preventing a silent bad-config
@@ -230,6 +260,45 @@ pub enum ProxyError {
     },
 }
 
+impl ProxyError {
+    /// The text a user reads for this failure (the start-error toast, `last_error`). For a variant carrying a garter
+    /// error it is the variant's `Display` and garter's `Display`, safe to show by [`garter::Error`]'s contract. Never
+    /// a `source()`: the chain belongs to the log.
+    pub fn user_message(&self) -> String {
+        match self {
+            ProxyError::PluginStartFailed(reason) => format!("{self}: {reason}"),
+            ProxyError::PluginUnrecorded(reason) => format!("{self}: {reason}"),
+            ProxyError::PluginStopUnconfirmed(reason) => format!("{self}: {reason}"),
+            ProxyError::PluginPort(_)
+            | ProxyError::InvalidMethod(_)
+            | ProxyError::InvalidKeyMaterial { .. }
+            | ProxyError::InvalidPluginName(_)
+            | ProxyError::Runtime(_)
+            | ProxyError::Gateway(_)
+            | ProxyError::DohBootstrap(_)
+            | ProxyError::RouteSetup(_)
+            | ProxyError::AlreadyRunning
+            | ProxyError::Cancelled
+            | ProxyError::WintunMissing { .. }
+            | ProxyError::WintunLoad { .. }
+            | ProxyError::Plugin(_)
+            | ProxyError::NetworkBlocked
+            | ProxyError::MalformedPluginOptions(_)
+            | ProxyError::BindRace { .. }
+            | ProxyError::TunnelRequiresSocks5
+            | ProxyError::NoListenersEnabled
+            | ProxyError::DuplicateListenerPort { .. }
+            | ProxyError::InvalidListenerPort { .. }
+            | ProxyError::ForwarderSelfTestFailed { .. }
+            | ProxyError::TunnelSilent { .. }
+            | ProxyError::TunnelSetupIncomplete { .. }
+            | ProxyError::NoTunnelConnection { .. }
+            | ProxyError::ForeignAdapter { .. }
+            | ProxyError::DnsConfinementFailed { .. } => self.to_string(),
+        }
+    }
+}
+
 impl From<&ProxyError> for hole_common::protocol::StartError {
     fn from(e: &ProxyError) -> Self {
         use hole_common::protocol::StartError;
@@ -250,6 +319,10 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             | ProxyError::WintunMissing { .. }
             | ProxyError::WintunLoad { .. }
             | ProxyError::Plugin(_)
+            | ProxyError::PluginPort(_)
+            | ProxyError::PluginUnrecorded(_)
+            | ProxyError::PluginStopUnconfirmed(_)
+            | ProxyError::PluginStartFailed(_)
             | ProxyError::MalformedPluginOptions(_)
             | ProxyError::BindRace { .. }
             | ProxyError::TunnelRequiresSocks5
@@ -261,7 +334,9 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             | ProxyError::TunnelSetupIncomplete { .. }
             | ProxyError::NoTunnelConnection { .. }
             | ProxyError::ForeignAdapter { .. }
-            | ProxyError::DnsConfinementFailed { .. } => StartError::Failed { message: e.to_string() },
+            | ProxyError::DnsConfinementFailed { .. } => StartError::Failed {
+                message: e.user_message(),
+            },
         }
     }
 }

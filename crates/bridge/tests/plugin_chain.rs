@@ -460,3 +460,34 @@ async fn a_crash_on_stderr_reaches_the_ring_before_the_chain_reports_failure() {
         "got:\n{output}"
     );
 }
+
+/// A plugin whose identity cannot be recorded can never be reaped after a crash, so the start fails with the typed
+/// error instead of leaving it running. The state directory sits under a file, so no record can land.
+#[skuld::test]
+async fn a_plugin_that_cannot_be_recorded_fails_the_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").expect("write blocker");
+    let state_dir = blocker.join("state");
+
+    let cancel = CancellationToken::new();
+    let err = start_plugin_chain(
+        "v2ray-plugin",
+        test_plugin_path().to_str().expect("utf-8 path"),
+        Some("host=example.com"),
+        "127.0.0.1",
+        9,
+        Some(&state_dir),
+        None,
+        false,
+        &cancel,
+        None,
+    )
+    .await
+    .expect_err("an unrecordable plugin must fail the start");
+
+    assert!(
+        matches!(err, hole_bridge::proxy::ProxyError::PluginUnrecorded(_)),
+        "got: {err:?}"
+    );
+}

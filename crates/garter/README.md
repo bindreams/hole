@@ -67,21 +67,25 @@ shutdown ends the retries. A conflict on the public address is the caller's, so
 the chain reports it. This makes `ChainPlugin::run` re-runnable: a plugin is a
 description of a hop, and `run` may be called again after it returned.
 
-`ChainRunner::run` returns `Error::StartFailed { plugin, cause }` whenever a hop
-fails to start, whether it reported a failure or ended before it was ready
-(whatever it returned). The chain cancels every plugin first, with or without an
-`on_ready` callback, and the start failure outranks the plugins' own exit
-errors and the drain timeout. A shutdown before the chain is ready is not
-itself a start failure, unless the hop that was starting had delivered one by
-then.
+`ChainRunner::run` fails whenever a hop fails to start. The chain cancels every
+plugin first, with or without an `on_ready` callback. A hop that reported a
+failure ends `run` with `Error::StartFailed { plugin, cause }` (whatever the hop
+returned), which outranks the plugins' own exit errors. A hop that ended before
+it was ready without reporting one ends `run` with the error the members
+returned, and `on_ready` is told that error's words as a `Fatal`; only when
+every member returned `Ok(())` is it `StartFailed` with a synthesized "exited
+before becoming ready". An unconfirmed stop or a refused pid sink outranks both.
+A shutdown before the chain is ready is not itself a start failure, unless the
+hop that was starting had delivered one by then.
 
 A public `local_port` of `0` is passed through to the hop, which picks its own
 port. The chain reports it in `ChainReady::listen` when the hop says which port
 it bound (sitrep `ready` carries `listen`).
 
 A hop that does not speak sitrep (`ReadinessMode::Probe`) cannot report a lost
-intermediate port. It exits without a typed conflict, so the chain fails with a
-`Fatal` "exited before becoming ready" start failure and does not restart it,
+intermediate port. It exits without a typed conflict, so the chain fails with
+that hop's own exit error (an "exited before becoming ready" start failure when it
+exited cleanly) and does not restart it,
 and if another process now listens on that port the probe reports ready for that
 process instead. Use `ExpectSitrep` for a hop that is not the public one. A
 `TapPlugin` reports its inner plugin's typed conflict as its own, so a tap whose

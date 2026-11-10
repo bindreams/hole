@@ -129,7 +129,8 @@ enum First {
 /// `decided` the hop's [`Decision`] once its readiness, or its end, is known. Returns what the plugin returns.
 ///
 /// An intermediate hop that reports a bind conflict is stopped, waited for, and run again on a fresh pick, with no
-/// attempt cap: only `shutdown` ends it. Any other failure, and a conflict on the public port, is the hop's decision.
+/// attempt cap: only `shutdown` ends it, or a stop that cannot be confirmed (see [`crate::Error::stop_confirmed`]),
+/// which the hop returns. Any other failure, and a conflict on the public port, is the hop's decision.
 ///
 /// A pick that ends because `shutdown` fired starts nothing and decides nothing. A pick that fails for a reason that
 /// is not a race fails the hop with a [`StartError::Fatal`].
@@ -155,7 +156,7 @@ pub(crate) async fn run_hop(
                     Ok(None) => return Ok(()),
                     Err(error) => {
                         outlet.report(Decision::Failed(StartError::Fatal {
-                            detail: format!("picking a port for plugin '{}' failed: {error}", plugin.name()),
+                            detail: format!("could not pick a port for plugin '{}'", plugin.name()),
                             errno: error.raw_os_error(),
                         }));
                         return Err(error.into());
@@ -168,7 +169,19 @@ pub(crate) async fn run_hop(
         let Some(cause) = outlet.restart.take() else {
             return result;
         };
+        // An attempt whose stop was not confirmed may still be running: the hop does not start another over it.
+        if let Some(unconfirmed) = result.as_ref().err().filter(|e| !e.stop_confirmed()) {
+            tracing::warn!(
+                plugin = plugin.name(),
+                port = local.port(),
+                lost_port = %cause,
+                error = unconfirmed as &dyn std::error::Error,
+                "intermediate port lost, but the stopped attempt could not be confirmed stopped; not restarting the hop"
+            );
+            return result;
+        }
         tracing::info!(
+            plugin = plugin.name(),
             port = local.port(),
             error = &cause as &dyn std::error::Error,
             "intermediate port lost; restarting the hop on a fresh port"

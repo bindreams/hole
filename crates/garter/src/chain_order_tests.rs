@@ -410,7 +410,7 @@ async fn a_probe_error_that_is_not_a_race_fails_the_start_and_starts_no_hop() {
 
     match told {
         Err(StartError::Fatal { detail, errno: got }) => {
-            assert!(detail.contains("picking a port for plugin 'B'"), "{detail}");
+            assert_eq!(detail, "could not pick a port for plugin 'B'");
             assert_eq!(got, errno);
         }
         other => panic!("the caller must be told a Fatal start failure, got {other:?}"),

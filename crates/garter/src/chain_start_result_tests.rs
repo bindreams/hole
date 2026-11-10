@@ -221,15 +221,34 @@ fn is_reported(failure: Failure, cause: &StartError) -> bool {
     }
 }
 
+/// A hop that ends before ready with an error of its own: `run` returns that error, and `on_ready` gets it as the
+/// `Fatal` its `Display` words, with no errno.
+fn ended_with_its_own_error(failure: Failure, ends: Ends) -> bool {
+    matches!((failure, ends), (Failure::Dropped, Ends::ReturnsErr))
+}
+
 /// `Err` names the first thing wrong with a run, so a table reports every failing row.
-fn check(failure: Failure, outcome: &Outcome) -> Result<(), String> {
-    match &outcome.result {
-        Err(crate::Error::StartFailed { plugin, cause }) if plugin == "failing" && is_reported(failure, cause) => {}
-        other => return Err(format!("run returned {other:?}")),
-    }
-    if let Some(heard) = &outcome.heard {
-        if !matches!(heard, Ok(Err(cause)) if is_reported(failure, cause)) {
-            return Err(format!("on_ready got {heard:?}"));
+fn check(failure: Failure, ends: Ends, outcome: &Outcome) -> Result<(), String> {
+    if ended_with_its_own_error(failure, ends) {
+        match &outcome.result {
+            Err(crate::Error::PluginExit { name, code: 3 }) if name == "failing" => {}
+            other => return Err(format!("run returned {other:?}, not the hop's own error")),
+        }
+        if let Some(heard) = &outcome.heard {
+            let wanted = "plugin 'failing' exited with code 3";
+            if !matches!(heard, Ok(Err(StartError::Fatal { detail, errno: None })) if detail == wanted) {
+                return Err(format!("on_ready got {heard:?}, not a Fatal saying {wanted:?}"));
+            }
+        }
+    } else {
+        match &outcome.result {
+            Err(crate::Error::StartFailed { plugin, cause }) if plugin == "failing" && is_reported(failure, cause) => {}
+            other => return Err(format!("run returned {other:?}")),
+        }
+        if let Some(heard) = &outcome.heard {
+            if !matches!(heard, Ok(Err(cause)) if is_reported(failure, cause)) {
+                return Err(format!("on_ready got {heard:?}"));
+            }
         }
     }
     if outcome.healthy_stopped == Some(false) {
@@ -257,7 +276,7 @@ async fn assert_every_row_errs(rows: Vec<(Failure, Position, Ends, bool)>) {
     let mut failures = Vec::new();
     for (failure, position, ends, on_ready) in rows {
         let outcome = run_chain(failure, position, ends, on_ready).await;
-        if let Err(why) = check(failure, &outcome) {
+        if let Err(why) = check(failure, ends, &outcome) {
             failures.push(format!("{failure:?} {position:?} {ends:?} on_ready={on_ready}: {why}"));
         }
     }
@@ -269,7 +288,8 @@ async fn assert_every_row_errs(rows: Vec<(Failure, Position, Ends, bool)>) {
     );
 }
 
-/// The table: `run` returns the typed failure, the others were cancelled, and a registered callback got the same one.
+/// The table: `run` returns the typed failure (or, for a hop that ended before ready with an error of its own, that
+/// error), the others were cancelled, and a registered callback got the same one.
 #[skuld::test]
 async fn run_returns_the_start_failure_whichever_hop_failed_and_however_the_caller_listens() {
     assert_every_row_errs(rows(Ends::ReturnsErr, &[true, false])).await;
