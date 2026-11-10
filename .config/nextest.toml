@@ -143,6 +143,11 @@ nextest-version = "0.9.130"
 #     `Dispatcher::new` opens a real TUN device, and on macOS it is a
 #     kernel-assigned `utun` adapter with no fixed name):
 #     crates/bridge/src/dispatcher_privileged_tests.rs
+#   - `cover_dhcp_nd_global_net_state_` prefix (#1075 — arms each real cover,
+#     forces a DHCP renewal and a neighbor solicitation on the egress NIC and
+#     reads whether they happen; the covers block host egress, and the
+#     measurement edits the NIC's addresses and its DHCP lease):
+#     crates/tun-engine/tests/cover_dhcp_nd_privileged.rs
 #   - `e2e_full_tunnel_local_udp_intact` — matched by the `^e2e_…full_tunnel…`
 #     anchor above, not by a term of its own. It carries
 #     `labels = [DIST_BIN, TUN], serial = TUN` in
@@ -173,7 +178,7 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/macos_lockdown_failed_engage_/) + test(/failclosed_permits_/) + test(/simulated_reboot_rearms_the_cover/) + test(/failclosed_cover_transition_/) + test(/failclosed_cover_state_purge_/) + test(/failclosed_cover_engage_does_not_sever_/) + test(/failclosed_cover_load_/) + test(/macos_recover_cover_/) + test(/release_all_/) + test(/boottime_global_net_state_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/)'
+filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/macos_lockdown_failed_engage_/) + test(/failclosed_permits_/) + test(/simulated_reboot_rearms_the_cover/) + test(/failclosed_cover_transition_/) + test(/failclosed_cover_state_purge_/) + test(/failclosed_cover_engage_does_not_sever_/) + test(/failclosed_cover_load_/) + test(/macos_recover_cover_/) + test(/release_all_/) + test(/boottime_global_net_state_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/) + test(/cover_dhcp_nd_global_net_state_/)'
 test-group = 'global_net_state'
 
 # `macos_failclosed_cover_transition_never_admits_blocked_flow` prints the
@@ -195,6 +200,10 @@ test-group = 'global_net_state'
 # `immediate-final` prints it as the test finishes and again in the summary.
 [[profile.default.overrides]]
 filter = 'test(/failclosed_cover_transition_/)'
+success-output = 'immediate-final'
+
+[[profile.default.overrides]]
+filter = 'test(/cover_dhcp_nd_global_net_state_/)'
 success-output = 'immediate-final'
 
 [[profile.default.overrides]]

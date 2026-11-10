@@ -13,7 +13,7 @@
 //! attribute — platform choices are `cfg!()` branches instead, so every
 //! branch is typechecked on every target and a change that breaks one
 //! platform's harness cannot hide until that platform's lane runs. `pktmon`
-//! (a Windows-only tool), `cover` (it reads the Windows/macOS firewall
+//! (a Windows-only tool), `dad` (the Windows address-change API), `cover` (it reads the Windows/macOS firewall
 //! back, and `routing::failclosed` has no other target) and `dns_notify`
 //! (a macOS-only libSystem API) are the exceptions, gated at the `mod`
 //! declaration instead.
@@ -24,6 +24,8 @@
 pub mod command;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub mod cover;
+#[cfg(target_os = "windows")]
+pub mod dad;
 #[cfg(target_os = "macos")]
 pub mod dns_notify;
 pub mod escape;
@@ -40,7 +42,9 @@ pub use cover::held_covers;
 pub use dns_notify::DnsConfigNotify;
 pub use escape::{recovery_command, write_recovery_record, EscapeGuard, RecordSpec};
 #[cfg(target_os = "windows")]
-pub use pktmon::{capture_contains_nonce, nonce, pktmon, send_marker, PktmonGuard};
+pub use pktmon::{
+    capture_contains_nonce, nonce, pktmon, pktmon_checked, send_marker, stop_reports_no_events_lost, PktmonGuard,
+};
 pub use probe::{classify, classify_send, ProbeFate, SendFate};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub use resolvers::resolver_set_uncovered;

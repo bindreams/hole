@@ -55,15 +55,11 @@ mod windows_impl {
     use std::sync::mpsc::{channel, Sender};
     use std::sync::Arc;
 
-    use windows::Win32::Foundation::{ERROR_NOT_FOUND, HANDLE, NO_ERROR};
-    use windows::Win32::NetworkManagement::IpHelper::{
-        CancelMibChangeNotify2, ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex, GetUnicastIpAddressEntry,
-        NotifyUnicastIpAddressChange, MIB_NOTIFICATION_TYPE, MIB_UNICASTIPADDRESS_ROW,
-    };
+    use tun_engine::test_utils::dad::{dad_verdict, AddressChangeRegistration, DadVerdict};
+    use windows::Win32::Foundation::NO_ERROR;
+    use windows::Win32::NetworkManagement::IpHelper::{ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex};
     use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-    use windows::Win32::Networking::WinSock::{
-        IpDadStateDeprecated, IpDadStateDuplicate, IpDadStateInvalid, IpDadStatePreferred, AF_INET, SOCKADDR_INET,
-    };
+    use windows::Win32::Networking::WinSock::AF_INET;
 
     /// Distinct from `WINDOWS_TUN_ALIAS` (`hole-tun`) so a concurrent bridge e2e,
     /// the adapter-cleanup sweep, and this test can never target each other's
@@ -88,165 +84,6 @@ mod windows_impl {
         }
     }
 
-    /// What the address's DAD state means for this test, read from the
-    /// authoritative entry rather than from the notification.
-    enum DadVerdict {
-        /// Usable as a source address, so `GetBestRoute2` can resolve through
-        /// this interface.
-        Usable,
-        /// DAD found another host holding the address.
-        Duplicate,
-        /// The stack rejected the address outright.
-        Invalid,
-        /// `GetUnicastIpAddressEntry` itself failed.
-        QueryFailed(u32),
-        /// DAD is still running, or the address is not registered yet. The only
-        /// state worth waiting through — wait for the next notification.
-        Pending,
-    }
-
-    /// Owns both the registration handle and the boxed [`Sender`] its context
-    /// pointer targets, so one `Drop` cancels the registration before the box
-    /// releases — regardless of which order the two were constructed in.
-    /// Declaration order alone does not give this: `tx` was declared before
-    /// `notify` below, so a panic unwinding past both would drop `tx` (and
-    /// free the box) FIRST, while the kernel-held registration still points
-    /// into it — a leak turned into a use-after-free, reachable from every
-    /// `panic!` in the `DadVerdict` match below, not just a happy-path
-    /// return. Bundling them means there is no order left to get wrong.
-    struct AddressChangeRegistration {
-        notify: HANDLE,
-        /// Never read after registration — kept alive only because `notify`
-        /// holds a raw pointer into it until cancelled.
-        _tx: Box<Sender<u32>>,
-        /// Test-only observability: set once `Drop` confirms the cancel
-        /// succeeded. `None` in the privileged test's real usage. A second
-        /// real `CancelMibChangeNotify2` on an already-cancelled handle is
-        /// itself unsafe (confirmed empirically: it corrupted the heap) —
-        /// this flag is what lets `address_change_registration_cancels_on_drop_
-        /// even_through_an_early_return` observe the cancel ran without
-        /// touching the handle again.
-        cancel_confirmed: Option<Arc<AtomicBool>>,
-    }
-
-    impl AddressChangeRegistration {
-        /// Registers `tx` boxed, so its address is stable for the
-        /// registration's context pointer.
-        ///
-        /// # Safety
-        /// The boxed `tx` outlives the registration (this `Drop` cancels it
-        /// before the box releases), so the callback's context pointer stays
-        /// valid throughout.
-        fn register(tx: Sender<u32>) -> Self {
-            Self::register_with(tx, None)
-        }
-
-        fn register_with(tx: Sender<u32>, cancel_confirmed: Option<Arc<AtomicBool>>) -> Self {
-            let tx = Box::new(tx);
-            let mut notify = HANDLE::default();
-            let status = unsafe {
-                NotifyUnicastIpAddressChange(
-                    AF_INET,
-                    Some(on_address_change),
-                    Some(&*tx as *const Sender<u32> as *const core::ffi::c_void),
-                    false,
-                    &mut notify,
-                )
-            };
-            assert_eq!(status, NO_ERROR, "NotifyUnicastIpAddressChange failed: {status:?}");
-            Self {
-                notify,
-                _tx: tx,
-                cancel_confirmed,
-            }
-        }
-    }
-
-    impl Drop for AddressChangeRegistration {
-        fn drop(&mut self) {
-            // SAFETY: `self.notify` is the live handle `register`'s
-            // successful call produced.
-            let cancelled = unsafe { CancelMibChangeNotify2(self.notify) };
-            // Gated on `!panicking()`: a failed cancel during unwind must not
-            // itself panic — a second panic during unwind aborts the process,
-            // destroying the ORIGINAL failure message this Drop is running to
-            // preserve (a leaked, still-armed registration either way; abort
-            // just also erases the diagnostic).
-            if cancelled != NO_ERROR && !std::thread::panicking() {
-                panic!("CancelMibChangeNotify2 failed: {cancelled:?}");
-            }
-            if cancelled == NO_ERROR {
-                if let Some(flag) = &self.cancel_confirmed {
-                    flag.store(true, Ordering::SeqCst);
-                }
-            }
-            // `_tx` (and the box `notify`'s context pointer named) drops only
-            // after this line — the registration is confirmed gone first.
-        }
-    }
-
-    /// The notification callback.
-    ///
-    /// **It must not read `DadState`.** `NotifyUnicastIpAddressChange`'s contract
-    /// is that the row handed to the callback "contains incomplete data ... only
-    /// enough information that an application can call
-    /// `GetUnicastIpAddressEntry`": exactly `Address`, `InterfaceLuid` and
-    /// `InterfaceIndex`. Every other member — `DadState` included — is left at
-    /// its zero value, and `IpDadStateInvalid` IS zero, so reading it here
-    /// reports a rejection on every single notification. That is what made the
-    /// first version of this test fail deterministically while claiming the
-    /// subnet was already in use.
-    ///
-    /// So the callback forwards only the interface index and the main thread
-    /// does the authoritative query. Keeping it to a channel send also respects
-    /// the documented rule that `CancelMibChangeNotify2` must never be reached
-    /// from the callback thread.
-    unsafe extern "system" fn on_address_change(
-        context: *const core::ffi::c_void,
-        row: *const MIB_UNICASTIPADDRESS_ROW,
-        _kind: MIB_NOTIFICATION_TYPE,
-    ) {
-        if context.is_null() || row.is_null() {
-            return;
-        }
-        // SAFETY: `context` is the boxed `Sender` passed to
-        // `NotifyUnicastIpAddressChange`, kept alive until after
-        // `CancelMibChangeNotify2`. `row` is kernel-owned and valid for the
-        // duration of the callback; `InterfaceIndex` is one of the three members
-        // the API documents as populated.
-        let tx = unsafe { &*(context as *const Sender<u32>) };
-        let index = unsafe { (*row).InterfaceIndex };
-        let _ = tx.send(index);
-    }
-
-    /// Ask for the COMPLETE entry, which is the only place `DadState` is real.
-    fn dad_verdict(luid: NET_LUID_LH, index: u32) -> DadVerdict {
-        let mut row = MIB_UNICASTIPADDRESS_ROW {
-            Address: ipv4_sockaddr(TEST_ADDR),
-            InterfaceLuid: luid,
-            InterfaceIndex: index,
-            ..Default::default()
-        };
-        // SAFETY: `row` is an owned local seeded with the three members
-        // `GetUnicastIpAddressEntry` requires as input.
-        let status = unsafe { GetUnicastIpAddressEntry(&mut row) };
-        if status == ERROR_NOT_FOUND {
-            // The address has not been registered yet — the adapter's creation
-            // notification can arrive first.
-            return DadVerdict::Pending;
-        }
-        if status != NO_ERROR {
-            return DadVerdict::QueryFailed(status.0);
-        }
-        match row.DadState {
-            s if s == IpDadStatePreferred || s == IpDadStateDeprecated => DadVerdict::Usable,
-            s if s == IpDadStateDuplicate => DadVerdict::Duplicate,
-            s if s == IpDadStateInvalid => DadVerdict::Invalid,
-            // Tentative — the documented transient.
-            _ => DadVerdict::Pending,
-        }
-    }
-
     /// The test adapter's LUID and interface index, or `None` while it does not
     /// exist yet.
     fn adapter_identity() -> Option<(NET_LUID_LH, u32)> {
@@ -261,13 +98,6 @@ mod windows_impl {
             return None;
         }
         Some((luid, index))
-    }
-
-    fn ipv4_sockaddr(addr: std::net::Ipv4Addr) -> SOCKADDR_INET {
-        let mut sa = SOCKADDR_INET::default();
-        sa.Ipv4.sin_family = AF_INET;
-        sa.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(addr.octets());
-        sa
     }
 
     #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
@@ -285,7 +115,7 @@ mod windows_impl {
         // Registered BEFORE the adapter exists, so the address's DAD transition
         // cannot be missed in the gap between creation and subscription.
         let (tx, rx) = channel::<u32>();
-        let registration = AddressChangeRegistration::register(tx);
+        let registration = AddressChangeRegistration::register(AF_INET, tx);
 
         let _guard = AdapterGuard;
         let _device = tun_engine::Device::build(|c| {
@@ -303,7 +133,7 @@ mod windows_impl {
         // The notification only reports THAT something changed; `dad_verdict`
         // does the authoritative `GetUnicastIpAddressEntry` query, because the
         // row handed to the callback leaves `DadState` zeroed and zero is
-        // `IpDadStateInvalid` (see `on_address_change`).
+        // `IpDadStateInvalid` (see `test_utils::dad`).
         //
         // Checks BEFORE blocking, so an address that is already usable by the
         // time `Device::build` returns needs no notification at all. Registering
@@ -313,7 +143,7 @@ mod windows_impl {
         // stack rejected.
         let expected = loop {
             if let Some((luid, index)) = adapter_identity() {
-                match dad_verdict(luid, index) {
+                match dad_verdict(luid, index, TEST_ADDR.into()) {
                     DadVerdict::Usable => break index,
                     DadVerdict::Duplicate => panic!(
                         "{TEST_ADDR} is already in use on this host (DAD reported a duplicate); pick a different subnet than {TEST_CIDR}"
@@ -383,7 +213,7 @@ mod windows_impl {
     #[skuld::test]
     fn address_change_registration_cancels_on_drop_even_through_an_early_return() {
         fn construct_and_drop_early(tx: Sender<u32>, cancel_confirmed: Arc<AtomicBool>) {
-            let _registration = AddressChangeRegistration::register_with(tx, Some(cancel_confirmed));
+            let _registration = AddressChangeRegistration::register_with(AF_INET, tx, Some(cancel_confirmed));
             // early return — exercises the same "control leaves before the
             // happy-path cleanup" shape a `panic!` unwind has, dropping
             // `_registration` here rather than at some later, explicit point.

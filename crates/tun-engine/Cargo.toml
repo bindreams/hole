@@ -120,6 +120,11 @@ walkdir = "2"
 # them. Already in the tree (every proc-macro crate pulls it).
 proc-macro2 = "1"
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# `cover_dhcp_nd_privileged` sends the DHCP renewal from port 68 beside the DHCP client's own socket, which
+# needs `set_reuse_port` (the `all` feature).
+socket2 = { version = "0.6", features = ["all"] }
+
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -149,4 +154,11 @@ harness = false
 [[test]]
 name = "macos_session_key_lifetime_probe"
 path = "tests/macos_session_key_lifetime_probe.rs"
+harness = false
+
+# Own binary, like `gateway_privileged`: skuld's one-label-declaration-per-binary rule (the lib already
+# declares `TUN`), and it needs only the crate's public surface (`failclosed::engage*`).
+[[test]]
+name = "cover_dhcp_nd_privileged"
+path = "tests/cover_dhcp_nd_privileged.rs"
 harness = false

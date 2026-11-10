@@ -23,22 +23,36 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;
 
-/// Run a `pktmon` subcommand, failing loud on a non-zero exit. `pktmon` is the
-/// proof's measurement apparatus — a missing or broken pktmon must FAIL the
-/// test, never silently skip it.
+/// Run a `pktmon` subcommand, failing loud on a spawn failure or a non-zero exit.
+/// `pktmon` is the proof's measurement apparatus — a missing or broken pktmon must
+/// FAIL the test, never silently skip it. The message says which of the two it was.
 pub fn pktmon(args: &[&str]) -> std::process::Output {
+    pktmon_checked(args).unwrap_or_else(|e| panic!("pktmon is the measurement apparatus: {e}"))
+}
+
+/// [`pktmon`] that reports a failure instead of panicking, for a caller inside a
+/// fail-closed cover's window that judges the reading after the cover is released.
+/// The error names whether `pktmon` could not be started or ran and failed.
+pub fn pktmon_checked(args: &[&str]) -> Result<std::process::Output, String> {
     let out = Command::new("pktmon")
         .args(args)
         .output()
-        .unwrap_or_else(|e| panic!("pktmon is the measurement apparatus and must be present: spawn {args:?}: {e}"));
-    assert!(
-        out.status.success(),
-        "pktmon {args:?} failed ({}): stdout={} stderr={}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    out
+        .map_err(|e| format!("pktmon could not be started for {args:?} (not installed?): {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "pktmon ran {args:?} and failed ({}): stdout={} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        ));
+    }
+    Ok(out)
+}
+
+/// Whether the `pktmon stop` that produced `stop_output` reports that the capture
+/// lost no events. A capture that lost events cannot prove a packet absent.
+pub fn stop_reports_no_events_lost(stop_output: &std::process::Output) -> bool {
+    String::from_utf8_lossy(&stop_output.stdout).contains("(No events lost)")
 }
 
 /// RAII guard that always tears down the live pktmon session and filters, so a
