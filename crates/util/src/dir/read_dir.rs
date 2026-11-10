@@ -24,7 +24,7 @@ impl ReadDir {
         #[cfg(windows)]
         return platform::open_dir_read(path).map(Self::from_handle);
         #[cfg(unix)]
-        return platform::open_dir(path, false, None, platform::caller()).map(Self::from_handle);
+        return platform::open_dir(path, false, None, platform::caller(), platform::DIR_MODE).map(Self::from_handle);
     }
 
     pub(super) fn from_handle(file: File) -> ReadDir {

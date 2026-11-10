@@ -1,4 +1,5 @@
 use super::*;
+use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
 use std::sync::mpsc;
@@ -598,4 +599,50 @@ fn a_lock_directory_owned_by_a_third_party_is_refused_and_nothing_is_made_in_it(
         entries(tmp.path()).is_empty(),
         "a lock file was made in a refused directory"
     );
+}
+
+// acquire_in ==========================================================================================================
+
+#[skuld::test]
+fn acquire_in_locks_in_the_held_folder_not_at_the_path_it_was_opened_by() {
+    let tmp = tempfile::tempdir().unwrap();
+    let held = tmp.path().join("runtime");
+    let dir = Dir::open(&held, true, None).unwrap();
+    // The folder is moved away and another put at its old path.
+    let moved = tmp.path().join("moved");
+    std::fs::rename(&held, &moved).unwrap();
+    std::fs::create_dir(&held).unwrap();
+
+    let _lock = Exclusive::acquire_in(&dir, OsStr::new("x.lock"), None).unwrap();
+
+    assert!(
+        moved.join("x.lock").is_file(),
+        "the lock file is in the folder that is held"
+    );
+    assert!(!held.join("x.lock").exists(), "the lock file followed the path");
+}
+
+#[skuld::test]
+fn acquire_in_contends_with_the_path_taking_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let _held = Exclusive::acquire_in(&dir, OsStr::new("x.lock"), None).unwrap();
+
+    let second = Exclusive::try_acquire(&tmp.path().join("x.lock"), None).unwrap();
+
+    assert!(second.is_none(), "one lock file, one holder");
+}
+
+#[skuld::test]
+fn acquire_in_names_the_bare_name_in_a_refusal() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("x.lock")).unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+
+    let err = Exclusive::acquire_in(&dir, OsStr::new("x.lock"), None)
+        .map(|_| ())
+        .unwrap_err();
+
+    let refused = Refused::from_error(&err).unwrap_or_else(|| panic!("not a Refused: {err:?}"));
+    assert_eq!(refused.path(), Path::new("x.lock"));
 }

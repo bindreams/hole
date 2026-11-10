@@ -253,6 +253,17 @@ impl Exclusive {
         Self::acquire_as(path, owner, platform::caller())
     }
 
+    /// [`Self::acquire`] for the file `name` in the `dir` the caller already holds: no path is opened, so
+    /// nothing done to a name above `dir` can lead the lock elsewhere. `name` is one component. `owner` is as in
+    /// [`Self::try_acquire`]; the directory is the caller's to have vetted. A refusal's [`Refused::path`] is
+    /// `name`.
+    pub fn acquire_in(dir: &Dir, name: &OsStr, owner: Option<(u32, u32)>) -> io::Result<Self> {
+        on_acquire_entry();
+        let file = platform::open_locked_in(dir, name, Path::new(name), true, owner, platform::caller())?
+            .expect("blocking open_locked always returns Some");
+        Ok(Exclusive { file })
+    }
+
     /// [`Self::acquire`] as `caller`; see [`Self::try_acquire_as`].
     fn acquire_as(path: &Path, owner: Option<(u32, u32)>, caller: platform::Caller) -> io::Result<Self> {
         on_acquire_entry();

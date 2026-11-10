@@ -194,7 +194,12 @@ impl Standing {
 struct Walk {
     steps: VecDeque<Step>,
     trail: Trail<u32>,
+    /// The mode the last component is made with, if the walk has to make it; the ones above it get [`DIR_MODE`].
+    leaf_mode: u32,
 }
+
+/// The mode a directory is made with, before the umask, as `create_dir_all` does.
+pub(super) const DIR_MODE: u32 = 0o777;
 
 /// Hands the folder `name` in `dir`, which the walk just made as the process of uid `maker`, to `uid` (the group is
 /// left as it is). The name is opened once, and it is that handle that is judged and handed over: the user who owns
@@ -242,8 +247,13 @@ fn descend(cur: &Standing, name: &OsStr, create: bool, walk: &mut Walk) -> io::R
             Ok(entry) => entry,
             Err(err) if err.kind() == io::ErrorKind::NotFound && create => {
                 walk.trail.create_in(|| cur.owner())?;
+                let mode = if walk.steps.is_empty() {
+                    walk.leaf_mode
+                } else {
+                    DIR_MODE
+                };
                 // SAFETY: `cname` is a valid NUL-terminated string and `cur` an open directory.
-                match check(unsafe { libc::mkdirat(cur.fd.as_raw_fd(), cname.as_ptr(), 0o777) }) {
+                match check(unsafe { libc::mkdirat(cur.fd.as_raw_fd(), cname.as_ptr(), mode as libc::mode_t) }) {
                     Ok(_) => {
                         // The folder is the maker's on disk. Below a user's link it must be the user's, or the next
                         // walk through the link refuses what this one made.
@@ -277,10 +287,17 @@ fn descend(cur: &Standing, name: &OsStr, create: bool, walk: &mut Walk) -> io::R
     }
 }
 
-pub(super) fn open_dir(path: &Path, create: bool, owner: Option<(u32, u32)>, caller: Caller) -> io::Result<File> {
+pub(super) fn open_dir(
+    path: &Path,
+    create: bool,
+    owner: Option<(u32, u32)>,
+    caller: Caller,
+    leaf_mode: u32,
+) -> io::Result<File> {
     let mut walk = Walk {
         steps: steps_of(path),
         trail: Trail::new(MAX_LINKS),
+        leaf_mode,
     };
     let rooted = matches!(walk.steps.front(), Some(Step::Root));
     let mut cur = Standing {
@@ -323,12 +340,12 @@ pub(super) fn open_file(dir: &File, name: &OsStr, how: OpenFile) -> io::Result<F
     let (flags, mode) = match how {
         OpenFile::CreateNew { mode } => (libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, mode),
         OpenFile::Existing => (libc::O_RDWR, 0),
-        OpenFile::Read => (libc::O_RDONLY | libc::O_NONBLOCK, 0),
+        OpenFile::Read | OpenFile::ReadPinned => (libc::O_RDONLY | libc::O_NONBLOCK, 0),
         OpenFile::Append => (libc::O_WRONLY | libc::O_APPEND | libc::O_NONBLOCK, 0),
         OpenFile::CreateAppend { mode } => (libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_EXCL, mode),
     };
     let file = File::from(open_fd(dir.as_raw_fd(), &cstr(name)?, flags | libc::O_NOFOLLOW, mode)?);
-    if matches!(how, OpenFile::Read) && !file.metadata()?.is_file() {
+    if matches!(how, OpenFile::Read | OpenFile::ReadPinned) && !file.metadata()?.is_file() {
         return Err(Refusal::NotRegular.into_io_error());
     }
     Ok(file)

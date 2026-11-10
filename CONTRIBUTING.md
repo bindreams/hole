@@ -760,7 +760,8 @@ symlink or a FIFO planted at a name it acts on changes nothing it leads to, and 
 (or removes it) or refuses it with a typed refusal, and a second run in the same layout, with or without a user's link
 on the path, succeeds. A source file that opens a `Dir`, calls `make_dir_and_free_name` or `append_own_file`, or
 writes a `VersionedFile`, and has no row in its table fails
-`every_file_that_opens_a_dir_has_a_row`, so a new writer cannot skip them. The readers have the same kind
+`every_file_that_opens_a_dir_has_a_row`, so a new writer cannot skip them (galoshes' extraction folder,
+`embedded/sealed_dir.rs`, is one: `hole-bridge` dev-depends on `galoshes` for its row). The readers have the same kind
 of table (`no_reader_reads_through_a_symlink_planted_at_its_name`, `no_reader_waits_on_a_fifo_planted_at_its_name`,
 and `state_symlink_tests.rs` in `tun-engine`): each writes a valid file, plants the name, and the reader must not
 report the file the name leads to. A hard link is the file's own inode, so only `read_vouched`'s ownership and link-count rule tells it from the
@@ -3412,9 +3413,44 @@ compatibility.
 `EX_RAY_SHA256`, and galoshes re-hashes the embedded bytes at runtime and refuses
 to run on mismatch. At startup galoshes extracts ex-ray to
 [`embedded::runtime_dir`](crates/galoshes/src/embedded.rs)
-(`$XDG_RUNTIME_DIR/galoshes` else the platform cache dir; bails if neither is
-set) and probes it for `noexec` (statvfs/statfs) — the Linux `/tmp` fallback was
+(`$XDG_RUNTIME_DIR/galoshes-<euid>` else `galoshes-<euid>` in the platform cache dir under the account's home;
+bails if `XDG_RUNTIME_DIR` is unset and there is no home; Windows keeps `galoshes`) and probes it for `noexec` (statvfs/statfs) — the Linux `/tmp` fallback was
 removed because tmpfs is commonly `noexec` (#401).
+
+The directory belongs to one principal, so the name carries the effective uid on every unix (`galoshes-<euid>`, under
+`$XDG_RUNTIME_DIR` too): a run as root under `sudo -E` or an elevation prompt inherits the invoking user's
+`XDG_RUNTIME_DIR` and `HOME`, and without the uid it would share a path with, and leave files in, the user's. The default
+root on every unix is the account's own home (`getpwuid_r`), not `$HOME`; `$HOME` is used only for a uid with no account
+entry (a container run with `--user <n>`), and the account is looked up only when `XDG_RUNTIME_DIR` is unset. Old `galoshes` directories are no longer used
+and may be deleted.
+
+galoshes can still run as root with that directory in a user's profile (an explicit `XDG_RUNTIME_DIR`), so what it execs
+is what it hashed: the directory is walked through handles (`util::dir::Dir`), the file is opened first through that
+handle (`OpenFile::ReadPinned`: never following a link, regular files only, and on unix only one the running user owns
+that group and other cannot write and the owner can execute), hashed through it, and the handle is kept through the
+spawn. Linux execs `/proc/self/fd/N`. Windows opens with `FILE_SHARE_READ` only, which pins the file's real path, the
+one that is run: nobody can write, delete or rename the file or a folder above it (measured), so the path is read off
+the handle (`GetFinalPathNameByHandleW`) and a junction on the name it was given cannot be retargeted to other bytes.
+macOS cannot exec a descriptor, so it execs the name and accepts the directory only if every component of the path the
+held handle resolves to (`F_GETPATH`) is the running user's or root's, not writable by group or other, and not on a
+volume mounted `MNT_IGNORE_OWNERSHIP` (`embedded/sealed_dir.rs`); an ACL on a component is its owner's own grant and is
+not inspected. Under root that is a root-owned path, so a user's home is refused. A directory that exists is judged as
+it is, never repaired or moved: Linux uses it if it opens, macOS refuses it with the typed `SealedDirRefusal`, and one
+that does not open fails the start with the OS error and its path. One galoshes makes is made `0o700` in the `mkdirat`
+itself. A file at the name that is missing, a link, not a regular file, or held open for writing by a foreign process is
+replaced; if the replace fails, the start fails with its cause. Instances starting together take turns through
+`<name>.lock` in the directory (`file_lock::Exclusive::acquire_in`, through the `Dir` already held, so no name above it
+is looked up again; held to the end of `prepare_in`): no replacement of the name can then meet a file another instance
+has just published and still holds open for writing, which fails the Windows pin and makes Linux `execve` fail with
+`ETXTBSY`. Anyone who can write the directory can make a start wait (the wait ends with their process), none can change
+what runs.
+
+**One ex-ray build per user at a time.** The extracted name carries neither the galoshes version nor the hash, so two
+galoshes builds that embed different ex-ray bytes and run as one user share `<dir>/ex-ray`. On Windows the running one
+pins the file, so the second start fails (`failed to extract ex-ray`) until the first exits; on macOS the second can
+replace the name between the first's hash and its exec; on Linux each runs its own bytes. Within Hole two builds never
+overlap (one bridge per host; garter ends plugins with their bridge). A file name per embedded hash would lift this and
+needs a rule for cleaning up old binaries: [bindreams/hole#1217](https://github.com/bindreams/hole/issues/1217).
 
 **Client TLS dial paths must fail closed on ECH.** Every client TLS dial path in
 the vendored `ex-ray/third_party/v2ray-core` must build its config via a factory:

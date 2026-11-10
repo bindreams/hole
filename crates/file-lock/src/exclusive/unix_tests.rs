@@ -7,6 +7,19 @@ const ME: u32 = 1000;
 const OWNER: u32 = 2001;
 const STRANGER: u32 = 3002;
 
+/// [`open_locked_with`] for the file at `path`: the directory is opened first, as [`open_locked`] does.
+fn locked_with(
+    path: &std::path::Path,
+    block: bool,
+    owner: Option<(u32, u32)>,
+    euid: Caller,
+    after_open: impl FnMut(),
+) -> io::Result<Option<Locked>> {
+    let (parent, name) = split(path)?;
+    let dir = Dir::open_as(parent, true, owner, euid)?;
+    open_locked_with(&dir, name, path, block, owner, euid, after_open)
+}
+
 fn file(uid: u32) -> Facts {
     Facts {
         regular: true,
@@ -120,7 +133,7 @@ fn a_lock_file_left_by_a_crash_before_its_fchown_is_replaced_by_a_fresh_one() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     let mine = real_uid();
 
-    let file = open_locked_with(&path, false, Some((mine + 2, mine + 2)), mine, || {})
+    let file = locked_with(&path, false, Some((mine + 2, mine + 2)), mine, || {})
         .unwrap()
         .expect("a leftover must not lock the owner out")
         .file;
@@ -151,7 +164,7 @@ fn a_victim_unlinked_from_the_lock_name_after_the_open_is_left_alone() {
     let mine = real_uid();
     let mut planted = true;
 
-    let file = open_locked_with(&path, false, Some((mine + 2, mine + 2)), mine, || {
+    let file = locked_with(&path, false, Some((mine + 2, mine + 2)), mine, || {
         if std::mem::take(&mut planted) {
             std::fs::remove_file(&path).unwrap();
         }
@@ -177,7 +190,7 @@ fn a_file_swapped_in_after_the_open_is_the_one_locked() {
     let mine = real_uid();
     let mut swapped = false;
 
-    let file = open_locked_with(&path, false, Some((mine, real_gid())), mine + 1, || {
+    let file = locked_with(&path, false, Some((mine, real_gid())), mine + 1, || {
         if !std::mem::replace(&mut swapped, true) {
             std::fs::remove_file(&path).unwrap();
             std::fs::write(&path, b"second").unwrap();
@@ -202,7 +215,7 @@ fn a_file_unlinked_after_the_open_is_replaced_not_refused() {
     let mine = real_uid();
     let mut unlinked = false;
 
-    let file = open_locked_with(&path, false, Some((mine, real_gid())), mine + 1, || {
+    let file = locked_with(&path, false, Some((mine, real_gid())), mine + 1, || {
         if !std::mem::replace(&mut unlinked, true) {
             std::fs::remove_file(&path).unwrap();
         }
@@ -268,7 +281,7 @@ fn a_directory_swapped_for_a_symlink_after_the_open_is_not_followed() {
     let mine = real_uid();
     let mut swapped = false;
 
-    let file = open_locked_with(
+    let file = locked_with(
         &state.join("target.json.lock"),
         false,
         Some((mine + 2, mine + 2)),

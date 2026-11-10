@@ -139,16 +139,29 @@ fn lock(file: &File, block: bool) -> io::Result<bool> {
     Err(err)
 }
 
-/// Opens and locks the lock file, blocking or not per `block`; see the module doc
-/// for the protocol. `Ok(None)` only when `block` is false and the lock is held
-/// elsewhere.
+/// Opens the directory of `path` and locks the file in it; see [`open_locked_in`].
 pub(super) fn open_locked(
     path: &Path,
     block: bool,
     owner: Option<(u32, u32)>,
     euid: Caller,
 ) -> io::Result<Option<File>> {
-    let Some(Locked { file, changeable }) = open_locked_with(path, block, owner, euid, || {})? else {
+    let (parent, name) = split(path)?;
+    let dir = Dir::open_as(parent, true, owner, euid).map_err(|err| Refused::from_dir_error(path, err))?;
+    open_locked_in(&dir, name, path, block, owner, euid)
+}
+
+/// Opens and locks the file `name` in `dir`, blocking or not per `block`; see the module doc for the protocol.
+/// `path` is what a refusal names. `Ok(None)` only when `block` is false and the lock is held elsewhere.
+pub(super) fn open_locked_in(
+    dir: &Dir,
+    name: &OsStr,
+    path: &Path,
+    block: bool,
+    owner: Option<(u32, u32)>,
+    euid: Caller,
+) -> io::Result<Option<File>> {
+    let Some(Locked { file, changeable }) = open_locked_with(dir, name, path, block, owner, euid, || {})? else {
         return Ok(None);
     };
     if changeable {
@@ -160,17 +173,17 @@ pub(super) fn open_locked(
 /// [`open_locked`] with `after_open` run right after each open: the point where
 /// another principal's change to the name matters.
 pub(super) fn open_locked_with(
+    dir: &Dir,
+    name: &OsStr,
     path: &Path,
     block: bool,
     owner: Option<(u32, u32)>,
     euid: Caller,
     mut after_open: impl FnMut(),
 ) -> io::Result<Option<Locked>> {
-    let (parent, name) = split(path)?;
-    // Everything below goes through this handle, never through `path` again.
-    let dir = Dir::open_as(parent, true, owner, euid).map_err(|err| Refused::from_dir_error(path, err))?;
+    // Everything below goes through `dir`, never through `path` again.
     loop {
-        let Some(Opened { file, created }) = open_name(&dir, name, path)? else {
+        let Some(Opened { file, created }) = open_name(dir, name, path)? else {
             continue;
         };
         after_open();
@@ -184,7 +197,7 @@ pub(super) fn open_locked_with(
         }
         // Whoever held the lock before may have unlinked or replaced the name; this
         // file is then an orphan, and the name is evaluated afresh.
-        if !names(&dir, name, &file)? {
+        if !names(dir, name, &file)? {
             continue;
         }
 

@@ -60,7 +60,7 @@
 //! itself, and reading or appending through one is an error. [`Dir::stage`]
 //! writes a complete temp file that [`Staged::publish`] renames over a name or
 //! [`Staged::claim`] renames to a free one; [`Dir::write_atomic`] is the two in one.
-//! On Windows a file that is read or appended shares everything with other
+//! On Windows a file that is read (but for [`OpenFile::ReadPinned`]) or appended shares everything with other
 //! handles, delete included, and a replace or an unlink has POSIX semantics where
 //! the volume has them (Windows 10 1607, NTFS), so an open reader neither blocks
 //! it nor keeps the old name alive.
@@ -147,6 +147,13 @@ pub enum OpenFile {
     /// (unix): anything that is not a regular file is [`Refusal::NotRegular`]. Shares everything with other
     /// handles, delete included, so a replace of the file does not wait for the reader.
     Read,
+    /// Opens what is there to read, as [`Self::Read`], but on Windows shares read only, so while the handle is held
+    /// nobody can write, delete or rename the file, and an open writer, or a writable mapped view of the file whose
+    /// handles are all closed, makes this fail (a sharing violation, measured unelevated). It is opened without backup
+    /// intent, so the file's ACL applies to it as to any other open, whatever the caller's backup privilege. Whether
+    /// that privilege would also pass a share mode is not measured for this open.
+    /// Unix: as `Read`.
+    ReadPinned,
     /// Open what is there to append to, `NotFound` if nothing: it does not create the file, so that the caller
     /// knows whether it made it. Never follows a symlink. Shares everything with other handles, delete included,
     /// so a reader or a rename of the name does not wait for the writer. A FIFO is opened without blocking (unix),
@@ -197,7 +204,15 @@ impl Dir {
     /// [`Self::open`] as `caller`; the seam lets a test claim to be another user.
     #[doc(hidden)]
     pub fn open_as(path: &Path, create: bool, owner: Option<(u32, u32)>, caller: Caller) -> io::Result<Dir> {
-        platform::open_dir(path, create, owner, caller).map(|file| Dir { file })
+        platform::open_dir(path, create, owner, caller, platform::DIR_MODE).map(|file| Dir { file })
+    }
+
+    /// [`Self::open`] with `create`, where the last component, if it has to be made, is made with `leaf_mode`
+    /// (unix: in the `mkdirat` itself, before the umask) instead of `0o777`; the components above it are made as
+    /// `open` makes them. A last component that exists is opened as it is, whatever its mode. Windows has no mode and
+    /// ignores `leaf_mode`.
+    pub fn open_with_leaf_mode(path: &Path, leaf_mode: u32) -> io::Result<Dir> {
+        platform::open_dir(path, true, None, platform::caller(), leaf_mode).map(|file| Dir { file })
     }
 
     /// The directory's own handle, for an operation on the directory itself (an ACL on Windows).

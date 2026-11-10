@@ -78,18 +78,30 @@ fn open_name(dir: &Dir, name: &OsStr, path: &Path) -> io::Result<Option<File>> {
     }
 }
 
-/// Opens the lock file, vets the handle and locks it; see the module doc for the
-/// protocol. `owner` is ignored.
+/// Opens the directory of `path` and locks the file in it; see [`open_locked_in`]. `owner` is ignored.
 pub(super) fn open_locked(
+    path: &Path,
+    block: bool,
+    owner: Option<(u32, u32)>,
+    caller: Caller,
+) -> io::Result<Option<File>> {
+    let (parent, name) = split(path)?;
+    let dir = Dir::open(parent, true, None).map_err(|err| Refused::from_dir_error(path, err))?;
+    open_locked_in(&dir, name, path, block, owner, caller)
+}
+
+/// Opens the file `name` in `dir`, vets the handle and locks it; see the module doc for the protocol. `path` is
+/// what a refusal names. `owner` is ignored.
+pub(super) fn open_locked_in(
+    dir: &Dir,
+    name: &OsStr,
     path: &Path,
     block: bool,
     _owner: Option<(u32, u32)>,
     _caller: Caller,
 ) -> io::Result<Option<File>> {
-    let (parent, name) = split(path)?;
-    let dir = Dir::open(parent, true, None).map_err(|err| Refused::from_dir_error(path, err))?;
     let file = loop {
-        if let Some(file) = open_name(&dir, name, path)? {
+        if let Some(file) = open_name(dir, name, path)? {
             break file;
         }
     };
