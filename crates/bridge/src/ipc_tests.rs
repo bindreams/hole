@@ -3401,8 +3401,8 @@ fn redaction_config() -> ProxyConfig {
 
 /// Stands in for the open-ended set of producers the sink exists for: a
 /// dependency at the default global `info`, which no per-site edit reaches.
-fn emit_third_party_line() {
-    tracing::info!(target: "some_dependency::dialer", "creating connection to {REDACT_ADDR}:8388");
+fn emit_third_party_line(addr: &str) {
+    tracing::info!(target: "some_dependency::dialer", "creating connection to {addr}:8388");
 }
 
 #[skuld::test]
@@ -3417,7 +3417,7 @@ async fn start_request_arms_redaction_before_it_logs() {
             Json(redaction_config()),
         )
         .await;
-        emit_third_party_line();
+        emit_third_party_line(REDACT_ADDR);
     }
 
     assert_eq!(
@@ -3434,34 +3434,68 @@ async fn start_request_arms_redaction_before_it_logs() {
     assert!(log.contains(&token), "the token is missing from the log: {log}");
 }
 
+/// The `/v1/test-server` handler is its own route with its own arming call: it
+/// would ship unarmed while `start_request_arms_redaction_before_it_logs` still
+/// passed. The stub records the registry's rendering of the configured host at
+/// each query, and the host resolves to a multicast documentation address
+/// (RFC 5771): a TCP connect to it cannot be answered, and the preflight gives
+/// up after a short timeout. The connect is still attempted, so no verdict is
+/// asserted, only what the handler armed.
 #[skuld::test]
-async fn test_server_request_arms_redaction_before_it_logs() {
-    // A separate axum route with its own arming call: it would ship unarmed
-    // while `start_request_arms_redaction_before_it_logs` still passed.
-    let (subscriber, writer) = redacting_capture();
-    let token = hole_common::logging::redact_arm::token_for(REDACT_ENTRY_ID);
+async fn test_server_request_arms_the_configured_and_the_resolved_address() {
+    let host = "armed-before-first-use.example";
+    let resolved: std::net::IpAddr = "233.252.0.1".parse().unwrap();
     let mut entry = redaction_config().server;
-    entry.plugin = Some("definitely-not-a-real-plugin-binary".into());
-    {
-        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
-        let _ = super::handle_test_server(
-            axum::extract::State(ipc_state(mock_proxy())),
-            Json(hole_common::protocol::TestServerRequest {
-                entry,
-                dns: hole_common::config::DnsConfig::default(),
-            }),
-        )
-        .await;
-        emit_third_party_line();
-    }
-
+    entry.id = "c1a0b7e2-0000-0000-0000-000000000000".to_string();
+    // A hostname, so the run goes through a DoH bootstrap leg (a literal IP
+    // would short-circuit it).
+    entry.server = host.into();
+    let dns = hole_common::config::DnsConfig {
+        servers: vec!["1.1.1.1".parse().unwrap()],
+        ..hole_common::config::DnsConfig::default()
+    };
+    let probe = Arc::new(crate::test_support::doh_stub::ArmedProbeQuerier {
+        inner: crate::test_support::doh_stub::WiringStubQuerier {
+            host: host.into(),
+            ip: resolved,
+        },
+        host_as_rendered: Default::default(),
+    });
+    let mut state = IpcState::new(mock_proxy(), "test", tempfile::tempdir().unwrap().keep());
+    state.test_server_config = crate::server_test::TestConfig {
+        bootstrap: crate::dns::bootstrap::BootstrapResolver::with_querier(probe.clone()),
+        preflight_timeout: std::time::Duration::from_millis(500),
+        ..crate::server_test::TestConfig::production()
+    };
+    let token = hole_common::logging::redact_arm::token_for(&entry.id);
     assert_eq!(
-        util::redact::redact_str(REDACT_ADDR),
-        token,
-        "the test-server handler must arm the configured address"
+        util::redact::redact_str(&resolved.to_string()),
+        resolved.to_string(),
+        "the resolved address must start unarmed"
     );
-    let log = writer.snapshot();
-    assert!(!log.contains(REDACT_ADDR), "the address reached the log: {log}");
+
+    let response = super::handle_test_server(
+        axum::extract::State(Arc::new(state)),
+        Json(hole_common::protocol::TestServerRequest { entry, dns }),
+    )
+    .await;
+
+    assert_ne!(
+        response.0.outcome,
+        hole_common::protocol::ServerTestOutcome::DnsFailed,
+        "the run must resolve through the stub"
+    );
+    let rendered = probe.host_as_rendered.lock().unwrap().clone();
+    assert!(!rendered.is_empty(), "the bootstrap leg never queried the stub");
+    assert!(
+        rendered.iter().all(|r| *r == token),
+        "the configured host was not armed at its first use: {rendered:?}"
+    );
+    assert_eq!(
+        util::redact::redact_str(&resolved.to_string()),
+        token,
+        "the resolved address must be armed through the handler"
+    );
 }
 
 #[skuld::test]
@@ -3528,7 +3562,7 @@ async fn reload_to_a_different_server_that_fails_is_redacted_in_log_and_response
         .expect("initial start must succeed");
 
         let result = handle_reload(axum::extract::State(state.clone()), Json(reloaded)).await;
-        emit_third_party_line();
+        emit_third_party_line(REDACT_ADDR);
 
         let Err((status, Json(body))) = result else {
             panic!("expected the stop+start reload to fail");

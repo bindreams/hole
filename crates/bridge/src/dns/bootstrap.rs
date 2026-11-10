@@ -15,7 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RecordType};
-use hole_common::config::{DnsConfig, DnsProtocol};
+use hole_common::config::{DnsConfig, DnsProtocol, ServerEntry};
 
 use crate::dns::connector::DirectConnector;
 use crate::dns::ech::PinSource;
@@ -274,14 +274,59 @@ pub struct Bootstrapped {
     pub via: PinSource,
 }
 
-/// Resolve `host` to an IP over the configured DoH `dns.servers`. See the task
-/// interface for the fail-closed / `allow_insecure_bootstrap` contract.
-pub async fn resolve_via_doh(host: &str, dns: &DnsConfig) -> Result<Bootstrapped, BootstrapError> {
-    resolve_via_doh_with(host, dns, Arc::new(ForwarderQuerier)).await
+/// Where the bootstrap resolution goes: the production DoH path, or under a test
+/// an injected querier. The one owner of resolving a server's hostname, so the
+/// `ProxyManager` and the server test resolve it, and arm the result for
+/// redaction, the same way.
+#[derive(Clone, Default)]
+pub struct BootstrapResolver {
+    #[cfg(test)]
+    querier: Option<Arc<dyn DohQuerier>>,
 }
 
-/// `resolve_via_doh` with an injected querier (test seam).
-pub async fn resolve_via_doh_with(
+impl BootstrapResolver {
+    /// Resolve through `querier`: no OS resolver and no network.
+    #[cfg(test)]
+    pub(crate) fn with_querier(querier: Arc<dyn DohQuerier>) -> Self {
+        Self { querier: Some(querier) }
+    }
+
+    /// Resolve `entry`'s server over the configured DoH `dns.servers` (the
+    /// injected querier under test), then arm the resolved address under the
+    /// entry's token before returning it: no caller can hold it unarmed.
+    pub(crate) async fn resolve(&self, entry: &ServerEntry, dns: &DnsConfig) -> Result<Bootstrapped, BootstrapError> {
+        let host = entry.server.expose();
+        #[cfg(test)]
+        let querier = self.querier.clone().unwrap_or_else(|| Arc::new(ForwarderQuerier));
+        #[cfg(not(test))]
+        let querier: Arc<dyn DohQuerier> = Arc::new(ForwarderQuerier);
+        let bootstrapped = resolve_via_doh_with(host, dns, querier).await?;
+        Self::arm(entry, bootstrapped.server_ip);
+        Ok(bootstrapped)
+    }
+
+    /// A held-cover retry reuses the address (and pin) of the start that
+    /// engaged the cover instead of resolving. That address may have been armed
+    /// under another entry's id (the reuse match is by host), so it is armed
+    /// under THIS entry's token, and the pin is revalidated against this
+    /// start's resolver set.
+    pub(crate) fn reuse(entry: &ServerEntry, cached: Bootstrapped, dns: &DnsConfig) -> Bootstrapped {
+        Self::arm(entry, cached.server_ip);
+        Bootstrapped {
+            server_ip: cached.server_ip,
+            via: crate::dns::ech::revalidate(cached.via, &dns.servers),
+        }
+    }
+
+    fn arm(entry: &ServerEntry, server_ip: IpAddr) {
+        hole_common::logging::redact_arm::arm_resolved_ip(&entry.id, server_ip);
+    }
+}
+
+/// Resolve `host` to an IP over the configured DoH `dns.servers` through
+/// `querier`. Returns the address unarmed, so only [`BootstrapResolver`] calls
+/// it. Fail-closed unless `dns.allow_insecure_bootstrap`.
+async fn resolve_via_doh_with(
     host: &str,
     dns: &DnsConfig,
     querier: Arc<dyn DohQuerier>,

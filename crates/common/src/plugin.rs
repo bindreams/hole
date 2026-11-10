@@ -12,6 +12,20 @@ pub struct PluginDescriptor {
     /// list. Resolution — `lookup` / `is_known` / `binary_name` — covers
     /// ALL descriptors regardless; only the UI list filters on this.
     pub user_visible: bool,
+    /// Transports the SIP003 handoff port (`SS_LOCAL_PORT`) must be free for.
+    ///
+    /// Sized *before* the plugin reports the transports it negotiated. A
+    /// UDP-capable plugin (galoshes' YAMUX) gets TCP and UDP so its internal
+    /// `UdpSocket::bind` on the same address cannot hit the Windows
+    /// cross-protocol excluded-port race; `ex-ray` is TCP-only. Not the runtime
+    /// UDP-drop policy: that reads the sitrep `transports` off
+    /// `PluginChain::transports()`.
+    pub alloc_protocols: util::port_alloc::Protocols,
+    /// Whether Hole injects its own SIP003 directives (`loglevel`, and `ech-doh`
+    /// when ECH is derived) into this plugin's options, and so permits the
+    /// resolver a derived `ech-doh` names. A plugin that does not understand
+    /// these keys is left its options untouched.
+    pub takes_hole_directives: bool,
 }
 
 static KNOWN_PLUGINS: &[PluginDescriptor] = &[
@@ -21,6 +35,8 @@ static KNOWN_PLUGINS: &[PluginDescriptor] = &[
         name: "v2ray-plugin",
         binary_name: "ex-ray",
         user_visible: true,
+        alloc_protocols: util::port_alloc::Protocols::TCP,
+        takes_hole_directives: true,
     },
     // Impl detail, hidden from the UI list — `ex-ray` is the binary that
     // `v2ray-plugin` resolves to, exposed here only so a config that names
@@ -29,11 +45,15 @@ static KNOWN_PLUGINS: &[PluginDescriptor] = &[
         name: "ex-ray",
         binary_name: "ex-ray",
         user_visible: false,
+        alloc_protocols: util::port_alloc::Protocols::TCP,
+        takes_hole_directives: true,
     },
     PluginDescriptor {
         name: "galoshes",
         binary_name: "galoshes",
         user_visible: true,
+        alloc_protocols: util::port_alloc::Protocols::TCP.union(util::port_alloc::Protocols::UDP),
+        takes_hole_directives: true,
     },
 ];
 
@@ -71,31 +91,6 @@ pub fn user_visible_plugin_names() -> impl Iterator<Item = &'static str> {
 /// not one of them.
 pub fn known_plugin_names_joined() -> String {
     user_visible_plugin_names().collect::<Vec<_>>().join(", ")
-}
-
-/// Transports to allocate the local handoff port for, by BINARY name.
-///
-/// This is the *pre-spawn* port-verification concern: the proxy manager
-/// must size the SIP003 handoff port (passed to the plugin via
-/// `SS_LOCAL_PORT`) *before* the plugin reports the transports it
-/// actually negotiated, so it stays a static map keyed by the on-disk
-/// binary name. A UDP-capable binary (galoshes, YAMUX) gets a port
-/// verified on both TCP and UDP so the plugin's internal `UdpSocket::bind`
-/// on the same address can't hit the Windows cross-protocol excluded-port
-/// race; `ex-ray` (and unknown binaries) are TCP-only.
-///
-/// Not to be confused with the runtime UDP-drop policy: the authoritative
-/// end-to-end UDP capability comes from the plugin's reported sitrep
-/// `transports` (read via `PluginChain::transports()` in the bridge — the
-/// single source of truth for whether `Proxy`-routed UDP flows are
-/// carried or dropped). This function only decides which transports
-/// to *verify-free* at allocation time.
-pub fn plugin_alloc_protocols(binary_name: &str) -> util::port_alloc::Protocols {
-    use util::port_alloc::Protocols;
-    match binary_name {
-        "galoshes" => Protocols::TCP | Protocols::UDP,
-        _ => Protocols::TCP,
-    }
 }
 
 #[cfg(test)]

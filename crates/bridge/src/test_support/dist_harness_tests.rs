@@ -106,7 +106,7 @@ fn dump_harness_log_handles_missing_file() {
 #[skuld::test]
 fn spawn_refuses_an_empty_hole_binary() {
     let dist = tempfile::tempdir().expect("tempdir");
-    let hole = dist.path().join(if cfg!(windows) { "hole.exe" } else { "hole" });
+    let hole = dist.path().join(format!("hole{}", std::env::consts::EXE_SUFFIX));
     std::fs::write(&hole, b"").expect("write empty hole");
 
     let err = crate::test_support::rt()

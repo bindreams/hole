@@ -398,11 +398,20 @@ binary must not call (`handle-holders`' `lsof`) is a `[dev-dependencies]` entry
 of the bridge, not a `[dependencies]` one. Test and tooling code that runs under `sudo`/an admin shell
 in CI (the privileged lanes) is attended and keeps bare names.
 
-The plugin spawn is the one root spawn this does not cover:
-`resolve_plugin_path_inner` returns a bare plugin name when no sibling binary
-exists next to the bridge, and `garter::BinaryPlugin::run` (which carries the
-per-site allow) passes it to cosca, which searches `PATH`. Closing it changes what
-users can configure; it is bindreams/hole#1072.
+The plugin spawn follows the same rule by a different mechanism: the privileged
+bridge runs only the plugins Hole ships (`hole_common::plugin::KNOWN_PLUGINS`),
+resolved next to the bridge executable and nowhere else. `resolve_plugin` (which
+reads `current_exe()` itself) is the only production producer of a `BundledPlugin`
+(a shipped plugin's descriptor bound to the absolute path of its binary beside the
+executable), and `start_plugin_chain` takes only that, so a bare name for
+`garter::BinaryPlugin` to look up on `PATH` cannot be written on the bridge's path.
+`resolve_plugin_beside` takes the executable explicitly for tests that stage an
+install. It is the one gate for "may this plugin run", asked first in
+`start_cancellable` and `run_server_test`, before any DoH bootstrap, cover or
+dial: an unbundled name or a missing binary is refused with nothing touched and
+reaches the user as the usual start error. Import already rejects such plugins, so
+only a hand-edited or old config, or a direct IPC call, gets here. Third-party
+SIP003 plugins are not supported.
 
 `Dns` has a two-layer seam — outer (`MockDns` at `ProxyManager::new_with_dns`)
 and inner per-platform backend (`MockBackend` at `SystemDns::new_with_backend`).
@@ -534,7 +543,7 @@ needs many retries, a healthy machine one. See #285, #300, #304.
 
 **Reserve for the protocols the consumer will bind.** Where the consumer is
 known at reservation time, name it exactly —
-`hole_common::plugin::plugin_alloc_protocols` keys SS_LOCAL by binary (galoshes
+`PluginDescriptor::alloc_protocols` sizes SS_LOCAL per plugin (galoshes
 TCP+UDP, everything else TCP). Where the reservation happens before the
 consumer is known, reserve the union over the possible consumers:
 `plugin_e2e::ports::reserve_ss_local` is generic over which client plugin will
@@ -1328,7 +1337,7 @@ structurally the only value this fetch can need, not a heuristic threshold):
 `EchDoh::resolver`, the exact address Hole's own `ech-doh` URL names, gated on
 `crate::proxy::plugin::effective_ech_doh` returning `Holes` — the value ex-ray
 will actually dial, not merely a plugin being configured (no plugin is one way
-to get `None`; a non-ECH-capable plugin, a fatal ex-ray config, `ech=never`,
+to get `None`; a plugin whose descriptor does not set `takes_hole_directives`, a fatal ex-ray config, `ech=never`,
 no TLS-enabled domain SNI, or an operator's own `ech-doh` outranking Hole's
 are the others — see `ech_fetch_is_reachable`'s and `classify_ech_doh`'s docs).
 Without it, ex-ray's later lazy ECH-config fetch — which fires
@@ -1338,7 +1347,7 @@ trust regardless of `PinSource`:** Hole *authored* the address — `ech_doh_url`
 either uses the bootstrap-verified IP or falls back to one in the user's own
 configured `dns.servers` — so config-authorship trust alone is judged
 sufficient. This is NOT a claim that this attempt personally dialed the
-address: `resolve_via_doh` does dial every configured resolver even on total
+address: `resolve_via_doh_with` does dial every configured resolver even on total
 failure (so `Answered` and `SecureBootstrapFailed` both had it dialed this
 session), but `NoQueryNeeded` (a literal-IP server) dials nothing at all, and
 `ResolverDeselected` (a covered retry whose `dns.servers` changed) may name an
@@ -1348,8 +1357,10 @@ address is different: an operator's own `ech-doh` in `plugin_opts` can win
 first-wins over Hole's (`crate::proxy::plugin::effective_ech_doh`, not
 `ech_doh.is_some()` alone, decides which value actually reaches ex-ray), and
 that address is never permitted — Hole did not author it, so config-authorship
-trust does not extend to it. `effective_ech_doh` also means a non-ECH-capable
-plugin never widens the cover for a fetch that provably does not use it. A
+trust does not extend to it. `effective_ech_doh` also means a plugin whose
+descriptor does not set `takes_hole_directives` (read by it and by
+`inject_plugin_directives`) never widens the cover for a fetch that provably does
+not use it. A
 covered retry against the same server reuses the held cover as-is UNLESS this
 attempt's freshly-derived permit now differs from what the cover was actually
 engaged with (e.g. `dns.servers` changed the fallback address, a plugin was
@@ -1388,8 +1399,8 @@ macOS this blocks the fetch outright, silently, on every lockdown-on covered
 start with an ECH-effective config — not only a restart-adopt, which merely
 compounds it by also removing the in-process signal a fresh engage still has
 (`effective_ech_doh`, computed before `install_lockdown` runs) but has no API
-to consume. On Windows the App-ID floor (`resolve_plugin_path(plugin)` — the
-plugin's OWN resolved binary) is sufficient for a direct `ex-ray`/
+to consume. On Windows the App-ID floor (`PluginChain::binary()` — the
+file the chain was spawned from) is sufficient for a direct `ex-ray`/
 `v2ray-plugin` config, but NOT for a chained plugin like `galoshes`: it
 `include_bytes!`s ex-ray and spawns it as a separate process from its own
 extracted runtime path (`crates/galoshes/src/embedded.rs`), which
@@ -3760,8 +3771,8 @@ HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 plugin sidecars + `NOTICES.md` + per-platform debug symbols + `wintun.dll` on
 Windows) matching the installed `Program Files\hole\bin\`. The bridge must be
 staged out of the cargo target dir because the running bridge file-locks its own
-exe; the plugin sidecars must be siblings so `resolve_plugin_path_inner` finds
-them. The canonical file list (the single source of truth, per-OS) is
+exe; the plugin sidecars must be siblings, the only place `resolve_plugin`
+looks. The canonical file list (the single source of truth, per-OS) is
 [`bindir_dest_names`](xtask-lib/src/bindir.rs); the installer manifests are
 checked against it by conformance tests (`cargo xtask bindir-names`).
 
@@ -4420,11 +4431,17 @@ The out-of-process plugin (`ex-ray`, `galoshes`) is otherwise invisible:
   the #248 diagnostic), `close_kind`, and `tap_conn_id`. On self-test failure the
   bridge emits a breadcrumb to the tap lines (#388). Costs a loopback round-trip
   per byte + a line per connection — not for default operation under load.
-- **Plugin directive injection** — `inject_plugin_directives` appends
-  `loglevel=debug` (always) and `ech-doh=<resolver-DoH-url>` (when a resolver is
-  configured) to `SS_PLUGIN_OPTIONS` for `v2ray-plugin`/`ex-ray`/`galoshes`;
-  stderr is captured via `garter::binary` and filtered by `HOLE_BRIDGE_LOG`. The
-  bridge never injects `ech=<mode>` — ex-ray owns the mode (default `auto`).
+- **Plugin directive injection** — for a plugin whose
+  `PluginDescriptor::takes_hole_directives` is set, `inject_plugin_directives`
+  appends `loglevel=debug` and `ech-doh=<resolver-DoH-url>` (when a resolver is
+  configured) to `SS_PLUGIN_OPTIONS`; any other plugin gets its options
+  validated and passed through untouched. An operator's own `loglevel` is always
+  replaced; their `ech-doh` is replaced only when Hole's URL displaces it
+  (`hole_ech_doh_outranks`), otherwise it stands and Hole's appended copy loses
+  to it (ex-ray is first-wins). The derivation of the `ech-doh` URL
+  (`derive_ech_doh`) and the cover's resolver permit read the same field.
+  Stderr is captured via `garter::binary` and filtered by `HOLE_BRIDGE_LOG`.
+  The bridge never injects `ech=<mode>` — ex-ray owns the mode (default `auto`).
 
 ## CLI (dev/admin commands)
 

@@ -14,7 +14,9 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use util::port_alloc;
 
+use super::config::BundledPlugin;
 use super::ProxyError;
+use hole_common::plugin::PluginDescriptor;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -40,6 +42,8 @@ pub struct PluginChain {
     transports: garter::Transports,
     state_dir: Option<PathBuf>,
     log: Arc<crate::proxy::plugin_log::PluginLog>,
+    /// The plugin the chain was spawned from.
+    plugin: BundledPlugin,
 }
 
 impl std::fmt::Debug for PluginChain {
@@ -74,6 +78,12 @@ impl PluginChain {
         self.transports
     }
 
+    /// The file the chain was spawned from, for the lockdown App-ID permit: read
+    /// off the chain so the permit names the file that ran.
+    pub fn binary(&self) -> &Path {
+        self.plugin.path()
+    }
+
     /// The chain's kept log lines — see [`crate::proxy::plugin_log`].
     pub fn log(&self) -> &Arc<crate::proxy::plugin_log::PluginLog> {
         &self.log
@@ -92,6 +102,7 @@ impl PluginChain {
         log: Arc<crate::proxy::plugin_log::PluginLog>,
         cancel: CancellationToken,
         state_dir: Option<PathBuf>,
+        plugin: BundledPlugin,
     ) -> Self {
         Self {
             task: ChainTask {
@@ -102,6 +113,7 @@ impl PluginChain {
             transports: garter::Transports::TCP,
             state_dir,
             log,
+            plugin,
         }
     }
 
@@ -112,6 +124,7 @@ impl PluginChain {
     pub(crate) fn over_task_for_test(
         handle: tokio::task::JoinHandle<garter::Result<()>>,
         cancel: CancellationToken,
+        plugin: BundledPlugin,
     ) -> Self {
         Self {
             task: ChainTask { handle, cancel },
@@ -119,6 +132,7 @@ impl PluginChain {
             transports: garter::Transports::TCP,
             state_dir: None,
             log: crate::proxy::plugin_log::PluginLog::new(),
+            plugin,
         }
     }
 
@@ -154,12 +168,11 @@ impl Drop for ChainTask {
 /// When `None`, no state is tracked (used by `server_test` for one-shot
 /// probes that die with the bridge).
 ///
-/// `plugin_name` selects the protocol set for the local port allocation
+/// `plugin` selects the protocol set for the local port allocation
 /// — UDP-capable plugins (galoshes) need the port verified for both TCP
 /// and UDP so their internal dual bind on the local address can't hit
-/// the Windows cross-protocol excluded-port race. The config name is
-/// first resolved to its on-disk binary name, then mapped via
-/// [`hole_common::plugin::plugin_alloc_protocols`].
+/// the Windows cross-protocol excluded-port race. The set is the descriptor's
+/// `alloc_protocols`.
 ///
 /// Allocates the handoff port via [`port_alloc::bind_ephemeral`]. The
 /// plugin subprocess binds `local_addr` out-of-process, so its bind
@@ -171,8 +184,7 @@ impl Drop for ChainTask {
 /// probe-drop-to-subprocess-bind TOCTOU is tracked in bindreams/hole#304.
 #[allow(clippy::too_many_arguments)] // bundling into a struct adds more noise than the warning; matches spawn_plugin_runner_at below.
 pub async fn start_plugin_chain(
-    plugin_name: &str,
-    plugin_path: &str,
+    plugin: &BundledPlugin,
     plugin_opts: Option<&str>,
     server_host: &str,
     server_port: u16,
@@ -183,15 +195,10 @@ pub async fn start_plugin_chain(
     ech_doh: Option<&crate::dns::ech::EchDoh>,
 ) -> Result<PluginChain, ProxyError> {
     // Inject Hole-owned SIP003 directives — see `inject_plugin_directives`.
-    let merged_opts = inject_plugin_directives(plugin_name, plugin_opts, ech_doh)?;
-    // Resolve the config name to its on-disk binary name before sizing the
-    // handoff port — `plugin_alloc_protocols` is keyed by binary name so
-    // `v2ray-plugin` (→ `ex-ray`) and unknown plugins get a TCP-only port
-    // while galoshes gets a UDP-capable one (#414).
-    let binary = hole_common::plugin::lookup(plugin_name)
-        .map(|d| d.binary_name)
-        .unwrap_or(plugin_name);
-    let protocols = hole_common::plugin::plugin_alloc_protocols(binary);
+    let merged_opts = inject_plugin_directives(plugin.descriptor(), plugin_opts, ech_doh)?;
+    // Size the handoff port by the descriptor, so `v2ray-plugin` (→ `ex-ray`)
+    // gets a TCP-only port while galoshes gets a UDP-capable one.
+    let protocols = plugin.descriptor().alloc_protocols;
     // Built before `bind_ephemeral` so every bind-retry attempt feeds the same
     // ring — a losing attempt's output explains the retry.
     let log = crate::proxy::plugin_log::PluginLog::new();
@@ -211,8 +218,7 @@ pub async fn start_plugin_chain(
             async move {
                 let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
                 spawn_plugin_runner_at(
-                    plugin_name,
-                    plugin_path,
+                    plugin,
                     merged_opts.as_deref(),
                     local_addr,
                     server_host,
@@ -251,6 +257,7 @@ pub async fn start_plugin_chain(
         transports,
         state_dir: state_dir.map(Path::to_path_buf),
         log,
+        plugin: plugin.clone(),
     })
 }
 
@@ -333,10 +340,9 @@ fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
 /// A plugin `StartError::BindConflict` (the only retryable start class)
 /// maps to [`ProxyError::BindRace`] so the outer `bind_ephemeral` retries
 /// on a fresh port; a `StartError::Fatal` maps to [`ProxyError::Plugin`].
-#[allow(clippy::too_many_arguments)] // 11 args — bundling into a struct adds more noise than the warning.
+#[allow(clippy::too_many_arguments)] // bundling into a struct adds more noise than the warning.
 async fn spawn_plugin_runner_at(
-    plugin_name: &str,
-    plugin_path: &str,
+    plugin: &BundledPlugin,
     merged_opts: Option<&str>,
     local_addr: SocketAddr,
     server_host: &str,
@@ -347,7 +353,12 @@ async fn spawn_plugin_runner_at(
     start_cancel: CancellationToken,
     log: &Arc<crate::proxy::plugin_log::PluginLog>,
 ) -> Result<(ChainTask, SocketAddr, garter::Transports), ProxyError> {
-    let mut plugin = garter::BinaryPlugin::new(plugin_path, merged_opts).readiness(readiness_for(plugin_name));
+    let plugin_name = plugin.descriptor().name;
+    // Every shipped plugin speaks sitrep, whose AUTHORITATIVE transports the
+    // UDP-drop policy needs (galoshes' `tcp,udp`); `Probe`'s TCP connect
+    // would discard them.
+    let mut plugin =
+        garter::BinaryPlugin::new(plugin.path(), merged_opts).readiness(garter::ReadinessMode::ExpectSitrep);
     // Before the tap wrap: `TapPlugin` delegates `run`, so the sink still fires.
     plugin = plugin.log_sink(log.sink());
 
@@ -498,18 +509,6 @@ fn unpinned_reason(ech_doh: Option<&crate::dns::ech::EchDoh>) -> &'static str {
     }
 }
 
-/// The v2ray-family plugin names `inject_plugin_directives` rewrites
-/// `ech-doh` for. `v2ray-plugin` resolves to the first-party `ex-ray` binary,
-/// but a config may also name `ex-ray` directly, so both spellings are
-/// covered; `galoshes` ignores the keys itself but forwards the whole options
-/// string to its inner ex-ray. Every OTHER plugin name gets no `ech-doh`
-/// injected — nothing that plugin does can be influenced by Hole's ECH
-/// derivation at all — but its options string is still validated; see
-/// `inject_plugin_directives`'s doc comment.
-fn takes_ech_directives(plugin_name: &str) -> bool {
-    matches!(plugin_name, "v2ray-plugin" | "ex-ray" | "galoshes")
-}
-
 /// Whether Hole's OWN `ech_doh` outranks (and should replace) an operator's
 /// existing `ech-doh` value already present in `plugin_opts`: only a resolver
 /// that ANSWERED the bootstrap, or a name-authority operator value carrying
@@ -529,8 +528,12 @@ fn hole_ech_doh_outranks(ech_doh: &crate::dns::ech::EchDoh, config_value: &str) 
 /// actual plugin spawn always agree on the same answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EffectiveEchDoh {
-    /// A non-ECH-capable plugin, or an ECH-capable one with no `ech-doh`
-    /// from any source — ECH is off, nothing will be fetched.
+    /// Nothing will be fetched: a plugin that does not take Hole's directives,
+    /// an options string ex-ray cannot parse, no `ech-doh` from any source, or
+    /// any `ech-doh` rendered inert by `ech=never` or by no TLS-enabled domain
+    /// SNI. A configuration ex-ray rejects outright (`ex_ray_fatal_config_error`)
+    /// is `None` too, though there the plugin exits before dialing anything and
+    /// the connection fails.
     None,
     /// Hole's own `ech_doh` is the value ex-ray will fetch.
     Holes,
@@ -549,26 +552,26 @@ pub(crate) enum EffectiveEchDoh {
 
 /// Whether ex-ray will actually receive HOLE'S `ech_doh` as the winning
 /// `ech-doh=` value once `inject_plugin_directives` runs on this exact
-/// `(plugin_name, opts)` pair. Test-only: production code (`ProxyManager`)
+/// `(plugin, opts)` pair. Test-only: production code (`ProxyManager`)
 /// reads the full [`EffectiveEchDoh`] off [`effective_ech_doh`] directly, so
 /// it can ALSO warn about the `Operators` case — this bool-only view is a
 /// convenience for tests that only care about the `Holes` outcome.
 #[cfg(test)]
 pub(crate) fn ech_doh_will_reach_ex_ray(
-    plugin_name: &str,
+    plugin: &PluginDescriptor,
     opts: Option<&str>,
     ech_doh: Option<&crate::dns::ech::EchDoh>,
 ) -> bool {
-    matches!(effective_ech_doh(plugin_name, opts, ech_doh), EffectiveEchDoh::Holes)
+    matches!(effective_ech_doh(plugin, opts, ech_doh), EffectiveEchDoh::Holes)
 }
 
 /// Which `ech-doh` value ex-ray will actually dial for this exact
-/// `(plugin_name, opts, ech_doh)` triple — a PURE query, no logging. Shares
+/// `(plugin, opts, ech_doh)` triple — a PURE query, no logging. Shares
 /// [`classify_ech_doh`] with `inject_plugin_directives`, so the "will
 /// something fetch an ECH config, and whose value" question and the actual
 /// plugin spawn read the exact same parse and the exact same outrank
 /// decision (they cannot drift the way two independent re-derivations of
-/// `takes_ech_directives` + `hole_ech_doh_outranks` could), WITHOUT also
+/// the parse + `hole_ech_doh_outranks` could), WITHOUT also
 /// re-triggering `inject_plugin_directives`'s `tracing::warn!` calls: this
 /// is queried once per start attempt from the permit-derivation path
 /// (`ProxyManager::start_cancellable`), and the eventual plugin spawn calls
@@ -578,17 +581,45 @@ pub(crate) fn ech_doh_will_reach_ex_ray(
 /// make `inject_plugin_directives` return `Err`, so the plugin chain never
 /// starts and nothing ech-doh-shaped ever reaches ex-ray.
 pub(crate) fn effective_ech_doh(
-    plugin_name: &str,
+    plugin: &PluginDescriptor,
     opts: Option<&str>,
     ech_doh: Option<&crate::dns::ech::EchDoh>,
 ) -> EffectiveEchDoh {
-    if !takes_ech_directives(plugin_name) {
+    if !plugin.takes_hole_directives {
         return EffectiveEchDoh::None;
     }
     let Ok(segments) = garter::split_plugin_options(opts.unwrap_or_default()) else {
         return EffectiveEchDoh::None;
     };
     classify_ech_doh(&segments, ech_doh).0
+}
+
+/// The `ech-doh` Hole would tell `plugin`, derived from `dns` and the `pin` the
+/// server resolution produced. `None` for a start with no plugin or one whose
+/// descriptor does not take Hole's directives: no fetch exists to name a
+/// resolver for, and an "unpinned ECH lookup" warning would name an exposure
+/// that does not exist. Also `None` for a plugin that takes them when there is
+/// no resolver to name (`dns.servers` empty and no pin): [`ech_doh_url`]'s
+/// answer passes through.
+///
+/// [`ech_doh_url`]: crate::dns::ech::ech_doh_url
+///
+/// The one derivation both `start_cancellable` and the server test make, so the
+/// directive gate cannot be read differently by the two.
+pub(crate) fn derive_ech_doh(
+    plugin: Option<&PluginDescriptor>,
+    dns: &hole_common::config::DnsConfig,
+    pin: crate::dns::ech::PinSource,
+) -> Option<crate::dns::ech::EchDoh> {
+    if !plugin.is_some_and(|p| p.takes_hole_directives) {
+        return None;
+    }
+    let derived = crate::dns::ech::ech_doh_url(dns, pin);
+    tracing::debug!(ech_doh = ?derived, ?pin, "ech-doh source");
+    if matches!(pin, crate::dns::ech::PinSource::ResolverDeselected) {
+        tracing::warn!("covered retry: the cached DoH resolver is no longer configured; the ECH lookup is unpinned");
+    }
+    derived
 }
 
 /// ex-ray's own default for the `host` option
@@ -1176,154 +1207,120 @@ fn classify_ech_doh(
     (effective, displaces)
 }
 
-/// Remove any existing copy of a key Hole is about to set, then append it.
-/// ex-ray's `Args.Get` is first-wins, so an appended duplicate would silently
-/// lose to a user's, and postern writes `ech-doh` before Hole ever sees the
-/// string. `ech` is never touched: `ech=always` sets `RequireEch`, and dropping
-/// a user's mode would silently downgrade a deliberate fail-closed posture.
+/// Merge Hole's directives into `opts`: `loglevel=debug` always, and `ech-doh`
+/// when `ech_doh` is `Some`. Hole's `loglevel` replaces any operator copy. Its
+/// `ech-doh` replaces the operator's only when it outranks it
+/// ([`hole_ech_doh_outranks`]); otherwise the operator's stands and Hole's is
+/// still appended, behind it. ex-ray's `Args.Get` is first-wins, so an appended
+/// duplicate would silently lose to a user's, and postern writes `ech-doh`
+/// before Hole ever sees the string. `ech` is never touched: `ech=always` sets
+/// `RequireEch`, and dropping a user's mode would silently downgrade a
+/// deliberate fail-closed posture.
 ///
-/// Only the v2ray-family plugins receive these: `v2ray-plugin` resolves to the
-/// first-party `ex-ray` binary, but a config may also name `ex-ray` directly,
-/// so both spellings are covered; `galoshes` ignores the keys itself but
-/// forwards the whole options string to its inner ex-ray. Every OTHER plugin
-/// name still has its options string validated, though nothing is injected —
-/// a malformed string must not reach `BinaryPlugin` unvalidated just because
-/// the plugin isn't one of these three. The ONE gate (`takes_ech_directives`)
-/// both this function and its callers rely on is checked exactly once, here.
+/// Only a plugin whose descriptor sets `takes_hole_directives` receives these;
+/// any other gets its options validated and passed through untouched.
+/// `v2ray-plugin` resolves to the first-party `ex-ray` binary, a config may
+/// also name `ex-ray` directly, and `galoshes` ignores the keys itself but
+/// forwards the whole options string to its inner ex-ray.
 /// Emits the ECH-posture `tracing::warn!` lines — called exactly once per
 /// actual plugin spawn (`start_plugin_chain`); the permit-derivation query
 /// [`effective_ech_doh`] deliberately does NOT call this, to avoid
 /// double-emitting them (see that function's doc).
 fn inject_plugin_directives(
-    plugin_name: &str,
+    plugin: &PluginDescriptor,
     opts: Option<&str>,
     ech_doh: Option<&crate::dns::ech::EchDoh>,
 ) -> Result<Option<String>, ProxyError> {
-    if !takes_ech_directives(plugin_name) {
-        // Still validated: see the doc comment above.
-        return match opts {
-            Some(o) => garter::split_plugin_options(o)
-                .map(|_| Some(o.to_string()))
-                .map_err(|e| ProxyError::MalformedPluginOptions(format!("{plugin_name}: {e}"))),
-            None => Ok(None),
-        };
+    let plugin_name = plugin.name;
+    let opts_str = opts.unwrap_or_default();
+    // Refuse rather than forward — see `ProxyError::MalformedPluginOptions`.
+    // Position only in the message; a segment can carry a secret.
+    let segments = garter::split_plugin_options(opts_str)
+        .map_err(|e| ProxyError::MalformedPluginOptions(format!("{plugin_name}: {e}")))?;
+    // Validated above either way: a malformed string must not reach the spawner
+    // just because the plugin takes no directives.
+    if !plugin.takes_hole_directives {
+        return Ok(opts.map(str::to_string));
     }
-    {
-        let opts = opts.unwrap_or_default();
-        // Refuse rather than forward — see `ProxyError::MalformedPluginOptions`.
-        // Position only in the message; a segment can carry a secret.
-        let segments = garter::split_plugin_options(opts)
-            .map_err(|e| ProxyError::MalformedPluginOptions(format!("{plugin_name}: {e}")))?;
 
-        let (_effective, displaces) = classify_ech_doh(&segments, ech_doh);
-        let config_ech_doh = segments.iter().find(|s| s.key == "ech-doh");
-        // Strip only what we are about to set, so an override never becomes
-        // a deletion. Keys compare as the PLUGIN decodes them.
-        let owned: &[&str] = if displaces {
-            &["loglevel", "ech-doh"]
-        } else {
-            &["loglevel"]
-        };
-
-        // Which ECH source won, and how much is known about it. Every outcome
-        // reaches ex-ray as one URL, so this is the only record of the choice.
-        // `find`, not `any`: ex-ray reads the FIRST `ech`, so a later one
-        // reporting a posture it will never apply would invert the line.
-        let fail_closed = segments
-            .iter()
-            .find(|s| s.key == "ech")
-            .is_some_and(|s| ex_ray_flag_value(s) == "always");
-        // A rejected config crashes the WHOLE plugin, unconditionally on
-        // whether any `ech-doh` is even configured — checked first, and
-        // reported as its own condition: unlike every arm below, this is not
-        // "ECH is off", it's "the connection attempt fails outright".
-        if let Some(key) = ex_ray_fatal_config_error(&segments, ech_doh) {
-            tracing::warn!(
-                plugin = %plugin_name,
-                invalid_key = key,
-                "ex-ray will refuse to start: this plugin configuration is invalid ({key}) — the \
-                 plugin process exits before dialing anything, ECH-config fetch included"
-            );
-        } else {
-            // Whether ex-ray will even ATTEMPT a fetch — shared with
-            // `classify_ech_doh` (see `ech_fetch_is_reachable`'s doc). An
-            // `ech-doh` source (Hole's or the config's) that would otherwise
-            // read as active must not be reported as such when no fetch will
-            // ever happen (`ech=never`, or no TLS-enabled domain SNI) — the
-            // `(None, None)` arm stays correct either way, since "ECH is
-            // off" holds regardless of reachability.
-            let reachable = ech_fetch_is_reachable(&segments, ech_doh);
-            // Presence alone isn't enough for the match below: ex-ray only
-            // arms `Ech_DOHserver` for a NON-empty value (same rule
-            // `classify_ech_doh` already applies to its `Operators` arm) —
-            // an explicitly empty `ech-doh=` must read as "no config
-            // value", not as one standing.
-            let config_ech_doh_value = config_ech_doh.filter(|s| !ex_ray_flag_value(s).is_empty());
-            match (ech_doh, config_ech_doh_value) {
-                _ if !reachable && (ech_doh.is_some() || config_ech_doh.is_some()) => tracing::warn!(
-                    plugin = %plugin_name,
-                    fail_closed,
-                    "ex-ray will never attempt an ECH-config fetch for this configuration (ech=never, \
-                     or no TLS-enabled domain SNI); any ech-doh source is inert"
-                ),
-                (Some(_), Some(s)) if !displaces => tracing::warn!(
-                    plugin = %plugin_name,
-                    "{}, so the config's own name-free ech-doh stands: {}",
-                    unpinned_reason(ech_doh),
-                    s.raw
-                ),
-                (Some(e), _) if !e.is_pinned() => tracing::warn!(
-                    plugin = %plugin_name, fail_closed,
-                    "{}; the ECH lookup uses a resolver that has not been exercised: {}",
-                    unpinned_reason(ech_doh),
-                    e.url
-                ),
-                (Some(_), _) => {}
-                // Stripping this would disarm ECH altogether, so it stands — but
-                // a name authority is resolved over plaintext system DNS.
-                (None, Some(s)) => tracing::warn!(
-                    plugin = %plugin_name,
-                    "no configured resolver to pin the ECH lookup to; the config's own ech-doh stands: {}", s.raw
-                ),
-                // ECH is armed only by `ech-doh`, so there is none. `ech=always`
-                // can't reach here — `ex_ray_fatal_config_error` already routes
-                // it through the fatal-config warning above (see that fn's
-                // doc). No `fail_closed` field to report.
-                (None, None) => tracing::warn!(plugin = %plugin_name, "no ech-doh from any source; ECH is off"),
-            }
-        }
-
-        let directive = ech_doh.map(|e| format!("ech-doh={}", e.url));
-
-        Ok(Some(garter::join_plugin_options(
-            segments
-                .iter()
-                .filter(|s| !owned.contains(&s.key.as_str()))
-                .map(|s| s.raw)
-                .chain(["loglevel=debug"])
-                .chain(directive.as_deref()),
-        )))
-    }
-}
-
-/// Plugin-readiness mode for the spawn.
-///
-/// Bundled plugins (galoshes, ex-ray / v2ray-plugin) speak the sitrep
-/// handshake, so [`ReadinessMode::ExpectSitrep`] reads their AUTHORITATIVE
-/// transports — the UDP-drop policy needs `tcp,udp` from galoshes, which the
-/// `Probe` self-probe (a TCP connect, hardcoded TCP-only) would discard (#536).
-/// An unknown plugin (an arbitrary binary resolved via PATH — see
-/// [`resolve_plugin_path`](super::config::resolve_plugin_path) / #414) may not speak sitrep, so it keeps the
-/// conservative `Probe` readiness rather than hanging until the readiness
-/// timeout waiting for a sitrep that never comes.
-///
-/// [`ReadinessMode::ExpectSitrep`]: garter::ReadinessMode::ExpectSitrep
-fn readiness_for(plugin_name: &str) -> garter::ReadinessMode {
-    if hole_common::plugin::is_known(plugin_name) {
-        garter::ReadinessMode::ExpectSitrep
+    let (_effective, displaces) = classify_ech_doh(&segments, ech_doh);
+    let config_ech_doh = segments.iter().find(|s| s.key == "ech-doh");
+    // Strip only what we are about to set, so an override never becomes
+    // a deletion. Keys compare as the PLUGIN decodes them.
+    let owned: &[&str] = if displaces {
+        &["loglevel", "ech-doh"]
     } else {
-        garter::ReadinessMode::Probe
+        &["loglevel"]
+    };
+
+    // Which ECH source won, and how much is known about it. Every outcome
+    // reaches ex-ray as one URL, so this is the only record of the choice.
+    // `find`, not `any`: ex-ray reads the FIRST `ech`, so a later one
+    // reporting a posture it will never apply would invert the line.
+    let fail_closed = segments
+        .iter()
+        .find(|s| s.key == "ech")
+        .is_some_and(|s| ex_ray_flag_value(s) == "always");
+    // A rejected config crashes the WHOLE plugin, unconditionally on
+    // whether any `ech-doh` is even configured — checked first, and
+    // reported as its own condition: unlike every arm below, this is not
+    // "ECH is off", it's "the connection attempt fails outright".
+    if let Some(key) = ex_ray_fatal_config_error(&segments, ech_doh) {
+        tracing::warn!(
+            plugin = %plugin_name,
+            invalid_key = key,
+            "ex-ray will refuse to start: this plugin configuration is invalid ({key}) — the \
+             plugin process exits before dialing anything, ECH-config fetch included"
+        );
+    } else {
+        // Shared with `classify_ech_doh`.
+        let reachable = ech_fetch_is_reachable(&segments, ech_doh);
+        // ex-ray arms `Ech_DOHserver` only for a non-empty value.
+        let config_ech_doh_value = config_ech_doh.filter(|s| !ex_ray_flag_value(s).is_empty());
+        match (ech_doh, config_ech_doh_value) {
+            _ if !reachable && (ech_doh.is_some() || config_ech_doh.is_some()) => tracing::warn!(
+                plugin = %plugin_name,
+                fail_closed,
+                "ex-ray will never attempt an ECH-config fetch for this configuration (ech=never, \
+                 or no TLS-enabled domain SNI); any ech-doh source is inert"
+            ),
+            (Some(_), Some(s)) if !displaces => tracing::warn!(
+                plugin = %plugin_name,
+                "{}, so the config's own name-free ech-doh stands: {}",
+                unpinned_reason(ech_doh),
+                s.raw
+            ),
+            (Some(e), _) if !e.is_pinned() => tracing::warn!(
+                plugin = %plugin_name, fail_closed,
+                "{}; the ECH lookup uses a resolver that has not been exercised: {}",
+                unpinned_reason(ech_doh),
+                e.url
+            ),
+            (Some(_), _) => {}
+            // Stripping this would disarm ECH altogether, so it stands — but
+            // a name authority is resolved over plaintext system DNS.
+            (None, Some(s)) => tracing::warn!(
+                plugin = %plugin_name,
+                "no configured resolver to pin the ECH lookup to; the config's own ech-doh stands: {}", s.raw
+            ),
+            // ECH is armed only by `ech-doh`, so there is none. `ech=always`
+            // can't reach here — `ex_ray_fatal_config_error` already routes
+            // it through the fatal-config warning above (see that fn's
+            // doc). No `fail_closed` field to report.
+            (None, None) => tracing::warn!(plugin = %plugin_name, "no ech-doh from any source; ECH is off"),
+        }
     }
+
+    let directive = ech_doh.map(|e| format!("ech-doh={}", e.url));
+
+    Ok(Some(garter::join_plugin_options(
+        segments
+            .iter()
+            .filter(|s| !owned.contains(&s.key.as_str()))
+            .map(|s| s.raw)
+            .chain(["loglevel=debug"])
+            .chain(directive.as_deref()),
+    )))
 }
 
 #[cfg(test)]
@@ -1333,8 +1330,22 @@ mod inject_tests {
 
     /// The merged options, or panic — for inputs that are not testing rejection.
     fn merged(plugin: &str, opts: Option<&str>, ech_doh: Option<&EchDoh>) -> Option<String> {
-        inject_plugin_directives(plugin, opts, ech_doh).expect("well-formed options")
+        inject_plugin_directives(bundled(plugin), opts, ech_doh).expect("well-formed options")
     }
+
+    /// The descriptor of the bundled plugin `name`.
+    fn bundled(name: &str) -> &'static PluginDescriptor {
+        hole_common::plugin::lookup(name).unwrap_or_else(|| panic!("{name} is not a bundled plugin"))
+    }
+
+    /// A plugin that does not take Hole's directives, as no bundled one does today.
+    const DIRECTIVE_LESS: PluginDescriptor = PluginDescriptor {
+        name: "directive-less",
+        binary_name: "directive-less",
+        user_visible: false,
+        alloc_protocols: util::port_alloc::Protocols::TCP,
+        takes_hole_directives: false,
+    };
 
     /// The IP `url`'s authority names, per `EchDoh::resolver`'s contract
     /// (Hole always constructs `url` FROM this address, in production) — or
@@ -1384,7 +1395,7 @@ mod inject_tests {
         );
         {
             let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-            let _ = inject_plugin_directives(plugin, opts, ech_doh);
+            let _ = inject_plugin_directives(bundled(plugin), opts, ech_doh);
         }
         writer.snapshot_string()
     }
@@ -1472,14 +1483,23 @@ mod inject_tests {
     }
 
     #[skuld::test]
-    fn unknown_plugin_passes_through_unchanged() {
-        assert_eq!(merged("some-future-plugin", Some("k=v"), None).as_deref(), Some("k=v"));
-        assert_eq!(merged("some-future-plugin", None, None), None);
+    fn a_plugin_without_hole_directives_passes_its_options_through_unchanged() {
+        let pinned = pinned("https://1.1.1.1/dns-query");
+        assert_eq!(
+            inject_plugin_directives(&DIRECTIVE_LESS, Some("k=v;loglevel=warning"), Some(&pinned)).unwrap(),
+            Some("k=v;loglevel=warning".to_string())
+        );
+        assert_eq!(
+            inject_plugin_directives(&DIRECTIVE_LESS, None, Some(&pinned)).unwrap(),
+            None
+        );
     }
 
     #[skuld::test]
-    fn unknown_plugin_with_malformed_options_is_rejected() {
-        assert!(inject_plugin_directives("obfs-local", Some(r"server;path=/a\"), None).is_err());
+    fn a_plugin_without_hole_directives_still_has_its_options_validated() {
+        let err = inject_plugin_directives(&DIRECTIVE_LESS, Some(r"server;path=/a\"), None)
+            .expect_err("a malformed string must not reach the plugin");
+        assert!(matches!(err, ProxyError::MalformedPluginOptions(_)), "got {err:?}");
     }
 
     #[skuld::test]
@@ -1517,16 +1537,6 @@ mod inject_tests {
     fn no_ech_doh_url_appends_only_loglevel() {
         let out = merged("ex-ray", Some("path=/x"), None);
         assert_eq!(out.as_deref(), Some("path=/x;loglevel=debug"));
-    }
-
-    #[skuld::test]
-    fn unknown_plugin_passes_through_even_with_ech_doh() {
-        let out = merged(
-            "some-future-plugin",
-            Some("k=v"),
-            Some(&pinned("https://1.1.1.1/dns-query")),
-        );
-        assert_eq!(out.as_deref(), Some("k=v"));
     }
 
     // The production shape: postern appends `;ech=<mode>;ech-doh=<url>` before
@@ -1680,8 +1690,12 @@ mod inject_tests {
     #[skuld::test]
     fn malformed_options_fail_the_start() {
         for opts in [r"path=/a\", "host=h;=v;mux=0", "a=1;;b=2"] {
-            let err = inject_plugin_directives("ex-ray", Some(opts), Some(&pinned("https://1.1.1.1/dns-query")))
-                .expect_err("malformed options must not reach the plugin");
+            let err = inject_plugin_directives(
+                bundled("ex-ray"),
+                Some(opts),
+                Some(&pinned("https://1.1.1.1/dns-query")),
+            )
+            .expect_err("malformed options must not reach the plugin");
             assert!(
                 matches!(err, ProxyError::MalformedPluginOptions(_)),
                 "expected MalformedPluginOptions for {opts:?}, got {err:?}"
@@ -1716,20 +1730,6 @@ mod inject_tests {
         assert_eq!(
             out.as_deref(),
             Some("tls;loglevel=debug;ech-doh=https://9.9.9.9/dns-query"),
-        );
-    }
-
-    // An unknown plugin gets no injection, so it gets no strip either.
-    #[skuld::test]
-    fn unknown_plugin_keeps_its_own_loglevel() {
-        assert_eq!(
-            merged(
-                "some-future-plugin",
-                Some("loglevel=warning"),
-                Some(&pinned("https://1.1.1.1/dns-query")),
-            )
-            .as_deref(),
-            Some("loglevel=warning"),
         );
     }
 
@@ -1949,39 +1949,49 @@ mod inject_tests {
 
     // effective_ech_doh / ech_doh_will_reach_ex_ray ===================================================================
 
-    // A regression that made this return `true` whenever `ech_doh.is_some()`
-    // would pass this test if the plugin-family gate were dropped: a
-    // non-ECH-capable plugin name
-    // must never be told it will fetch Hole's ech_doh, even with a pinned
-    // candidate in hand.
     #[skuld::test]
-    fn non_family_plugin_never_reaches_ex_ray() {
-        assert!(!ech_doh_will_reach_ex_ray(
-            "obfs-local",
-            None,
-            Some(&pinned("https://9.9.9.9/dns-query"))
-        ));
+    fn ex_ray_with_no_ech_doh_from_any_source_is_not_applicable() {
+        assert_eq!(effective_ech_doh(bundled("ex-ray"), None, None), EffectiveEchDoh::None);
+    }
+
+    // A plugin that does not take Hole's directives is never told Hole's
+    // `ech_doh`, even with a pinned candidate in hand, so the cover has no fetch
+    // to permit a resolver for.
+    #[skuld::test]
+    fn a_plugin_without_hole_directives_never_gets_a_fetch_permit() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        let opts = Some("tls;host=cdn.example");
         assert_eq!(
-            effective_ech_doh("obfs-local", None, Some(&pinned("https://9.9.9.9/dns-query"))),
+            effective_ech_doh(&DIRECTIVE_LESS, opts, Some(&e)),
             EffectiveEchDoh::None
         );
+        assert!(!ech_doh_will_reach_ex_ray(&DIRECTIVE_LESS, opts, Some(&e)));
+    }
+
+    // The derivation itself is gated on the descriptor: a plugin that does not
+    // take Hole's directives is handed no `ech-doh`, so nothing downstream
+    // (the spawner, the cover's permit, the "unpinned" warning) sees one.
+    #[skuld::test]
+    fn a_plugin_without_hole_directives_is_derived_no_ech_doh() {
+        let dns = hole_common::config::DnsConfig::default();
+        assert!(!dns.servers.is_empty(), "the default config names resolvers");
+        let pin = PinSource::NoQueryNeeded;
+        assert!(derive_ech_doh(Some(&DIRECTIVE_LESS), &dns, pin).is_none());
+        assert!(derive_ech_doh(None, &dns, pin).is_none());
+        let derived = derive_ech_doh(Some(bundled("ex-ray")), &dns, pin).expect("ex-ray takes Hole's directives");
+        assert_eq!(derived.source, pin);
     }
 
     #[skuld::test]
-    fn family_plugin_with_no_ech_doh_from_any_source_is_not_applicable() {
-        assert_eq!(effective_ech_doh("ex-ray", None, None), EffectiveEchDoh::None);
-    }
-
-    #[skuld::test]
-    fn family_plugin_with_no_operator_override_reaches_ex_ray_as_holes() {
+    fn ex_ray_with_no_operator_override_reaches_ex_ray_as_holes() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert!(ech_doh_will_reach_ex_ray(
-            "ex-ray",
+            bundled("ex-ray"),
             Some("tls;host=cdn.example"),
             Some(&e)
         ));
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host=cdn.example"), Some(&e)),
             EffectiveEchDoh::Holes
         );
     }
@@ -1989,16 +1999,16 @@ mod inject_tests {
     // An unpinned Hole guess against an operator's own IP-literal `ech-doh` —
     // the operator's choice stands, so ex-ray fetches THEIRS, not Hole's.
     #[skuld::test]
-    fn family_plugin_with_a_winning_operator_override_reaches_ex_ray_as_operators() {
+    fn ex_ray_with_a_winning_operator_override_reaches_ex_ray_as_operators() {
         let e = unpinned("https://1.1.1.1/dns-query");
         assert!(!ech_doh_will_reach_ex_ray(
-            "ex-ray",
+            bundled("ex-ray"),
             Some("tls;host=cdn.example;ech-doh=https://8.8.8.8/dns-query"),
             Some(&e)
         ));
         assert_eq!(
             effective_ech_doh(
-                "ex-ray",
+                bundled("ex-ray"),
                 Some("tls;host=cdn.example;ech-doh=https://8.8.8.8/dns-query"),
                 Some(&e)
             ),
@@ -2014,7 +2024,7 @@ mod inject_tests {
     #[skuld::test]
     fn empty_operator_ech_doh_never_reaches_ex_ray() {
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;ech-doh="), None),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host=cdn.example;ech-doh="), None),
             EffectiveEchDoh::None
         );
     }
@@ -2026,7 +2036,7 @@ mod inject_tests {
     #[skuld::test]
     fn bare_operator_ech_doh_never_reaches_ex_ray() {
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;ech-doh"), None),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host=cdn.example;ech-doh"), None),
             EffectiveEchDoh::None
         );
         let segments = garter::split_plugin_options("tls;host=cdn.example;ech-doh").unwrap();
@@ -2043,7 +2053,11 @@ mod inject_tests {
         let segments = garter::split_plugin_options("tls;host=cdn.example;ech-doh=not-a-url").unwrap();
         assert_eq!(ex_ray_fatal_config_error(&segments, Some(&e)), None);
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;ech-doh=not-a-url"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;ech-doh=not-a-url"),
+                Some(&e)
+            ),
             EffectiveEchDoh::Holes
         );
     }
@@ -2075,7 +2089,11 @@ mod inject_tests {
     fn a_signed_local_port_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;localPort=+8080"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;localPort=+8080"),
+                Some(&e)
+            ),
             EffectiveEchDoh::None
         );
     }
@@ -2084,7 +2102,11 @@ mod inject_tests {
     fn a_signed_remote_port_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;remotePort=+1080"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;remotePort=+1080"),
+                Some(&e)
+            ),
             EffectiveEchDoh::None
         );
     }
@@ -2096,7 +2118,11 @@ mod inject_tests {
     fn a_remote_port_above_u32_max_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;remotePort=4294967296"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;remotePort=4294967296"),
+                Some(&e)
+            ),
             EffectiveEchDoh::None
         );
     }
@@ -2106,7 +2132,11 @@ mod inject_tests {
     fn a_local_port_above_u32_max_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;localPort=4294967296"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;localPort=4294967296"),
+                Some(&e)
+            ),
             EffectiveEchDoh::None
         );
     }
@@ -2124,7 +2154,7 @@ mod inject_tests {
             "tls;host=cdn.example;remotePort=",
         ] {
             assert_eq!(
-                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                effective_ech_doh(bundled("ex-ray"), Some(opts), Some(&e)),
                 EffectiveEchDoh::None,
                 "opts={opts:?}"
             );
@@ -2139,7 +2169,7 @@ mod inject_tests {
     fn a_non_canonical_zero_local_port_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;localPort=00"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host=cdn.example;localPort=00"), Some(&e)),
             EffectiveEchDoh::None
         );
         let segments = garter::split_plugin_options("tls;host=cdn.example;localPort=00").unwrap();
@@ -2182,7 +2212,7 @@ mod inject_tests {
             "tls;host=cdn.example;localAddr=127.0.0.1|::1", // multi-address
         ] {
             assert_eq!(
-                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                effective_ech_doh(bundled("ex-ray"), Some(opts), Some(&e)),
                 EffectiveEchDoh::None,
                 "opts={opts:?}"
             );
@@ -2208,7 +2238,7 @@ mod inject_tests {
         assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("remoteAddr"));
         assert_eq!(
             effective_ech_doh(
-                "ex-ray",
+                bundled("ex-ray"),
                 Some("server;tls;host=cdn.example;remoteAddr=cdn.example"),
                 Some(&e)
             ),
@@ -2240,7 +2270,7 @@ mod inject_tests {
             "tls;host=cdn.example;remoteAddr=[::ffff:0.0.0.0]",
         ] {
             assert_eq!(
-                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                effective_ech_doh(bundled("ex-ray"), Some(opts), Some(&e)),
                 EffectiveEchDoh::None,
                 "opts={opts:?}"
             );
@@ -2259,12 +2289,12 @@ mod inject_tests {
     fn exp_8357_prefixed_host_is_evaluated_after_stripping() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=experiment:8357203.0.113.5"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host=experiment:8357203.0.113.5"), Some(&e)),
             EffectiveEchDoh::None,
             "stripped SNI is the IP literal 203.0.113.5 — no domain to key the DoH lookup on"
         );
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=experiment:8357cdn.example"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host=experiment:8357cdn.example"), Some(&e)),
             EffectiveEchDoh::Holes,
             "stripped SNI is the domain cdn.example — reachable"
         );
@@ -2279,7 +2309,7 @@ mod inject_tests {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
             effective_ech_doh(
-                "ex-ray",
+                bundled("ex-ray"),
                 Some("tls;host=experiment:8357;remoteAddr=cdn.example"),
                 Some(&e)
             ),
@@ -2288,7 +2318,7 @@ mod inject_tests {
         );
         assert_eq!(
             effective_ech_doh(
-                "ex-ray",
+                bundled("ex-ray"),
                 Some("tls;host=experiment:8357;remoteAddr=203.0.113.5"),
                 Some(&e)
             ),
@@ -2296,7 +2326,7 @@ mod inject_tests {
             "remoteAddr is an IP — unreachable"
         );
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=experiment:8357"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host=experiment:8357"), Some(&e)),
             EffectiveEchDoh::None,
             "no remoteAddr — falls back to Hole's own SS_REMOTE_HOST, always an IP literal"
         );
@@ -2351,7 +2381,7 @@ mod inject_tests {
             "tls;host=cdn.example;loglevel=verbose",
         ] {
             assert_eq!(
-                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                effective_ech_doh(bundled("ex-ray"), Some(opts), Some(&e)),
                 EffectiveEchDoh::Holes,
                 "opts={opts:?}: loglevel is always overridden by Hole's own injection"
             );
@@ -2367,7 +2397,7 @@ mod inject_tests {
     #[skuld::test]
     fn ech_always_with_no_ech_doh_from_any_source_never_reaches_ex_ray() {
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;ech=always"), None),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host=cdn.example;ech=always"), None),
             EffectiveEchDoh::None
         );
         let segments = garter::split_plugin_options("tls;host=cdn.example;ech=always").unwrap();
@@ -2462,7 +2492,7 @@ mod inject_tests {
     fn a_fatal_mux_value_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;mux=-1"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host=cdn.example;mux=-1"), Some(&e)),
             EffectiveEchDoh::None,
             "mux=-1 parses but is out of uint32Opt's 0..=u32::MAX range — config.go rejects it"
         );
@@ -2475,7 +2505,11 @@ mod inject_tests {
     fn an_unparseable_mux_value_is_fatal() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;mux=not-a-number"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;mux=not-a-number"),
+                Some(&e)
+            ),
             EffectiveEchDoh::None
         );
         let segments = garter::split_plugin_options("tls;host=cdn.example;mux=not-a-number").unwrap();
@@ -2496,7 +2530,11 @@ mod inject_tests {
     fn a_fatal_fwmark_value_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;fwmark=4294967296"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;fwmark=4294967296"),
+                Some(&e)
+            ),
             EffectiveEchDoh::None,
             "fwmark above u32::MAX is out of uint32Opt's range — config.go rejects it"
         );
@@ -2522,7 +2560,7 @@ mod inject_tests {
     fn a_fatal_mux_concurrency_value_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;mux=1025"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host=cdn.example;mux=1025"), Some(&e)),
             EffectiveEchDoh::None,
             "mux=1025 is within uint32Opt's range but outside core.New's 1..=1024 concurrency bound"
         );
@@ -2534,7 +2572,7 @@ mod inject_tests {
     fn a_mux_concurrency_value_at_the_boundary_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;mux=1024"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host=cdn.example;mux=1024"), Some(&e)),
             EffectiveEchDoh::Holes
         );
     }
@@ -2546,7 +2584,7 @@ mod inject_tests {
     fn a_zero_mux_never_hits_the_concurrency_bound() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;mux=0"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host=cdn.example;mux=0"), Some(&e)),
             EffectiveEchDoh::Holes
         );
     }
@@ -2558,7 +2596,11 @@ mod inject_tests {
     fn a_large_mux_with_mode_quic_never_hits_the_concurrency_bound() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("host=cdn.example;mode=quic;mux=99999"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("host=cdn.example;mode=quic;mux=99999"),
+                Some(&e)
+            ),
             EffectiveEchDoh::Holes
         );
     }
@@ -2567,7 +2609,11 @@ mod inject_tests {
     fn a_fatal_tcp_keepalive_value_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;tcp-keepalive=32768"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;tcp-keepalive=32768"),
+                Some(&e)
+            ),
             EffectiveEchDoh::None,
             "tcp-keepalive above tcpKeepAliveParams' 32767 max — config.go rejects it"
         );
@@ -2579,7 +2625,11 @@ mod inject_tests {
     fn a_negative_tcp_keepalive_value_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;tcp-keepalive=-1"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;tcp-keepalive=-1"),
+                Some(&e)
+            ),
             EffectiveEchDoh::None,
             "tcp-keepalive below tcpKeepAliveParams' 0 minimum — config.go rejects it"
         );
@@ -2590,7 +2640,7 @@ mod inject_tests {
         let e = pinned("https://9.9.9.9/dns-query");
         for opts in ["tls;host=cdn.example;localPort=0", "tls;host=cdn.example;localPort="] {
             assert_eq!(
-                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                effective_ech_doh(bundled("ex-ray"), Some(opts), Some(&e)),
                 EffectiveEchDoh::None,
                 "opts={opts:?}: ex-ray cannot honor port-0/empty OS-assignment (main.go) — exits before dialing"
             );
@@ -2601,7 +2651,11 @@ mod inject_tests {
     fn an_out_of_range_local_port_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;localPort=65536"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;localPort=65536"),
+                Some(&e)
+            ),
             EffectiveEchDoh::None,
             "localPort above net.PortFromString's 65535 max — config.go rejects it"
         );
@@ -2611,21 +2665,25 @@ mod inject_tests {
     fn an_unparseable_remote_port_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;remotePort=not-a-port"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;remotePort=not-a-port"),
+                Some(&e)
+            ),
             EffectiveEchDoh::None,
             "remotePort must be strconv.ParseUint(_, 10, 32)-parseable (config.go) — else it rejects it"
         );
     }
 
     // `classify_ech_doh` must read whether ex-ray will even ATTEMPT ECH, not
-    // just plugin family + ech-doh presence — `ech=never` short-circuits it
+    // just the plugin + ech-doh presence — `ech=never` short-circuits it
     // (config.go's `buildTLSConfig`, `case "never":`) regardless of
     // `tls`/`host`/`ech-doh`.
     #[skuld::test]
     fn ech_never_never_reaches_ex_ray_even_with_tls_and_ech_doh() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;ech=never"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host=cdn.example;ech=never"), Some(&e)),
             EffectiveEchDoh::None
         );
     }
@@ -2637,11 +2695,19 @@ mod inject_tests {
     fn ech_never_is_first_wins() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;ech=never;ech=auto"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;ech=never;ech=auto"),
+                Some(&e)
+            ),
             EffectiveEchDoh::None
         );
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;ech=auto;ech=never"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;ech=auto;ech=never"),
+                Some(&e)
+            ),
             EffectiveEchDoh::Holes,
             "the FIRST ech= wins — auto here, so never (second) is ignored"
         );
@@ -2653,7 +2719,7 @@ mod inject_tests {
     fn absent_host_falls_back_to_ex_rays_own_domain_default_and_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls"), Some(&e)),
             EffectiveEchDoh::Holes
         );
     }
@@ -2675,7 +2741,7 @@ mod inject_tests {
             "tls;host=203.0.113.5 ", // same, trailing
         ] {
             assert_eq!(
-                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                effective_ech_doh(bundled("ex-ray"), Some(opts), Some(&e)),
                 EffectiveEchDoh::None,
                 "opts={opts:?} must not reach ex-ray: no domain SNI to key the DoH lookup on"
             );
@@ -2697,7 +2763,7 @@ mod inject_tests {
             "tls;host=;remoteAddr=203.0.113.5",
         ] {
             assert_eq!(
-                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                effective_ech_doh(bundled("ex-ray"), Some(opts), Some(&e)),
                 EffectiveEchDoh::None,
                 "opts={opts:?}: host= is fatal regardless of remoteAddr"
             );
@@ -2715,7 +2781,7 @@ mod inject_tests {
     fn bare_host_reads_as_ex_rays_own_domain_default_and_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;host"), Some(&e)),
             EffectiveEchDoh::Holes
         );
     }
@@ -2731,7 +2797,7 @@ mod inject_tests {
     fn bare_ech_is_an_invalid_enum_value_and_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;ech"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;ech"), Some(&e)),
             EffectiveEchDoh::None
         );
     }
@@ -2744,7 +2810,7 @@ mod inject_tests {
     fn an_unrecognized_ech_value_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;ech=Always"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;ech=Always"), Some(&e)),
             EffectiveEchDoh::None,
             "ex-ray's echMode switch is case-sensitive; a value ex-ray itself would reject as \
              \"invalid ech mode\" must not be read as reachable"
@@ -2760,7 +2826,7 @@ mod inject_tests {
     fn bare_mode_is_an_invalid_transport_and_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;mode"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;mode"), Some(&e)),
             EffectiveEchDoh::None
         );
     }
@@ -2770,7 +2836,7 @@ mod inject_tests {
     fn an_unrecognized_mode_value_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;mode=grpc"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("tls;mode=grpc"), Some(&e)),
             EffectiveEchDoh::None,
             "ex-ray's mode switch accepts only websocket/quic; \"unsupported mode\" is a \
              config-build error, not a fetch that happens"
@@ -2785,7 +2851,7 @@ mod inject_tests {
         let e = pinned("https://9.9.9.9/dns-query");
         for opts in ["tls;host=[2001:db8::1", "tls;host=2001:db8::1]"] {
             assert_eq!(
-                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                effective_ech_doh(bundled("ex-ray"), Some(opts), Some(&e)),
                 EffectiveEchDoh::Holes,
                 "opts={opts:?}: an unmatched bracket is not IPv6-literal stripping, so this is a \
                  (nonsensical but real) domain string ex-ray will dial DoH for"
@@ -2965,12 +3031,20 @@ mod inject_tests {
     fn domain_host_is_first_wins() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=203.0.113.5;host=cdn.example"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=203.0.113.5;host=cdn.example"),
+                Some(&e)
+            ),
             EffectiveEchDoh::None,
             "the FIRST host= wins — an IP literal here, so the later domain is ignored"
         );
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;host=203.0.113.5"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("tls;host=cdn.example;host=203.0.113.5"),
+                Some(&e)
+            ),
             EffectiveEchDoh::Holes,
             "the FIRST host= wins — a domain here, so the later IP literal is ignored"
         );
@@ -2986,10 +3060,13 @@ mod inject_tests {
     fn no_tls_and_not_quic_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("host=cdn.example;mode=websocket"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("host=cdn.example;mode=websocket"), Some(&e)),
             EffectiveEchDoh::None
         );
-        assert_eq!(effective_ech_doh("ex-ray", None, Some(&e)), EffectiveEchDoh::None);
+        assert_eq!(
+            effective_ech_doh(bundled("ex-ray"), None, Some(&e)),
+            EffectiveEchDoh::None
+        );
     }
 
     // `mode=quic` force-enables TLS even with no explicit `tls` flag
@@ -2999,11 +3076,15 @@ mod inject_tests {
     fn quic_mode_reaches_ex_ray_without_an_explicit_tls_flag() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("host=cdn.example;mode=quic"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some("host=cdn.example;mode=quic"), Some(&e)),
             EffectiveEchDoh::Holes
         );
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("host=cdn.example;mode=quic;mode=websocket"), Some(&e)),
+            effective_ech_doh(
+                bundled("ex-ray"),
+                Some("host=cdn.example;mode=quic;mode=websocket"),
+                Some(&e)
+            ),
             EffectiveEchDoh::Holes,
             "first-wins: the second mode= does not un-set the quic TLS force-enable"
         );
@@ -3015,22 +3096,15 @@ mod inject_tests {
     #[skuld::test]
     fn malformed_opts_reaches_ex_ray_as_nothing_not_a_panic() {
         let e = pinned("https://9.9.9.9/dns-query");
-        assert!(!ech_doh_will_reach_ex_ray("ex-ray", Some(r"path=/a\"), Some(&e)));
+        assert!(!ech_doh_will_reach_ex_ray(
+            bundled("ex-ray"),
+            Some(r"path=/a\"),
+            Some(&e)
+        ));
         assert_eq!(
-            effective_ech_doh("ex-ray", Some(r"path=/a\"), Some(&e)),
+            effective_ech_doh(bundled("ex-ray"), Some(r"path=/a\"), Some(&e)),
             EffectiveEchDoh::None
         );
-    }
-
-    #[skuld::test]
-    fn readiness_known_plugins_expect_sitrep_unknown_probes() {
-        use garter::ReadinessMode;
-        // Bundled, sitrep-speaking plugins: authoritative transports.
-        assert_eq!(readiness_for("galoshes"), ReadinessMode::ExpectSitrep);
-        assert_eq!(readiness_for("v2ray-plugin"), ReadinessMode::ExpectSitrep);
-        assert_eq!(readiness_for("ex-ray"), ReadinessMode::ExpectSitrep);
-        // Arbitrary PATH plugin (may not speak sitrep): conservative probe.
-        assert_eq!(readiness_for("some-future-plugin"), ReadinessMode::Probe);
     }
 }
 

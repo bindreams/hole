@@ -133,6 +133,8 @@ pub(crate) struct IpcState<P: Proxy, R: Routing> {
     pub(crate) persist_gate: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)]
     pub(crate) persist_entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// What each `/v1/test-server` run starts from: production's, except where a test supplies one.
+    pub(crate) test_server_config: TestConfig,
 }
 
 impl<P: Proxy, R: Routing> IpcState<P, R> {
@@ -157,6 +159,7 @@ impl<P: Proxy, R: Routing> IpcState<P, R> {
             persist_gate: None,
             #[cfg(test)]
             persist_entered: std::sync::Mutex::new(None),
+            test_server_config: TestConfig::production(),
         }
     }
 }
@@ -1322,11 +1325,11 @@ async fn handle_diagnostics<P: Proxy + 'static, R: Routing + 'static>(
 }
 
 async fn handle_test_server<P: Proxy + 'static, R: Routing + 'static>(
-    State(_state): State<Arc<IpcState<P, R>>>,
+    State(state): State<Arc<IpcState<P, R>>>,
     Json(req): Json<TestServerRequest>,
 ) -> Json<TestServerResponse> {
     hole_common::logging::redact_arm::arm_server(&req.entry);
-    let mut cfg = TestConfig::production();
+    let mut cfg = state.test_server_config.clone();
     cfg.dns = req.dns;
     let outcome = run_server_test(&req.entry, &cfg).await;
     Json(TestServerResponse { outcome })

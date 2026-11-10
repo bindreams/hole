@@ -7,7 +7,7 @@
 //! reports a granular per-phase outcome. Concurrent calls are safe — each
 //! gets its own plugin process and its own [`ProxyClientStream`].
 
-use crate::proxy::resolve_plugin_path_inner;
+use crate::proxy::BundledPlugin;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::{ServerTestOutcome, LATENCY_VALIDATED_ON_CONNECT};
 use shadowsocks::config::{ServerAddr, ServerConfig, ServerType};
@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const HEAD_REQUEST: &[u8] = b"HEAD / HTTP/1.0\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n";
 
@@ -45,19 +45,13 @@ pub struct TestConfig {
     pub sentinel_read_timeout: Duration,
     /// Two sentinel `host:port` strings (the second is the fallback).
     pub sentinels: [String; 2],
-    /// Optional override for the plugin path. `None` → use
-    /// [`resolve_plugin_path_inner`]. Tests use this to point at a specific
-    /// on-disk plugin binary (the xtask-built `ex-ray`, or a provisioned
-    /// upstream v2ray-plugin) without depending on `PATH`.
-    pub plugin_path_override: Option<String>,
+    /// Where bundled plugins resolve; a test can stage an install directory.
+    pub plugin_lookup: crate::proxy::config::PluginLookup,
     /// User's resolver config for the private-DoH server bootstrap.
     pub dns: hole_common::config::DnsConfig,
-    /// Test-only DoH querier override. When present, `run_server_test` resolves
-    /// via `resolve_via_doh_with` instead of the production `resolve_via_doh`,
-    /// so a test can drive the full preflight path with no OS resolver or
-    /// network.
-    #[cfg(test)]
-    pub bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
+    /// How the server hostname resolves; a test can inject a DoH querier to
+    /// drive the full preflight path with no OS resolver or network.
+    pub bootstrap: crate::dns::bootstrap::BootstrapResolver,
 }
 
 impl std::fmt::Debug for TestConfig {
@@ -67,7 +61,6 @@ impl std::fmt::Debug for TestConfig {
             .field("ss_connect_timeout", &self.ss_connect_timeout)
             .field("sentinel_read_timeout", &self.sentinel_read_timeout)
             .field("sentinels", &self.sentinels)
-            .field("plugin_path_override", &self.plugin_path_override)
             .field("dns", &self.dns)
             .finish_non_exhaustive()
     }
@@ -80,10 +73,9 @@ impl TestConfig {
             ss_connect_timeout: Duration::from_secs(5),
             sentinel_read_timeout: Duration::from_secs(5),
             sentinels: ["1.1.1.1:80".to_string(), "1.0.0.1:80".to_string()],
-            plugin_path_override: None,
             dns: hole_common::config::DnsConfig::default(),
-            #[cfg(test)]
-            bootstrap_querier: None,
+            plugin_lookup: Default::default(),
+            bootstrap: Default::default(),
         }
     }
 }
@@ -104,40 +96,25 @@ impl TestConfig {
 pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTestOutcome {
     let started = Instant::now();
 
-    // Resolve the server hostname over PRIVATE DoH (never the OS resolver),
-    // mirroring `start_inner`. Fail-closed unless `dns.allow_insecure_bootstrap`
-    // → on failure return the existing `DnsFailed` outcome (host logged here,
-    // not surfaced). Preflight connects to the raw resolved IP; only the plugin
-    // handoff uses the bracket-safe `handoff_host` string.
-    let resolved = {
-        #[cfg(test)]
-        {
-            match &cfg.bootstrap_querier {
-                Some(q) => {
-                    crate::dns::bootstrap::resolve_via_doh_with(entry.server.expose(), &cfg.dns, q.clone()).await
-                }
-                None => crate::dns::bootstrap::resolve_via_doh(entry.server.expose(), &cfg.dns).await,
-            }
-        }
-        #[cfg(not(test))]
-        {
-            crate::dns::bootstrap::resolve_via_doh(entry.server.expose(), &cfg.dns).await
+    // A plugin Hole cannot run is refused before anything is dialed.
+    let plugin = match entry
+        .plugin
+        .as_deref()
+        .map(|name| cfg.plugin_lookup.resolve(name))
+        .transpose()
+    {
+        Ok(plugin) => plugin,
+        Err(e) => {
+            warn!(error = &e as &dyn std::error::Error, "server test: plugin refused");
+            return ServerTestOutcome::PluginStartFailed { detail: e.to_string() };
         }
     };
-    let bootstrapped = match resolved {
+
+    let bootstrapped = match bootstrap_server(entry, cfg).await {
         Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(
-                server = %hole_common::logging::redact_arm::token_for(&entry.id),
-                server_kind = hole_common::logging::redact_arm::server_kind(entry.server.expose()),
-                error = &e as &dyn std::error::Error,
-                "server_test: DoH bootstrap failed"
-            );
-            return ServerTestOutcome::DnsFailed;
-        }
+        Err(out) => return out,
     };
     let server_ip = bootstrapped.server_ip;
-    hole_common::logging::redact_arm::arm_resolved_ip(&entry.id, server_ip);
     let server_host = crate::dns::bootstrap::handoff_host(server_ip);
 
     // Phase 1: pre-flight DNS + TCP probe. Skipped for a QUIC server: its
@@ -145,7 +122,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
     // would always surface as a false TcpRefused/TcpTimeout). The full tunnel
     // handshake below still produces a correct diagnosis for an unreachable
     // QUIC server. See bindreams/hole#421.
-    if server_endpoint_is_udp(entry) {
+    if server_endpoint_is_udp(plugin.is_some(), entry.plugin_opts.as_deref(), entry.server.expose()) {
         debug!("server_test: skipping TCP preflight for UDP (quic) server endpoint");
     } else if let Err(out) = preflight(SocketAddr::new(server_ip, entry.server_port), cfg.preflight_timeout).await {
         return out;
@@ -157,7 +134,16 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
     };
 
     // Phase 2: spawn plugin if configured. The guard's Drop kills the child.
-    let _plugin_guard = match maybe_start_plugin(entry, &mut svr_cfg, &server_host, cfg, bootstrapped.via).await {
+    let _plugin_guard = match maybe_start_plugin(
+        plugin.as_ref(),
+        entry.plugin_opts.as_deref(),
+        &mut svr_cfg,
+        &server_host,
+        cfg,
+        bootstrapped.via,
+    )
+    .await
+    {
         Ok(p) => p,
         Err(out) => return out,
     };
@@ -214,7 +200,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
         &server_ip.to_string(),
         entry.server_port,
         &hole_common::logging::redact_arm::token_for(&entry.id),
-        entry.plugin.as_deref(),
+        plugin.is_some(),
         entry.plugin_opts.as_deref(),
         // One-shot probe; no caller-side cancel exists in run_server_test.
         &{
@@ -226,6 +212,28 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
 }
 
 // Helpers -------------------------------------------------------------------------------------------------------------
+
+/// Resolve the server hostname over PRIVATE DoH (never the OS resolver),
+/// as `start_cancellable` does; the resolver arms the resolved IP for
+/// redaction. Fail-closed unless `dns.allow_insecure_bootstrap`; on failure
+/// the host is logged here, not surfaced, and the outcome is `DnsFailed`.
+/// Preflight connects to the raw resolved IP; only the plugin handoff uses
+/// the bracket-safe `handoff_host`.
+async fn bootstrap_server(
+    entry: &ServerEntry,
+    cfg: &TestConfig,
+) -> Result<crate::dns::bootstrap::Bootstrapped, ServerTestOutcome> {
+    let bootstrapped = cfg.bootstrap.resolve(entry, &cfg.dns).await.map_err(|e| {
+        tracing::warn!(
+            server = %hole_common::logging::redact_arm::token_for(&entry.id),
+            server_kind = hole_common::logging::redact_arm::server_kind(entry.server.expose()),
+            error = &e as &dyn std::error::Error,
+            "server_test: DoH bootstrap failed"
+        );
+        ServerTestOutcome::DnsFailed
+    })?;
+    Ok(bootstrapped)
+}
 
 /// Per-sentinel result, internal to this module.
 enum SentinelOutcome {
@@ -246,13 +254,13 @@ async fn reclassify_blocked(
     host: &str,
     port: u16,
     token: &str,
-    plugin: Option<&str>,
+    has_plugin: bool,
     plugin_opts: Option<&str>,
     cancel: &CancellationToken,
 ) -> ServerTestOutcome {
     match tunnel_outcome {
         ServerTestOutcome::TunnelHandshakeFailed | ServerTestOutcome::ServerCannotReachInternet => {
-            if crate::reachability::probe_server_reachability(host, port, token, plugin, plugin_opts, cancel).await
+            if crate::reachability::probe_server_reachability(host, port, token, has_plugin, plugin_opts, cancel).await
                 == crate::reachability::ReachabilityVerdict::Blocked
             {
                 ServerTestOutcome::NetworkBlocked
@@ -282,12 +290,8 @@ async fn reclassify_blocked(
 /// TcpTimeout/TcpRefused verdict this asymmetry exists to avoid, and a raw
 /// TCP connect can't distinguish "genuinely TCP" from "unclassifiable" to
 /// make that guess safely.
-fn server_endpoint_is_udp(entry: &ServerEntry) -> bool {
-    match crate::reachability::classify_transport(
-        entry.plugin.as_deref(),
-        entry.plugin_opts.as_deref(),
-        entry.server.expose(),
-    ) {
+fn server_endpoint_is_udp(has_plugin: bool, plugin_opts: Option<&str>, server: &str) -> bool {
+    match crate::reachability::classify_transport(has_plugin, plugin_opts, server) {
         Ok(crate::reachability::ProbeTransport::Quic { .. }) => true,
         Ok(_) => false,
         Err(e) => {
@@ -342,27 +346,24 @@ fn build_server_config(entry: &ServerEntry, server_ip: IpAddr) -> Result<ServerC
     })
 }
 
-/// If `entry.plugin` is set, spawn it via Garter and override `svr_cfg`'s
-/// server address to point at the plugin chain's local port.
+/// If a plugin is configured (`plugin`, resolved by the caller), spawn it via
+/// Garter and override `svr_cfg`'s server address to point at the plugin
+/// chain's local port.
 ///
 /// Returns `Ok(None)` if no plugin is configured (plain shadowsocks). Returns
 /// the [`PluginChain`](crate::proxy::plugin::PluginChain) guard otherwise — its [`Drop`] cancels the chain
 /// (SIP003u graceful shutdown).
 async fn maybe_start_plugin(
-    entry: &ServerEntry,
+    plugin: Option<&BundledPlugin>,
+    plugin_opts: Option<&str>,
     svr_cfg: &mut ServerConfig,
     server_host: &str,
     cfg: &TestConfig,
     pin: crate::dns::ech::PinSource,
 ) -> Result<Option<crate::proxy::plugin::PluginChain>, ServerTestOutcome> {
-    let Some(plugin_name) = entry.plugin.as_ref() else {
+    let Some(plugin) = plugin else {
         return Ok(None);
     };
-
-    let plugin_path = cfg
-        .plugin_path_override
-        .clone()
-        .unwrap_or_else(|| resolve_plugin_path_inner(plugin_name, std::env::current_exe().ok()));
 
     // Hand the chain the DoH-resolved bracket-safe host (not the entry's
     // unresolved hostname), so garter recombines a valid `host:port`.
@@ -386,13 +387,10 @@ async fn maybe_start_plugin(
     #[allow(clippy::disallowed_methods)]
     // One-shot CLI probe: no caller-side cancel exists. See clippy.toml CancellationToken::new rule.
     let chain_cancel = CancellationToken::new();
-    // Same derivation as `start_cancellable` — see `dns::ech`.
-    let ech_doh = crate::dns::ech::ech_doh_url(&cfg.dns, pin);
-    debug!(ech_doh = ?ech_doh, ?pin, "ech-doh source");
+    let ech_doh = crate::proxy::plugin::derive_ech_doh(Some(plugin.descriptor()), &cfg.dns, pin);
     let chain = crate::proxy::plugin::start_plugin_chain(
-        plugin_name,
-        &plugin_path,
-        entry.plugin_opts.as_deref(),
+        plugin,
+        plugin_opts,
         server_host,
         server_port,
         None,
@@ -402,7 +400,13 @@ async fn maybe_start_plugin(
         ech_doh.as_ref(),
     )
     .await
-    .map_err(|e| ServerTestOutcome::PluginStartFailed { detail: e.to_string() })?;
+    .map_err(|e| {
+        warn!(
+            error = &e as &dyn std::error::Error,
+            "server test: plugin chain failed to start"
+        );
+        ServerTestOutcome::PluginStartFailed { detail: e.to_string() }
+    })?;
 
     // Override the server address to point at the plugin's local port. Uses
     // `set_addr`, not a rebuilt `ServerConfig::new`: for an AEAD-2022 EIH

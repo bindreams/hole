@@ -47,14 +47,14 @@ async fn accept_then_answer() -> SocketAddr {
 #[skuld::test(name = "reachability_tests::classify_no_plugin_is_raw")]
 fn classify_no_plugin_is_raw() {
     assert!(matches!(
-        classify_transport(None, None, "ex.com").unwrap(),
+        classify_transport(false, None, "ex.com").unwrap(),
         ProbeTransport::Raw
     ));
 }
 #[skuld::test(name = "reachability_tests::classify_tls_ws_sni_is_connect_host_not_opt")]
 fn classify_tls_ws_sni_is_connect_host_not_opt() {
     // A failure-only diagnostic must not emit the proxy domain in cleartext.
-    match classify_transport(Some("galoshes"), Some("tls;path=/t/x;host=h.ex.com"), "srv").unwrap() {
+    match classify_transport(true, Some("tls;path=/t/x;host=h.ex.com"), "srv").unwrap() {
         ProbeTransport::TlsWs { sni } => {
             assert_eq!(sni, "srv", "SNI must be the connect host");
             assert_ne!(sni, "h.ex.com", "SNI must not leak the host= opt (domain)");
@@ -64,7 +64,7 @@ fn classify_tls_ws_sni_is_connect_host_not_opt() {
 }
 #[skuld::test(name = "reachability_tests::classify_plain_ws_defaults_path_and_host")]
 fn classify_plain_ws_defaults_path_and_host() {
-    match classify_transport(Some("galoshes"), Some("path=/t/x"), "srv.ex.com").unwrap() {
+    match classify_transport(true, Some("path=/t/x"), "srv.ex.com").unwrap() {
         ProbeTransport::PlainWs { host, path } => {
             assert_eq!(host, "srv.ex.com");
             assert_eq!(path, "/t/x");
@@ -85,7 +85,7 @@ fn classify_path_key_matches_ex_ray_for_shapes_ex_ray_accepts() {
         ("path=/x;host=h", "/x"),
     ];
     for (opts, expected) in cases {
-        match classify_transport(Some("galoshes"), Some(opts), "srv.ex.com").unwrap() {
+        match classify_transport(true, Some(opts), "srv.ex.com").unwrap() {
             ProbeTransport::PlainWs { path, .. } => {
                 assert_eq!(path, expected, "opts={opts:?}");
             }
@@ -97,7 +97,7 @@ fn classify_path_key_matches_ex_ray_for_shapes_ex_ray_accepts() {
 // doc comment for why "/" is still the fallback here.
 #[skuld::test(name = "reachability_tests::classify_explicit_empty_path_falls_back_to_slash")]
 fn classify_explicit_empty_path_falls_back_to_slash() {
-    match classify_transport(Some("galoshes"), Some("path=;host=h"), "srv.ex.com").unwrap() {
+    match classify_transport(true, Some("path=;host=h"), "srv.ex.com").unwrap() {
         ProbeTransport::PlainWs { path, .. } => assert_eq!(path, "/"),
         _ => panic!("expected PlainWs"),
     }
@@ -105,7 +105,7 @@ fn classify_explicit_empty_path_falls_back_to_slash() {
 #[skuld::test(name = "reachability_tests::classify_quic_forces_quic")]
 fn classify_quic_forces_quic() {
     // Same no-domain-leak rule as the TLS-WS probe.
-    match classify_transport(Some("galoshes"), Some("mode=quic;host=h"), "srv").unwrap() {
+    match classify_transport(true, Some("mode=quic;host=h"), "srv").unwrap() {
         ProbeTransport::Quic { sni } => {
             assert_eq!(sni, "srv", "SNI must be the connect host");
             assert_ne!(sni, "h", "SNI must not leak the host= opt");
@@ -115,13 +115,13 @@ fn classify_quic_forces_quic() {
 }
 #[skuld::test(name = "reachability_tests::classify_rejects_malformed_options")]
 fn classify_rejects_malformed_options() {
-    assert!(classify_transport(Some("galoshes"), Some(r"path=/a\"), "srv").is_err());
+    assert!(classify_transport(true, Some(r"path=/a\"), "srv").is_err());
 }
 #[skuld::test(name = "reachability_tests::classify_recognizes_an_escaped_tls_key")]
 fn classify_recognizes_an_escaped_tls_key() {
     // A backslash escapes whatever byte follows, so `\tls` IS `tls` — to
     // ex-ray, and here.
-    match classify_transport(Some("galoshes"), Some(r"\tls;host=h"), "srv").unwrap() {
+    match classify_transport(true, Some(r"\tls;host=h"), "srv").unwrap() {
         ProbeTransport::TlsWs { .. } => {}
         _ => panic!("expected TlsWs for an escaped tls key"),
     }
@@ -130,7 +130,7 @@ fn classify_recognizes_an_escaped_tls_key() {
 fn classify_first_wins_on_duplicate_mode_key() {
     // ex-ray's Args.Get is first-wins; the FIRST `mode=` must be the one
     // consulted.
-    match classify_transport(Some("galoshes"), Some("mode=quic;mode=websocket"), "srv").unwrap() {
+    match classify_transport(true, Some("mode=quic;mode=websocket"), "srv").unwrap() {
         ProbeTransport::Quic { .. } => {}
         _ => panic!("expected Quic (first mode= wins)"),
     }
@@ -151,7 +151,7 @@ async fn malformed_options_probe_is_inconclusive() {
             &a.ip().to_string(),
             a.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some(r"path=/a\"),
             &CancellationToken::new()
         )
@@ -197,7 +197,7 @@ async fn plain_ws_reset_is_blocked() {
             &a.ip().to_string(),
             a.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some("path=/x"),
             &CancellationToken::new()
         )
@@ -213,7 +213,7 @@ async fn plain_ws_answered_is_reachable() {
             &a.ip().to_string(),
             a.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some("path=/x"),
             &CancellationToken::new()
         )
@@ -229,7 +229,7 @@ async fn tls_ws_bytes_back_is_reachable() {
             &a.ip().to_string(),
             a.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some("tls;host=h"),
             &CancellationToken::new()
         )
@@ -245,7 +245,7 @@ async fn tls_ws_reset_is_blocked() {
             &a.ip().to_string(),
             a.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some("tls;host=h"),
             &CancellationToken::new()
         )
@@ -266,7 +266,7 @@ async fn closed_port_is_refused() {
         &a.ip().to_string(),
         a.port(),
         "<server:00000000>",
-        None,
+        false,
         None,
         &CancellationToken::new(),
     )
@@ -283,7 +283,7 @@ async fn bogus_host_is_dns_failed() {
             "no-such-host.invalid",
             443,
             "<server:00000000>",
-            None,
+            false,
             None,
             &CancellationToken::new()
         )
@@ -346,7 +346,7 @@ async fn quic_silent_udp_is_blocked() {
             &a.ip().to_string(),
             a.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some("mode=quic;host=h"),
             &CancellationToken::new()
         )
@@ -362,7 +362,7 @@ async fn quic_server_is_reachable() {
             &a.ip().to_string(),
             a.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some("mode=quic;host=localhost"),
             &CancellationToken::new()
         )
@@ -378,7 +378,7 @@ async fn quic_server_v6_is_reachable() {
             &a.ip().to_string(),
             a.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some("mode=quic;host=localhost"),
             &CancellationToken::new()
         )
@@ -400,7 +400,7 @@ async fn cancel_against_silent_endpoint_is_inconclusive() {
             &a.ip().to_string(),
             a.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some("mode=quic;host=h"),
             &cancel
         )

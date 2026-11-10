@@ -83,7 +83,7 @@ pub fn authority_is_a_name(url: &str) -> bool {
 /// exactly this address regardless of `source`: it always comes from the
 /// user's OWN configured `dns.servers`, so permitting it is config-authorship
 /// trust, not a claim that THIS attempt personally dialed it — `Answered`
-/// and `SecureBootstrapFailed` did (`resolve_via_doh` dials every configured
+/// and `SecureBootstrapFailed` did (`resolve_via_doh_with` dials every configured
 /// resolver even on total failure); `NoQueryNeeded` dialed nothing at all
 /// (a literal-IP server short-circuits before the loop), and
 /// `ResolverDeselected`'s fallback may name an address only a PRIOR resolve

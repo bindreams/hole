@@ -63,15 +63,12 @@ fn is_known_false_for_unknown() {
     assert!(!plugin::is_known(""));
 }
 
-// `plugin_alloc_protocols` is keyed by BINARY name (the on-disk binary),
-// not the config token — the proxy manager resolves the config name to
-// its `binary_name` before allocating the handoff port (#414).
-
 #[skuld::test]
 fn alloc_protocols_ex_ray_is_tcp_only() {
     use util::port_alloc::Protocols;
     // `v2ray-plugin` resolves to the `ex-ray` binary, which is TCP-only.
-    assert_eq!(plugin::plugin_alloc_protocols("ex-ray"), Protocols::TCP);
+    assert_eq!(plugin::lookup("v2ray-plugin").unwrap().alloc_protocols, Protocols::TCP);
+    assert_eq!(plugin::lookup("ex-ray").unwrap().alloc_protocols, Protocols::TCP);
 }
 
 #[skuld::test]
@@ -80,15 +77,7 @@ fn alloc_protocols_galoshes_is_tcp_and_udp() {
     // galoshes binds UDP for YAMUX, so its handoff port must be
     // UDP-capable to avoid the Windows cross-protocol excluded-port race.
     assert_eq!(
-        plugin::plugin_alloc_protocols("galoshes"),
+        plugin::lookup("galoshes").unwrap().alloc_protocols,
         Protocols::TCP | Protocols::UDP
     );
-}
-
-#[skuld::test]
-fn alloc_protocols_unknown_defaults_to_tcp() {
-    use util::port_alloc::Protocols;
-    // Conservative default — unknown binaries are treated as TCP-only.
-    assert_eq!(plugin::plugin_alloc_protocols("xyzzy"), Protocols::TCP);
-    assert_eq!(plugin::plugin_alloc_protocols(""), Protocols::TCP);
 }
