@@ -1,5 +1,6 @@
 //! Windows apparatus for the #1075 measurement: `ipconfig /renew` for DHCP, a `pktmon` capture of
-//! the NIC for the neighbor solicitation DAD sends.
+//! the NIC for the neighbor solicitation DAD sends, and a record of the IPv6 neighbor, route and
+//! inbound-filter state around it.
 
 use std::net::{Ipv6Addr, UdpSocket};
 use std::process::Command;
@@ -11,6 +12,7 @@ use tun_engine::test_utils::{
     capture_contains_nonce, classify_send, describe_output, nonce, pktmon_checked, ps_capture,
     stop_reports_no_events_lost, PktmonGuard, SendFate,
 };
+use util::system_tool::SystemTool;
 use windows::Win32::Foundation::NO_ERROR;
 use windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceIndexToLuid;
 use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
@@ -48,6 +50,31 @@ fn unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock after 1970")
         .as_secs()
+}
+
+/// The `<item>` blocks of `netsh wfp show filters dir=in` whose display name is the cover's (the name
+/// `failclosed/windows.rs` gives its provider, sublayer and filters). The split is lexical: the output
+/// is a record for a human, not an input to a verdict.
+fn inbound_cover_filters() -> Result<String, String> {
+    const COVER_NAME: &str = "Hole fail-closed";
+    let out = SystemTool::Netsh
+        .command()
+        .map_err(|e| format!("locate netsh: {e}"))?
+        .args(["wfp", "show", "filters", "dir=in", "verbose=on", "file=-"])
+        .output()
+        .map_err(|e| format!("spawn netsh: {e}"))?;
+    if !out.status.success() {
+        return Err(describe_output(&out));
+    }
+    let xml = String::from_utf8_lossy(&out.stdout).into_owned();
+    let items: Vec<&str> = xml.split("<item>").filter(|i| i.contains(COVER_NAME)).collect();
+    if items.is_empty() {
+        return Ok(format!(
+            "no inbound filter is named {COVER_NAME:?} ({} bytes of netsh output)",
+            xml.len()
+        ));
+    }
+    Ok(items.join("<item>"))
 }
 
 /// Send a datagram carrying a fresh nonce to a destination neither cover permits. Returns the nonce.
@@ -122,6 +149,28 @@ impl Nic {
                 "the lease moved from {before} to {after}, before the renewal began at {started}; ipconfig: {renew}"
             ))
         }
+    }
+
+    /// Every NIC's IPv6 neighbor table, the IPv6 routes (RA-learned ones carry `RouterDiscovery`), and
+    /// the inbound filters Hole's provider holds. Record-only: a read that fails is text, not an error.
+    pub fn nd_state(&self) -> String {
+        let neighbors = ps_capture(
+            "Get-NetNeighbor -AddressFamily IPv6 | Sort-Object InterfaceAlias,IPAddress |              Format-Table InterfaceAlias,IPAddress,LinkLayerAddress,State -AutoSize | Out-String -Width 250",
+        );
+        let routes = ps_capture(
+            "Get-NetRoute -AddressFamily IPv6 | Sort-Object InterfaceAlias,DestinationPrefix |              Format-Table InterfaceAlias,DestinationPrefix,NextHop,Protocol,RouteMetric -AutoSize |              Out-String -Width 250",
+        );
+        format!(
+            "-- neighbors (Get-NetNeighbor -AddressFamily IPv6)
+{}
+-- routes (Get-NetRoute -AddressFamily IPv6)
+{}
+-- inbound filters of Hole's provider (netsh wfp show filters dir=in)
+{}",
+            neighbors.unwrap_or_else(|e| format!("<unreadable: {e}>")),
+            routes.unwrap_or_else(|e| format!("<unreadable: {e}>")),
+            inbound_cover_filters().unwrap_or_else(|e| format!("<unreadable: {e}>")),
+        )
     }
 
     /// Add a throwaway ULA address to the NIC, wait for DAD to end, and read a capture of every NIC

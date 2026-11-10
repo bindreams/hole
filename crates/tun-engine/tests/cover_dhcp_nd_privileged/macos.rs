@@ -1,6 +1,6 @@
 //! macOS apparatus for the #1075 measurement: a `tcpdump` of the NIC for both events. DHCP: the T1 unicast
 //! renewal the test sends itself, read off the wire (outbound only, see [`Nic::dhcp_renewal`]). ND: the neighbor
-//! solicitation DAD sends.
+//! solicitation DAD sends. Plus a record of the IPv6 neighbor and router tables around the ND measurement.
 
 use std::ffi::CString;
 use std::io::{BufRead, BufReader, ErrorKind, Read};
@@ -361,6 +361,20 @@ impl Nic {
             "the DHCP server's link-layer address is not resolved, so the request could be held behind a lookup the \
              ordering probe skips: {entry:?}"
         ))
+    }
+
+    /// Every NIC's IPv6 neighbor cache and default-router list. Record-only: a read that fails is
+    /// text, not an error.
+    pub fn nd_state(&self) -> String {
+        let read = |args: &[&str]| run("ndp", args).unwrap_or_else(|e| format!("<unreadable: {e}>"));
+        format!(
+            "-- neighbors (ndp -an)
+{}
+-- routers (ndp -rn)
+{}",
+            read(&["-an"]),
+            read(&["-rn"])
+        )
     }
 
     /// Add a throwaway ULA address to the NIC while `tcpdump` watches it, wait for DAD to end, and

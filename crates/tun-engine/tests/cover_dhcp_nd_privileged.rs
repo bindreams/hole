@@ -49,6 +49,10 @@
 //!   Windows ND calibrates with an IPv4 datagram that the cover's ALE filters reject before it reaches
 //!   any NIC, which cannot show whether the capture sees packets dropped at the layer ND uses.
 //!
+//! The neighbor-discovery tests also print an `ND-STATE #1075` record (neighbor table, routers or routes, and on
+//! Windows the cover's inbound filters) before the cover engages and while it is engaged. It decides nothing: it is
+//! evidence for whether inbound neighbor/router advertisements need a test of their own.
+//!
 //! The control is a measurement of the apparatus, not of the cover: a test whose control did not work
 //! says `COULD NOT MEASURE`, never `DEFECT`.
 //!

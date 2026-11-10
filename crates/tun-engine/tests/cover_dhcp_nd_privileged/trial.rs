@@ -81,12 +81,26 @@ pub fn run(kind: CoverKind, probe: Probe) {
         Probe::NeighborDiscovery => nic.neighbor_discovery(covered),
     };
 
+    // Record-only: what the neighbor and router tables hold before the cover, and while it is engaged.
+    let record_nd_state = |phase: &str| {
+        if matches!(probe, Probe::NeighborDiscovery) {
+            eprintln!(
+                "ND-STATE #1075 | {} | cover={kind:?} | {phase}
+{}",
+                std::env::consts::OS,
+                nic.nd_state()
+            );
+        }
+    };
+
+    record_nd_state("before the cover engages");
     let control = measure(false);
     // The covered reading is taken inside the window and judged after the cover is gone, so a failed
     // reading can never skip the release.
     let covered = match control {
         Reading::Worked(_) => {
             let cover = engage(kind, escape.state_dir());
+            record_nd_state("cover engaged");
             let reading = measure(true);
             drop(cover);
             Some(reading)
