@@ -1,0 +1,49 @@
+# Scratch measurement for #1081: does backup intent let an elevated open pass a share mode?
+#
+# The branch re-adds backup intent (`FILE_OPEN_FOR_BACKUP_INTENT`) to `OpenFile::ReadPinned`. This runner is elevated
+# (GitHub's Windows runners run as an administrator), so the tests below run with the token's privileges.
+#
+#   read_pinned_fails_while_a_holder_denies_sharing: the pin must fail while a holder denies sharing. If it FAILS here,
+#     backup intent lets an elevated open through a holder that denies sharing, and the pin cannot rely on the share
+#     mode alone. If it PASSES, backup intent does not affect the share mode.
+#   the others read as an unprivileged thread (the process token with every privilege removed) and expect the sharing
+#     violation, on the claim that an elevated reader would read through the holder. They pass either way; their
+#     outcomes are printed for the record.
+#
+# Not for merging.
+name: scratch-1081-backup
+
+on: workflow_dispatch
+
+jobs:
+  measure:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-build
+
+      - uses: cargo-bins/cargo-binstall@v1.26.2
+
+      - name: Install nextest
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .github/scripts/retry.sh cargo binstall --no-confirm --locked cargo-nextest
+
+      - name: Show the token
+        shell: pwsh
+        run: |
+          $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+          "elevated administrator: $($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
+          whoami /priv
+
+      - name: Run the tests
+        shell: bash
+        run: |
+          set +e
+          cargo nextest run -p util -p hole-common --no-fail-fast --failure-output immediate --success-output immediate -E 'test(read_pinned_fails_while_a_holder_denies_sharing) | test(read_of_a_file_held_without_sharing_names_the_ntstatus_of_the_open) | test(the_os_code_of_a_status_error_is_in_its_source_and_readers_see_through_the_wrapper) | test(load_of_a_held_file_carries_the_ntstatus_in_the_error_and_the_log) | test(a_marker_held_open_against_readers_reads_as_unreadable)'
+          echo "nextest exit code: $?"

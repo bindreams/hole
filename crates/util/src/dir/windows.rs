@@ -630,16 +630,14 @@ fn open_file_with(dir: &File, name: &OsStr, how: OpenFile, rights: u32) -> io::R
         FILE_OPEN_FOR_BACKUP_INTENT,
         FILE_OPEN_REPARSE_POINT,
     ];
-    let pinned_file = [FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT];
     // `FILE_APPEND_DATA` without `FILE_WRITE_DATA`: every write lands at the end.
     let append = FILE_APPEND_DATA.0 | FILE_READ_ATTRIBUTES.0;
     let (rights, share, disposition, flags) = match how {
         OpenFile::CreateNew { .. } => (rights, SHARE_NO_DELETE, FILE_CREATE, options(&own_file)),
         OpenFile::Existing => (rights, SHARE_NO_DELETE, FILE_OPEN, options(OPEN_AS_ITSELF)),
         OpenFile::Read => (FILE_GENERIC_READ.0, SHARE_ALL, FILE_OPEN, options(&own_file)),
-        // No backup intent: the open is subject to the file's ACL, not the backup privilege's override. The pin
-        // itself is the share mode, which this flag is not known to affect.
-        OpenFile::ReadPinned => (FILE_GENERIC_READ.0, SHARE_READ, FILE_OPEN, options(&pinned_file)),
+        // MEASUREMENT (scratch branch): backup intent re-added, to see whether an elevated open passes a share mode.
+        OpenFile::ReadPinned => (FILE_GENERIC_READ.0, SHARE_READ, FILE_OPEN, options(&own_file)),
         OpenFile::Append => (append, SHARE_ALL, FILE_OPEN, options(&own_file)),
         OpenFile::CreateAppend { .. } => (append, SHARE_ALL, FILE_CREATE, options(&own_file)),
     };
