@@ -18,8 +18,6 @@ packages = ["src/msi_installer"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Tests that install Hole system-wide run only when asked for (`-m system_wide`), never by a bare `pytest`.
-addopts = "-m 'not system_wide and not cleanup'"
 markers = [
     "wix: tests requiring the WiX toolchain (skip with -m 'not wix')",
     "cdb: tests requiring the Windows SDK Debugging Tools and the Microsoft symbol server (skip with -m 'not cdb')",
