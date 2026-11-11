@@ -21,6 +21,8 @@ mod cli_log;
 mod cli;
 mod commands;
 mod elevation;
+#[cfg(target_os = "macos")]
+mod embedded_plugins;
 mod import_dialog;
 mod log_collector;
 mod logging;

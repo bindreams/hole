@@ -5,6 +5,9 @@ that ships with only the linker's ad-hoc Mach-O signature and no
 `_CodeSignature/CodeResources` seal. Such a bundle launches "damaged"
 under Gatekeeper quarantine because the Mach-O claims sealed resources
 that don't exist.
+
+The plugins are no longer in the bundle (`hole` embeds them), so no signature is asserted on them here; the
+install-and-connect e2e covers running them.
 """
 
 import subprocess
@@ -54,26 +57,6 @@ def test_main_binary_is_not_linker_signed(installed_app: Path) -> None:
     assert "linker-signed" not in output, (
         f"main binary still carries the linker-applied ad-hoc signature "
         f"(0x20000 flag bit) — Tauri's codesign step did not re-sign it:\n{output}"
-    )
-
-
-def test_sidecar_has_real_signature(installed_app: Path) -> None:
-    output = _codesign_dv(installed_app / "Contents" / "MacOS" / "ex-ray")
-    assert "Identifier=a.out" not in output, (
-        f"ex-ray sidecar still has the Go-linker default identifier 'a.out' "
-        f"— Tauri's codesign step did not re-sign it:\n{output}"
-    )
-    assert "linker-signed" not in output, f"ex-ray sidecar still carries the linker-applied ad-hoc signature:\n{output}"
-
-
-def test_galoshes_sidecar_present_and_signed(installed_app: Path) -> None:
-    """galoshes must ship inside Hole.app and be re-signed by Tauri (#512)."""
-    galoshes = installed_app / "Contents" / "MacOS" / "galoshes"
-    assert galoshes.exists(), "galoshes sidecar missing from the .app bundle (externalBin not bundled?)"
-    output = _codesign_dv(galoshes)
-    assert "linker-signed" not in output, (
-        f"galoshes sidecar still carries the linker-applied ad-hoc signature "
-        f"— Tauri's codesign step did not re-sign it:\n{output}"
     )
 
 

@@ -67,6 +67,21 @@ static LOG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 /// `run`'s args), so the version is threaded through this static.
 static VERSION_OVERRIDE: OnceLock<String> = OnceLock::new();
 
+/// Where the service finds its plugins: beside the installed bridge executable, where the installer put them.
+pub fn service_plugin_source() -> crate::proxy::PluginSource {
+    crate::proxy::PluginSource::InstallDir {
+        exe: crate::proxy::BridgeExe::Running,
+    }
+}
+
+/// Where a foreground bridge started with `--plugin-dir DIR` finds its plugins: `DIR`, read and never written. An
+/// error unless `DIR` names a directory.
+pub fn explicit_plugin_source(dir: std::path::PathBuf) -> std::io::Result<crate::proxy::PluginSource> {
+    Ok(crate::proxy::PluginSource::Explicit {
+        dir: crate::proxy::plugin_source::absolute_plugin_dir(dir)?,
+    })
+}
+
 /// Run as a Windows Service (called by the service control manager).
 pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path, version: &str) -> std::io::Result<()> {
     let default = hole_common::protocol::default_bridge_socket_path();
@@ -193,11 +208,14 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(hole_common::paths::default_state_dir);
         let log_dir = LOG_DIR_OVERRIDE.get().cloned().unwrap_or_else(service_log_dir);
 
-        let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(crate::proxy_manager::ProxyManager::new(
-            crate::proxy::ShadowsocksProxy::new(),
-            // No owner: the service daemon runs as SYSTEM and its dirs are SYSTEM-owned by design.
-            tun_engine::routing::SystemRouting::new(state_dir.clone(), None),
-        )));
+        let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::proxy_manager::ProxyManager::new(
+                crate::proxy::ShadowsocksProxy::new(),
+                // No owner: the service daemon runs as SYSTEM and its dirs are SYSTEM-owned by design.
+                tun_engine::routing::SystemRouting::new(state_dir.clone(), None),
+            )
+            .with_plugin_source(service_plugin_source()),
+        ));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
         let socket_path = SOCKET_PATH_OVERRIDE
@@ -846,6 +864,11 @@ pub fn is_installed() -> bool {
         return false;
     };
     manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS).is_ok()
+}
+
+/// Whether anything is left for an uninstall to remove: the registration is all that is (the MSI owns the files).
+pub fn has_anything_to_uninstall() -> bool {
+    is_installed()
 }
 
 /// Check whether the service is registered and currently running.

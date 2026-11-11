@@ -1,7 +1,10 @@
 // macOS: launchd bridge management.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::info;
+
+use crate::plugin_repair::{EmbeddedPlugin, PluginDirLayout, Prepared, RepairOutcome, RepairVerdict};
+use crate::proxy::PluginSource;
 
 // Constants ===========================================================================================================
 
@@ -13,6 +16,38 @@ pub const SERVICE_LOG_DIR: &str = "/var/log/hole";
 /// `/var/db/<daemon>`). Holds the bridge crash-recovery state files
 /// (DNS, routes, plugins).
 pub const SERVICE_STATE_DIR: &str = "/var/db/hole/state";
+/// The folder only root can write, holding the plugins `hole` carries. The service makes it hold exactly those at
+/// every start; `hole` itself stays at [`HELPER_PATH`].
+pub const PLUGIN_DIR: &str = "/Library/Application Support/Hole";
+/// A folder only root can write, where a plugin that extracts itself at run time puts what it extracts. Outside
+/// [`PLUGIN_DIR`] on purpose: repair removes what it does not recognize there.
+pub const SERVICE_RUNTIME_DIR: &str = "/var/run/hole";
+
+/// The service's plugin folder and its owner, root.
+fn plugin_dir_layout() -> PluginDirLayout {
+    PluginDirLayout {
+        dir: PathBuf::from(PLUGIN_DIR),
+        owner: (0, 0),
+    }
+}
+
+/// Where the service finds its plugins: [`PLUGIN_DIR`], not derived from the executable, once `verdict` says the
+/// repair of this start made it hold what `hole` carries.
+pub fn service_plugin_source(verdict: RepairVerdict) -> PluginSource {
+    PluginSource::Managed {
+        layout: plugin_dir_layout(),
+        runtime_dir: PathBuf::from(SERVICE_RUNTIME_DIR),
+        verdict,
+    }
+}
+
+/// Where a foreground bridge started with `--plugin-dir DIR` finds its plugins: `DIR`, read and never written, and
+/// only if its layout stamp is current. An error unless `DIR` names a directory.
+pub fn explicit_plugin_source(dir: PathBuf) -> std::io::Result<PluginSource> {
+    Ok(PluginSource::ExplicitStamped {
+        dir: crate::proxy::plugin_source::absolute_plugin_dir(dir)?,
+    })
+}
 
 // Plist generation ====================================================================================================
 
@@ -257,10 +292,9 @@ fn ensure_stopped_with(
 ///
 /// `Unknown` is an error, not a success: `setup::uninstall_bridge_with` gates
 /// deregistration on this call, and deleting the plist over a still-loaded job
-/// is the macOS shape of the #1003 dead end — `is_installed()` then reads
-/// false, every later uninstall skips its teardown, and the bridge that holds
-/// the liveness lock is never stopped again, so the cover release refuses
-/// forever.
+/// leaves a running bridge with no registration naming it, and a bridge left running holds the liveness lock, so the
+/// cover release refuses against it. The registration is the only handle a later attempt has on a job it could not
+/// confirm stopped.
 ///
 /// `Loaded` is reached whenever the bootout did not succeed and launchd still
 /// has the job — the real refusal, as opposed to the bootout that failed
@@ -282,22 +316,50 @@ fn ensure_stopped_verdict(registration: Registration) -> std::io::Result<()> {
 
 /// Stop, unload, and remove the bridge.
 ///
-/// The stop is FATAL here, not best-effort. `is_installed()` is a `PLIST_PATH`
-/// existence check, so deleting the plist over a still-loaded job makes every
-/// later `uninstall` skip its teardown — nothing would ever stop the bridge
-/// again, and the cover release refuses against it forever.
+/// The stop is FATAL here, not best-effort. The removals below delete the plist, the registration, over whatever
+/// launchd still holds; a bridge not confirmed stopped keeps its liveness lock, so the cover release refuses against it.
+/// `has_anything_to_uninstall()` gates only those removals, never the stop.
 pub fn uninstall() -> std::io::Result<()> {
     ensure_stopped()?;
 
-    if Path::new(PLIST_PATH).exists() {
-        std::fs::remove_file(PLIST_PATH)?;
-    }
-    if Path::new(HELPER_PATH).exists() {
-        std::fs::remove_file(HELPER_PATH)?;
-    }
+    // Every removal is attempted: one that always fails (an immutable folder, a mount point) must not keep the
+    // registration from going, or the uninstall could never finish.
+    let layout = plugin_dir_layout();
+    remove_all([
+        (
+            "remove the plugin folder",
+            crate::plugin_repair::apply::remove_folder(&layout.dir, layout.owner),
+        ),
+        (
+            "remove the plugin runtime folder",
+            crate::plugin_repair::apply::remove_folder(Path::new(SERVICE_RUNTIME_DIR), layout.owner),
+        ),
+        ("remove the launchd plist", remove_if_present(PLIST_PATH)),
+        ("remove the helper", remove_if_present(HELPER_PATH)),
+    ])?;
 
     info!("launchd bridge uninstalled");
     Ok(())
+}
+
+/// Removes `path` if it is there.
+fn remove_if_present(path: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+/// Ok if every removal went, else one error naming each that did not.
+fn remove_all(removals: impl IntoIterator<Item = (&'static str, std::io::Result<()>)>) -> std::io::Result<()> {
+    let failures: Vec<String> = removals
+        .into_iter()
+        .filter_map(|(what, result)| result.err().map(|e| format!("{what}: {e}")))
+        .collect();
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(failures.join("; ")))
 }
 
 // Start/stop ==========================================================================================================
@@ -322,6 +384,27 @@ pub fn stop() -> std::io::Result<()> {
 /// Check whether the bridge plist is installed.
 pub fn is_installed() -> bool {
     Path::new(PLIST_PATH).exists()
+}
+
+/// Whether anything Hole installed is still on this machine: the registration, or a file or folder an uninstall that
+/// failed part-way left. Gates the uninstall's removals, so one that failed after the plist went can be retried; a
+/// status readout asks [`is_installed`], which a leftover folder must not turn into "installed".
+pub fn has_anything_to_uninstall() -> bool {
+    any_present(&[
+        Path::new(PLIST_PATH),
+        Path::new(HELPER_PATH),
+        Path::new(PLUGIN_DIR),
+        Path::new(SERVICE_RUNTIME_DIR),
+    ])
+}
+
+/// Whether something is at any of `paths`, a link as itself. A path that cannot be looked at counts: the removal is
+/// attempted and says why it cannot.
+fn any_present(paths: &[&Path]) -> bool {
+    paths.iter().any(|path| match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    })
 }
 
 /// What [`hold_start_type`] returns.
@@ -378,19 +461,28 @@ pub fn is_running() -> bool {
 ///
 /// `log_dir` is the directory the crash-marker sweep reads (markers land
 /// next to `bridge.log`; see bindreams/hole#438).
+///
+/// `plugins` are the plugin binaries `hole` carries; the service makes [`PLUGIN_DIR`] hold exactly those before it
+/// serves anything.
 pub fn run(
     socket_path: &std::path::Path,
     state_dir: &std::path::Path,
     log_dir: &std::path::Path,
     version: &str,
+    plugins: &'static [EmbeddedPlugin],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(crate::proxy_manager::ProxyManager::new(
-            crate::proxy::ShadowsocksProxy::new(),
-            // No owner: the launchd daemon runs as root and its dirs are root-owned by design.
-            tun_engine::routing::SystemRouting::new(state_dir.to_path_buf(), None),
-        )));
+        // The repair of this start writes it; the plugin source reads it.
+        let verdict = RepairVerdict::default();
+        let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::proxy_manager::ProxyManager::new(
+                crate::proxy::ShadowsocksProxy::new(),
+                // No owner: the launchd daemon runs as root and its dirs are root-owned by design.
+                tun_engine::routing::SystemRouting::new(state_dir.to_path_buf(), None),
+            )
+            .with_plugin_source(service_plugin_source(verdict.clone())),
+        ));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
         // Bind BEFORE the liveness acquire and BEFORE recovery — a second
@@ -407,7 +499,17 @@ pub fn run(
         let _liveness =
             tokio::task::spawn_blocking(move || crate::liveness::BridgeLiveness::acquire(&state_dir_liveness, None))
                 .await??;
-        // DNS recovery runs first; see crate::dns::recovery docs for ordering.
+        // Repairs come first: a bridge wedged or stopped in any later step never reaches a repair placed after it
+        // (Windows does the same, `registration::run_startup_steps`). Nothing is served yet, and the one bridge that
+        // holds the liveness lock is the only repairer.
+        prepare_plugins(
+            plugin_dir_layout(),
+            PathBuf::from(SERVICE_RUNTIME_DIR),
+            plugins,
+            &verdict,
+        )
+        .await;
+        // DNS recovery runs next; see crate::dns::recovery docs for ordering.
         let state_dir_dns = state_dir.to_path_buf();
         if let Err(e) =
             tokio::task::spawn_blocking(move || crate::dns::recovery::recover_dns_config(&state_dir_dns)).await
@@ -472,6 +574,51 @@ pub fn run(
         Ok::<(), Box<dyn std::error::Error>>(())
     })?;
     Ok(())
+}
+
+/// Makes the plugin folder hold what `hole` carries and the runtime folder exist, on a blocking thread, and records
+/// how the repair went in `verdict`. Never stops the start: a bridge whose plugins cannot be repaired still serves,
+/// and a connect that needs them says why.
+async fn prepare_plugins(
+    layout: PluginDirLayout,
+    runtime_dir: PathBuf,
+    plugins: &'static [EmbeddedPlugin],
+    verdict: &RepairVerdict,
+) {
+    let started = std::time::Instant::now();
+    let joined = tokio::task::spawn_blocking(move || {
+        let outcome = crate::plugin_repair::apply::repair(&layout, plugins);
+        let runtime = crate::plugin_repair::apply::make_runtime_dir(&runtime_dir, layout.owner);
+        (outcome, runtime)
+    })
+    .await;
+    match joined {
+        Ok((outcome, runtime)) => {
+            // The runtime folder is part of what a plugin may run with, so its failure is part of the verdict.
+            let prepared = Prepared::new(outcome, runtime);
+            prepared.log();
+            verdict.record(prepared);
+            // A measurement of what the repair costs on a start: hashing the plugins on every start, writing them on
+            // the first start after an install or an update.
+            info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "plugin folder prepared"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                error = &e as &dyn std::error::Error,
+                "plugin folder repair task panicked"
+            );
+            verdict.record(Prepared::new(
+                RepairOutcome::Degraded {
+                    notes: Vec::new(),
+                    failures: vec!["the repair task panicked".to_owned()],
+                },
+                Ok(()),
+            ));
+        }
+    }
 }
 
 /// Clear a stale update-in-progress marker on the new bridge's post-bind sweep.

@@ -53,6 +53,14 @@ impl ReadDir {
         read_whole_vouched(&self.file, name)
     }
 
+    /// Every name in the directory, in no particular order, without `.` and `..`. Read through the open handle, so
+    /// no path is resolved again; a name added or removed while it runs may or may not be listed. Unix only: the one
+    /// caller is the macOS plugin-folder repair.
+    #[cfg(unix)]
+    pub fn names(&self) -> io::Result<Vec<std::ffi::OsString>> {
+        platform::names(&self.file)
+    }
+
     /// What `name` is right now, or `None` if there is nothing. A symlink is itself, not what it points at.
     pub fn kind_of(&self, name: &OsStr) -> io::Result<Option<EntryKind>> {
         single_component(name)?;

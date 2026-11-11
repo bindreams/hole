@@ -311,6 +311,87 @@ fn windows_writers() -> Vec<Writer> {
     }]
 }
 
+/// The plugin-folder rows (unix). Another platform lists their sources and runs none of them.
+#[cfg(unix)]
+fn plugin_folder_writers() -> Vec<Writer> {
+    use crate::plugin_repair::{apply, layout_stamp, EmbeddedPlugin, PluginDirLayout, RepairOutcome};
+
+    fn layout_at(dir: &Path, owner: Owner) -> PluginDirLayout {
+        PluginDirLayout {
+            dir: dir.to_path_buf(),
+            owner: owner.expect("the unix owner is always given"),
+        }
+    }
+    fn plugins() -> Vec<EmbeddedPlugin> {
+        [
+            ("ex-ray", &b"ex-ray fixture"[..]),
+            ("galoshes", &b"galoshes fixture"[..]),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| EmbeddedPlugin {
+            name,
+            bytes: bytes.to_vec().leak(),
+            sha256: <sha2::Sha256 as sha2::Digest>::digest(bytes).into(),
+        })
+        .collect()
+    }
+    /// A repair that left the folder as it found it, because it could not read the stamp, is the refusal of a name.
+    fn as_a_write(outcome: RepairOutcome) -> io::Result<()> {
+        match outcome {
+            RepairOutcome::Converged => Ok(()),
+            RepairOutcome::Repaired { .. } => Ok(()),
+            RepairOutcome::Refused(_) => Err(io::Error::other(LeftAsItIs)),
+            RepairOutcome::Degraded { failures, notes } => Err(io::Error::other(format!("{failures:?} {notes:?}"))),
+        }
+    }
+    vec![
+        Writer {
+            name: "the plugin folder, repaired",
+            sources: &["crates/bridge/src/plugin_repair/apply.rs"],
+            names: &["ex-ray", "galoshes"],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, owner| as_a_write(apply::repair(&layout_at(dir, owner), &plugins())),
+        },
+        Writer {
+            name: "the plugin folder's layout file, stored",
+            sources: &["crates/bridge/src/plugin_repair/layout_stamp.rs"],
+            names: &[layout_stamp::STAMP_FILE_NAME],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, owner| {
+                // The folder is the layout's own: repair makes it, the stamp is stored into it.
+                std::fs::create_dir_all(dir)?;
+                layout_stamp::store(&layout_at(dir, owner)).map_err(io::Error::other)
+            },
+        },
+        Writer {
+            name: "the plugin folder, removed",
+            sources: &[],
+            // The folder's own name, in its parent.
+            names: &["Hole"],
+            at_a_planted_name: AtAPlantedName::Replaces,
+            runs_here: true,
+            run: |dir, owner| apply::remove_folder(&dir.join("Hole"), owner.expect("the unix owner is always given")),
+        },
+    ]
+}
+
+#[cfg(not(unix))]
+fn plugin_folder_writers() -> Vec<Writer> {
+    vec![Writer {
+        name: "the plugin folder (unix)",
+        sources: &[
+            "crates/bridge/src/plugin_repair/apply.rs",
+            "crates/bridge/src/plugin_repair/layout_stamp.rs",
+        ],
+        names: &[],
+        at_a_planted_name: AtAPlantedName::Replaces,
+        runs_here: false,
+        run: |_, _| unreachable!("a row of another platform is not run"),
+    }]
+}
+
 fn writers() -> Vec<Writer> {
     use tun_engine::routing::failclosed::{boottime_witness, lockdown_state};
     let mut rows = vec![
@@ -533,6 +614,7 @@ fn writers() -> Vec<Writer> {
     ];
     rows.extend(macos_writers());
     rows.extend(windows_writers());
+    rows.extend(plugin_folder_writers());
     rows
 }
 
@@ -1442,7 +1524,7 @@ const RESOLVING_ALLOWED: &[(&str, &str, &str)] = &[
         "a dedup key for the walk of an extracted payload: nothing is opened through it",
     ),
     (
-        "crates/bridge/src/proxy/config.rs",
+        "crates/bridge/src/proxy/plugin_source.rs",
         "canonicalize(&exe)",
         "the bridge's own executable, to find the plugin beside it",
     ),
@@ -1951,7 +2033,7 @@ const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "crates/bridge/src/platform/macos.rs",
         "std::fs::remove_file",
-        2,
+        1,
         "the install and uninstall run as root, in /Library/PrivilegedHelperTools, /Library/LaunchDaemons, /var/log/hole and /var/db/hole/state, which only root can add names to",
     ),
     (
