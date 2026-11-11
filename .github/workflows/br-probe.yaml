@@ -42,15 +42,13 @@ jobs:
           - { condition: baseline, cover: false }
           - { condition: bfe-stopped, cover: false }
           - { condition: exe-missing, cover: false }
-          - { condition: exe-acl-denied, cover: false }
-          - { condition: stray-bridge-peer, cover: false }
-          - { condition: stray-bridge-service-dir, cover: false }
-          - { condition: state-dir-write-denied, cover: false }
-          - { condition: target-file-is-dir, cover: false }
           # With the standing cover engaged the runner's own egress is blocked until the script unblocks it.
           - { condition: baseline, cover: true }
           - { condition: bfe-stopped, cover: true }
           - { condition: exe-missing, cover: true }
+          - { condition: exe-blocked, cover: true }
+          - { condition: stray-bridge-service-dir, cover: true }
+          - { condition: state-dir-write-denied, cover: true }
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -62,9 +60,7 @@ jobs:
         env:
           BR_COVER: ${{ matrix.cover }}
         run: |
-          $cover = @()
-          if ($env:BR_COVER -eq 'true') { $cover = @('-Cover') }
-          & .github\scripts\br-probe.ps1 -Condition '${{ matrix.condition }}' -MsiPath "$env:RUNNER_TEMP\msi\hole.msi" -OutDir "$env:RUNNER_TEMP\br-out" @cover
+          & .github\scripts\br-probe.ps1 -Condition '${{ matrix.condition }}' -MsiPath "$env:RUNNER_TEMP\msi\hole.msi" -OutDir "$env:RUNNER_TEMP\br-out" -Cover:($env:BR_COVER -eq 'true')
       - name: Results
         if: always()
         shell: pwsh
