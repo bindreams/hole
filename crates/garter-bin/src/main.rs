@@ -2,6 +2,11 @@ use garter::{BinaryPlugin, ChainRunner, Mode, PluginEnv};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Some(text) = garter_bin::cli::info_output(std::env::args().skip(1)) {
+        println!("{text}");
+        return Ok(());
+    }
+
     // Sanctioned production caller of `fmt::SubscriberBuilder::init`;
     // banned in tests via clippy.toml `disallowed_methods`. See #301.
     #[allow(clippy::disallowed_methods)]
