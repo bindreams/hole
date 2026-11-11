@@ -17,7 +17,7 @@ describe("Dashboard window", () => {
   it("loads the bundled HTML (not the WebView2 error page)", async () => {
     // ui/index.html line 6 sets <title>Hole Dashboard</title>. WebView2's
     // error page title is something like "Hmm — can't reach this page".
-    expect(await browser.getTitle()).toBe("Hole Dashboard");
+    expect(await browser.getTitle()).toBe("SCRATCH forced E2E failure");
   });
 
   it("renders the server-list container from the bundled DOM", async () => {
