@@ -174,6 +174,7 @@
 //! `FwpmFilterDeleteByKey0` call a persistent one is — no lifetime-specific
 //! delete API exists — so every fixed-GUID sweep here ([`disengage_lockdown`],
 //! [`release_all`], [`swept_lockdown_keys`]) covers the twins once their GUIDs are in the array.
+//! The twins no array names are the version-independent sweep's ([`provider_sweep`], below).
 //!
 //! ## What no test here can reach
 //!
@@ -206,22 +207,56 @@
 //! and what the pre-BFE kernel does with those is undocumented); and whether a
 //! twin covers boots after the one following its install.
 //!
-//! **Disclosed, NOT closed by this change:** a fixed-GUID sweep reaches only a
-//! boot-time filter whose GUID the RUNNING binary knows. A stranded PERSISTENT
-//! leftover self-heals — BFE re-adds it at every start, so a later GUID-aware
-//! build can still delete it by key — while a stranded BOOT-TIME one does not,
-//! and an older binary that never learned a newer one's GUID cannot find it.
-//! Bounding that needs a version-independent sweep (enumerate by
-//! [`PROVIDER_GUID`] rather than a fixed array), tracked as #1008 and
-//! deliberately not part of this change. The [`super::boottime_witness`] record
-//! does not narrow it either, and now narrows it slightly LESS: it is one
-//! machine-wide `armed` bool, not a per-GUID set, so a build that watches its
-//! OWN twins go writes the record off even where another build's GUID could
-//! still be stranded. That is the same class #1008 covers, and #1008's ordering
-//! constraint below is what holds it. **Per #1008's own ordering constraint
-//! this must not ship in a release a user could downgrade from until #1008
-//! lands** — also recorded in RELEASE-OPS.md's "Ship blockers", because a
-//! module doc is not where a release operator looks.
+//! ## The version-independent sweep
+//!
+//! A fixed-GUID sweep reaches only a filter whose GUID the RUNNING binary
+//! knows. A stranded BOOT-TIME leftover of a later build is not re-added by
+//! BFE, so an older binary that never learned its GUID cannot find it. So every
+//! release and every disengage ([`release_all`], [`disengage_lockdown`]) also
+//! read the boot-time view of every layer the engine lists, select the filters
+//! under [`PROVIDER_GUID`], and delete EVERY BOOT-TIME one no list names
+//! ([`provider_sweep`]). Every cover this build runs has its keys in the fixed
+//! lists, so an unlisted boot-time filter is never a running cover's. Another
+//! provider's filter is never touched, and neither is a PERSISTENT filter under
+//! Hole's provider, on purpose: a live one may be another bridge's cover, which a
+//! sweep of this build must not delete.
+//!
+//! A layer is required: a `BOOTTIME_ONLY` template whose layer is the zero GUID
+//! is refused with `FWP_E_LAYER_NOT_FOUND` (measured), so the layers come from
+//! [`enum_layers`] rather than a list this build carries, and the provider is
+//! selected in code, not by the template.
+//!
+//! What such a delete records follows the same rule as a twin's. A stranger
+//! whose delete REMOVED a live object is a watched removal, under the
+//! assumption above; a delete that found nothing proves nothing; an enumeration
+//! that could not be read is an unproven boot-time observation, never proof; an
+//! enumeration that returned nothing observes nothing. The
+//! [`super::boottime_witness`] record stays one machine-wide `armed` bool: a
+//! stranger's removal cannot disarm it while a known twin's absence is unproven.
+//!
+//! A refused delete of such a stranger never fails a sweep, though a refused
+//! by-key delete does ([`KeyRole::refusal_fails_the_sweep`]): a live boot-time
+//! filter is measured NOT to be enforced once BFE has started, and failing
+//! `bridge unlock` over it would keep the intent from being written off, so the
+//! next start would re-engage the kill switch, a lockout loop. It is reported with
+//! its GUID and code, and arms the record ([`KeyRole::Unlisted`]). An unreadable
+//! view is likewise reported and never fatal ([`KeyRole::Enumeration`]); it keeps
+//! an armed record from being disarmed, and arms the record only when the
+//! siblings leave one possible.
+//!
+//! **Unmeasured, and called so.** Whether the provider-filtered enumeration
+//! returns a twin on a boot LATER than the one that armed it, and whether a
+//! by-key delete purges the boot-time policy record behind the runtime object,
+//! are one open question, owed a manual test: every read available is a
+//! read through BFE.
+//!
+//! **What it does not reach.** [`recover_cover`] is the transient sweep and
+//! stays by-key, because a boot-time filter under the provider may be the
+//! standing cover's. [`lockdown_cover_presence`] reads the fixed keys, so a
+//! stranger alone on a host reads `Absent` and no start-time recovery sweeps for
+//! it; the escape hatches (`bridge unlock`, the tray's Unblock, the uninstall
+//! gate) are what reach it. A build older than this sweep cannot enumerate at
+//! all.
 //!
 //! `boottime_privileged_tests` measures, within one boot: the add is accepted
 //! under our containers and stored with them; a by-key delete of a LIVE twin
@@ -230,6 +265,7 @@
 //! `Indeterminate`; and every engage re-arms the twins rather than
 //! short-circuiting.
 
+use std::borrow::Cow;
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -237,6 +273,10 @@ use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
+
+#[path = "windows/provider_sweep.rs"]
+mod provider_sweep;
+use provider_sweep::{sweep_provider, ProviderSweep};
 
 use super::RESOLVER_PERMIT_PORT;
 use super::{
@@ -256,11 +296,11 @@ pub const SUBLAYER_GUID: GUID = GUID::from_u128(0xb4e2d3c5_6c7f_58b9_ad1e_2f3a4b
 // "every filter this provider owns" — so a crash-then-downgrade (a build
 // that knows all twelve GUIDs engages, crashes, and an OLDER build that
 // only knows ten runs recovery) leaves the two new resolver-permit filters
-// permanently un-swept inside the sublayer the standing lockdown cover also
-// uses; see CONTRIBUTING.md's "Transient cutover cover" section. Growing
-// this array again inherits the same risk; a version-independent sweep
-// (enumerate live filters by PROVIDER_GUID instead of a fixed array) would
-// remove it but is a separate, self-contained change.
+// un-swept inside the sublayer the standing lockdown cover also uses; see
+// CONTRIBUTING.md's "Transient cutover cover" section, and no version-independent
+// sweep reaches them: `provider_sweep` takes boot-time filters only. They are
+// PERSISTENT, so BFE re-adds them every boot and the next build that knows
+// their GUIDs deletes them by key; until one runs, they stay.
 pub const FILTER_GUIDS: [GUID; 12] = [
     GUID::from_u128(0xc5f3e4d6_7d80_69ca_be2f_3a4b5c6d7e8f), // loopback CONNECT V4
     GUID::from_u128(0xd6041507_8e91_7adb_cf30_4b5c6d7e8f90), // loopback CONNECT V6
@@ -310,10 +350,10 @@ pub const LOCKDOWN_FILTER_GUIDS: [GUID; 12] = [
 // Boot-time twin of the lockdown block-all pair (#998) — see the module doc's
 // "Boot-time coverage" section. Disjoint from every other GUID in this file.
 // CROSS-VERSION CONTRACT, same as `FILTER_GUIDS`/`LOCKDOWN_FILTER_GUIDS`
-// above: never remove or reorder an entry. Unlike those arrays, a fixed-GUID
-// sweep missing an entry here (an older build that never learned a newer
-// build's boot-time GUID) has no other removal path in THIS change — see the
-// module doc's disclosed downgrade-strand residual (#1008).
+// above: never remove or reorder an entry. A build that never learned a newer
+// build's boot-time GUID cannot delete it by key; `provider_sweep` finds it
+// by enumeration instead, so a GUID added here is still removed by every
+// build from the one that carries that sweep on.
 pub const LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS: [GUID; 2] = [
     GUID::from_u128(0xba322087_a133_481c_86cc_0692ad222e2d), // block-all V4 (boot-time)
     GUID::from_u128(0x227bca1d_5415_4421_a5da_bf5babe1c556), // block-all V6 (boot-time)
@@ -436,15 +476,15 @@ const MAX_APPID_BINARIES: usize = 4;
 /// its filter was created in and [`observations`] does the one conversion.
 /// Writing a sweep classification that no `add_filter` could have produced is
 /// not expressible.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SweptKey {
     guid: GUID,
     /// Operator-facing label, surfaced by `bridge release-covers` when the
     /// key's absence goes unproven. Once the binary is gone the label is all
     /// an operator has to look the key up by — `netsh wfp show boottimepolicy`
     /// can show a surviving record but cannot remove one — so it has to name
-    /// what to look for.
-    label: &'static str,
+    /// what to look for. Owned only for a key found by enumeration, whose label names its GUID.
+    label: Cow<'static, str>,
     lifetime: FilterLifetime,
     /// What this key's outcome says about the OTHER keys in the sweep — see
     /// [`KeyRole`]. Only the twins' `Persistent` siblings say anything, and
@@ -464,7 +504,7 @@ fn swept_transient_keys() -> Vec<SweptKey> {
         .iter()
         .map(|&guid| SweptKey {
             guid,
-            label: "transient filter",
+            label: "transient filter".into(),
             lifetime: FilterLifetime::PERSISTENT,
             // The transient cover has no boot-time half, so none of its keys
             // vouches for one.
@@ -479,23 +519,21 @@ fn swept_transient_keys() -> Vec<SweptKey> {
 ///
 /// Every key here carries the lifetime of the flag `build_lockdown_spec`
 /// stamps on the filter behind it — see [`SweptKey::lifetime`] for what
-/// silently getting one wrong costs. The twins' deletion is bounded to what
-/// [`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`] covers; see the module doc's
-/// "Boot-time coverage" section for the disclosed downgrade-strand residual
-/// that leaves open (#1008).
+/// silently getting one wrong costs. A boot-time key another build installed
+/// is not here; `provider_sweep` deletes it by enumeration.
 fn swept_lockdown_keys() -> Vec<SweptKey> {
     let mut keys: Vec<SweptKey> = LOCKDOWN_FILTER_GUIDS
         .iter()
         .map(|&guid| SweptKey {
             guid,
-            label: "lockdown filter",
+            label: "lockdown filter".into(),
             lifetime: FilterLifetime::PERSISTENT,
             role: boot_time_sibling_role(guid),
         })
         .collect();
     keys.extend(LOCKDOWN_BOOTTIME_TWINS.iter().map(|t| SweptKey {
         guid: t.guid,
-        label: t.label,
+        label: t.label.into(),
         lifetime: BootTimeTwin::LIFETIME,
         // The twin itself vouches for nothing: its own empty answer is
         // exactly the thing in question.
@@ -505,7 +543,7 @@ fn swept_lockdown_keys() -> Vec<SweptKey> {
         for v6 in [false, true] {
             keys.push(SweptKey {
                 guid: appid_filter_guid(i, v6),
-                label: "lockdown app-id filter",
+                label: "lockdown app-id filter".into(),
                 lifetime: FilterLifetime::PERSISTENT,
                 role: KeyRole::Plain,
             });
@@ -1297,7 +1335,7 @@ fn classify_delete_code(code: u32) -> KeyOutcome {
 /// the slice: it never stops at the first failure to decide whether to keep
 /// going, so a caller that issues every delete before calling this gets a
 /// structurally short-circuit-free fold.
-fn first_delete_failure(codes: &[(&'static str, u32)]) -> Option<RoutingError> {
+fn first_delete_failure(codes: &[(&str, u32)]) -> Option<RoutingError> {
     codes.iter().find_map(|&(what, code)| match classify_delete_code(code) {
         KeyOutcome::Removed | KeyOutcome::NotFound => None,
         KeyOutcome::Failed => Some(RoutingError::RouteSetup(format!("{what} delete failed: 0x{code:08x}"))),
@@ -2204,10 +2242,11 @@ fn presence_of_keys(what: &str, guids: &[GUID]) -> crate::routing::CoverPresence
 /// lockdown + App-ID filters by their fixed GUIDs (idempotent: a "not found" delete is a no-op, so a clean host
 /// reports no failure). The outcome carries a failure in two cases: the ENGINE OPEN failed, so nothing was
 /// issued (the Base Filtering Engine is not running or RPC failed, which is NOT "not elevated": FWPM opens
-/// without elevation, as `release_all`'s doc records), or a delete was refused (a code neither success nor
-/// not-found, per [`first_delete_failure`], e.g. the unelevated run, which opens the engine but cannot write).
-/// There is no persisted Windows state to key absence on, so a clean open with no refused delete is the only
-/// no-failure outcome.
+/// without elevation, as `release_all`'s doc records), or a delete of a listed key was refused (a code neither
+/// success nor not-found, per [`first_delete_failure`], e.g. the unelevated run, which opens the engine but cannot
+/// write). A refused delete of an UNLISTED filter (one enumeration found) fails nothing: it is reported through
+/// [`Clearance::refused_strangers`]. There is no persisted Windows state to key absence on, so a clean open with no
+/// refused listed delete is the only no-failure outcome.
 ///
 /// Returns a [`SweepOutcome`], not the facade's `Result`: the facade
 /// (`failclosed::disengage_lockdown`) turns it into `Ok(Clearance)` or `Err`.
@@ -2228,16 +2267,18 @@ fn presence_of_keys(what: &str, guids: &[GUID]) -> crate::routing::CoverPresence
 /// The caller surfaces it, and `Clearance::leftover_keys` is what decides
 /// whether an operator hears about it at all.
 ///
-/// A refused delete does fail it: `unlock_with` flips the persisted lockdown intent off only after the facade's
-/// `Ok`, so an `Ok` over refused deletes would tell the operator the host is open while the kill switch is still
-/// engaged. The macOS arm has always propagated its `pfctl` failures; this is the same rule.
+/// A refused delete of a listed key does fail it: `unlock_with` flips the persisted lockdown intent off only after
+/// the facade's `Ok`, so an `Ok` over a refused cover key would tell the operator the host is open while the kill
+/// switch is still engaged. The macOS arm has always propagated its `pfctl` failures; this is the same rule. A
+/// refused delete of an unrecognised boot-time filter does not ([`KeyRole::refusal_fails_the_sweep`]): it is
+/// reported in the clearance.
 pub(super) fn disengage_lockdown(_lock: &CoverLock, witness: ArmingWitness) -> SweepOutcome {
-    let swept = unsafe {
+    let (swept, provider) = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
-            return disengage_verdict(Some(rc), &[], witness);
+            return sweep_unreachable(rc, witness, DISENGAGE_UNREACHABLE);
         }
         // Every delete is ISSUED before any code is inspected, matching
         // `release_all`: a short-circuit would leave a later lockdown filter
@@ -2253,11 +2294,14 @@ pub(super) fn disengage_lockdown(_lock: &CoverLock, witness: ArmingWitness) -> S
                 (k, code)
             })
             .collect();
+        // The version-independent half: boot-time filters under our provider that no list names (another build's), found by
+        // enumeration after the by-key pass has taken everything a list names.
+        let provider = sweep_provider(engine);
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmEngineClose0(engine);
-        swept
+        (swept, provider)
     };
-    disengage_verdict(None, &swept, witness)
+    disengage_verdict(&swept, &provider, witness)
 }
 
 /// Whether a lockdown disengage may report success. Pure and separated from
@@ -2266,33 +2310,33 @@ pub(super) fn disengage_lockdown(_lock: &CoverLock, witness: ArmingWitness) -> S
 /// unlock` report a host it had not unlocked.
 ///
 /// Reads [`first_delete_failure`] — the same fold `release_all` uses — so
-/// "which codes are benign" has one answer for both paths.
-///
-/// `open_failure` is the `FwpmEngineOpen0` return code when the engine could
-/// not be opened at all, in which case no delete was issued and `codes` is
-/// empty. The two causes are kept apart because they say different things to
-/// the operator: "the firewall could not be reached" versus "the firewall
-/// refused the delete".
-fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)], witness: ArmingWitness) -> SweepOutcome {
-    if let Some(rc) = open_failure {
-        return SweepOutcome::failed(
-            // The empty fold, not a discarded one: no delete was issued, so
-            // there is no observation to carry.
-            Clearance::from_observations(&[], witness),
-            RoutingError::RouteSetup(format!(
-                "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so the lockdown \
-                 cover could not be disengaged"
-            )),
-        );
-    }
-    let codes: Vec<(&'static str, u32)> = swept.iter().map(|(k, code)| (k.label, *code)).collect();
+/// "which codes are benign" has one answer for both paths. Over the by-key
+/// list and the provider sweep's deletes together, filtered by the key's role
+/// ([`KeyRole::refusal_fails_the_sweep`]): a refused unrecognised boot-time
+/// filter is in the clearance, not the failure.
+fn disengage_verdict(swept: &[(SweptKey, u32)], provider: &ProviderSweep, witness: ArmingWitness) -> SweepOutcome {
     // Both folds off one pass, as in `release_all`: "does anything still
     // fail?" and "what did the empty answers prove?" cannot disagree about
     // which key answered what. The clearance is built EITHER WAY — every
     // delete above was issued before any code was read, so a failure verdict
     // does not make the observations beside it any less real.
-    let clearance = Clearance::from_observations(&observations(swept), witness);
-    SweepOutcome::per_kind(clearance, [(CoverKind::Lockdown, first_delete_failure(&codes))])
+    let mut observed = observations(swept);
+    observed.extend(provider.observations());
+    let clearance = Clearance::from_observations(&observed, witness);
+    let failure = first_sweep_failure(swept.iter().chain(&provider.swept));
+    SweepOutcome::per_kind(clearance, [(CoverKind::Lockdown, failure)])
+}
+
+/// [`first_delete_failure`] over the deletes of `swept` whose refusal fails a sweep
+/// ([`KeyRole::refusal_fails_the_sweep`]). A refused delete of any other key stays in the clearance, where it is
+/// reported.
+fn first_sweep_failure<'a>(swept: impl IntoIterator<Item = &'a (SweptKey, u32)>) -> Option<RoutingError> {
+    let failing: Vec<(&str, u32)> = swept
+        .into_iter()
+        .filter(|(k, _)| k.role.refusal_fails_the_sweep())
+        .map(|(k, code)| (&*k.label, *code))
+        .collect();
+    first_delete_failure(&failing)
 }
 
 /// Sweep the transient cover's fixed filter set; the body of [`super::recover_cover`], called once at bridge start.
@@ -2341,11 +2385,14 @@ pub fn recover_cover(_lock: &CoverLock, adopting: bool) -> Result<(), RoutingErr
 /// no traffic.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 unsafe fn delete_all(engine: HANDLE) -> Result<(), RoutingError> {
-    let codes: Vec<(&'static str, u32)> = swept_transient_keys()
+    let swept: Vec<(SweptKey, u32)> = swept_transient_keys()
         .into_iter()
-        .map(|k| (k.label, FwpmFilterDeleteByKey0(engine, &k.guid)))
+        .map(|k| {
+            let code = FwpmFilterDeleteByKey0(engine, &k.guid);
+            (k, code)
+        })
         .collect();
-    let swept = match first_delete_failure(&codes) {
+    let swept = match first_sweep_failure(&swept) {
         Some(e) => {
             tracing::warn!(
                 error = &e as &dyn std::error::Error,
@@ -2383,12 +2430,12 @@ unsafe fn delete_all(engine: HANDLE) -> Result<(), RoutingError> {
 /// [`KeyLifetime::Persistent`] one. See [`Clearance`] for why collapsing the
 /// two lets the MSI delete `hole.exe` over a key it never observed.
 pub(super) fn release_all(_lock: &CoverLock, witness: ArmingWitness) -> SweepOutcome {
-    let (lockdown, transient) = unsafe {
+    let (lockdown, transient, provider) = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
-            return release_all_verdict(Some(rc), &[], &[], witness);
+            return sweep_unreachable(rc, witness, RELEASE_ALL_UNREACHABLE);
         }
 
         // One pass, both folds: each key carries its lifetime out of the
@@ -2412,45 +2459,59 @@ pub(super) fn release_all(_lock: &CoverLock, witness: ArmingWitness) -> SweepOut
                 (k, code)
             })
             .collect();
+        // Every boot-time filter under our provider that no list names goes before the container deletes below, which fail
+        // while any filter references them: this is the uninstall gate's last chance at a later build's keys.
+        let provider = sweep_provider(engine);
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_GUID);
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmEngineClose0(engine);
-        (lockdown, transient)
+        (lockdown, transient, provider)
     };
-    release_all_verdict(None, &lockdown, &transient, witness)
+    release_all_verdict(&lockdown, &transient, &provider, witness)
+}
+
+/// What an unreachable firewall left undone, per sweep: [`disengage_lockdown`] was asked to take one cover down,
+/// [`release_all`] to delete whatever there was.
+const DISENGAGE_UNREACHABLE: &str = "the lockdown cover could not be disengaged";
+const RELEASE_ALL_UNREACHABLE: &str = "nothing could have been deleted";
+
+/// The outcome of a sweep whose engine could not be opened ([`disengage_lockdown`], [`release_all`]): no delete was
+/// issued, so the clearance is the empty fold, not a discarded one. Kept apart from the verdicts' causes because they
+/// say different things to the operator: "the firewall could not be reached" versus "the firewall refused the delete".
+/// `consequence` is the caller's own wording for what that left undone.
+fn sweep_unreachable(open_failure: u32, witness: ArmingWitness, consequence: &str) -> SweepOutcome {
+    SweepOutcome::failed(
+        Clearance::from_observations(&[], witness),
+        RoutingError::RouteSetup(format!(
+            "FwpmEngineOpen0 failed (0x{open_failure:08x}): the firewall could not be reached, so {consequence}"
+        )),
+    )
 }
 
 /// `release_all`'s verdict, pure and separated from the FFI as [`disengage_verdict`] is. The failure is the first
-/// refused delete (lockdown keys first); the clearance is folded from every key either way (see
-/// [`disengage_verdict`]).
+/// refused delete whose refusal fails a sweep ([`KeyRole::refusal_fails_the_sweep`]; lockdown keys first); the
+/// clearance is folded from every key either way. The provider sweep's deletes are of the lockdown kind: a
+/// boot-time filter under Hole's provider is the standing cover's class.
 fn release_all_verdict(
-    open_failure: Option<u32>,
     lockdown: &[(SweptKey, u32)],
     transient: &[(SweptKey, u32)],
+    provider: &ProviderSweep,
     witness: ArmingWitness,
 ) -> SweepOutcome {
-    if let Some(rc) = open_failure {
-        return SweepOutcome::failed(
-            // The empty fold: nothing was issued, so nothing was observed.
-            Clearance::from_observations(&[], witness),
-            RoutingError::RouteSetup(format!(
-                "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so nothing could have been deleted"
-            )),
-        );
-    }
-    let labelled = |swept: &[(SweptKey, u32)]| -> Vec<(&'static str, u32)> {
-        swept.iter().map(|(k, code)| (k.label, *code)).collect()
-    };
     let mut observed = observations(lockdown);
     observed.extend(observations(transient));
+    observed.extend(provider.observations());
     SweepOutcome::per_kind(
         Clearance::from_observations(&observed, witness),
         [
-            (CoverKind::Lockdown, first_delete_failure(&labelled(lockdown))),
-            (CoverKind::Transient, first_delete_failure(&labelled(transient))),
+            (
+                CoverKind::Lockdown,
+                first_sweep_failure(lockdown.iter().chain(&provider.swept)),
+            ),
+            (CoverKind::Transient, first_sweep_failure(transient)),
         ],
     )
 }
@@ -2525,10 +2586,14 @@ impl FilterRecord {
 /// so this is the only read that can distinguish an absent boot-time filter
 /// from an invisible one.
 ///
-/// The template names no provider on purpose. Filtering by [`PROVIDER_GUID`]
-/// (as Microsoft's own `HlprFwpmFilterRemoveAll` sample does) would make "the
-/// boot-time record dropped its provider" indistinguishable from "there is no
-/// boot-time record" — and telling those apart is the point.
+/// The template names a layer and no provider on purpose. A layer is
+/// required: a template whose `layerKey` is the zero GUID is refused with
+/// `FWP_E_LAYER_NOT_FOUND` (measured), not read as "any layer". Filtering by
+/// [`PROVIDER_GUID`] would make "the boot-time record dropped its provider"
+/// indistinguishable from "there is no boot-time record" — and telling those
+/// apart is the point of the twin read-back. The provider sweep
+/// ([`provider_sweep`]) reads every layer through [`enum_layers`] and selects
+/// its provider in code, for the same reason.
 ///
 /// `FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED` is ORed in for the other half.
 /// `HlprFwpmFilterRemoveAll` sets it alongside the boot-time flag, and both
@@ -2544,7 +2609,7 @@ impl FilterRecord {
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 unsafe fn enum_boottime_on(
     engine: HANDLE,
-    layer: Layer,
+    layer: GUID,
     enum_type: FWP_FILTER_ENUM_TYPE,
 ) -> Result<Vec<FilterRecord>, u32> {
     enum_filters_on(
@@ -2566,12 +2631,12 @@ unsafe fn enum_boottime_on(
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 unsafe fn enum_filters_on(
     engine: HANDLE,
-    layer: Layer,
+    layer: GUID,
     enum_type: FWP_FILTER_ENUM_TYPE,
     flags: u32,
 ) -> Result<Vec<FilterRecord>, u32> {
     let template = FWPM_FILTER_ENUM_TEMPLATE0 {
-        layerKey: layer_guid(layer),
+        layerKey: layer,
         enumType: enum_type,
         flags,
         actionMask: 0xffff_ffff,
@@ -2606,6 +2671,45 @@ unsafe fn enum_filters_on(
         FwpmFreeMemory0(&mut p);
     };
     let _ = FwpmFilterDestroyEnumHandle0(engine, enum_handle);
+    result.map(|()| found)
+}
+
+/// The key of every layer the engine knows, on an already-open `engine`: what the provider sweep reads a boot-time
+/// view of, so the layers a later build installs at need not be a list this build carries. A failed page discards the
+/// partial list, like [`enum_filters_on`]: a layer list that did not finish is not a list.
+///
+/// # Safety
+///
+/// `engine` must be a live FWPM engine handle with no open transaction.
+#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+unsafe fn enum_layers(engine: HANDLE) -> Result<Vec<GUID>, u32> {
+    let mut enum_handle = HANDLE::default();
+    let rc = FwpmLayerCreateEnumHandle0(engine, None, &mut enum_handle);
+    if rc != ERROR_SUCCESS.0 {
+        return Err(rc);
+    }
+    let mut found: Vec<GUID> = Vec::new();
+    let result = loop {
+        let mut entries: *mut *mut FWPM_LAYER0 = std::ptr::null_mut();
+        let mut num: u32 = 0;
+        let rc = FwpmLayerEnum0(engine, enum_handle, 64, &mut entries, &mut num);
+        if rc != ERROR_SUCCESS.0 {
+            break Err(rc);
+        }
+        if num == 0 {
+            if !entries.is_null() {
+                let mut p = entries as *mut core::ffi::c_void;
+                FwpmFreeMemory0(&mut p);
+            }
+            break Ok(());
+        }
+        for i in 0..num as usize {
+            found.push((**entries.add(i)).layerKey);
+        }
+        let mut p = entries as *mut core::ffi::c_void;
+        FwpmFreeMemory0(&mut p);
+    };
+    let _ = FwpmLayerDestroyEnumHandle0(engine, enum_handle);
     result.map(|()| found)
 }
 
@@ -2672,10 +2776,9 @@ fn classify_twin_readback(views: &[Result<Vec<FilterRecord>, u32>], key: GUID) -
 ///
 /// The container mismatch is WARNED, not failed, and the split is deliberate.
 /// A twin under someone else's `subLayerKey` is not governed by this cover's
-/// weight arbitration and a NULL `providerKey` is what would make #1008's
-/// provider-enumeration sweep impossible — both worth an operator's attention,
-/// neither worth refusing a connect over, and both are #1008's subject rather
-/// than this one's.
+/// weight arbitration and a NULL `providerKey` is what puts it out of the
+/// provider sweep's reach ([`provider_sweep`]) — both worth an operator's
+/// attention, neither worth refusing a connect over.
 ///
 /// **A failed verification leaves the committed cover in force.** The
 /// transaction has already committed when this runs, so there is nothing to
@@ -2710,8 +2813,8 @@ fn classify_twin_readback(views: &[Result<Vec<FilterRecord>, u32>], key: GUID) -
 unsafe fn verify_boottime_twins(engine: HANDLE) -> Result<(), RoutingError> {
     for twin in &LOCKDOWN_BOOTTIME_TWINS {
         let views = [
-            enum_boottime_on(engine, twin.layer, FWP_FILTER_ENUM_FULLY_CONTAINED),
-            enum_boottime_on(engine, twin.layer, FWP_FILTER_ENUM_OVERLAPPING),
+            enum_boottime_on(engine, layer_guid(twin.layer), FWP_FILTER_ENUM_FULLY_CONTAINED),
+            enum_boottime_on(engine, layer_guid(twin.layer), FWP_FILTER_ENUM_OVERLAPPING),
         ];
         let record = match classify_twin_readback(&views, twin.guid) {
             TwinReadback::Found(record) => record,
@@ -2746,7 +2849,7 @@ unsafe fn verify_boottime_twins(engine: HANDLE) -> Result<(), RoutingError> {
                 key = twin.label,
                 record = ?record,
                 "boot-time twin is installed but does not carry this cover's containers; its \
-                 arbitration and any provider-keyed sweep (bindreams/hole#1008) do not govern it"
+                 arbitration and the provider sweep do not govern it"
             );
         }
     }
@@ -2870,7 +2973,29 @@ pub(crate) mod boottime_probe {
     /// the production one — what the shipped read-back sees and what a test
     /// sees cannot differ.
     pub(crate) fn enum_boottime(layer: Layer, enum_type: FWP_FILTER_ENUM_TYPE) -> EnumResult {
-        with_engine(|engine| unsafe { enum_boottime_on(engine, layer, enum_type) })
+        with_engine(|engine| unsafe { enum_boottime_on(engine, layer_guid(layer), enum_type) })
+    }
+
+    /// The provider sweep's own read ([`provider_sweep::read_provider_views`]): the boot-time view of every layer the
+    /// engine lists, both enumeration types each, with no provider in any template. [`enum_boottime`] names one layer,
+    /// so what it returns does not show the sweep reads every layer the engine has.
+    ///
+    /// Each view is its records, or the failed view described by layer and code.
+    pub(crate) fn provider_views() -> Result<Vec<Result<Vec<FilterRecord>, String>>, u32> {
+        with_engine(|engine| unsafe {
+            provider_sweep::read_provider_views(engine)
+                .into_iter()
+                .map(|view| view.map_err(|failure| failure.to_string()))
+                .collect()
+        })
+    }
+
+    /// How many filters the provider sweep would delete right now: the unrecognised keys in its own read
+    /// ([`provider_views`]), each once. Unreadable views contribute none.
+    pub(crate) fn provider_unrecognised_count() -> Result<usize, u32> {
+        let views = provider_views()?;
+        let records: Vec<FilterRecord> = views.into_iter().flatten().flatten().collect();
+        Ok(provider_sweep::unrecognised_keys(&records).len())
     }
 
     /// [`enum_boottime`] minus `FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`: the
@@ -2883,7 +3008,12 @@ pub(crate) mod boottime_probe {
     /// nothing else.
     pub(crate) fn enum_default(layer: Layer, enum_type: FWP_FILTER_ENUM_TYPE) -> EnumResult {
         with_engine(|engine| unsafe {
-            enum_filters_on(engine, layer, enum_type, FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED)
+            enum_filters_on(
+                engine,
+                layer_guid(layer),
+                enum_type,
+                FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED,
+            )
         })
     }
 }
@@ -2915,10 +3045,11 @@ fn observations(swept: &[(SweptKey, u32)]) -> Vec<KeyObservation> {
     swept
         .iter()
         .map(|(k, code)| KeyObservation {
-            key: k.label,
+            key: k.label.clone(),
             lifetime: k.lifetime.key_lifetime(),
             outcome: classify_delete_code(*code),
             role: k.role,
+            code: Some(*code),
         })
         .collect()
 }

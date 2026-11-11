@@ -15,7 +15,7 @@ mod windows_profiles;
 
 use std::path::{Path, PathBuf};
 
-use tun_engine::routing::failclosed::{Clearance, CoverLock};
+use tun_engine::routing::failclosed::{Clearance, CoverLock, UnprovenKey};
 
 /// The privileged service's state dir (Windows: `C:\ProgramData\hole\state`),
 /// where the crash-recovery state and the lockdown intent + cover state live.
@@ -323,6 +323,10 @@ fn unlock_with(
 /// bookkeeping. The gate stops claiming proof it does not
 /// have; it does not withhold the uninstall. `hole bridge release-covers`
 /// turns an unproven clearance into something an operator can act on.
+///
+/// A filter the OS REFUSED to delete ([`Clearance::refused_strangers`]) does not fail this call either: a boot-time
+/// filter is live only between kernel start and BFE start, so it is a bounded harm, and failing over a refusal that
+/// may never clear would leave the product unremovable. It is reported with its GUID and code, and arms the witness.
 pub fn release_covers() -> std::io::Result<Clearance> {
     let state_dir = service_state_dir();
     let others = peer_state_dirs();
@@ -364,17 +368,18 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// `PERSISTENT` siblings in this very sweep (`failclosed::KeyRole`) and the
 /// persisted `failclosed::boottime_witness` — reporting when EITHER speaks.
 ///
-/// `leftover_keys` is a GATE on the whole set rather than a boot-time-only
-/// filter of it, and every key that reaches THIS message is nonetheless a
-/// boot-time twin. A `Persistent` key goes unproven under exactly one outcome,
-/// `failclosed::KeyOutcome::Failed`; that outcome is what `first_delete_failure`
-/// turns into the failure of a `SweepOutcome::per_kind`, so the clearance holding it reaches
-/// `unlock_with`/`release_covers_with` as `Err` and is dropped by their `?`
-/// before any of the three render sites runs. The message therefore states
-/// what its keys are instead of hedging
-/// (`an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name`)
-/// — a hedge here describes a state it is never printed in, in the one message
-/// an operator reads after `hole.exe` has been deleted.
+/// `leftover_keys` is a GATE on the whole set, and two kinds of key pass it, worded apart. A filter key
+/// ([`Clearance::leftover_filters`]) is always a boot-time twin or stranger here: a `Persistent` key goes unproven
+/// under exactly one outcome, `failclosed::KeyOutcome::Failed`, which `first_delete_failure` turns into the failure
+/// of a `SweepOutcome::per_kind`, so a clearance holding one reaches `unlock_with`/`release_covers_with` as `Err`
+/// and is dropped by their `?` before any of the three render sites runs. (A boot-time stranger whose delete was
+/// refused is the exception that does not fail any sweep, so it reaches all three sites: it is worded on its own
+/// line, "the OS refused to delete ..." with its code when the OS gave one, and a remedy.) The message
+/// states what such keys are instead of hedging
+/// (`an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name`) — a hedge here describes a
+/// state it is never printed in, in the one message an operator reads after `hole.exe` has been deleted. A view the
+/// sweep could not enumerate ([`Clearance::unenumerated_views`]) is no filter at all: it is worded as a look that did
+/// not happen and names no `netsh` lookup.
 ///
 /// The union is not belt-and-braces. The sibling alone is CONSUMED by the
 /// first sweep that removes it, and "turn the kill switch off, then uninstall"
@@ -396,24 +401,69 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 ///
 /// Removing a WFP filter takes an FWPM call, and `RemoveFiles` just deleted
 /// the only caller on the host. So the only honest remedy is to put one back.
-pub fn release_clearance_report(clearance: &Clearance) -> Option<String> {
-    let keys = clearance.leftover_keys();
-    if keys.is_empty() {
+///
+/// `running_version` is the build making the report, and the remedy names it: a key that answered not-found is not
+/// live, so no enumeration sees it and only a build whose list names the key can address it. The running build's
+/// list names every key it installs, so a key a later release adds is covered with no edit here.
+pub fn release_clearance_report(clearance: &Clearance, running_version: &str) -> Option<String> {
+    let filters: Vec<&str> = clearance.leftover_filters().map(UnprovenKey::label).collect();
+    let unenumerated: Vec<&str> = clearance.unenumerated_views().map(UnprovenKey::label).collect();
+    let mut parts = Vec::new();
+    if let Some(refused) = refused_strangers_line(clearance) {
+        parts.push(format!("{refused}. {REFUSED_STRANGER_REMEDY}"));
+    }
+    if !filters.is_empty() {
+        parts.push(format!(
+            "{} boot-time filter key(s) could not be proven empty: {}. \
+             A boot-time filter is live only between kernel start and Base Filtering Engine start, \
+             so a delete-by-key finds nothing on any later boot whether or not a policy record \
+             survives behind it. To check after this uninstall, run `netsh wfp show boottimepolicy` \
+             elevated and look for these keys; if egress is blocked early in boot, that is where it \
+             would show. `netsh wfp` cannot remove one — it has no delete verb, only capture/dump/\
+             help/set/show — and removing a WFP filter takes an FWPM call, which no binary left on this \
+             host can make. Reinstalling this release, {running_version}, or later (a build can delete a boot-time \
+             key only if its own list names it) and running `hole bridge release-covers` elevated puts back the \
+             only tool that addresses these keys.",
+            filters.len(),
+            filters.join(", "),
+        ));
+    }
+    if !unenumerated.is_empty() {
+        parts.push(format!(
+            "the sweep could not enumerate {}, so a filter another build left there was not looked for. \
+             Running `hole bridge release-covers` elevated again repeats the sweep \
+             (reinstall this release, {running_version}, or later first if `hole` is gone).",
+            unenumerated.join(", "),
+        ));
+    }
+    if parts.is_empty() {
         return None;
     }
-    Some(format!(
-        "covers released, but {} boot-time filter key(s) could not be proven empty: {}. \
-         A boot-time filter is live only between kernel start and Base Filtering Engine start, \
-         so a delete-by-key finds nothing on any later boot whether or not a policy record \
-         survives behind it. To check after this uninstall, run `netsh wfp show boottimepolicy` \
-         elevated and look for these keys; if egress is blocked early in boot, that is where it \
-         would show. `netsh wfp` cannot remove one — it has no delete verb, only capture/dump/\
-         help/set/show — and removing a WFP filter takes an FWPM call, which no binary left on this \
-         host can make. Reinstalling Hole and running `hole bridge release-covers` elevated puts \
-         back the only tool that addresses these keys.",
-        keys.len(),
-        keys.join(", "),
-    ))
+    Some(format!("covers released, but {}", parts.join(" Also, ")))
+}
+
+/// What the operator can do about filters the OS refused to delete: a refusal may be transient, so the sweep may
+/// succeed later; failing that, an external tool, since `netsh wfp` has no delete verb.
+const REFUSED_STRANGER_REMEDY: &str = "Boot-time filters are live only between kernel start and Base Filtering Engine \
+     start, so they block nothing now, but one that survives can block egress early in the next boot. A refusal may \
+     be transient: after a reboot, or on a later `hole bridge unlock`, the sweep may delete what it refused. Failing \
+     that, remove each by its key with an elevated tool that calls `FwpmFilterDeleteByKey0` (`netsh wfp` has no \
+     delete verb).";
+
+/// One line naming each filter under Hole's provider that no key list names and the OS refused to delete, with the
+/// code it answered when it did, or `None` when there is none.
+fn refused_strangers_line(clearance: &Clearance) -> Option<String> {
+    let lines: Vec<String> = clearance
+        .refused_strangers()
+        .map(|(label, code)| match code {
+            Some(code) => format!("the OS refused to delete {label} (code 0x{code:08x})"),
+            None => format!("the OS refused to delete {label}"),
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines.join("; "))
 }
 
 /// Every state dir OTHER than the service's that a bridge on this host could be
