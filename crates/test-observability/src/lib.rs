@@ -9,6 +9,9 @@
 //!
 //! * `RUST_BACKTRACE=full` (if unset) so the stdlib panic hook prints
 //!   a usable backtrace.
+//! * Windows only: `XDG_RUNTIME_DIR=<workspace>/target/galoshes-runtime` (if unset or empty), so each
+//!   worktree's galoshes extracts its ex-ray into its own directory. If that directory cannot be created, prints
+//!   one line to stderr and goes on without the isolation.
 //! * A global `tracing` subscriber writing to stderr. Skuld's
 //!   FD-level capture (under bare `cargo test`) and nextest's
 //!   per-subprocess capture (under CI) buffer and dump the events on
@@ -83,13 +86,49 @@ const DEFAULT_FILTER: &str = "info,\
     dump_macros=debug,\
     handle_holders=debug";
 
-/// Install the global subscriber, panic hook, and backtrace env var.
+/// Point galoshes at a per-worktree runtime directory (Windows).
 ///
-/// Idempotent: subsequent calls are no-ops. Safe to invoke from any
-/// `ctor::declarative::ctor!` site or from a regular `fn`.
+/// galoshes extracts its embedded ex-ray to one file per user, and every worktree builds
+/// different ex-ray bytes, so two worktrees running tests at once make one galoshes fail with
+/// "Access is denied".
+/// A non-empty `XDG_RUNTIME_DIR` already in the environment wins. If the directory cannot be created
+/// (a staged binary run from another tree, a missing drive) it prints one line to stderr and goes on
+/// without the isolation: this runs inside a ctor, where a panic aborts the process and would lose every
+/// test of the binary, even during `nextest --list`.
 ///
-/// Short-circuits and does nothing when `HOLE_LOGGING_TEST_KIND` is
-/// set — the FD-redirect child-process branch in
+/// Called only from [`install`]'s one-time block, which runs single-threaded (pre-main under
+/// `register!()`, or at the top of this crate's own test `main`), so `set_var` cannot race an env read.
+#[cfg(windows)]
+fn isolate_galoshes_runtime_dir() {
+    if std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crates/test-observability is two levels below the workspace root");
+    let dir = root.join("target").join("galoshes-runtime");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        // Best-effort: a closed stderr must not turn a skipped isolation into a ctor panic.
+        let _ = writeln!(
+            std::io::stderr(),
+            "hole-test-observability: cannot create {}: {e}; continuing without a per-worktree galoshes runtime dir (set XDG_RUNTIME_DIR to a writable dir)",
+            dir.display()
+        );
+        return;
+    }
+    // SAFETY: see the function doc.
+    unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+}
+
+/// Install the global subscriber, panic hook, `RUST_BACKTRACE`, and (Windows) `XDG_RUNTIME_DIR`.
+///
+/// Idempotent: subsequent calls are no-ops. The first call sets environment variables, so it must
+/// run before any other thread starts: from `register!()`'s ctor, or as the first thing in a custom
+/// `main`.
+///
+/// When `HOLE_LOGGING_TEST_KIND` is set, applies the Windows runtime-dir isolation and then skips the
+/// subscriber and panic-hook setup: the FD-redirect child-process branch in
 /// `crates/common/src/lib.rs::main` re-dispatches into
 /// `logging_test_helpers::run_child` which installs its OWN
 /// `set_global_default`. Pre-installing here would make that call
@@ -97,11 +136,13 @@ const DEFAULT_FILTER: &str = "info,\
 /// `skuld::run_all` before any test body runs, so the global
 /// subscriber serves no diagnostic purpose there anyway.
 pub fn install() {
-    if std::env::var_os("HOLE_LOGGING_TEST_KIND").is_some() {
-        return;
-    }
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        #[cfg(windows)]
+        isolate_galoshes_runtime_dir();
+        if std::env::var_os("HOLE_LOGGING_TEST_KIND").is_some() {
+            return;
+        }
         // SAFETY: ctor runs pre-main, single-threaded. The workspace
         // has no other ctor that reads env vars (grep-verified for
         // `ctor::declarative::ctor!` / `ctor::ctor`).
@@ -218,5 +259,7 @@ mod lib_tests;
 
 #[cfg(test)]
 fn main() {
+    // No `register!()` here, so install by hand (see `install`).
+    install();
     skuld::run_all();
 }
