@@ -740,8 +740,9 @@ const FAILURE_ONLY: [&str; 3] = [
 
 /// Steps only a release call runs (`inputs.release-tag` set). The mapping above models an ordinary run, where
 /// none of them runs on any leg.
-const RELEASE_ONLY: [&str; 5] = [
+const RELEASE_ONLY: [&str; 6] = [
     "release-tag",
+    "release-build-garter",
     "release-stage-plugins",
     "release-stage-dmg",
     "release-stage-msi",

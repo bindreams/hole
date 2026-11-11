@@ -15,8 +15,10 @@ on:
         type: string
         default: ""
 
+# A release call is its own group: `github.workflow` and `github.ref` are the caller's, so two dispatches of one draft
+# workflow would otherwise share a group and a third would silently cancel the pending second.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.release-tag != '' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -62,6 +64,12 @@ jobs:
   # log and runs the `always()` steps; the lanes after the hung step do not run.
   # The GitHub cap is 360m. Raised only, never tightened
   # (`no_leg_wall_is_below_the_walls_of_the_jobs_it_absorbed`).
+  #
+  # RELEASE PATH: a release call also runs the `release-*` steps, which the audit's
+  # ordinary-run model skips. Each wall is the ordinary wall plus the budgets of the
+  # release steps that run on the leg: the tag 5, the garter build 15, the plugin
+  # stage 5, the upload 10, and on installer legs the installer stage 10 (35 on
+  # a leg without an installer, 45 with one). These budgets are estimates, not measured.
   ci:
     name: Build, lint, test (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -80,12 +88,12 @@ jobs:
           # `ech` = the ECH-gate Go tests; `portable-lint` = the portable prek
           # hooks and the renovate config check; `frontend` = the Vite bundle and
           # type check.
-          - { os: windows, arch: amd64, runner: windows-latest,   timeout: 175, cache-saver: true, hole: true, installer: true, ex-ray-unit: true }
-          - { os: windows, arch: arm64, runner: windows-11-arm,   timeout: 90 }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel,   timeout: 310, hole: true, dmg: true }
-          - { os: darwin,  arch: arm64, runner: macos-latest,     timeout: 160, cache-saver: true, hole: true, dmg: true, ex-ray-unit: true }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest,    timeout: 60,  cache-saver: true, portable-lint: true, ech: true, frontend: true }
-          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm, timeout: 60 }
+          - { os: windows, arch: amd64, runner: windows-latest,   timeout: 220, cache-saver: true, hole: true, installer: true, ex-ray-unit: true }
+          - { os: windows, arch: arm64, runner: windows-11-arm,   timeout: 125 }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel,   timeout: 355, hole: true, dmg: true }
+          - { os: darwin,  arch: arm64, runner: macos-latest,     timeout: 205, cache-saver: true, hole: true, dmg: true, ex-ray-unit: true }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest,    timeout: 95,  cache-saver: true, portable-lint: true, ech: true, frontend: true }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm, timeout: 95 }
     steps:
       # Provisioning ===================================================================================================
       # Step budgets: 1.25 x the worst measured step, rounded up to 5m; a step
@@ -352,12 +360,21 @@ jobs:
         shell: bash
         run: cargo xtask run plugin-e2e-tests
 
-      # Release calls: stage the binaries plugin-e2e just ran on (galoshes, ex-ray), and build and
-      # stage the garter CLI, which no lane builds in the release profile. See RELEASE ASSETS.
+      # Release calls: the garter CLI is the one shipped binary no lane builds in the release profile.
+      # Built here, before the stage below, which runs it.
+      - id: release-build-garter
+        name: Build the garter CLI a release ships
+        if: ${{ inputs.release-tag != '' && steps.test-plugin-e2e.outcome == 'success' }}
+        timeout-minutes: 15
+        shell: bash
+        run: cargo xtask build garter-bin
+
+      # Release calls: stage the binaries plugin-e2e just ran on (galoshes, ex-ray) and the garter CLI,
+      # which is probed for the release version since nothing else runs it. See RELEASE ASSETS.
       - id: release-stage-plugins
         name: Stage the plugin binaries a release ships
-        if: ${{ inputs.release-tag != '' && steps.test-plugin-e2e.outcome == 'success' }}
-        timeout-minutes: 20
+        if: ${{ inputs.release-tag != '' && steps.release-build-garter.outcome == 'success' }}
+        timeout-minutes: 5
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.release-tag }}
@@ -705,7 +722,8 @@ jobs:
         shell: bash
         run: cargo xtask run hole-msi-cleanup
 
-      # Release calls: stage the MSI the lifecycle just installed, and its update archive. Before the TUN lane.
+      # Release calls: stage the MSI the lifecycle just installed, and an update zip packed from the directory
+      # the MSI was built from (`target/release/installer-stage`). Before the TUN lane.
       - id: release-stage-msi
         name: Stage the MSI a release ships
         if: ${{ inputs.release-tag != '' && steps.installer-tests.outcome == 'success' }}
@@ -919,7 +937,7 @@ jobs:
       - id: release-upload
         name: Upload the staged release assets
         if: ${{ success() && inputs.release-tag != '' }}
-        timeout-minutes: 15
+        timeout-minutes: 10
         uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.os }}-${{ matrix.arch }}

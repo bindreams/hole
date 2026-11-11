@@ -4711,18 +4711,34 @@ Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
   (ex-ray in `crates/ex-ray/version.toml`); validate with `cargo xtask version [--check --group <name> [--exact]]` (release CI uses `--exact`). The legacy
   `v0.1.0` tag predates the scheme and is ignored.
 - **A draft ships what CI tested.** Every draft workflow checks that its commit is
-  an ancestor of `main`, then calls `ci.yaml` on it with `release-tag` set. Each
-  leg creates the tag locally before building, so the binaries carry the release
-  version, and stages what the tag's product ships right after the tests of those
-  files (`cargo xtask stage-release --lane msi|dmg|plugins`, steps `release-stage-*`):
-  the MSI or DMG plus the update archive (checked for its contents and, on macOS,
-  its code signature), or the galoshes / garter / ex-ray binary. Only a passing
-  leg uploads `release-<os>-<arch>`; the draft job needs the whole of CI to have
-  passed, then hashes and uploads those artifacts and builds nothing. The garter CLI is the one
-  file no CI lane builds in the release profile, so `stage-release` builds it
-  (`cargo xtask build garter-bin`) and no test runs on that binary itself. The DMG
-  tests take the DMG from `DMG_UNDER_TEST` (default: the release build's), the
-  installer tests the MSI from `MSI_UNDER_TEST`.
+  an ancestor of `main` (`.github/actions/verify-release-commit-on-main`), then calls
+  `ci.yaml` on it with `release-tag` set (the call has its own concurrency group, so
+  two drafts never cancel each other). Each leg creates the tag locally before
+  building, so the binaries carry the release version, and stages what the tag's
+  product ships right after the tests of those files (`cargo xtask stage-release --lane msi|dmg|plugins`, steps `release-stage-*`): the MSI or DMG plus the update
+  archive (checked for its contents and, on macOS, its code signature, extracted as
+  the updater extracts it), or the galoshes / garter / ex-ray binary. The Windows
+  update zip is packed from `target/release/installer-stage`, the directory the MSI
+  is built from, not from whatever `target/release` holds by then. Staging also
+  runs the shipped executables that report a version: `hole.exe version` (the MSI's
+  payload) and `garter --version` must print the tag's version, so a build of a
+  dirty tree (`X.Y.Z.dirty`) fails; `garter --help` must exit 0. The garter CLI is
+  the one binary no earlier lane builds in the release profile, so `ci.yaml` builds
+  it (`release-build-garter`) before staging, and these probes are the only test
+  that runs on it. galoshes and ex-ray have no version command, so their version
+  stamp is not checked (the galoshes and ex-ray sidecars inside the MSI and DMG are
+  covered by their installer tests). Only a passing leg uploads
+  `release-<os>-<arch>`; the draft job needs the whole of CI to have passed, checks
+  that the downloaded files are exactly what `cargo xtask release-assets --tag <tag>`
+  lists (the one definition of what a track ships, `stage_release::plan` over the
+  platforms `build.yaml` runs each lane's target on), builds the release notes'
+  Downloads table from the same list, then hashes and uploads the files; it builds
+  nothing. A leg's wall in `ci.yaml` includes the budgets of its release-only steps.
+- **Installer under test.** The DMG tests take the DMG from `DMG_UNDER_TEST`
+  (default: the release build's single `.dmg`), the MSI lifecycle tests the MSI from
+  `MSI_UNDER_TEST` (default: `target/release/hole.msi`), and `stage-release` stages
+  the same files. A relative path in either variable is from the repo root, in the
+  Python harnesses and in xtask alike.
 
 Rollback, minisign key rotation, and the crates.io dry-run TOCTOU note are in
 [RELEASE-OPS.md](RELEASE-OPS.md).

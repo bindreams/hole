@@ -28,14 +28,6 @@ on:
         description: "Group name for `cargo xtask version --check --exact --group <name>`"
         required: true
         type: string
-      matrix:
-        description: "JSON-encoded `include:` list of the platforms the release notes' Downloads table lists"
-        required: true
-        type: string
-      expected-sha256sums-count:
-        description: "Expected number of lines in SHA256SUMS (matrix size)"
-        required: true
-        type: number
       release-title:
         description: "GitHub release title (e.g. `galoshes v${VERSION}`)"
         required: true
@@ -55,6 +47,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       version: ${{ steps.version.outputs.version }}
+      platforms: ${{ steps.assets.outputs.platforms }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -63,32 +56,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
 
-      # `workflow_dispatch` accepts --ref, so without this a draft can be pinned to unmerged code and every
-      # later check still passes.
-      - name: Verify the release commit is on main
-        env:
-          SHA: ${{ github.sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch --quiet origin main
-
-          set +e
-          git merge-base --is-ancestor "$SHA" origin/main
-          STATUS=$?
-          set -e
-
-          case "$STATUS" in
-            0) echo "$SHA is an ancestor of origin/main" ;;
-            1)
-              echo "::error::$SHA is not an ancestor of origin/main. Release only from merged commits."
-              exit 1
-              ;;
-            *)
-              echo "::error::git merge-base failed (exit $STATUS); cannot confirm $SHA is on main"
-              exit 1
-              ;;
-          esac
+      - uses: ./.github/actions/verify-release-commit-on-main
 
       - name: Normalize and validate version
         id: version
@@ -110,6 +78,11 @@ jobs:
 
       - name: Validate Cargo.toml matches version
         run: cargo xtask version --check --exact --group ${{ inputs.cargo-version-group }}
+
+      # What this release ships, per platform, from the plan `stage-release` stages by.
+      - name: List the release assets
+        id: assets
+        run: echo "platforms=$(cargo xtask release-assets --tag "releases/${{ inputs.track }}/v${{ steps.version.outputs.version }}")" >> "$GITHUB_OUTPUT"
 
   # CI's whole test track on the release commit, with the release tag created locally so the binaries
   # carry the release version. Each leg stages the binary it tested and uploads it as
@@ -134,6 +107,17 @@ jobs:
           pattern: release-*
           merge-multiple: true
 
+      # The files must be exactly what the release ships (`cargo xtask release-assets`): a leg that staged
+      # nothing, or something extra, fails here.
+      - name: Check the assets are what the release ships
+        env:
+          PLATFORMS: ${{ needs.validate.outputs.platforms }}
+        run: |
+          set -euo pipefail
+          jq -r '.[].assets[]' <<<"$PLATFORMS" | sort > "$RUNNER_TEMP/expected-assets.txt"
+          find . -maxdepth 1 -type f -printf '%f\n' | sort > "$RUNNER_TEMP/actual-assets.txt"
+          diff -u "$RUNNER_TEMP/expected-assets.txt" "$RUNNER_TEMP/actual-assets.txt"
+
       # Hash on ubuntu (single platform) so SHA256SUMS is uniformly
       # text-mode regardless of which per-matrix runner built each
       # artifact. Git-Bash sha256sum on Windows defaults to binary mode
@@ -142,12 +126,6 @@ jobs:
       - name: Compute SHA256SUMS
         run: |
           sha256sum ${{ inputs.track }}-* > SHA256SUMS
-
-          lines=$(wc -l < SHA256SUMS)
-          if [ "$lines" -ne ${{ inputs.expected-sha256sums-count }} ]; then
-            echo "::error::Expected ${{ inputs.expected-sha256sums-count }} entries in SHA256SUMS, got $lines"
-            exit 1
-          fi
 
           echo "SHA256SUMS:"
           cat SHA256SUMS
@@ -169,7 +147,7 @@ jobs:
             --new-tag "$TAG" \
             --head "${{ github.sha }}" \
             --repo-root source \
-            --platforms '${{ inputs.matrix }}' \
+            --platforms '${{ needs.validate.outputs.platforms }}' \
             --version "$VERSION" \
             > release-notes.md
           echo "--- release-notes.md ---"
