@@ -185,6 +185,7 @@ fn dispatch_exempts_bridge_run_from_cli_log_guard() {
             log_dir: None,
             state_dir: None,
             ready_notify: None,
+            plugin_dir: None,
         },
     };
     assert!(!should_install_cli_log_guard(&cmd));
@@ -925,6 +926,7 @@ fn resolve_cli_log_dir_returns_none_for_exempt_commands() {
             log_dir: None,
             state_dir: None,
             ready_notify: None,
+            plugin_dir: None,
         },
     })
     .is_none());
@@ -1314,4 +1316,73 @@ fn a_state_dir_with_no_absolute_form_is_an_error() {
     let err = super::absolute_state_dir(std::path::PathBuf::new()).unwrap_err();
 
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+// --plugin-dir ========================================================================================================
+
+#[skuld::test]
+fn bridge_run_parses_plugin_dir() {
+    let cli = Cli::try_parse_from(["hole", "bridge", "run", "--plugin-dir", "/some/folder"]).unwrap();
+
+    match cli.command {
+        Some(Command::Bridge {
+            action: BridgeAction::Run { plugin_dir, .. },
+        }) => assert_eq!(plugin_dir, Some(std::path::PathBuf::from("/some/folder"))),
+        _ => panic!("expected `bridge run`"),
+    }
+}
+
+#[skuld::test]
+fn bridge_run_without_the_flag_has_no_plugin_dir() {
+    let cli = Cli::try_parse_from(["hole", "bridge", "run"]).unwrap();
+
+    assert!(matches!(
+        cli.command,
+        Some(Command::Bridge {
+            action: BridgeAction::Run { plugin_dir: None, .. }
+        })
+    ));
+}
+
+#[skuld::test]
+fn the_service_takes_no_plugin_dir() {
+    // launchd's plist never passes it, and the service's folder is the one fixed root-owned path.
+    assert!(Cli::try_parse_from(["hole", "bridge", "run", "--service", "--plugin-dir", "/x"]).is_err());
+}
+
+#[skuld::test]
+fn foreground_source_without_the_flag_is_beside_the_executable() {
+    // An executable in a folder of its own: nothing beside it, whatever sits beside the test binary on this machine.
+    let empty = tempfile::tempdir().unwrap();
+    let exe = hole_bridge::proxy::BridgeExe::At(empty.path().join("hole"));
+    let source = super::foreground_source(None, exe).unwrap();
+
+    // No plugin is beside it, and the remedy is the staged build's.
+    let err = source.resolve("galoshes").unwrap_err().to_string();
+    assert!(err.contains("cargo xtask stage"), "{err}");
+}
+
+#[skuld::test]
+fn foreground_source_with_a_folder_refuses_what_is_not_a_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+
+    assert!(super::foreground_source(Some(file), hole_bridge::proxy::BridgeExe::Running).is_err());
+    assert!(super::foreground_source(Some(tmp.path().join("absent")), hole_bridge::proxy::BridgeExe::Running).is_err());
+}
+
+#[skuld::test]
+fn foreground_source_makes_a_relative_folder_absolute() {
+    // The cwd always exists, so a relative path to it needs no folder made inside the repository.
+    let relative = std::path::PathBuf::from(".");
+
+    let source = super::foreground_source(Some(relative), hole_bridge::proxy::BridgeExe::Running).unwrap();
+
+    let (hole_bridge::proxy::PluginSource::Explicit { dir }
+    | hole_bridge::proxy::PluginSource::ExplicitStamped { dir }) = &source
+    else {
+        panic!("a `--plugin-dir` folder gives an explicit source: {source:?}");
+    };
+    assert!(dir.is_absolute(), "{dir:?}");
 }

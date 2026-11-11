@@ -3465,7 +3465,7 @@ async fn test_server_request_arms_the_configured_and_the_resolved_address() {
     state.test_server_config = crate::server_test::TestConfig {
         bootstrap: crate::dns::bootstrap::BootstrapResolver::with_querier(probe.clone()),
         preflight_timeout: std::time::Duration::from_millis(500),
-        ..crate::server_test::TestConfig::production()
+        ..crate::server_test::TestConfig::production(crate::proxy::PluginSource::default())
     };
     let token = hole_common::logging::redact_arm::token_for(&entry.id);
     assert_eq!(

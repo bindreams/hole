@@ -30,12 +30,11 @@ use shadowsocks_service::config::Config;
 pub mod config;
 pub mod plugin;
 pub mod plugin_log;
+pub mod plugin_source;
 pub mod shadowsocks;
 
-pub use config::{
-    build_ss_config, resolve_plugin, resolve_plugin_beside, validate_proxy_config, BundledPlugin, KeyMaterialFault,
-    PluginResolveError, ProxyError, TUN_SUBNET, TUN_SUBNET6,
-};
+pub use config::{build_ss_config, validate_proxy_config, KeyMaterialFault, ProxyError, TUN_SUBNET, TUN_SUBNET6};
+pub use plugin_source::{BridgeExe, BundledPlugin, PluginResolveError, PluginSource};
 pub use shadowsocks::{ShadowsocksProxy, ShadowsocksRunning};
 
 // Trait surface =======================================================================================================

@@ -14,7 +14,7 @@
 
 use super::{run_server_test, TestConfig};
 use crate::dns::bootstrap::BootstrapResolver;
-use crate::proxy::PluginResolveError;
+use crate::proxy::{BridgeExe, PluginResolveError};
 use crate::test_support::plugin_install::{fake_install_with_unspawnable_ex_ray, install_with_built_ex_ray};
 use crate::test_support::port_alloc::wait_for_port;
 use crate::test_support::rt;
@@ -57,7 +57,7 @@ fn fast_test_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfi
         ss_connect_timeout: Duration::from_millis(800),
         sentinel_read_timeout: Duration::from_millis(800),
         sentinels: [sentinel_a.to_string(), sentinel_b.to_string()],
-        plugin_lookup: Default::default(),
+        plugin_source: Default::default(),
         dns: hole_common::config::DnsConfig::default(),
         bootstrap: Default::default(),
     }
@@ -104,7 +104,7 @@ fn preflight_only_config() -> TestConfig {
         ss_connect_timeout: Duration::from_millis(500),
         sentinel_read_timeout: Duration::from_millis(500),
         sentinels: [bogus.to_string(), bogus.to_string()],
-        plugin_lookup: Default::default(),
+        plugin_source: Default::default(),
         dns: hole_common::config::DnsConfig {
             servers: Vec::new(),
             allow_insecure_bootstrap: true,
@@ -431,10 +431,10 @@ fn run_test_with_v2ray_plugin_happy_path() {
         // SS/sentinel timeouts are too short for the WS handshake.
         let dir = tempfile::tempdir().unwrap();
         let cfg = TestConfig {
-            plugin_lookup: crate::proxy::config::PluginLookup::beside(install_with_built_ex_ray(
+            plugin_source: crate::proxy::PluginSource::build_dir(BridgeExe::At(install_with_built_ex_ray(
                 dir.path(),
                 &plugin_path,
-            )),
+            ))),
             // Generous SS connect/sentinel timeouts because the WS handshake
             // adds latency on top of the raw TCP connect.
             ss_connect_timeout: Duration::from_secs(5),
@@ -492,14 +492,14 @@ fn maybe_start_plugin_preserves_eih_identity_keys() {
         let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
         let dir = tempfile::tempdir().unwrap();
         let cfg = TestConfig {
-            plugin_lookup: crate::proxy::config::PluginLookup::beside(install_with_built_ex_ray(
+            plugin_source: crate::proxy::PluginSource::build_dir(BridgeExe::At(install_with_built_ex_ray(
                 dir.path(),
                 &plugin_path,
-            )),
+            ))),
             ..fast_test_config(sentinel_a, sentinel_b)
         };
         let plugin = cfg
-            .plugin_lookup
+            .plugin_source
             .resolve("v2ray-plugin")
             .expect("the built ex-ray resolves");
 
@@ -587,7 +587,7 @@ fn preflight_path_uses_doh_resolved_ip() {
             ss_connect_timeout: Duration::from_millis(500),
             sentinel_read_timeout: Duration::from_millis(500),
             sentinels: [bogus.to_string(), bogus.to_string()],
-            plugin_lookup: Default::default(),
+            plugin_source: Default::default(),
             dns: DnsConfig {
                 enabled: true,
                 servers: vec!["1.1.1.1".parse().unwrap()],
@@ -919,7 +919,9 @@ fn plugin_preflight_uses_raw_ipv6_not_bracketed_host() {
         let mut entry = entry("v6.example", port, TEST_METHOD_STR, TEST_PASSWORD);
         entry.plugin = Some("v2ray-plugin".into());
         let cfg = TestConfig {
-            plugin_lookup: crate::proxy::config::PluginLookup::beside(fake_install_with_unspawnable_ex_ray(dir.path())),
+            plugin_source: crate::proxy::PluginSource::build_dir(BridgeExe::At(fake_install_with_unspawnable_ex_ray(
+                dir.path(),
+            ))),
             ..ipv6_doh_config(bogus, bogus)
         };
 
@@ -1007,11 +1009,13 @@ fn a_failed_plugin_chain_start_is_logged() {
     // Options the SIP003 parser rejects: the chain refuses before spawning.
     entry.plugin_opts = Some(r"path=/a\".into());
     let cfg = TestConfig {
-        plugin_lookup: crate::proxy::config::PluginLookup::beside(fake_install_with_unspawnable_ex_ray(dir.path())),
+        plugin_source: crate::proxy::PluginSource::build_dir(BridgeExe::At(fake_install_with_unspawnable_ex_ray(
+            dir.path(),
+        ))),
         ..preflight_only_config()
     };
     let plugin = cfg
-        .plugin_lookup
+        .plugin_source
         .resolve("v2ray-plugin")
         .expect("the fake install resolves");
     let mut svr_cfg = super::build_server_config(&entry, "127.0.0.1".parse().unwrap()).expect("a plain entry builds");

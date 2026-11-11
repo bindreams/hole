@@ -154,6 +154,14 @@ pub(crate) enum BridgeAction {
         /// service mode.
         #[arg(long)]
         ready_notify: Option<String>,
+        /// Run the plugins found in this folder instead of the ones beside the executable. The bridge runs them with
+        /// its own privileges and reads the folder, never writes it. On macOS it checks only that this is a Hole
+        /// plugin folder (a current `layout.json`), not who can write it, so name only a folder that only root can
+        /// write, such as `/Library/Application Support/Hole`. That file is read under the bridge's vouched-read
+        /// rules: name the real folder, not a user's link to a folder somebody else owns. A plugin that unpacks itself (galoshes) uses the
+        /// environment the bridge was started with. Not for the service, whose folder is fixed
+        #[arg(long, conflicts_with = "service")]
+        plugin_dir: Option<std::path::PathBuf>,
     },
     /// Install and start the bridge service
     Install {
@@ -457,6 +465,18 @@ fn absolute_state_dir(state_dir: std::path::PathBuf) -> std::io::Result<std::pat
     std::path::absolute(&state_dir)
 }
 
+/// Where a foreground bridge finds its plugins: beside `exe`, its executable (a staged build directory), unless
+/// `--plugin-dir` names a folder, which is read and never written. An error when the folder is not a directory.
+fn foreground_source(
+    plugin_dir: Option<std::path::PathBuf>,
+    exe: hole_bridge::proxy::BridgeExe,
+) -> std::io::Result<hole_bridge::proxy::PluginSource> {
+    match plugin_dir {
+        None => Ok(hole_bridge::proxy::PluginSource::build_dir(exe)),
+        Some(dir) => hole_bridge::platform::os::explicit_plugin_source(dir),
+    }
+}
+
 /// Per-user log directory under the resolved user's home, derived from `home`
 /// (never `$HOME`/`dirs`, which under osascript-admin still point at the
 /// invoking user but are easy to get wrong for an elevated process).
@@ -688,6 +708,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             log_dir,
             state_dir,
             ready_notify,
+            plugin_dir,
         } => {
             // Resolve the elevated-run owner once: `Some` only for a
             // privileged, non-`--service` run (the daemon and the
@@ -741,7 +762,13 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             let result: Result<(), Box<dyn std::error::Error>> = if service {
                 #[cfg(target_os = "macos")]
                 {
-                    hole_bridge::platform::os::run(&socket_path, &state_dir, &log_dir, hole::version::VERSION)
+                    hole_bridge::platform::os::run(
+                        &socket_path,
+                        &state_dir,
+                        &log_dir,
+                        hole::version::VERSION,
+                        crate::embedded_plugins::PLUGINS,
+                    )
                 }
                 #[cfg(target_os = "windows")]
                 {
@@ -749,14 +776,18 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                         .map_err(|e| Box::new(e) as _)
                 }
             } else {
-                hole_bridge::foreground::run(
-                    &socket_path,
-                    &state_dir,
-                    &log_dir,
-                    ready_notify.as_deref(),
-                    hole::version::VERSION,
-                    owner_ids,
-                )
+                match foreground_source(plugin_dir, hole_bridge::proxy::BridgeExe::Running) {
+                    Ok(plugin_source) => hole_bridge::foreground::run(
+                        &socket_path,
+                        &state_dir,
+                        &log_dir,
+                        ready_notify.as_deref(),
+                        hole::version::VERSION,
+                        owner_ids,
+                        plugin_source,
+                    ),
+                    Err(e) => Err(format!("cannot use the --plugin-dir folder: {e}").into()),
+                }
             };
 
             if let Err(e) = result {

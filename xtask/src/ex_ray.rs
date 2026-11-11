@@ -17,8 +17,11 @@ use anyhow::{Context, Result};
 /// expects and what `crates/galoshes/build.rs` reads via
 /// `ex-ray-{TARGET}{ext}`. The trailing `.exe` is included on Windows.
 pub fn output_name() -> String {
-    let exe = if cfg!(target_os = "windows") { ".exe" } else { "" };
-    format!("ex-ray-{}{exe}", crate::target::host_target_triple())
+    xtask_lib::bindir::cache_sidecar_file_name(
+        "ex-ray",
+        crate::target::host_target_triple(),
+        cfg!(target_os = "windows"),
+    )
 }
 
 /// Build (or rebuild) the ex-ray binary for the host platform.

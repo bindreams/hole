@@ -160,6 +160,18 @@ impl Drop for ChainTask {
     }
 }
 
+/// The variable galoshes reads for the folder it extracts its embedded ex-ray into (on macOS, `XDG_RUNTIME_DIR`, else
+/// a folder under `HOME`, which a launchd daemon may not have).
+const RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
+
+/// The environment variable that points `plugin` at its runtime directory, when its source has one: the same value
+/// whether or not the service's environment carries a `HOME`, in a folder only root can write.
+fn runtime_dir_env(plugin: &BundledPlugin) -> Option<(&'static str, String)> {
+    plugin
+        .runtime_dir()
+        .map(|dir| (RUNTIME_DIR_ENV, dir.to_string_lossy().into_owned()))
+}
+
 /// Start a plugin chain with a single binary plugin.
 ///
 /// When `state_dir` is `Some`, plugin PIDs are recorded to
@@ -354,6 +366,7 @@ async fn spawn_plugin_runner_at(
     log: &Arc<crate::proxy::plugin_log::PluginLog>,
 ) -> Result<(ChainTask, SocketAddr, garter::Transports), ProxyError> {
     let plugin_name = plugin.descriptor().name;
+    let runtime_env = runtime_dir_env(plugin);
     // Every shipped plugin speaks sitrep, whose AUTHORITATIVE transports the
     // UDP-drop policy needs (galoshes' `tcp,udp`); `Probe`'s TCP connect
     // would discard them.
@@ -361,6 +374,9 @@ async fn spawn_plugin_runner_at(
         garter::BinaryPlugin::new(plugin.path(), merged_opts).readiness(garter::ReadinessMode::ExpectSitrep);
     // Before the tap wrap: `TapPlugin` delegates `run`, so the sink still fires.
     plugin = plugin.log_sink(log.sink());
+    if let Some((key, value)) = runtime_env {
+        plugin = plugin.env(key, value);
+    }
 
     if let Some(dir) = state_dir {
         let dir = dir.to_path_buf();
