@@ -17,6 +17,7 @@ pub mod liveness;
 pub mod logging;
 pub mod platform;
 pub mod plugin_recovery;
+pub mod plugin_repair;
 pub mod plugin_state;
 pub mod proxy;
 pub mod proxy_manager;

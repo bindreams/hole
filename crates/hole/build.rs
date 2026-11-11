@@ -2,6 +2,9 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[path = "build/embed_plugins.rs"]
+mod embed_plugins;
+
 fn main() {
     let icons_dir = Path::new("icons");
 
@@ -38,8 +41,12 @@ fn main() {
     // lives in `cargo xtask deps`, not here — this build.rs is
     // compile-time metadata only.
 
-    println!("cargo:rerun-if-changed=tauri.conf.json");
+    // The base config and the platform file merged over it, when there is one (a missing path would rerun forever).
+    for path in tauri_conf_with_paths().1 {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     ensure_external_bin_stubs(&repo_root);
+    embed_plugins::embed(&repo_root);
 
     // Generate the context here so embedded assets are written before any unit
     // that reads them starts; `xtask::tauri_context_conformance_tests` says why
@@ -55,11 +62,7 @@ fn main() {
 /// for the target being built, then `TAURI_CONFIG` merged over it.
 fn report_missing_frontend_dist() -> bool {
     let config_dir = std::env::current_dir().expect("failed to read the current directory");
-    let target = tauri_utils::platform::Target::from_triple(
-        &std::env::var("TARGET").expect("cargo sets TARGET for build scripts"),
-    );
-    let (config, _paths) = tauri_utils::config::parse::read_from(target, &config_dir)
-        .unwrap_or_else(|e| panic!("failed to read the Tauri config: {e}"));
+    let (config, _paths) = tauri_conf_in(&config_dir);
     let tauri_config = std::env::var("TAURI_CONFIG").ok();
     let missing = xtask_lib::frontend_dist::missing_frontend_dist(
         tauri_build::is_dev(),
@@ -131,9 +134,19 @@ fn write_temp(path: &Path, bytes: &[u8], inputs: SystemTime) -> PathBuf {
     temp
 }
 
+/// The Tauri config of the target being built: `tauri.conf.json` with the platform file merged over it, as
+/// `tauri-build` reads it, and the files it read.
+fn tauri_conf_in(config_dir: &Path) -> (serde_json::Value, Vec<PathBuf>) {
+    let target = std::env::var("TARGET").expect("cargo sets TARGET for build scripts");
+    xtask_lib::tauri_config::merged_tauri_config(&target, config_dir).unwrap_or_else(|e| panic!("{e:#}"))
+}
+
+fn tauri_conf_with_paths() -> (serde_json::Value, Vec<PathBuf>) {
+    tauri_conf_in(&std::env::current_dir().expect("failed to read the current directory"))
+}
+
 fn tauri_conf() -> serde_json::Value {
-    let conf = std::fs::read_to_string("tauri.conf.json").expect("failed to read tauri.conf.json");
-    serde_json::from_str(&conf).expect("failed to parse tauri.conf.json")
+    tauri_conf_with_paths().0
 }
 
 /// The files `tauri.conf.json`'s `bundle.icon` lists, as paths from the crate
@@ -149,7 +162,8 @@ fn bundle_icons() -> Vec<PathBuf> {
 
 /// Stub every `externalBin` sidecar so `tauri_build::build()` passes
 /// validation even when `cargo xtask deps` has not been run yet. The stub
-/// list derives from `tauri.conf.json`'s `bundle.externalBin`, so a new
+/// list derives from the merged config's `bundle.externalBin` (absent on macOS,
+/// which embeds its plugins: `embed_plugins` stubs those), so a new
 /// sidecar entry can never desync from its stub. Each entry `<base>` resolves
 /// to `<repo>/<base>-<target>{suffix}`, mirroring what Tauri's bundler reads.
 /// The real binaries are built by `cargo xtask deps`.
@@ -157,9 +171,13 @@ fn ensure_external_bin_stubs(repo_root: &Path) {
     let target = std::env::var("TARGET").unwrap();
     let suffix = if target.contains("windows") { ".exe" } else { "" };
     let conf = tauri_conf();
-    let entries = conf["bundle"]["externalBin"]
-        .as_array()
-        .expect("tauri.conf.json bundle.externalBin must be an array");
+    let no_sidecars = Vec::new();
+    let entries = match conf["bundle"].get("externalBin") {
+        None => &no_sidecars,
+        Some(entries) => entries
+            .as_array()
+            .expect("tauri.conf.json bundle.externalBin must be an array"),
+    };
     for entry in entries {
         let base = entry.as_str().expect("externalBin entry must be a string");
         let path = repo_root.join(format!("{base}-{target}{suffix}"));

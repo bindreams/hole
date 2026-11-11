@@ -36,6 +36,8 @@ aho-corasick = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+# `ReadDir::names`: listing a directory through its open handle.
+rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 # `Win32_Foundation`, `Win32_Storage_FileSystem`: `versioned_file`'s POSIX-semantics

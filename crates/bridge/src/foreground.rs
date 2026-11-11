@@ -6,7 +6,7 @@ use tun_engine::routing::SystemRouting;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::proxy::ShadowsocksProxy;
+use crate::proxy::{PluginSource, ShadowsocksProxy};
 use crate::proxy_manager::ProxyManager;
 
 /// Run the bridge in foreground mode (for development).
@@ -20,6 +20,10 @@ use crate::proxy_manager::ProxyManager;
 /// `log_dir` is the same directory that the global tracing subscriber
 /// writes `bridge.log` into — so all bridge-owned files land in one
 /// place and the CI artifact-upload step can glob for them.
+///
+/// `plugin_source` says where the plugins are: a foreground bridge is never
+/// repaired, so it runs from a staged build directory or the folder an admin
+/// named with `--plugin-dir`.
 pub fn run(
     socket_path: &Path,
     state_dir: &Path,
@@ -27,9 +31,18 @@ pub fn run(
     ready_notify: Option<&str>,
     version: &str,
     owner: Option<(u32, u32)>,
+    plugin_source: PluginSource,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_inner(socket_path, state_dir, log_dir, ready_notify, version, owner))
+    rt.block_on(run_inner(
+        socket_path,
+        state_dir,
+        log_dir,
+        ready_notify,
+        version,
+        owner,
+        plugin_source,
+    ))
 }
 
 /// Resolve when a shutdown signal arrives: Ctrl+C (SIGINT) everywhere,
@@ -152,11 +165,15 @@ async fn run_inner(
     ready_notify: Option<&str>,
     version: &str,
     owner: Option<(u32, u32)>,
+    plugin_source: PluginSource,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(ProxyManager::new(
-        ShadowsocksProxy::new(),
-        SystemRouting::new(state_dir.to_path_buf(), owner),
-    )));
+    let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
+        ProxyManager::new(
+            ShadowsocksProxy::new(),
+            SystemRouting::new(state_dir.to_path_buf(), owner),
+        )
+        .with_plugin_source(plugin_source),
+    ));
     let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
     // Bind BEFORE the liveness acquire and BEFORE recovery. If a second

@@ -93,6 +93,12 @@ before editing; the sections linked below are the authoritative source.
   seam generifies `Engine`/`Driver` over their packet I/O so the TUN loop is
   drivable from memory. →
   [CONTRIBUTING.md#datapath-coverage-which-lane-proves-what](CONTRIBUTING.md#datapath-coverage-which-lane-proves-what)
+- **Plugin binaries.** The bridge runs only the plugins Hole ships, found in the one folder its
+  `PluginSource` names, never `PATH`. On macOS `hole` carries both plugins and the service makes a root-owned
+  folder (`/Library/Application Support/Hole`) hold exactly those at every start, before it serves; the app
+  bundle ships none. A layout stamp this release cannot read is never repaired over; plugins are run from that
+  folder only once the start's repair left it holding what `hole` carries. →
+  [CONTRIBUTING.md#plugin-binaries-where-each-platform-gets-them](CONTRIBUTING.md#plugin-binaries-where-each-platform-gets-them)
 - **Proxy shutdown contract.** `stop()` returns only once the listener sockets
   are closed; the proxy owns its own runtime because upstream's teardown is
   three layers of bare `abort()`. →

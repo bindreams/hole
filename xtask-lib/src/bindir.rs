@@ -109,11 +109,46 @@ pub fn bindir_dest_names(os: Os) -> Vec<String> {
     names
 }
 
-/// SIP003 plugin sidecar binaries (no extension) that every installer must ship
-/// next to the bridge so `resolve_plugin` finds them. Subset of
-/// [`bindir_dest_names`]; drives the macOS `externalBin` conformance check.
+/// SIP003 plugin binaries (no extension) Hole ships. The Windows installer puts them
+/// next to the bridge, where its `PluginSource` finds them; on macOS `hole` embeds them
+/// ([`embedded_plugin_names`]). Subset of [`bindir_dest_names`].
 pub fn plugin_sidecar_names() -> &'static [&'static str] {
     &["ex-ray", "galoshes"]
+}
+
+/// The plugin binaries `hole` carries inside itself on `os`, rather than as files beside it: the names of
+/// [`plugin_sidecar_names`] on macOS, where the service runs them from a root-owned folder it fills at start, and none
+/// elsewhere. The one place this platform difference is stated.
+pub fn embedded_plugin_names(os: Os) -> &'static [&'static str] {
+    match os {
+        Os::Darwin => plugin_sidecar_names(),
+        Os::Windows => &[],
+        Os::Linux => &[],
+    }
+}
+
+/// What the app bundle holds on `os`: [`bindir_dest_names`] without the plugins `hole` embeds.
+pub fn bundle_payload_names(os: Os) -> Vec<String> {
+    let embedded = embedded_plugin_names(os);
+    bindir_dest_names(os)
+        .into_iter()
+        .filter(|name| !embedded.contains(&name.as_str()))
+        .collect()
+}
+
+/// The file name a plugin takes in `.cache/<name>/`: `<name>-<triple>{.exe}`, what Tauri appends to an `externalBin`
+/// entry and what `hole`'s build embeds.
+pub fn cache_sidecar_file_name(name: &str, triple: &str, windows: bool) -> String {
+    let exe = if windows { ".exe" } else { "" };
+    format!("{name}-{triple}{exe}")
+}
+
+/// Where `cargo xtask deps` leaves the plugin `name` for `triple`: `<repo>/.cache/<name>/<name>-<triple>{.exe}`.
+pub fn cache_sidecar_path(repo_root: &std::path::Path, name: &str, triple: &str, windows: bool) -> std::path::PathBuf {
+    repo_root
+        .join(".cache")
+        .join(name)
+        .join(cache_sidecar_file_name(name, triple, windows))
 }
 
 #[cfg(test)]
