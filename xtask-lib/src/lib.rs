@@ -15,6 +15,8 @@ pub mod bindir;
 pub mod frontend_dist;
 pub mod git_rerun;
 pub mod repo_root;
+#[cfg(feature = "tauri-config")]
+pub mod tauri_config;
 
 #[cfg(feature = "version")]
 pub mod ex_ray_version;
@@ -39,6 +41,10 @@ mod asset_tests;
 #[cfg(all(test, feature = "tauri-config"))]
 #[path = "frontend_dist_tests.rs"]
 mod frontend_dist_tests;
+
+#[cfg(all(test, feature = "tauri-config"))]
+#[path = "tauri_config_tests.rs"]
+mod tauri_config_tests;
 
 #[cfg(test)]
 #[path = "git_rerun_tests.rs"]

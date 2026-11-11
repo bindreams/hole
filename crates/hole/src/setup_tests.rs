@@ -352,7 +352,7 @@ struct UninstallOutcome {
 }
 
 /// The scripted outcome of each injected effect. `installed` is what
-/// `is_installed` reports; every other field is the `Result` its step returns.
+/// `has_anything_to_uninstall` reports; every other field is the `Result` its step returns.
 struct UninstallScript {
     keep_covers: bool,
     hold: std::io::Result<()>,

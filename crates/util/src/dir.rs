@@ -425,6 +425,16 @@ impl Dir {
         platform::unlink(&self.file, name)
     }
 
+    /// Removes `name` and, if it is a directory, everything below it, each level through its parent's handle. No link
+    /// is followed, at the name or below: a link is removed as itself. `NotFound` if there is none. One entry that
+    /// cannot go does not stop the others; the first failure is returned. Unix only: the one caller is the macOS
+    /// plugin-folder repair and uninstall.
+    #[cfg(unix)]
+    pub fn remove_tree(&self, name: &OsStr) -> io::Result<()> {
+        single_component(name)?;
+        platform::remove_tree(&self.file, name)
+    }
+
     /// [`Self::open`] with the right to read and rewrite the final directory's ACL through [`Self::file`], which
     /// opening for use does not ask for (and which fails where the caller lacks it).
     #[cfg(windows)]

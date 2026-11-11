@@ -288,7 +288,7 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// How the server hostname resolves; a test can inject a DoH querier.
     bootstrap: crate::dns::bootstrap::BootstrapResolver,
     /// Where bundled plugins resolve; a test can stage an install directory.
-    plugin_lookup: crate::proxy::config::PluginLookup,
+    plugin_source: crate::proxy::PluginSource,
     /// The `ech-doh` URL the most recent start derived. Test-only: the
     /// derivation is otherwise observable only through the plugin it spawns.
     #[cfg(test)]
@@ -447,7 +447,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             adopted_standing_cover: false,
             unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             bootstrap: Default::default(),
-            plugin_lookup: Default::default(),
+            plugin_source: Default::default(),
             #[cfg(test)]
             last_ech_doh: None,
         }
@@ -465,7 +465,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// test binary.
     #[cfg(test)]
     pub fn set_bridge_exe_for_test(&mut self, exe: std::path::PathBuf) {
-        self.plugin_lookup = crate::proxy::config::PluginLookup::beside(exe);
+        self.plugin_source = crate::proxy::PluginSource::build_dir(crate::proxy::BridgeExe::At(exe));
+    }
+
+    /// Where this manager's plugins come from; the entry point of each mode says so (a bare `new` looks beside the
+    /// running executable).
+    pub fn with_plugin_source(mut self, source: crate::proxy::PluginSource) -> Self {
+        self.plugin_source = source;
+        self
+    }
+
+    /// The source plugins resolve through. `IpcState::new` derives the server test's from this, so a connect and a
+    /// test of a server look in the same place.
+    pub fn plugin_source_handle(&self) -> crate::proxy::PluginSource {
+        self.plugin_source.clone()
     }
 
     /// The bundled plugin `name` names, or why it cannot run. Side-effect free.
@@ -473,7 +486,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         &self,
         name: &str,
     ) -> Result<crate::proxy::BundledPlugin, crate::proxy::PluginResolveError> {
-        self.plugin_lookup.resolve(name)
+        self.plugin_source.resolve(name)
     }
 
     /// Clone of the shared routing handle. `IpcState::new` derives

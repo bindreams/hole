@@ -54,6 +54,8 @@ xtask-lib = { path = "../../xtask-lib" }
 shadowsocks-service = { version = "1", features = ["local", "local-http", "aead-cipher-2022"] }
 shadowsocks = "=1.24.0"
 hex = "0.4"
+# `plugin_repair`: the hash of a plugin file on disk, compared with the one `hole` carries.
+sha2 = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "io-util", "net"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

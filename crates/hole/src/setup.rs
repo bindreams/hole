@@ -639,7 +639,7 @@ pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Err
             hole_bridge::platform::os::ensure_stopped()?;
             Ok(())
         },
-        hole_bridge::platform::os::is_installed,
+        hole_bridge::platform::os::has_anything_to_uninstall,
         || {
             hole_bridge::platform::os::uninstall()?;
 
@@ -679,18 +679,18 @@ pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Err
 /// **Stop, deregister, release — and the stop is gated on nothing.** Whether a
 /// bridge is running and whether a registration record still names it are
 /// independent facts; the fail-closed covers are held by the live process, not
-/// by the record. Gating the stop on `is_installed` made the two look like one,
+/// by the record. Gating the stop on a registration record made the two look like one,
 /// and a lost record then skipped the teardown that would have stopped the
 /// bridge — whose liveness lock refuses the release forever. A service marked
-/// for deletion still opens (`is_installed` stays true), and a stop reaches it
-/// through its handle. macOS has the plist deleted over a still-loaded job.
+/// for deletion still opens, and a stop reaches it through its handle. macOS has
+/// the plist deleted over a still-loaded job. `has_anything_to_uninstall` gates only the deregistration.
 ///
 /// **Deregistration requires a confirmed stop.** The registration is the only
 /// handle a later attempt has, so a stop that could not be confirmed leaves it
 /// alone: the uninstall fails, and the next one still has something to work
 /// with. The platform `uninstall()`s enforce the same rule at their own level.
 ///
-/// **The release is unconditional** — never gated on `is_installed`, never
+/// **The release is unconditional** — never gated on `has_anything_to_uninstall`, never
 /// skipped because an earlier step failed. Cover existence is independent of
 /// service registration: the Windows filters are keyed on compile-time GUIDs
 /// and are machine-wide, so a lost registration (a failed install, `sc delete`,
@@ -714,7 +714,7 @@ fn uninstall_bridge_with<Hold>(
     keep_covers: bool,
     hold: impl FnOnce() -> std::io::Result<Hold>,
     ensure_stopped: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
-    is_installed: impl FnOnce() -> bool,
+    has_anything_to_uninstall: impl FnOnce() -> bool,
     deregister: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
     release: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -737,7 +737,7 @@ fn uninstall_bridge_with<Hold>(
         }
 
         if stopped.is_ok() {
-            if is_installed() {
+            if has_anything_to_uninstall() {
                 if let Err(e) = deregister() {
                     failures.push(format!("could not deregister the bridge service: {e}"));
                 }

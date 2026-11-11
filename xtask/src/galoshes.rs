@@ -3,8 +3,9 @@
 //! (written to `<repo>/.cache/ex-ray/`, where galoshes's `build.rs` picks
 //! it up).
 //!
-//! Output: `<repo>/target/release/galoshes{.exe}`, plus a Tauri-sidecar copy
-//! at `<repo>/.cache/galoshes/galoshes-<triple>{.exe}` for the macOS DMG.
+//! Output: `<repo>/target/release/galoshes{.exe}`, plus a copy at
+//! `<repo>/.cache/galoshes/galoshes-<triple>{.exe}`: the Tauri sidecar where the
+//! app bundle ships one, and the bytes `hole`'s build embeds on macOS.
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
@@ -33,9 +34,9 @@ pub fn build(repo_root: &Path) -> Result<PathBuf> {
         return Err(anyhow!("galoshes binary not found at {} after build", binary.display()));
     }
 
-    // Also stage a Tauri-sidecar copy at `.cache/galoshes/galoshes-<triple>`.
-    // `npx tauri build` (the macOS DMG path) bundles `externalBin` entries by
-    // appending the host triple, mirroring how ex-ray lands in `.cache/ex-ray/`.
+    // Also stage a copy at `.cache/galoshes/galoshes-<triple>`, mirroring how
+    // ex-ray lands in `.cache/ex-ray/`: Tauri bundles `externalBin` entries by
+    // appending the host triple, and `hole`'s build embeds it on macOS.
     let cache_dir = repo_root.join(".cache").join("galoshes");
     std::fs::create_dir_all(&cache_dir).with_context(|| format!("failed to create {}", cache_dir.display()))?;
     let sidecar = cache_dir.join(cache_sidecar_name());
@@ -64,10 +65,13 @@ pub(crate) fn build_args(crash_dumps: bool, windows_host: bool) -> Vec<&'static 
     args
 }
 
-/// Tauri-sidecar filename: `galoshes-<triple>{.exe}`. Tauri's bundler appends
-/// the host triple to each `externalBin` path, so the macOS DMG needs galoshes
-/// at `.cache/galoshes/galoshes-<triple>` to bundle it into `Contents/MacOS/`.
+/// The cache filename: `galoshes-<triple>{.exe}`. Tauri's bundler appends the
+/// host triple to each `externalBin` path, and `hole`'s build embeds the file of
+/// this name on macOS (`xtask_lib::bindir::cache_sidecar_path`).
 pub fn cache_sidecar_name() -> String {
-    let exe = if cfg!(target_os = "windows") { ".exe" } else { "" };
-    format!("galoshes-{}{exe}", crate::target::host_target_triple())
+    xtask_lib::bindir::cache_sidecar_file_name(
+        "galoshes",
+        crate::target::host_target_triple(),
+        cfg!(target_os = "windows"),
+    )
 }

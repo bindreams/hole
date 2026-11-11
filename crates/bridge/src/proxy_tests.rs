@@ -1,5 +1,5 @@
 use super::*;
-use crate::proxy::config::PluginLookup;
+use crate::proxy::{BridgeExe, PluginSource};
 use crate::test_support::plugin_install::{empty_install, sibling_path};
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
@@ -216,7 +216,7 @@ impl FakeInstall {
     }
 
     fn resolve(&self, name: &str) -> Result<BundledPlugin, PluginResolveError> {
-        PluginLookup::beside(self.exe.clone()).resolve(name)
+        PluginSource::build_dir(BridgeExe::At(self.exe.clone())).resolve(name)
     }
 }
 
@@ -265,7 +265,9 @@ fn resolve_refuses_an_unbundled_plugin_even_when_a_sibling_of_that_name_exists()
 
 #[skuld::test]
 fn resolve_refuses_an_unbundled_plugin_without_a_bridge_exe() {
-    let err = PluginLookup::exe_unknown().resolve("some-custom-plugin").unwrap_err();
+    let err = PluginSource::build_dir(BridgeExe::Unknown)
+        .resolve("some-custom-plugin")
+        .unwrap_err();
     assert!(matches!(err, PluginResolveError::NotBundled { .. }), "got: {err:?}");
 }
 
@@ -276,7 +278,7 @@ fn resolve_a_bundled_plugin_missing_next_to_the_bridge_is_a_typed_error_not_a_ba
     let err = install.resolve("v2ray-plugin").unwrap_err();
 
     assert!(
-        matches!(&err, PluginResolveError::BinaryMissing { plugin, binary } if plugin == "v2ray-plugin" && *binary == format!("ex-ray{EXE_SUFFIX}")),
+        matches!(&err, PluginResolveError::BinaryMissing { plugin, binary, .. } if plugin == "v2ray-plugin" && *binary == format!("ex-ray{EXE_SUFFIX}")),
         "got: {err:?}"
     );
 }
@@ -316,7 +318,9 @@ fn resolve_refuses_a_name_that_could_be_a_path_as_not_bundled() {
 
 #[skuld::test]
 fn resolve_without_a_bridge_exe_is_a_typed_error_that_carries_the_os_error() {
-    let err = PluginLookup::exe_unknown().resolve("galoshes").unwrap_err();
+    let err = PluginSource::build_dir(BridgeExe::Unknown)
+        .resolve("galoshes")
+        .unwrap_err();
     assert!(
         matches!(&err, PluginResolveError::ExeUnknown { plugin, .. } if plugin == "galoshes"),
         "got: {err:?}"
@@ -348,7 +352,9 @@ fn the_not_bundled_message_shows_the_configured_name_escaped() {
 #[skuld::test]
 fn resolve_with_a_relative_bridge_exe_is_a_typed_error() {
     // A relative exe would make the sibling path relative, i.e. cwd-dependent.
-    let err = PluginLookup::beside("hole".into()).resolve("galoshes").unwrap_err();
+    let err = PluginSource::build_dir(BridgeExe::At("hole".into()))
+        .resolve("galoshes")
+        .unwrap_err();
     assert!(
         matches!(err, PluginResolveError::ExeUnknown { cause: None, .. }),
         "got: {err:?}"
@@ -366,7 +372,9 @@ fn resolve_with_a_relative_bridge_exe_never_looks_in_the_cwd() {
     let relative_exe = dir.path().strip_prefix(&cwd).unwrap().join(format!("hole{EXE_SUFFIX}"));
     assert!(relative_exe.is_relative() && relative_exe.exists(), "fixture");
 
-    let err = PluginLookup::beside(relative_exe).resolve("galoshes").unwrap_err();
+    let err = PluginSource::build_dir(BridgeExe::At(relative_exe))
+        .resolve("galoshes")
+        .unwrap_err();
 
     assert!(matches!(err, PluginResolveError::ExeUnknown { .. }), "got: {err:?}");
 }
@@ -389,7 +397,9 @@ fn resolve_logs_when_the_bridge_exe_cannot_be_canonicalized() {
 
     let err = {
         let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-        PluginLookup::beside(exe).resolve("galoshes").unwrap_err()
+        PluginSource::build_dir(BridgeExe::At(exe))
+            .resolve("galoshes")
+            .unwrap_err()
     };
 
     assert!(matches!(err, PluginResolveError::BinaryMissing { .. }), "got: {err:?}");
