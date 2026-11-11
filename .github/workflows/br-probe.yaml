@@ -1,0 +1,77 @@
+# BR-probe: investigation, never merged. Induces each condition under which the MSI's BridgeRelease custom action
+# can fail, on throwaway runners, and records the uninstall's exit code, MSI log, Hole's logs and the WFP filters left.
+# Runs only on pushes to azhukova/br-probe.
+name: BR probe
+
+on:
+  push:
+    branches: [azhukova/br-probe]
+
+jobs:
+  msi:
+    name: Build MSI
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: ./.github/actions/setup-build
+      - name: Build MSI
+        shell: pwsh
+        run: cargo xtask build hole-msi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: br-probe-msi
+          path: target/release/hole.msi
+          retention-days: 7
+
+  probe:
+    name: ${{ matrix.condition }} (cover=${{ matrix.cover }})
+    needs: msi
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { condition: baseline, cover: false }
+          - { condition: bfe-stopped, cover: false }
+          - { condition: exe-missing, cover: false }
+          - { condition: exe-acl-denied, cover: false }
+          - { condition: stray-bridge-peer, cover: false }
+          - { condition: stray-bridge-service-dir, cover: false }
+          - { condition: state-dir-write-denied, cover: false }
+          - { condition: target-file-is-dir, cover: false }
+          # With the standing cover engaged the runner's own egress is blocked until the script unblocks it.
+          - { condition: baseline, cover: true }
+          - { condition: bfe-stopped, cover: true }
+          - { condition: exe-missing, cover: true }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: br-probe-msi
+          path: ${{ runner.temp }}/msi
+      - name: Probe
+        shell: pwsh
+        env:
+          BR_COVER: ${{ matrix.cover }}
+        run: |
+          $cover = @()
+          if ($env:BR_COVER -eq 'true') { $cover = @('-Cover') }
+          & .github\scripts\br-probe.ps1 -Condition '${{ matrix.condition }}' -MsiPath "$env:RUNNER_TEMP\msi\hole.msi" -OutDir "$env:RUNNER_TEMP\br-out" @cover
+      - name: Results
+        if: always()
+        shell: pwsh
+        run: Get-Content "$env:RUNNER_TEMP\br-out\results.txt"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: br-probe-${{ matrix.condition }}-cover-${{ matrix.cover }}
+          path: ${{ runner.temp }}/br-out
+          retention-days: 14
