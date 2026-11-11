@@ -156,6 +156,8 @@ targets:
     # Pytest harness that asserts the produced .app's code signature is
     # internally consistent (sealed resources, no linker-signed-only Mach-Os,
     # sidecar identifier rewritten). Guards against issue #364 regressing.
+    #
+    # Tests the single DMG of the release build, or the one `DMG_UNDER_TEST` names.
     depends: hole-dmg
     platforms: [darwin/amd64, darwin/arm64]
     run: uv run --directory dmg-installer pytest -v
