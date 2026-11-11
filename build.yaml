@@ -160,6 +160,34 @@ targets:
     platforms: [darwin/amd64, darwin/arm64]
     run: uv run --directory dmg-installer pytest -v
 
+  hole-msi-install-tests:
+    # Installs the MSI under test system-wide, checks it, runs the dashboard E2E
+    # against the installed binary, uninstalls and verifies (msi-installer/tests/
+    # installed/). The MSI is an input, never built here: `MSI_UNDER_TEST`, else
+    # target\release\hole.msi (`cargo xtask build hole-msi`). Run it from an
+    # ELEVATED shell: it changes the machine (CONTRIBUTING.md, "Windows
+    # installer"). `cargo xtask run hole-msi-cleanup` finishes an interrupted run.
+    #
+    # No `depends`: `frontend-build` would `npm ci` and rebuild ui/dist, which
+    # CI's `hole-build` has already compiled in. The E2E needs the `node_modules`
+    # a `hole-msi` or `frontend-build` run left.
+    platforms: [windows/amd64]
+    build:
+      # A stale lockfile fails the same way on every attempt: check it offline before the retry.
+      - uv lock --check --offline --directory msi-installer
+      # Fetch the Python dependencies under retry.
+      - .github/scripts/retry.sh uv sync --directory msi-installer --group dev
+      # tauri-driver, msedgedriver and gsudo, into .cache/installer-e2e.
+      - uv run --directory msi-installer --group dev provision-e2e-tools
+    run: uv run --directory msi-installer --group dev pytest -v -s -m system_wide tests/installed/test_lifecycle.py
+
+  hole-msi-cleanup:
+    # Uninstalls what an interrupted `hole-msi-install-tests` left (a step timeout
+    # or Ctrl-C skips its teardown) and verifies nothing is installed. Idempotent;
+    # only removes a Hole that run installed. Elevated shell, same MSI input.
+    platforms: [windows/amd64]
+    run: uv run --directory msi-installer --group dev pytest -v -s -m cleanup tests/installed/test_cleanup.py
+
   frontend-build:
     # Vite bundle of ui/ → ui/dist/. Pure JS/TS toolchain, platform-
     # independent output. The type-check (`cargo xtask run frontend-check`)
