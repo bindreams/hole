@@ -67,6 +67,8 @@ def msi_path() -> Path:
 @pytest.fixture(scope="session")
 def e2e_environment() -> dict[str, str]:
     """The environment for the E2E children: this process's, with the provisioned tools ahead on PATH."""
+    if not (REPO_ROOT / "node_modules").is_dir():
+        pytest.fail("the E2E needs the repo's node_modules: run `cargo xtask build frontend-build`")
     return e2e_env(os.environ, provision_e2e_tools(REPO_ROOT, Console(stderr=True)))
 
 
