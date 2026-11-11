@@ -654,8 +654,7 @@ const NON_HOLE_LEGS: [&str; 3] = ["windows/arm64", "linux/amd64", "linux/arm64"]
 /// new-step mapping table in the PR description, independently of ci.yaml, so a
 /// matrix flag lost in an edit fails here instead of silently dropping a lane.
 ///
-/// Failure-only steps (installer log dump and bridge-log upload, DMG
-/// diagnostics) are off in a healthy run by construction and are listed in
+/// Failure-only steps (installer bridge-log upload, DMG diagnostics) are off in a healthy run by construction and are listed in
 /// `FAILURE_ONLY`.
 fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
     let mut g: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
@@ -702,17 +701,8 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
         "installer-pytest",
         "installer-build-msi",
         "installer-smoke",
-        "installer-tauri-driver",
-        "installer-msedgedriver",
-        "installer-gsudo",
-        "installer-install",
-        "installer-verify-install",
-        "installer-kill-launch",
-        "installer-verify-gsudo",
-        "installer-e2e",
-        "installer-kill",
-        "installer-uninstall",
-        "installer-verify-uninstall",
+        "installer-tests",
+        "installer-cleanup",
         "installer-upload-msi-logs",
         "hole-test-tun",
         "hole-verify-executed",
@@ -736,9 +726,7 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
     g
 }
 
-const FAILURE_ONLY: [&str; 5] = [
-    "installer-dump-log",
-    "installer-dump-uninstall-diagnostics",
+const FAILURE_ONLY: [&str; 3] = [
     "installer-upload-bridge-logs",
     "dmg-diagnostics",
     "dmg-upload-diagnostics",
@@ -981,43 +969,50 @@ fn ran_after_failure(leg_name: &str, failing: &str) -> BTreeSet<String> {
     steps_on_after_failure(leg(&all, leg_name), &ci_yaml, "ci", failing).expect("evaluate steps")
 }
 
-/// A failed installer E2E must still tear down: kill the app, uninstall, verify
-/// the uninstall, and upload the logs. The TUN lane still runs, because one
-/// failing lane hides nothing.
+/// A failed installer lifecycle run must still be cleaned up and leave the other
+/// lanes running: the cleanup call, the log uploads and the TUN lane all run
+/// after `installer-tests` fails. The TUN lane still runs, because one failing
+/// lane hides nothing.
 #[skuld::test]
-fn a_failed_installer_e2e_still_cleans_up_and_leaves_the_other_lanes_running() {
-    let ran = ran_after_failure("windows/amd64", "installer-e2e");
+fn a_failed_installer_lifecycle_still_cleans_up_and_leaves_the_other_lanes_running() {
+    let ran = ran_after_failure("windows/amd64", "installer-tests");
     for id in [
-        "installer-kill",
-        "installer-dump-log",
-        "installer-uninstall",
-        "installer-verify-uninstall",
+        "installer-cleanup",
         "installer-upload-msi-logs",
         "installer-upload-bridge-logs",
         "hole-test-tun",
     ] {
-        assert!(ran.contains(id), "{id} must run after installer-e2e fails");
+        assert!(ran.contains(id), "{id} must run after installer-tests fails");
     }
 }
 
-/// The TUN lane shares the VM with the installer block. If the MSI's SYSTEM
-/// service may still be installed (the uninstall verification failed), the lane
-/// would run next to a live production bridge on the same WFP, route and adapter
-/// state, so its verdicts would be confounded. A failure that leaves nothing
-/// installed (the MSI never built, or the E2E failed and the uninstall verified
-/// clean) does not stop it.
+/// The TUN lane shares the VM with the installer lifecycle. If the MSI's SYSTEM
+/// service may still be installed (the cleanup could not verify an empty
+/// machine), the lane would run next to a live production bridge on the same
+/// WFP, route and adapter state, so its verdicts would be confounded. A failure
+/// that leaves nothing installed (the MSI never built, or the lifecycle failed
+/// and the cleanup verified clean) does not stop it.
 #[skuld::test]
 fn the_tun_lane_does_not_run_beside_an_installation_that_may_remain() {
     assert!(
-        !ran_after_failure("windows/amd64", "installer-verify-uninstall").contains("hole-test-tun"),
-        "hole-test-tun ran although the uninstall verification failed"
+        !ran_after_failure("windows/amd64", "installer-cleanup").contains("hole-test-tun"),
+        "hole-test-tun ran although the cleanup failed"
     );
-    for failing in ["installer-e2e", "installer-install", "installer-build-msi"] {
+    for failing in ["installer-tests", "installer-build-msi"] {
         assert!(
             ran_after_failure("windows/amd64", failing).contains("hole-test-tun"),
             "hole-test-tun must still run when only {failing} failed"
         );
     }
+}
+
+/// The cleanup runs after a lifecycle failure and after the MSI build failed
+/// (where it finds nothing), but never when the MSI was not built at all: it
+/// needs the MSI to uninstall.
+#[skuld::test]
+fn the_cleanup_runs_after_a_lifecycle_failure_but_not_without_an_msi() {
+    assert!(ran_after_failure("windows/amd64", "installer-tests").contains("installer-cleanup"));
+    assert!(!ran_after_failure("windows/amd64", "installer-build-msi").contains("installer-cleanup"));
 }
 
 /// The #999 proof step reads both lanes' reports, which is only meaningful once
@@ -1060,11 +1055,8 @@ fn a_failed_dmg_still_captures_diagnostics_and_runs_the_hole_lanes() {
     }
 }
 
-/// Steps that are meant to run when something failed earlier: log dumps and
-/// artifact uploads.
-const RUNS_AFTER_A_FAILURE: [&str; 5] = [
-    "installer-dump-log",
-    "installer-dump-uninstall-diagnostics",
+/// Steps that are meant to run when something failed earlier: artifact uploads.
+const RUNS_AFTER_A_FAILURE: [&str; 3] = [
     "installer-upload-msi-logs",
     "installer-upload-bridge-logs",
     "hole-upload-bridge-logs",
