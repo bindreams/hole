@@ -1,0 +1,10 @@
+# Tools the installer E2E needs, provisioned into <repo>/.cache/installer-e2e by
+# `uv run --directory msi-installer provision-e2e-tools`. msedgedriver is not
+# pinned: it must match the WebView2 runtime on the machine, which auto-updates.
+
+[tauri-driver]
+version = "2.0.6"
+
+[gsudo]
+version = "2.6.1"
+url = "https://github.com/gerardog/gsudo/releases/download/v{version}/gsudo.portable.zip"
