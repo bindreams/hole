@@ -44,6 +44,7 @@ pub mod run_injected_env;
 pub mod schemars_pin;
 pub mod skuld_label_coverage;
 pub mod stage;
+pub mod stage_release;
 pub mod target;
 pub mod tauri_pairs;
 pub mod test_binaries;
@@ -375,6 +376,24 @@ pub enum Command {
         #[arg(long)]
         archive: PathBuf,
     },
+    /// Copy the files a release ships out of this CI leg's build into `--out`,
+    /// named as the release names them, for the draft workflow to upload.
+    ///
+    /// `--lane` is the point in `ci.yaml` the files have just passed their
+    /// tests; a group the lane ships nothing for stages nothing. For hole it
+    /// also builds and verifies the update archive. The installer is
+    /// `MSI_UNDER_TEST` / `DMG_UNDER_TEST` when set, else the release build.
+    StageRelease {
+        /// Release tag, `releases/<group>/vX.Y.Z`.
+        #[arg(long)]
+        tag: String,
+        /// Which tested files to stage.
+        #[arg(long, value_enum)]
+        lane: stage_release::Lane,
+        /// Directory to stage into.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Print this host's update-archive asset suffix (e.g. `windows-amd64.zip`).
     ///
     /// The release workflow captures it to name the published archive; the
@@ -524,6 +543,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             println!("xtask: update archive verified {}", archive.display());
             Ok(())
         }
+        Command::StageRelease { tag, lane, out } => stage_release::stage(&repo_root()?, &tag, lane, &out),
         Command::AssetSuffix => {
             println!("{}", xtask_lib::asset::host_update_asset_suffix());
             Ok(())

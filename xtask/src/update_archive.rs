@@ -2,6 +2,8 @@
 //! the shared `payload-archive` crate (the same code the bridge unpacks with).
 //! Windows: a flat `.zip`; macOS: a `.tar.gz` of the built `Hole.app`.
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use std::path::Path;
 
 use anyhow::Result;
@@ -101,6 +103,36 @@ pub fn verify_update_archive(archive: &Path) -> Result<()> {
         let _ = archive;
         anyhow::bail!("update-archive is only built on windows/macos")
     }
+}
+
+/// Assert the `.app` inside a macOS update archive passes `codesign --verify`, as Gatekeeper will judge it after the
+/// updater unpacks it.
+#[cfg(target_os = "macos")]
+pub fn verify_app_signature(archive: &Path) -> Result<()> {
+    use anyhow::{bail, Context};
+
+    let workdir = tempfile::tempdir().context("create a scratch dir to unpack the archive")?;
+    let status = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(workdir.path())
+        .status()
+        .context("spawn tar")?;
+    if !status.success() {
+        bail!("tar -xzf {} failed: {status}", archive.display());
+    }
+    let app = payload_archive::find_single_app(workdir.path())
+        .map_err(|e| anyhow::anyhow!("select the .app unpacked from {}: {e}", archive.display()))?;
+    let status = std::process::Command::new("codesign")
+        .args(["--verify", "--deep", "--strict", "--verbose=2"])
+        .arg(&app)
+        .status()
+        .context("spawn codesign")?;
+    if !status.success() {
+        bail!("codesign --verify failed for {}: {status}", app.display());
+    }
+    Ok(())
 }
 
 /// The single built `.app` under `target/<profile>/bundle/macos`, via the shared
