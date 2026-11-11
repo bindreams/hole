@@ -68,6 +68,16 @@ impl Fixture {
         fs::set_permissions(self.dir(), fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Whether the volume holding the plugin folder reads two names that differ only in case as one entry (macOS's
+    /// default). Needs the folder to exist; a stat error panics rather than reading as "case-sensitive".
+    fn volume_folds_case(&self) -> bool {
+        let probe = self.dir().join("case-probe");
+        fs::write(&probe, b"").unwrap();
+        let folds = self.dir().join("CASE-PROBE").try_exists().unwrap();
+        fs::remove_file(probe).unwrap();
+        folds
+    }
+
     fn put(&self, name: &str, bytes: &[u8], mode: u32) {
         fs::write(self.dir().join(name), bytes).unwrap();
         fs::set_permissions(self.dir().join(name), fs::Permissions::from_mode(mode)).unwrap();
@@ -582,11 +592,27 @@ fn a_socket_at_a_plugin_name_is_replaced_by_the_file_and_the_next_repair_converg
 
 #[skuld::test]
 fn a_name_the_volume_reads_as_a_carried_name_is_that_entry_and_never_a_stray() {
-    // A second name for the same file is what a case-insensitive volume makes of `Ex-Ray` and `Layout.json`.
+    // What a volume lists for a carried file under another case: on a case-insensitive one the same entry renamed
+    // (`Ex-Ray` opens as `ex-ray`), on a case-sensitive one the same file under a second name.
     let fx = Fixture::new();
     repair(&fx.layout, &plugins());
-    fs::hard_link(fx.dir().join("ex-ray"), fx.dir().join("Ex-Ray")).unwrap();
-    fs::hard_link(fx.dir().join("layout.json"), fx.dir().join("Layout.json")).unwrap();
+    let folds_case = fx.volume_folds_case();
+    for (carried_name, variant) in [("ex-ray", "Ex-Ray"), ("layout.json", "Layout.json")] {
+        let (from, to) = (fx.dir().join(carried_name), fx.dir().join(variant));
+        if folds_case {
+            fs::rename(from, to).unwrap();
+        } else {
+            fs::hard_link(from, to).unwrap();
+        }
+    }
+    // Without this the test would pass on a volume that kept the stored name, never reaching the case-variant branch.
+    let listing = fx.listing();
+    for variant in ["Ex-Ray", "Layout.json"] {
+        assert!(
+            listing.iter().any(|name| name == variant),
+            "the volume does not preserve case: {variant} is not listed in {listing:?}"
+        );
+    }
     let embedded = plugins();
     let carried: Vec<_> = embedded.iter().map(EmbeddedPlugin::carried).collect();
 
@@ -603,16 +629,20 @@ fn a_name_the_volume_reads_as_a_carried_name_is_that_entry_and_never_a_stray() {
 
 #[skuld::test]
 fn a_name_that_only_looks_like_a_carried_name_is_a_stray_when_it_is_another_file() {
-    // What a case-sensitive volume makes of `Ex-Ray`.
+    // On a case-sensitive volume `Ex-Ray` is another file; on a case-insensitive one it is `ex-ray` itself, so writing
+    // it only changes what `ex-ray` holds, and nothing is left over for repair to take for a stray.
     let fx = Fixture::new();
     repair(&fx.layout, &plugins());
     fx.put("Ex-Ray", b"not the plugin", 0o755);
-    fx.put("Layout.json", b"{}", 0o600);
+    if !fx.volume_folds_case() {
+        fx.put("Layout.json", b"{}", 0o600);
+    }
 
     let outcome = repair(&fx.layout, &plugins());
 
     assert!(matches!(outcome, RepairOutcome::Repaired { .. }), "{outcome:?}");
     assert_eq!(fx.listing(), ["ex-ray", "galoshes", "layout.json"]);
+    assert_eq!(fs::read(fx.dir().join("ex-ray")).unwrap(), EX_RAY_BYTES);
 }
 
 #[skuld::test]
