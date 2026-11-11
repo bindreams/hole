@@ -381,8 +381,10 @@ pub enum Command {
     ///
     /// `--lane` is the point in `ci.yaml` the files have just passed their
     /// tests; a group the lane ships nothing for stages nothing. For hole it
-    /// also builds and verifies the update archive. The installer is
-    /// `MSI_UNDER_TEST` / `DMG_UNDER_TEST` when set, else the release build.
+    /// also packs and verifies the update archive. The staged executables that
+    /// report a version (hole, garter) must report the tag's. The installer is
+    /// `MSI_UNDER_TEST` / `DMG_UNDER_TEST` when set (a relative path is from the
+    /// repo root), else the release build.
     StageRelease {
         /// Release tag, `releases/<group>/vX.Y.Z`.
         #[arg(long)]
@@ -393,6 +395,16 @@ pub enum Command {
         /// Directory to stage into.
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Print the files a release `--tag` ships, per platform, as a JSON array.
+    ///
+    /// The draft-release workflows check the downloaded assets against it and
+    /// build the notes' Downloads table from it; it comes from the same plan
+    /// `stage-release` stages by.
+    ReleaseAssets {
+        /// Release tag, `releases/<group>/vX.Y.Z`.
+        #[arg(long)]
+        tag: String,
     },
     /// Print this host's update-archive asset suffix (e.g. `windows-amd64.zip`).
     ///
@@ -543,6 +555,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             println!("xtask: update archive verified {}", archive.display());
             Ok(())
         }
+        Command::ReleaseAssets { tag } => stage_release::list(&tag),
         Command::StageRelease { tag, lane, out } => stage_release::stage(&repo_root()?, &tag, lane, &out),
         Command::AssetSuffix => {
             println!("{}", xtask_lib::asset::host_update_asset_suffix());

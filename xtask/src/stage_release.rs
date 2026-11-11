@@ -2,7 +2,8 @@
 //! release names it, so the draft workflow uploads the files the leg's tests ran on.
 //!
 //! A lane is the point in `ci.yaml` where one kind of shipped file has just passed its tests, and each
-//! (group, lane) pair says what to stage there.
+//! (group, lane) pair says what to stage there. [`plan`] is the one definition of what a release ships:
+//! `--list` derives the asset set the draft workflow checks and the notes' Downloads table from it.
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
@@ -10,14 +11,18 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::ValueEnum;
+use serde::Serialize;
 use xtask_lib::version::{parse_release_tag, Group};
 
-use crate::manifest::{Os, Platform};
+use crate::manifest::{Manifest, Os, Platform};
 use crate::Profile;
 
 /// Overrides for the installer to stage, the same variables the installer tests read.
 const MSI_ENV: &str = "MSI_UNDER_TEST";
 const DMG_ENV: &str = "DMG_UNDER_TEST";
+
+/// Where `msi-installer` stages the BINDIR the MSI is built from, relative to the repo root.
+const MSI_STAGE_DIR: [&str; 3] = ["target", "release", "installer-stage"];
 
 /// Where `ci.yaml` calls `stage-release`: right after the tests of the files it stages.
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -30,30 +35,79 @@ pub enum Lane {
     Plugins,
 }
 
-/// One file to copy into the release directory.
+impl Lane {
+    /// The `build.yaml` target whose platforms are the CI legs that run this lane.
+    fn target(self) -> &'static str {
+        match self {
+            Lane::Msi => "hole-msi",
+            Lane::Dmg => "hole-dmg",
+            Lane::Plugins => "plugin-e2e-tests",
+        }
+    }
+}
+
+/// A command a shipped executable must survive: exit 0 and, when `prints` is set, print exactly that on stdout.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Probe {
+    pub args: &'static [&'static str],
+    pub prints: Option<String>,
+}
+
+/// A shipped executable and the probes that run on it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Executable {
+    pub path: PathBuf,
+    pub probes: Vec<Probe>,
+}
+
+/// One file to copy into the release directory. `probes` run on the staged copy, when it is an executable.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Asset {
     pub src: PathBuf,
     pub name: String,
+    pub probes: Vec<Probe>,
+}
+
+/// Which files an update archive is packed from.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpdateArchiveSource {
+    /// The BINDIR the MSI was built from.
+    StagedBindir(PathBuf),
+    /// The `.app` the DMG was built from.
+    BuiltApp,
+}
+
+/// The Hole update archive that ships beside the installer.
+#[derive(Debug, PartialEq, Eq)]
+pub struct UpdateArchive {
+    pub name: String,
+    pub source: UpdateArchiveSource,
 }
 
 /// What a (group, lane) pair ships on one platform.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Shipment {
-    /// `build.yaml` target that produces the files, when no earlier lane of the leg built them.
-    pub build_target: Option<&'static str>,
     pub files: Vec<Asset>,
-    /// Whether the Hole update archive ships beside the installer.
-    pub update_archive: bool,
+    pub update_archive: Option<UpdateArchive>,
+    /// An executable inside the installer's payload that is probed, since the installer itself cannot be.
+    pub payload_binary: Option<Executable>,
 }
 
 impl Shipment {
     fn nothing() -> Self {
         Self {
-            build_target: None,
             files: Vec::new(),
-            update_archive: false,
+            update_archive: None,
+            payload_binary: None,
         }
+    }
+
+    /// Every file name the shipment adds to the release.
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.files
+            .iter()
+            .map(|a| a.name.as_str())
+            .chain(self.update_archive.iter().map(|a| a.name.as_str()))
     }
 }
 
@@ -70,6 +124,14 @@ fn exe_suffix(platform: Platform) -> &'static str {
     }
 }
 
+/// `<program> <version>`, what `--version` / `version` prints.
+fn version_probe(args: &'static [&'static str], program: &str, version: &str) -> Probe {
+    Probe {
+        args,
+        prints: Some(format!("{program} {version}")),
+    }
+}
+
 /// `installer` is the MSI or DMG the lane's tests ran on, resolved by the caller (see [`resolve_installer`]).
 pub fn plan(
     group: Group,
@@ -79,57 +141,90 @@ pub fn plan(
     repo_root: &Path,
     installer: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<Shipment> {
-    let binary = |src: PathBuf| Asset {
+    let binary = |src: PathBuf, probes: Vec<Probe>| Asset {
         src,
         name: asset_name(group, version, platform, exe_suffix(platform)),
+        probes,
     };
     let release = repo_root.join("target").join("release");
+    let update_archive = |source| UpdateArchive {
+        name: format!(
+            "{group}-{version}-{}",
+            xtask_lib::asset::update_asset_suffix(platform.os, &platform.arch.to_string())
+        ),
+        source,
+    };
     match (group, lane) {
         (Group::Hole, Lane::Msi) => {
             ensure!(
                 platform.os == Os::Windows,
                 "the msi lane runs on Windows, not {platform}"
             );
+            let stage_dir = MSI_STAGE_DIR
+                .iter()
+                .fold(repo_root.to_path_buf(), |dir, part| dir.join(part));
             Ok(Shipment {
-                build_target: None,
                 files: vec![Asset {
                     src: installer()?,
                     name: asset_name(group, version, platform, ".msi"),
+                    probes: Vec::new(),
                 }],
-                update_archive: true,
+                // The zip is packed from the directory the MSI was built from, not from whatever `target/release`
+                // holds by the time this lane runs.
+                update_archive: Some(update_archive(UpdateArchiveSource::StagedBindir(stage_dir.clone()))),
+                payload_binary: Some(Executable {
+                    path: stage_dir.join("hole.exe"),
+                    probes: vec![version_probe(&["version"], "hole", version)],
+                }),
             })
         }
+        // The DMG tests check the shipped version themselves (`test_shipped_version_is_exact`).
         (Group::Hole, Lane::Dmg) => {
             ensure!(platform.os == Os::Darwin, "the dmg lane runs on macOS, not {platform}");
             Ok(Shipment {
-                build_target: None,
                 files: vec![Asset {
                     src: installer()?,
                     name: asset_name(group, version, platform, ".dmg"),
+                    probes: Vec::new(),
                 }],
-                update_archive: true,
+                update_archive: Some(update_archive(UpdateArchiveSource::BuiltApp)),
+                payload_binary: None,
             })
         }
         (Group::Galoshes, Lane::Plugins) => Ok(Shipment {
-            build_target: None,
-            files: vec![binary(release.join(format!("galoshes{}", exe_suffix(platform))))],
-            update_archive: false,
+            files: vec![binary(
+                release.join(format!("galoshes{}", exe_suffix(platform))),
+                Vec::new(),
+            )],
+            update_archive: None,
+            payload_binary: None,
         }),
-        // No earlier lane builds the garter CLI: the archive lane tests the crates in the debug profile.
+        // `ci.yaml` builds the garter CLI in the release profile right before this lane, since no earlier lane does,
+        // and nothing else runs it: the probes are the only test of the staged file.
         (Group::Garter, Lane::Plugins) => Ok(Shipment {
-            build_target: Some("garter-bin"),
-            files: vec![binary(release.join(format!("garter{}", exe_suffix(platform))))],
-            update_archive: false,
+            files: vec![binary(
+                release.join(format!("garter{}", exe_suffix(platform))),
+                vec![
+                    version_probe(&["--version"], "garter", version),
+                    Probe {
+                        args: &["--help"],
+                        prints: None,
+                    },
+                ],
+            )],
+            update_archive: None,
+            payload_binary: None,
         }),
         (Group::ExRay, Lane::Plugins) => Ok(Shipment {
-            build_target: None,
             files: vec![binary(
                 repo_root
                     .join(".cache")
                     .join("ex-ray")
                     .join(crate::ex_ray::output_name()),
+                Vec::new(),
             )],
-            update_archive: false,
+            update_archive: None,
+            payload_binary: None,
         }),
         (Group::Hole, Lane::Plugins)
         | (Group::Galoshes | Group::Garter | Group::ExRay, Lane::Msi)
@@ -137,8 +232,60 @@ pub fn plan(
     }
 }
 
-/// The installer a lane stages: `env_var`'s path when set, else the single `.dmg` in the release bundle dir / the
-/// release MSI.
+/// What a release ships for one platform.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct PlatformAssets {
+    pub os: String,
+    pub arch: String,
+    /// The file the release notes link for the platform: its installer, or its binary.
+    pub asset: String,
+    /// Every file the platform adds to the release.
+    pub assets: Vec<String>,
+}
+
+/// Every platform a release of `group` ships on and the files it ships there: the union over all lanes of the
+/// platforms `build.yaml` runs the lane's target on.
+pub fn shipped(group: Group, version: &str, manifest: &Manifest) -> Result<Vec<PlatformAssets>> {
+    let mut out: Vec<PlatformAssets> = Vec::new();
+    for lane in <Lane as ValueEnum>::value_variants() {
+        let target = manifest
+            .get(lane.target())
+            .with_context(|| format!("build.yaml has no target {}", lane.target()))?;
+        for &platform in &target.platforms {
+            let shipment = plan(group, *lane, version, platform, Path::new(""), || Ok(PathBuf::new()))?;
+            let mut names = shipment.names().map(str::to_owned);
+            let Some(primary) = names.next() else { continue };
+            let (os, arch) = (platform.os.to_string(), platform.arch.to_string());
+            let at = match out.iter().position(|p| p.os == os && p.arch == arch) {
+                Some(at) => at,
+                None => {
+                    out.push(PlatformAssets {
+                        os,
+                        arch,
+                        asset: primary.clone(),
+                        assets: Vec::new(),
+                    });
+                    out.len() - 1
+                }
+            };
+            out[at].assets.push(primary);
+            out[at].assets.extend(names);
+        }
+    }
+    Ok(out)
+}
+
+/// Print what the release `tag` ships, as the JSON array of [`PlatformAssets`] the draft workflow consumes.
+pub fn list(tag: &str) -> Result<()> {
+    let (group, version) = parse_release_tag(tag)?;
+    let (manifest, _) = crate::load_manifest()?;
+    let platforms = shipped(group, &version.to_string(), &manifest)?;
+    println!("{}", serde_json::to_string(&platforms)?);
+    Ok(())
+}
+
+/// The installer a lane stages: `env_var`'s path when set (a relative one is from the repo root), else the single
+/// `.dmg` in the release bundle dir / the release MSI.
 fn resolve_installer(lane: Lane, repo_root: &Path) -> Result<PathBuf> {
     let release = repo_root.join("target").join("release");
     let (env_var, default) = match lane {
@@ -147,7 +294,7 @@ fn resolve_installer(lane: Lane, repo_root: &Path) -> Result<PathBuf> {
         Lane::Plugins => bail!("the plugins lane stages no installer"),
     };
     if let Some(path) = std::env::var_os(env_var).filter(|p| !p.is_empty()) {
-        return Ok(PathBuf::from(path));
+        return Ok(repo_root.join(path));
     }
     if lane != Lane::Dmg {
         return Ok(default);
@@ -169,6 +316,30 @@ fn resolve_installer(lane: Lane, repo_root: &Path) -> Result<PathBuf> {
     }
 }
 
+/// `exe` ran `probe`'s command and printed `stdout`: it must be what the probe says.
+fn check_probe_output(exe: &Path, probe: &Probe, stdout: &str) -> Result<()> {
+    if let Some(expected) = &probe.prints {
+        ensure!(
+            stdout.trim() == expected,
+            "`{} {}` printed {:?}, expected {expected:?}; a `.dirty` suffix means the build stamped a dirty tree",
+            exe.display(),
+            probe.args.join(" "),
+            stdout.trim()
+        );
+    }
+    Ok(())
+}
+
+/// Run each probe on `exe`: it must exit 0 and print what the probe says.
+fn run_probes(exe: &Path, probes: &[Probe]) -> Result<()> {
+    for probe in probes {
+        let output = crate::command::run_captured(std::process::Command::new(exe).args(probe.args))?;
+        check_probe_output(exe, probe, &String::from_utf8_lossy(&output.stdout))?;
+        println!("xtask: {} {} passed", exe.display(), probe.args.join(" "));
+    }
+    Ok(())
+}
+
 /// Stage what `lane` ships for the release `tag` into `out`.
 pub fn stage(repo_root: &Path, tag: &str, lane: Lane, out: &Path) -> Result<()> {
     let (group, version) = parse_release_tag(tag)?;
@@ -181,9 +352,6 @@ pub fn stage(repo_root: &Path, tag: &str, lane: Lane, out: &Path) -> Result<()> 
         println!("xtask: {group} ships nothing from the {lane:?} lane on {platform}");
         return Ok(());
     }
-    if let Some(target) = shipment.build_target {
-        crate::run_build(Some(target.to_string()), false)?;
-    }
 
     std::fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;
     for asset in &shipment.files {
@@ -192,15 +360,22 @@ pub fn stage(repo_root: &Path, tag: &str, lane: Lane, out: &Path) -> Result<()> 
         std::fs::copy(&asset.src, &dest)
             .with_context(|| format!("copy {} to {}", asset.src.display(), dest.display()))?;
         println!("xtask: staged {} as {}", asset.src.display(), asset.name);
+        run_probes(&dest, &asset.probes)?;
+    }
+    if let Some(exe) = &shipment.payload_binary {
+        run_probes(&exe.path, &exe.probes)?;
     }
 
-    if shipment.update_archive {
-        // Named from the one suffix source the updater also uses, so it cannot drift from what the updater downloads.
-        let archive = out.join(format!(
-            "{group}-{version}-{}",
-            xtask_lib::asset::host_update_asset_suffix()
-        ));
-        crate::update_archive::build_update_archive(Profile::Release, repo_root, &archive)?;
+    if let Some(update_archive) = &shipment.update_archive {
+        let archive = out.join(&update_archive.name);
+        match &update_archive.source {
+            UpdateArchiveSource::StagedBindir(dir) => {
+                crate::update_archive::build_update_archive_from_stage(dir, &archive)?
+            }
+            UpdateArchiveSource::BuiltApp => {
+                crate::update_archive::build_update_archive(Profile::Release, repo_root, &archive)?
+            }
+        }
         crate::update_archive::verify_update_archive(&archive)?;
         #[cfg(target_os = "macos")]
         crate::update_archive::verify_app_signature(&archive)?;

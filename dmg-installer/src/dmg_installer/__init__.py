@@ -31,10 +31,11 @@ def _find_repo_root() -> Path:
 
 
 def find_built_dmg(repo_root: Path) -> Path:
-    """The DMG under test: `DMG_UNDER_TEST` when set, else the single `.dmg` of the release build."""
+    """The DMG under test: `DMG_UNDER_TEST` when set (a relative path is from the repo root), else the single `.dmg`
+    of the release build."""
     override = os.environ.get(DMG_ENV)
     if override:
-        path = Path(override)
+        path = repo_root / override
         if not path.is_file():
             raise DmgTestError(f"{DMG_ENV} names {path}, which is not a file")
         return path

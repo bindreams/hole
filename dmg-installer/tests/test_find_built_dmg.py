@@ -22,6 +22,14 @@ def test_the_environment_variable_names_the_dmg(tmp_path: Path, monkeypatch: pyt
     assert dmg_installer.find_built_dmg(tmp_path) == elsewhere
 
 
+def test_a_relative_override_is_from_the_repo_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    named = make_dmg(tmp_path / "out", "named.dmg")
+    monkeypatch.chdir(tmp_path / "out")
+    monkeypatch.setenv(dmg_installer.DMG_ENV, "out/named.dmg")
+
+    assert dmg_installer.find_built_dmg(tmp_path) == named
+
+
 def test_without_the_variable_the_single_built_dmg_is_used(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(dmg_installer.DMG_ENV, raising=False)
     built = make_dmg(tmp_path / "target" / "release" / "bundle" / "dmg", "built.dmg")

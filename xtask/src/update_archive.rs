@@ -46,6 +46,34 @@ pub fn build_update_archive(profile: Profile, repo_root: &Path, out: &Path) -> R
     }
 }
 
+/// Build the Windows update zip from the BINDIR files staged in `dir` (`cargo xtask stage`'s output, the directory the
+/// MSI is built from), so the zip holds the files the MSI installs. Every other host bails.
+pub fn build_update_archive_from_stage(dir: &Path, out: &Path) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use anyhow::{ensure, Context};
+        use xtask_lib::bindir::{bindir_dest_names, Os};
+
+        let mut entries = Vec::new();
+        for name in bindir_dest_names(Os::Windows) {
+            let path = dir.join(&name);
+            ensure!(
+                path.is_file(),
+                "{} is not a file; was `{}` staged?",
+                path.display(),
+                name
+            );
+            entries.push((path, name));
+        }
+        payload_archive::pack_zip(&entries, out).context("pack windows update zip from the staged BINDIR")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (dir, out);
+        anyhow::bail!("a staged-BINDIR update zip is only built on windows")
+    }
+}
+
 /// Assert `archive` carries a usable payload: every BINDIR entry present and
 /// non-empty on Windows, a non-empty app binary on macOS. Runs against the real
 /// built artifact in the release workflow, where the fake-tree unit tests can't
@@ -106,32 +134,20 @@ pub fn verify_update_archive(archive: &Path) -> Result<()> {
 }
 
 /// Assert the `.app` inside a macOS update archive passes `codesign --verify`, as Gatekeeper will judge it after the
-/// updater unpacks it.
+/// updater unpacks it: the archive is extracted with `payload_archive::unpack_targz`, the code the updater extracts with.
 #[cfg(target_os = "macos")]
 pub fn verify_app_signature(archive: &Path) -> Result<()> {
-    use anyhow::{bail, Context};
+    use anyhow::Context;
 
     let workdir = tempfile::tempdir().context("create a scratch dir to unpack the archive")?;
-    let status = std::process::Command::new("tar")
-        .arg("-xzf")
-        .arg(archive)
-        .arg("-C")
-        .arg(workdir.path())
-        .status()
-        .context("spawn tar")?;
-    if !status.success() {
-        bail!("tar -xzf {} failed: {status}", archive.display());
-    }
+    payload_archive::unpack_targz(archive, workdir.path()).with_context(|| format!("unpack {}", archive.display()))?;
     let app = payload_archive::find_single_app(workdir.path())
         .map_err(|e| anyhow::anyhow!("select the .app unpacked from {}: {e}", archive.display()))?;
-    let status = std::process::Command::new("codesign")
-        .args(["--verify", "--deep", "--strict", "--verbose=2"])
-        .arg(&app)
-        .status()
-        .context("spawn codesign")?;
-    if !status.success() {
-        bail!("codesign --verify failed for {}: {status}", app.display());
-    }
+    crate::command::run_captured(
+        std::process::Command::new("codesign")
+            .args(["--verify", "--deep", "--strict", "--verbose=2"])
+            .arg(&app),
+    )?;
     Ok(())
 }
 
