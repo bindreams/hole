@@ -20,7 +20,6 @@ jobs:
     uses: ./.github/workflows/reusable-draft-release.yaml
     with:
       track: galoshes
-      crate: galoshes
       version: ${{ inputs.version }}
       version-regex: '^[0-9]+\.[0-9]+\.[0-9]+$'
       cargo-version-group: galoshes
@@ -33,7 +32,6 @@ jobs:
           { "os": "linux",   "arch": "amd64", "runner": "ubuntu-latest" },
           { "os": "linux",   "arch": "arm64", "runner": "ubuntu-24.04-arm" }
         ]
-      build-target: galoshes
       expected-sha256sums-count: 6
       release-title: galoshes v${{ inputs.version }}
       latest: false

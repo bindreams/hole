@@ -4,6 +4,9 @@
 # CI artifact staging (build-job output for test-job download)
 /ci-artifacts
 
+# Files a release call of ci.yaml stages for upload
+/release-assets
+
 # Git worktrees
 /.worktrees
 

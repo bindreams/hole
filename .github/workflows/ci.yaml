@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # A draft-release workflow runs the whole workflow on the release commit. With `release-tag` set,
+  # each leg stages what it ships (RELEASE ASSETS below) so the draft uploads files that passed these tests.
+  workflow_call:
+    inputs:
+      release-tag:
+        description: "Release tag (releases/<group>/vX.Y.Z), created locally before any build so the binaries carry the release version"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -89,6 +98,16 @@ jobs:
         timeout-minutes: 10
         with:
           fetch-depth: 0
+
+      # Before anything builds: the version stamp reads the nearest release tag.
+      - id: release-tag
+        name: Create the release tag locally (release calls only)
+        if: ${{ inputs.release-tag != '' }}
+        timeout-minutes: 5
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: git tag "$RELEASE_TAG"
 
       - id: setup-python
         uses: actions/setup-python@v7
@@ -333,6 +352,17 @@ jobs:
         shell: bash
         run: cargo xtask run plugin-e2e-tests
 
+      # Release calls: stage the binaries plugin-e2e just ran on (galoshes, ex-ray), and build and
+      # stage the garter CLI, which no lane builds in the release profile. See RELEASE ASSETS.
+      - id: release-stage-plugins
+        name: Stage the plugin binaries a release ships
+        if: ${{ inputs.release-tag != '' && steps.test-plugin-e2e.outcome == 'success' }}
+        timeout-minutes: 20
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: cargo xtask stage-release --tag "$RELEASE_TAG" --lane plugins --out release-assets
+
       # ex-ray Go tests (the `ex-ray-tests` build.yaml target): the ECH
       # fail-closed gate plus the patched vendored tls/quic/hysteria2 (incl. utls)
       # gate/refuse/round-trip tests. The gate logic is platform-independent
@@ -479,6 +509,16 @@ jobs:
           path: ${{ runner.temp }}/dmg-flake-diag/**
           if-no-files-found: ignore
           retention-days: 14
+
+      # Release calls: stage the DMG the signing tests just ran on, and the update archive of its app.
+      - id: release-stage-dmg
+        name: Stage the DMG a release ships
+        if: ${{ inputs.release-tag != '' && steps.dmg.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: cargo xtask stage-release --tag "$RELEASE_TAG" --lane dmg --out release-assets
 
       # Hole test lanes =================================================================================================
       # Compile test binaries via the orchestrator (resolves the full DAG:
@@ -664,6 +704,16 @@ jobs:
         timeout-minutes: 15
         shell: bash
         run: cargo xtask run hole-msi-cleanup
+
+      # Release calls: stage the MSI the lifecycle just installed, and its update archive. Before the TUN lane.
+      - id: release-stage-msi
+        name: Stage the MSI a release ships
+        if: ${{ inputs.release-tag != '' && steps.installer-tests.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: cargo xtask stage-release --tag "$RELEASE_TAG" --lane msi --out release-assets
 
       # Evidence outlives the runner. The bounded wait in
       # invoke-msiexec-bounded.ps1 is what lets a wedged msiexec fail its step
@@ -860,6 +910,21 @@ jobs:
           # Retry covers only the fetch; the validation runs offline, once, so a retry can't mask a config error.
           .github/scripts/retry.sh npx --yes --package "renovate@${RENOVATE_VERSION}" -- node --version
           npx --offline --package "renovate@${RENOVATE_VERSION}" renovate-config-validator --strict --no-global .github/renovate.json
+
+      # Release assets ==================================================================================================
+      # A release call stages what its tag's group ships in `release-assets/`, at the lane that just tested
+      # each file (`cargo xtask stage-release`, steps `release-stage-*`; a group a lane ships nothing for
+      # stages nothing). The draft workflow requires this whole workflow to pass, then uploads these
+      # artifacts, so what it publishes is what passed here. Only a passing leg uploads.
+      - id: release-upload
+        name: Upload the staged release assets
+        if: ${{ success() && inputs.release-tag != '' }}
+        timeout-minutes: 15
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.os }}-${{ matrix.arch }}
+          path: release-assets/*
+          if-no-files-found: ignore
 
       # Logs ============================================================================================================
       # Upload bridge.log produced by `DistHarness` subprocesses. Matches files
