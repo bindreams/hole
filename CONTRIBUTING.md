@@ -3978,6 +3978,14 @@ Re-run the staging command after each source change (the staged binary doesn't
 auto-update). Co-named lib/bin targets disambiguate to `hole-lib.test.exe` /
 `hole-bin.test.exe` (#210).
 
+### Per-worktree galoshes runtime directory (Windows)
+
+On Windows, test binaries' `register!()` init sets `XDG_RUNTIME_DIR=target/galoshes-runtime` when it is unset or
+empty, so each worktree's galoshes extracts its ex-ray (a different build per worktree) into its own directory instead
+of failing with "Access is denied". Directly spawned processes inherit it; service-manager and task-scheduler children
+do not. An exported value wins. If `target/` is unwritable, one stderr line names the path and the run continues
+unisolated. A binary without `register!()` must call `hole_test_observability::install()` first in `main`.
+
 ### Investigating Windows CI flakes
 
 When Windows CI times out in `server_test_tests` or loopback connects hang, work
