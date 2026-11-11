@@ -34,6 +34,25 @@ def canonical_windows_bindir() -> set[str]:
     return set(json.loads(out.stdout))
 
 
+# System-wide tests ====================================================================================================
+
+# These change the machine (install Hole, open windows), so a run selects them by name: `-m system_wide` or
+# `-m cleanup`. An unrelated `-m` expression (`-m "not wix"`) must not pull them in, which `addopts = -m ...` would
+# allow, since a command-line `-m` replaces it.
+SYSTEM_WIDE_MARKERS = ("system_wide", "cleanup")
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    expression = config.getoption("markexpr") or ""
+    asked_for = {m for m in SYSTEM_WIDE_MARKERS if m in expression}
+    kept, dropped = [], []
+    for item in items:
+        system_wide = {m for m in SYSTEM_WIDE_MARKERS if item.get_closest_marker(m)}
+        (kept if system_wide <= asked_for else dropped).append(item)
+    items[:] = kept
+    config.hook.pytest_deselected(items=dropped)
+
+
 # XML fixtures =========================================================================================================
 
 
