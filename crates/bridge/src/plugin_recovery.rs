@@ -6,7 +6,7 @@
 // recorded process.
 //
 // One function, three callers: bridge startup (`boot::recover_then_reconcile`),
-// plugin-chain stop (`PluginChain::kill_tracked`), and the test harness's
+// session teardown (`Session::teardown`), and the test harness's
 // teardown.
 //
 // The invariant this exists to hold: a record may be removed only by the
@@ -28,6 +28,32 @@ use util::versioned_file::Loaded;
 /// that were accounted for.
 pub fn reap_recorded_plugins(state_dir: &Path) {
     reap_loaded(plugin_state::load(state_dir), state_dir);
+}
+
+/// [`reap_recorded_plugins`] on a blocking thread, so an async caller does not hold a runtime worker. A panic in the
+/// reap is logged, not propagated; a blocking task the runtime cancelled never ran, so the reap runs here instead.
+pub async fn reap_recorded_plugins_blocking(state_dir: &Path) {
+    let owned = state_dir.to_path_buf();
+    let joined = tokio::task::spawn_blocking(move || reap_recorded_plugins(&owned)).await;
+    settle_blocking_reap(joined, state_dir);
+}
+
+/// What follows the join of the blocking reap: a panic is logged as one, and a cancelled task, which never ran, is
+/// replaced by an inline reap, because the reap must happen.
+fn settle_blocking_reap(joined: Result<(), tokio::task::JoinError>, state_dir: &Path) {
+    let Err(e) = joined else { return };
+    if e.is_panic() {
+        tracing::warn!(
+            error = &e as &dyn std::error::Error,
+            "reap_recorded_plugins task panicked"
+        );
+        return;
+    }
+    tracing::warn!(
+        error = &e as &dyn std::error::Error,
+        "reap_recorded_plugins task was cancelled before it ran; reaping inline"
+    );
+    reap_recorded_plugins(state_dir);
 }
 
 /// The reap's dispositions, over an already-loaded state. Taking `Loaded` by

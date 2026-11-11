@@ -39,19 +39,8 @@ pub(crate) async fn recover_then_reconcile_with<P, R, D, F>(
     // Before the reconcile: the reap kills every plugin the state file records
     // and cannot tell a previous bridge's from the one the reconcile's
     // auto-connect is about to record.
-    reap_leftover_plugins(&state_dir).await;
+    crate::plugin_recovery::reap_recorded_plugins_blocking(&state_dir).await;
     crate::reconciler::reconcile_once(proxy, cancel).await;
-}
-
-async fn reap_leftover_plugins(state_dir: &Path) {
-    let state_dir = state_dir.to_path_buf();
-    if let Err(e) = tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir)).await
-    {
-        tracing::warn!(
-            error = &e as &dyn std::error::Error,
-            "reap_recorded_plugins task panicked"
-        );
-    }
 }
 
 #[cfg(test)]

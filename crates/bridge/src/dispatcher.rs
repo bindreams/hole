@@ -395,7 +395,7 @@ impl Drop for Dispatcher {
 
 #[cfg(test)]
 #[path = "dispatcher_tests.rs"]
-mod dispatcher_tests;
+pub(crate) mod dispatcher_tests;
 
 #[cfg(test)]
 #[path = "dispatcher_privileged_tests.rs"]
