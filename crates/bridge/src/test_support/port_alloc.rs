@@ -180,10 +180,10 @@ pub(crate) async fn wait_for_port(addr: SocketAddr, timeout: Duration) {
 ///
 /// Synchronous `std::process::Command::output()` is acceptable here — we
 /// are about to panic and the test has already failed. A stuck PowerShell
-/// is self-limiting: nextest hard-kills the process at its 30 s
-/// `terminate-after`. Also dumps `netstat -ano -p tcp` as a secondary
-/// source — different code path (kernel NETSTAT IOCTL vs NetTCPIP WMI),
-/// rules out PowerShell-module corruption.
+/// parks the failing test (no bound of its own; CI's job timeout ends it).
+/// Also dumps `netstat -ano -p tcp` as a secondary source — different code
+/// path (kernel NETSTAT IOCTL vs NetTCPIP WMI), rules out PowerShell-module
+/// corruption.
 #[cfg(windows)]
 #[allow(clippy::disallowed_methods)] // test diagnostics spawn host tools by name (attended)
 fn capture_windows_tcp_state(port: u16) {

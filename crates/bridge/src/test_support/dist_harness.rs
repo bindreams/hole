@@ -472,7 +472,7 @@ fn new_tempdir() -> std::io::Result<TempDir> {
 /// The full log is dumped (not a tail) so a multi-second hang window is
 /// fully captured. Nextest captures stderr per test and only prints it
 /// on failure, so the dump is bounded in practice to a single failed
-/// test's bridge lifetime (~30 s under nextest's `terminate-after` cap).
+/// test's bridge lifetime.
 pub(crate) struct BridgeChildLogSource {
     pub(crate) pid: u32,
     pub(crate) socket: PathBuf,
