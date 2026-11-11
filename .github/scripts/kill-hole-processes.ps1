@@ -1,5 +1,6 @@
 # Kills every running hole.exe except the HoleBridge service process, and waits
-# for the kernel to reap them.
+# for the kernel to reap them. With -InstallDir, only hole.exe processes running
+# from under that directory: a developer's own build elsewhere is left alone.
 #
 # Shared by the two ci.yaml steps that need a clean slate -- before tauri-driver
 # launches, and after the E2E run so the Uninstall step's msiexec finds no held
@@ -20,6 +21,8 @@
 # restarted bridge and blocks forever on a live process. Waiting on the objects
 # captured before the kill cannot.
 param(
+    [string]$InstallDir,
+
     # A kill that has not been reaped by now is not going to be. The bound is
     # the failure report, surfaced below, not a delay anything depends on.
     [ValidateRange(1, 600)]
@@ -29,6 +32,10 @@ param(
 # 0 when the service is not running (or not registered), which no process has.
 $servicePid = [int](Get-CimInstance Win32_Service -Filter "Name = 'HoleBridge'" -ErrorAction Stop).ProcessId
 $holeProcs = @(Get-Process hole -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $servicePid })
+if ($InstallDir) {
+    $prefix = $InstallDir.TrimEnd('') + ''
+    $holeProcs = @($holeProcs | Where-Object { $_.Path -and $_.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) })
+}
 if (-not $holeProcs) { return }
 
 # `-ErrorAction SilentlyContinue` because a process that exited on its own
