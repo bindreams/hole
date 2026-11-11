@@ -70,8 +70,7 @@ pub(in crate::dir) fn error_of(status: NTSTATUS) -> io::Error {
 /// The Win32 code of both is `ERROR_ACCESS_DENIED`, which a real denial
 /// shares, so only the status tells them apart. The code is not carried into the `NotFound`, or a reader of codes
 /// ([`crate::retry::is_file_contention`]) would take a gone file for a transient denial. An error with no status, or
-/// with another one, is returned as it is. Only the read is classified: to every other open the name is still taken,
-/// and the OS's error says so.
+/// with another one, is returned as it is.
 pub(in crate::dir) fn open_error(err: io::Error) -> io::Error {
     let gone = err
         .get_ref()
