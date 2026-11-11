@@ -2,12 +2,12 @@
 # for the kernel to reap them. With -InstallDir, only hole.exe processes running
 # from under that directory: a developer's own build elsewhere is left alone.
 #
-# Shared by the two ci.yaml steps that need a clean slate -- before tauri-driver
-# launches, and after the E2E run so the Uninstall step's msiexec finds no held
+# Shared by the installer harness's two kill points (msi-installer/tests/installed/support.py):
+# before tauri-driver launches, and before the uninstall so its msiexec finds no held
 # handles -- because they carry the same exposure, and a fix applied to one and
 # not the other is how this went wrong in the first place.
 #
-# The service process is spared. What both steps need is the GUI gone (a free
+# The service process is spared. What both kill points need is the GUI gone (a free
 # single-instance slot for tauri-driver, no held handles for msiexec); neither
 # needs the bridge dead. Killing it starts the SCM's 1s restart-on-failure
 # clock, and msiexec's uninstall then reaches the bridge about when the restart
@@ -33,7 +33,7 @@ param(
 $servicePid = [int](Get-CimInstance Win32_Service -Filter "Name = 'HoleBridge'" -ErrorAction Stop).ProcessId
 $holeProcs = @(Get-Process hole -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $servicePid })
 if ($InstallDir) {
-    $prefix = $InstallDir.TrimEnd('') + ''
+    $prefix = $InstallDir.TrimEnd('\') + '\'
     $holeProcs = @($holeProcs | Where-Object { $_.Path -and $_.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) })
 }
 if (-not $holeProcs) { return }

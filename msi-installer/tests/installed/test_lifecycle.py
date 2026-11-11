@@ -8,7 +8,17 @@ so they run after a failed test too.
 from pathlib import Path
 
 import pytest
-from support import BIN_DIR, E2E_MEDIUM, RUN_AT_MEDIUM, VERIFY_GSUDO, installed_hole, machine_path_has_bin_dir, run_ps
+from support import (
+    BIN_DIR,
+    DASHBOARD_E2E_TIMEOUT_SECONDS,
+    E2E_MEDIUM,
+    GSUDO_SELFTEST_TIMEOUT_SECONDS,
+    RUN_AT_MEDIUM,
+    VERIFY_GSUDO,
+    installed_hole,
+    machine_path_has_bin_dir,
+    run_ps,
+)
 from support import e2e_environment, msi_path, service_registered  # noqa: F401 (fixtures)
 
 from conftest import canonical_windows_bindir
@@ -36,7 +46,13 @@ def test_gsudo_deelevation_contract(installed_hole: Path, e2e_environment: dict[
     survives the launcher. Fails here, loudly, rather than as an opaque session timeout in the E2E.
     """
     env = {**e2e_environment, "HOLE_SELFTEST_CANARY": "canary-ok"}
-    code = run_ps(RUN_AT_MEDIUM, {"Script": str(VERIFY_GSUDO)}, env=env)
+    code = run_ps(
+        RUN_AT_MEDIUM,
+        {"Script": str(VERIFY_GSUDO)},
+        env=env,
+        timeout_seconds=GSUDO_SELFTEST_TIMEOUT_SECONDS,
+        phase="the gsudo de-elevation self-test",
+    )
     assert code == 7, f"gsudo de-elevation contract failed (exit {code}); see the child output above"
 
 
@@ -47,5 +63,11 @@ def test_dashboard_e2e_at_medium_integrity(installed_hole: Path, e2e_environment
     binary, rather than letting wdio fall back to the uninstalled workspace build.
     """
     env = {**e2e_environment, "HOLE_TEST_APP_PATH": str(BIN_DIR / "hole.exe")}
-    code = run_ps(RUN_AT_MEDIUM, {"Script": str(E2E_MEDIUM)}, env=env)
+    code = run_ps(
+        RUN_AT_MEDIUM,
+        {"Script": str(E2E_MEDIUM)},
+        env=env,
+        timeout_seconds=DASHBOARD_E2E_TIMEOUT_SECONDS,
+        phase="the dashboard E2E",
+    )
     assert code == 0, f"the dashboard E2E failed (exit {code})"

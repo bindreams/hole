@@ -1006,9 +1006,8 @@ fn the_tun_lane_does_not_run_beside_an_installation_that_may_remain() {
     }
 }
 
-/// The cleanup runs after a lifecycle failure and after the MSI build failed
-/// (where it finds nothing), but never when the MSI was not built at all: it
-/// needs the MSI to uninstall.
+/// The cleanup runs after a lifecycle failure, but not when the MSI build
+/// failed: with no MSI there is nothing installed and nothing to uninstall with.
 #[skuld::test]
 fn the_cleanup_runs_after_a_lifecycle_failure_but_not_without_an_msi() {
     assert!(ran_after_failure("windows/amd64", "installer-tests").contains("installer-cleanup"));

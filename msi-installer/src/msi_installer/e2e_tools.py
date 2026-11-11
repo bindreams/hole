@@ -9,25 +9,30 @@ Usage: uv run --directory msi-installer provision-e2e-tools
 
 import os
 import shutil
-import subprocess
 import sys
+import tarfile
+import tempfile
 import tomllib
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 
+import httpx
 from rich.console import Console
-from tenacity import Retrying, retry_if_result
 
-from msi_installer import _DOWNLOAD_WAIT, _PKG_DIR, BuildError, _download_and_hash, _find_repo_root, _nap
+from msi_installer import _PKG_DIR, BuildError, _download_and_hash, _find_repo_root
 
 E2E_TOOLS_PATH = _PKG_DIR / "e2e-tools.toml"
 
 # The WebView2 Evergreen runtime's client id in the EdgeUpdate registry.
 _WEBVIEW2_CLIENT_KEY = r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 
-# A program that cannot be run is the one failure no retry fixes.
-_CANNOT_RUN = (126, 127)
+# The prebuilt tauri-driver that `cargo binstall` resolves for the host: cargo-quickinstall's release asset.
+_TAURI_DRIVER_URL = (
+    "https://github.com/cargo-bins/cargo-quickinstall/releases/download/"
+    "tauri-driver-{version}/tauri-driver-{version}-x86_64-pc-windows-msvc.tar.gz"
+)
 
 
 def cache_dir(root: Path) -> Path:
@@ -55,47 +60,53 @@ def e2e_env(base: Mapping[str, str], tool_dirs: list[Path]) -> dict[str, str]:
     return env
 
 
+# staging --------------------------------------------------------------------------------------------------------------
+
+
+@contextmanager
+def _staged(final: Path) -> Iterator[Path]:
+    """A scratch directory beside `final`, renamed to it only when the block completes.
+
+    A run killed mid-extract leaves no `final` for a later run to take as a finished install.
+    """
+    final.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{final.name}-", dir=final.parent))
+    try:
+        yield stage
+        if final.exists():
+            shutil.rmtree(final)
+        os.replace(stage, final)
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def _require_file(path: Path, what: str) -> None:
+    if not path.is_file():
+        raise BuildError(f"{path.name} not found after extracting {what}")
+
+
 # tauri-driver ---------------------------------------------------------------------------------------------------------
 
 
 def _ensure_tauri_driver(cache: Path, version: str, console: Console) -> Path:
-    """A prebuilt binary at a pinned version, so the retried part is a download, not a compile.
+    """The prebuilt tauri-driver at a pinned version, downloaded like every other tool here.
 
-    Without cargo-binstall (a developer machine) it compiles from source with `cargo install`: slower, nothing else
-    differs. `GITHUB_TOKEN` is read from the environment: the unauthenticated GitHub API limit is 60 requests/hour.
+    A download that cannot succeed (no prebuilt for `version`) fails once, naming the URL; only a transient network
+    failure is retried (see `_download_and_hash`).
     """
-    root = cache / f"tauri-driver-v{version}"
-    bin_dir = root / "bin"
-    if (bin_dir / "tauri-driver.exe").is_file():
-        return bin_dir
-    if shutil.which("cargo-binstall"):
-        command = [
-            "cargo", "binstall", "--no-confirm", "--disable-strategies", "compile",
-            "--version", version, "--install-path", str(bin_dir), "tauri-driver",
-        ]  # fmt: skip
-    else:
-        command = ["cargo", "install", "--locked", "--version", version, "--root", str(root), "tauri-driver"]
-    console.print(f"[bold]Installing tauri-driver {version}[/] into {bin_dir}")
-    _run_until_success(command, console)
-    if not (bin_dir / "tauri-driver.exe").is_file():
-        raise BuildError(f"tauri-driver.exe not found in {bin_dir} after `{' '.join(command)}`")
-    return bin_dir
-
-
-def _run_until_success(command: list[str], console: Console) -> None:
-    """Run `command` until it exits 0, like `.github/scripts/retry.sh`: no attempt cap; a missing program ends it."""
-
-    def report(state) -> None:
-        console.print(f"[yellow]`{' '.join(command)}` exited {state.outcome.result()}; retrying[/]")
-
-    code = Retrying(
-        retry=retry_if_result(lambda code: code != 0 and code not in _CANNOT_RUN),
-        wait=_DOWNLOAD_WAIT,
-        sleep=lambda seconds: _nap(seconds),
-        before_sleep=report,
-    )(lambda: subprocess.run(command).returncode)
-    if code != 0:
-        raise BuildError(f"`{' '.join(command)}` exited {code}")
+    out = cache / f"tauri-driver-v{version}"
+    if (out / "tauri-driver.exe").is_file():
+        return out
+    console.print(f"[bold]Installing tauri-driver {version}[/] into {out}")
+    with _staged(out) as stage:
+        archive = stage / "tauri-driver.tar.gz"
+        _download_and_hash(_TAURI_DRIVER_URL.format(version=version), archive, console)
+        with tarfile.open(archive) as t:
+            t.extractall(stage, filter="data")
+        archive.unlink()
+        _require_file(stage / "tauri-driver.exe", f"the tauri-driver {version} archive")
+    return out
 
 
 # msedgedriver ---------------------------------------------------------------------------------------------------------
@@ -113,14 +124,13 @@ def _ensure_msedgedriver(cache: Path, console: Console) -> Path:
     if (out / "msedgedriver.exe").is_file():
         return out
     console.print(f"[bold]Installing msedgedriver {version}[/] (matches the WebView2 runtime)")
-    out.mkdir(parents=True, exist_ok=True)
-    archive = out / "edgedriver_win64.zip"
-    _download_and_hash(f"https://msedgedriver.microsoft.com/{version}/edgedriver_win64.zip", archive, console)
-    with zipfile.ZipFile(archive) as z:
-        z.extractall(out)
-    archive.unlink()
-    if not (out / "msedgedriver.exe").is_file():
-        raise BuildError(f"msedgedriver.exe not found in {out} after extracting the {version} driver")
+    with _staged(out) as stage:
+        archive = stage / "edgedriver_win64.zip"
+        _download_and_hash(f"https://msedgedriver.microsoft.com/{version}/edgedriver_win64.zip", archive, console)
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(stage)
+        archive.unlink()
+        _require_file(stage / "msedgedriver.exe", f"the msedgedriver {version} archive")
     return out
 
 
@@ -150,14 +160,13 @@ def _ensure_gsudo(cache: Path, pin: Mapping[str, str], console: Console) -> Path
     if exe.is_file():
         return exe.parent
     console.print(f"[bold]Installing gsudo {version}[/]")
-    out.mkdir(parents=True, exist_ok=True)
-    archive = out / "gsudo.portable.zip"
-    _download_and_hash(pin["url"].format(version=version), archive, console)
-    with zipfile.ZipFile(archive) as z:
-        z.extractall(out)
-    archive.unlink()
-    if not exe.is_file():
-        raise BuildError(f"gsudo.exe not found at {exe} after extract")
+    with _staged(out) as stage:
+        archive = stage / "gsudo.portable.zip"
+        _download_and_hash(pin["url"].format(version=version), archive, console)
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(stage)
+        archive.unlink()
+        _require_file(stage / "x64" / "gsudo.exe", f"the gsudo {version} archive")
     return exe.parent
 
 
@@ -167,6 +176,9 @@ def main() -> None:
         dirs = provision_e2e_tools(_find_repo_root(), console)
     except BuildError as e:
         console.print(f"[bold red]Error:[/] {e}")
+        sys.exit(1)
+    except httpx.HTTPStatusError as e:
+        console.print(f"[bold red]Error:[/] {e.request.url} answered {e.response.status_code}")
         sys.exit(1)
     for d in dirs:
         console.print(f"  {d}")

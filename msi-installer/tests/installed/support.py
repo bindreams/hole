@@ -27,6 +27,11 @@ E2E_MEDIUM = SCRIPTS / "e2e-medium.ps1"
 VERIFY_GSUDO = SCRIPTS / "verify-gsudo-deelevation.ps1"
 DUMP_UNINSTALL = SCRIPTS / "dump-uninstall-diagnostics.ps1"
 
+# Failure bounds on the child processes the E2E phases start: a wedged phase fails here, naming itself, so the fixture's
+# uninstall still runs inside the CI step's own (much larger) timeout.
+GSUDO_SELFTEST_TIMEOUT_SECONDS = 5 * 60
+DASHBOARD_E2E_TIMEOUT_SECONDS = 5 * 60
+
 SERVICE = "HoleBridge"
 INSTALL_DIR = Path(os.environ.get("ProgramW6432", r"C:\Program Files")) / "hole"
 BIN_DIR = INSTALL_DIR / "bin"
@@ -80,22 +85,40 @@ def _ps_quote(value: str) -> str:
 
 
 def run_ps(
-    script: Path, params: Mapping[str, str | None] | None = None, *, env: Mapping[str, str] | None = None
+    script: Path,
+    params: Mapping[str, str | None] | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    timeout_seconds: float | None = None,
+    phase: str | None = None,
 ) -> int:
     """Run `script` as a CI `shell: pwsh` step would (`$ErrorActionPreference = 'Stop'`); return its exit code.
 
     The child's output streams to this process's. A `None` value emits a bare `-Name` (a switch). The working
-    directory is the repo root, where the CI steps run.
+    directory is the repo root, where the CI steps run. With `timeout_seconds`, a child still running then has its
+    whole process tree killed and `TimeoutError` names `phase` (default: the script).
     """
     parts = ["$ErrorActionPreference = 'Stop';", f"& {_ps_quote(str(script))}"]
     for name, value in (params or {}).items():
         parts.append(f"-{name}" if value is None else f"-{name} {_ps_quote(value)}")
     parts.append("; exit $LASTEXITCODE")
-    return subprocess.run(
+    child = subprocess.Popen(
         ["pwsh", "-NoProfile", "-Command", " ".join(parts)],
         cwd=REPO_ROOT,
         env=dict(env) if env is not None else None,
-    ).returncode
+    )
+    try:
+        return child.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        # The phase's children (gsudo, node, tauri-driver, the GUI) outlive pwsh alone.
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(child.pid)], capture_output=True)
+        child.wait()
+        raise TimeoutError(
+            f"{phase or script.name} did not finish within {timeout_seconds:.0f}s; its process tree was killed"
+        ) from None
+    except BaseException:
+        child.kill()
+        raise
 
 
 def kill_installed_hole_processes() -> None:
@@ -132,14 +155,6 @@ def machine_path_has_bin_dir() -> bool:
     return str(BIN_DIR).casefold() in machine_path().casefold()
 
 
-def running_hole_processes() -> list[str]:
-    """`hole.exe` processes anywhere on the machine, as `tasklist` lines."""
-    out = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq hole.exe", "/NH", "/FO", "CSV"], capture_output=True, text=True, check=True
-    ).stdout
-    return [line for line in out.splitlines() if line.lower().startswith('"hole.exe"')]
-
-
 def assert_nothing_installed() -> None:
     problems = []
     if BIN_DIR.exists():
@@ -153,9 +168,15 @@ def assert_nothing_installed() -> None:
 
 # Install and uninstall ================================================================================================
 
+INSTALL_LOG_NAME = "msi-install.log"
+
 # Written once a run is about to install, removed once the machine is verified empty. The cleanup uninstalls only
 # when it is there, so a Hole the harness did not install is never removed.
 INSTALLED_MARKER = ".hole-installed-by-the-msi-test-harness"
+
+
+def install_log_path() -> Path:
+    return log_dir() / INSTALL_LOG_NAME
 
 
 def marker_path() -> Path:
@@ -170,34 +191,44 @@ def require_windows_elevated() -> None:
 
 
 def refuse_a_machine_with_hole() -> None:
-    """Fail before changing anything when Hole is, or may be, in use: it is not ours to install over or kill."""
+    """Fail before changing anything when Hole is installed: it is not ours to install over or uninstall.
+
+    A hole.exe running from the install dir implies the dir; one running from elsewhere (a development build) is not
+    the installed product and does not refuse.
+    """
     found = []
     if service_registered():
         found.append(f"the {SERVICE} service is registered")
     if INSTALL_DIR.exists():
         found.append(f"{INSTALL_DIR} exists")
-    if running_hole_processes():
-        found.append("a hole.exe process is running")
     assert not found, (
         f"Hole is already on this machine ({'; '.join(found)}). The suite will not install over it or uninstall it: "
         "quit and uninstall Hole yourself first"
     )
 
 
-def ensure_uninstalled(msi: Path, uninstall_log: Path) -> None:
-    """Kill the installed GUI, uninstall with `msi`, and verify nothing is left. Fine when nothing is installed."""
-    kill_installed_hole_processes()
-    # A failing uninstall is reported by msiexec's own output and by the verification below, which reads the machine.
-    run_ps(INVOKE_MSIEXEC, {"Verb": "/x", "MsiPath": str(msi), "LogPath": str(uninstall_log)})
-    assert_nothing_installed()
-
-
-def dump_failure_diagnostics(install_log: Path) -> None:
+def dump_failure_diagnostics() -> None:
     """What the uninstall's own processes and the SCM recorded, plus the install log's tail."""
+    install_log = install_log_path()
     run_ps(DUMP_UNINSTALL, {"MsiInstallLog": str(install_log)})
     if install_log.is_file():
         print(f"--- {install_log} (tail) ---")
         print("\n".join(install_log.read_text(errors="replace").splitlines()[-200:]))
+
+
+def ensure_uninstalled(msi: Path, uninstall_log: Path) -> None:
+    """Kill the installed GUI, uninstall with `msi`, and verify nothing is left. Fine when nothing is installed.
+
+    A failure dumps the diagnostics (`dump_failure_diagnostics`) before it propagates.
+    """
+    try:
+        kill_installed_hole_processes()
+        # A failing uninstall is reported by msiexec's own output and by the verification below, which reads the machine.
+        run_ps(INVOKE_MSIEXEC, {"Verb": "/x", "MsiPath": str(msi), "LogPath": str(uninstall_log)})
+        assert_nothing_installed()
+    except BaseException:
+        dump_failure_diagnostics()
+        raise
 
 
 @pytest.fixture(scope="module")
@@ -206,25 +237,27 @@ def installed_hole(msi_path: Path, request: pytest.FixtureRequest) -> Iterator[P
     require_windows_elevated()
     refuse_a_machine_with_hole()
 
-    logs = log_dir()
-    install_log = logs / "msi-install.log"
     failed_before = request.session.testsfailed
+    install_completed = False
     marker_path().touch()
     try:
         code = run_ps(
             INVOKE_MSIEXEC,
-            {"Verb": "/i", "MsiPath": str(msi_path), "LogPath": str(install_log), "FailOnNonZeroExit": None},
+            {
+                "Verb": "/i",
+                "MsiPath": str(msi_path),
+                "LogPath": str(install_log_path()),
+                "FailOnNonZeroExit": None,
+            },
         )
         assert code == 0, f"installing {msi_path} failed (exit {code})"
         # The MSI's `LaunchApp` starts the GUI; tauri-driver's own launch would route into it via single-instance.
         kill_installed_hole_processes()
+        install_completed = True
         yield INSTALL_DIR
     finally:
-        try:
-            ensure_uninstalled(msi_path, logs / "msi-uninstall.log")
-        except BaseException:
-            dump_failure_diagnostics(install_log)
-            raise
+        ensure_uninstalled(msi_path, log_dir() / "msi-uninstall.log")
         marker_path().unlink(missing_ok=True)
-        if request.session.testsfailed > failed_before:
-            dump_failure_diagnostics(install_log)
+        # A test's failure never reaches this generator; the session's count is the only trace of it.
+        if not install_completed or request.session.testsfailed > failed_before:
+            dump_failure_diagnostics()

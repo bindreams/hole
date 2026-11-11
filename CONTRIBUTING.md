@@ -3723,8 +3723,10 @@ cargo xtask run hole-msi-cleanup            # after an interrupted run
 It installs Hole system-wide (`C:\Program Files\hole`, the `HoleBridge` service as SYSTEM, the Machine `PATH`
 entry, shortcuts), opens a visible dashboard window for the E2E, then uninstalls and verifies. Tools download into the
 repo's `.cache/installer-e2e/`; nothing is added to `PATH` outside the test's child processes. It refuses an
-unelevated shell, a missing MSI, and a machine that already has Hole (the service, the install dir, or a running
-`hole.exe`), and never uninstalls a Hole it did not install. `MSI_TEST_LOG_DIR` (default `target\msi-test-logs\`) holds
+unelevated shell, a missing MSI, and a machine that already has Hole (the service or the install dir; a `hole.exe`
+running from elsewhere, such as a development build, is left alone), and never uninstalls a Hole it did not install.
+The gsudo self-test and the dashboard E2E are bounded at five minutes each: a wedged phase fails by name and the
+teardown still uninstalls. `MSI_TEST_LOG_DIR` (default `target\msi-test-logs\`) holds
 the install and uninstall logs. Nothing asserts what remains under `C:\ProgramData\hole` after the uninstall.
 
 CI's `installer-tests` step is this target and `installer-cleanup` (`if: always()`) is the cleanup one; the TUN lane runs

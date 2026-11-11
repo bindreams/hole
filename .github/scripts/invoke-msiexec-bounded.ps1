@@ -1,19 +1,19 @@
 # Runs msiexec (install or uninstall) with a bounded wait instead of an
 # unbounded `Start-Process -Wait`. `Process.WaitForExit(ms)` returns false on
-# timeout without touching the process, so a wedged msiexec fails this step
+# timeout without touching the process, so a wedged msiexec fails its caller
 # with diagnostics -- log tail, HoleBridge service state, surviving hole.exe
 # processes, msiexec's own process tree, and every thread's native call stack
-# -- instead of hanging until the JOB timeout kills the whole job and every
-# step after this one (including any artifact upload) never runs.
+# -- instead of hanging until the step's timeout kills it, skipping the
+# harness's teardown and every step after it (including any artifact upload).
 #
-# Shared by both the Install and Uninstall CI steps: they carry the same
-# unbounded-wait exposure, so the fix lives once here rather than twice in
-# ci.yaml.
+# Called for both the install and the uninstall by the installer harness
+# (msi-installer/tests/installed/support.py): they carry the same
+# unbounded-wait exposure, so the fix lives once here.
 #
 # `-ExePath`/`-ExeArgs` are a test seam: they substitute the process actually
 # started, so the bound + diagnostic-capture path can be exercised against a
-# stand-in that never exits, without a real MSI transaction. Every ci.yaml
-# call site leaves them at their defaults.
+# stand-in that never exits, without a real MSI transaction. The harness
+# leaves them at their defaults.
 param(
     [Parameter(Mandatory)]
     [ValidateSet('/i', '/x')]
@@ -25,19 +25,11 @@ param(
     [Parameter(Mandatory)]
     [string]$LogPath,
 
-    # No direct cold-run measurement exists for this job -- CI here runs
-    # often enough that sccache has never been observed to go fully cold --
-    # so this is derived, not measured: the sibling `dmg` step
-    # (same `timeout-minutes`, held equal by
-    # `ci_installer_assembly_steps_share_a_timeout_budget`) recorded its
-    # darwin/amd64 leg at 1.83x slower cold than warm (45m45s vs ~25min).
-    # Applied to this job's observed ~17-27min warm range, a cold run could
-    # reach ~49min, leaving the rest of the job wall if both Install and
-    # Uninstall wedge in the same run -- and a wedge on Install skips the
-    # E2E/tauri-driver steps that make up part of that warm baseline, so this
-    # is already a pessimistic estimate. 3 minutes each leaves comfortable
-    # margin; the steps themselves normally complete in 2-4 seconds, so a
-    # much smaller bound loses nothing.
+    # A failure bound, not an expected duration: install and uninstall
+    # normally complete in 2-4 seconds. The harness runs both inside one CI
+    # step (75 minutes, ci.yaml `installer-tests`) that also bounds each
+    # E2E phase, so a wedge on both costs about 2 x (3 + the capture below)
+    # and the step's timeout is nowhere near.
     [ValidateRange(0.0, 60.0)]
     [double]$BoundMinutes = 3,
 
@@ -47,21 +39,15 @@ param(
     # survive. Spent in evidentiary order (bridge first), so an exhausted
     # budget costs the least-informative capture, not the decisive one.
     #
-    # Sized against what is actually spare in the job budget, which is NOT
-    # the whole remainder above: 6 minutes of it are already committed to the
-    # two 3-minute bounds when both steps wedge.
-    #
     # This budget covers the capture loop only, so the wedge branch's real
     # worst case is the sum of every bound in it: two 15s CIM probes before
     # the loop, this 60s, and a 5s reap per process killed (one cdb, at most
     # one per target, at most one per msiexec-tree member) -- about 2min 10s
-    # for a plausible four targets. Both steps wedging spends that twice,
-    # ~4.5min of what is left, and the artifact upload -- the whole reason
-    # the bound exists -- still runs.
+    # for a plausible four targets.
     #
     # Measured cost is far under the cap: 33s for one process against a cold
     # symbol cache and 0.3s against a warm one (Windows 11 26100, SDK
-    # 10.0.26100 cdb), with the two steps sharing one cache under RUNNER_TEMP.
+    # 10.0.26100 cdb), with the install and the uninstall sharing one cache beside the log.
     # Every one of these is a failure bound, not an expected duration.
     [ValidateRange(0.0, 3600.0)]
     [double]$StackCaptureSeconds = 60,
@@ -76,8 +62,8 @@ param(
 
     # Second test seam, same shape as -ExePath: substitutes the debugger the
     # capture shells out to, so a stand-in that never exits drives the
-    # capture's own bound. Empty means "find the real cdb" -- every ci.yaml
-    # call site leaves it that way.
+    # capture's own bound. Empty means "find the real cdb" -- the harness
+    # leaves it that way.
     [string]$CdbPath
 )
 
@@ -221,9 +207,9 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     $suspendedTargetIds = @(Invoke-ThreadStackCapture -LogPath $LogPath -WedgedTreeIds $wedgedTreeIds `
             -BudgetSeconds $StackCaptureSeconds -DebuggerPathOverride $CdbPath)
 
-    # Nothing else in this job releases a target the capture left suspended:
-    # the tree kill below covers the msiexec tree only, and ci.yaml's
-    # "Kill hole.exe after E2E" runs BEFORE Uninstall, not after it. A
+    # Nothing else releases a target the capture left suspended: the tree
+    # kill below covers the msiexec tree only, and the harness kills the GUI
+    # (kill-hole-processes.ps1) BEFORE the uninstall, not after it. A
     # suspended HoleBridge would therefore survive this step unable to answer
     # the very SERVICE_CONTROL_STOP whose absence is under investigation --
     # the instrument manufacturing the hang it exists to diagnose.
@@ -249,8 +235,8 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     }
 
     # Kill the tree so a wedged msiexec doesn't outlive this step: on Install
-    # it would hold the `_MSIExecute` mutex against the Uninstall step that
-    # runs next (`if: always()`), and on Uninstall it would keep appending to
+    # it would hold the `_MSIExecute` mutex against the uninstall that
+    # the harness runs next (its teardown), and on Uninstall it would keep appending to
     # the log while "Upload MSI logs" reads it. Best-effort and isolated like
     # the probes above -- a failure here must not swallow the wedge `throw`.
     # Deferred by the whole capture above -- its budget plus the reaps -- so
@@ -273,7 +259,7 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
                 # `-Force` calls TerminateProcess, which returns synchronously
                 # without waiting for the process to actually be reaped --
                 # same reasoning as the `Wait-Process` after `Stop-Process` in
-                # the "Kill any running hole.exe" step.
+                # kill-hole-processes.ps1.
                 Wait-ProcessReaped -ProcessId $targetId -What 'wedged tree member'
                 $killed += $targetId
             } catch {
