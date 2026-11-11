@@ -559,6 +559,34 @@ fn a_migrated_load_logs_at_debug_and_a_current_one_does_not() {
     assert!(log.contains("supported=3"), "{log}");
 }
 
+/// A `NotFound` is `Absent`, and on Windows it can stand for a file that exists (a delete in flight): the debug line
+/// is the only trace of which one it was.
+#[skuld::test]
+fn a_not_found_read_logs_the_error_text_at_debug() {
+    struct NotThere;
+    impl Fs for NotThere {
+        fn read(&self, _dir: &crate::dir::ReadDir, _name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
+            Err(io::Error::new(io::ErrorKind::NotFound, "deleted under the read"))
+        }
+    }
+    let writer = WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let _guard = set_default_in_current_thread(subscriber);
+    let dir = dir();
+
+    let loaded = VersionedFile::<NoteV3>::with_fs(dir.path(), Arc::new(NotThere)).load();
+
+    assert!(matches!(loaded, Loaded::Absent), "{loaded:?}");
+    let log = writer.snapshot();
+    assert_eq!(log.matches("DEBUG").count(), 1, "{log}");
+    assert!(log.contains("note.json"), "{log}");
+    assert!(log.contains("deleted under the read"), "{log}");
+}
+
 #[skuld::test]
 fn unknown_fields_are_ignored_at_every_depth() {
     use crate::versioned_file::fixtures::{Inner, Kind, Nested};

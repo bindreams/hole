@@ -38,8 +38,9 @@ impl ReadDir {
     }
 
     /// The whole file `name`, read through a handle that shares delete, so a replace of the file does not wait for
-    /// the read. `NotFound` for a missing file. A symlink at the name is an error, not followed; so is anything that
-    /// is not a regular file ([`super::Refusal::NotRegular`], and a FIFO is never waited for).
+    /// the read. `NotFound` for a missing file. On Windows also for a file the name still leads to that is being
+    /// deleted or was just replaced. A symlink at the name is an error, not followed; so is anything that is not a regular
+    /// file ([`super::Refusal::NotRegular`], and a FIFO is never waited for).
     pub fn read(&self, name: &OsStr) -> io::Result<Vec<u8>> {
         read_whole(&self.file, name)
     }

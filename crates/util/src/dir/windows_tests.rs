@@ -541,3 +541,14 @@ fn the_legacy_replace_replaces_an_existing_file_and_keeps_the_destination_name()
     assert_eq!(std::fs::read(tmp.path().join("dest")).unwrap(), b"new");
     assert!(!tmp.path().join("src").exists());
 }
+
+// An open's rights ----------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+#[should_panic(expected = "fixes its own rights")]
+fn rights_for_a_variant_that_fixes_its_own_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+
+    let _ = open_file_with(&dir.file, "f".as_ref(), OpenFile::Read, Some(FILE_GENERIC_WRITE.0));
+}

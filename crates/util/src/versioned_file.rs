@@ -18,12 +18,16 @@
 //! [`VersionedFile::create_new`] takes no lock: the rename that publishes the file (refusing to replace) is atomic
 //! across processes.
 //!
-//! `observe` needs no exclusion from other processes, on Windows too: a write replaces the file with POSIX semantics,
-//! so a reader that has it open neither fails nor makes the write fail. That holds for a reader that opens the file
-//! with delete sharing, as `observe` and `std` do; one that does not (some editors and scanners) makes the write fail
-//! with a sharing violation. A volume that lacks POSIX rename (FAT, exFAT, some network shares) gets a plain
-//! replace, where a reader can make the write fail; see [`VersionedFile::update`]. Durability of the replace is
-//! described at `Placement::sync_dir`.
+//! A read from another process takes no exclusion, and a write replaces the file with POSIX semantics, so a reader
+//! that has it open neither fails nor makes the write fail. On Windows a read inside a replace may answer
+//! [`Loaded::Absent`] for a file that exists (the name is missing, 0xC0000034, or leads to the deleted old file,
+//! 0xC0000123); a read that opened the file before the replace reads the old file whole. On Unix a reader always sees
+//! the old file or the new one.
+//!
+//! A reader that opens the file with delete sharing, as `observe` and `std` do, does not make a write fail; one that
+//! does not (some editors and scanners) makes it fail with a sharing violation. A volume that lacks POSIX rename
+//! (FAT, exFAT, some network shares) gets a plain replace, where a reader can make the write fail; see
+//! [`VersionedFile::update`]. Durability of the replace is described at `Placement::sync_dir`.
 //!
 //! # Compatibility
 //!

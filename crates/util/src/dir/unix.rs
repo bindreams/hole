@@ -322,21 +322,61 @@ pub(super) fn open_dir(path: &Path, create: bool, owner: Option<(u32, u32)>, cal
 
 // Operations relative to a directory ----------------------------------------------------------------------------------
 
+/// What [`open_file`] asks of the system for one [`OpenFile`].
+struct Opening {
+    flags: libc::c_int,
+    mode: u32,
+}
+
 pub(super) fn open_file(dir: &File, name: &OsStr, how: OpenFile) -> io::Result<File> {
     // `O_NONBLOCK` keeps the open of a FIFO planted at the name from waiting for a peer that never comes; it does
     // nothing to a regular file.
-    let (flags, mode) = match how {
-        OpenFile::CreateNew { mode } => (libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, mode),
-        OpenFile::Existing => (libc::O_RDWR, 0),
-        OpenFile::Read => (libc::O_RDONLY | libc::O_NONBLOCK, 0),
-        OpenFile::Append => (libc::O_WRONLY | libc::O_APPEND | libc::O_NONBLOCK, 0),
-        OpenFile::CreateAppend { mode } => (libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_EXCL, mode),
+    let opening = match how {
+        OpenFile::CreateNew { mode } => Opening {
+            flags: libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            mode,
+        },
+        OpenFile::Existing => Opening {
+            flags: libc::O_RDWR,
+            mode: 0,
+        },
+        OpenFile::Read => Opening {
+            flags: libc::O_RDONLY | libc::O_NONBLOCK,
+            mode: 0,
+        },
+        OpenFile::Append => Opening {
+            flags: libc::O_WRONLY | libc::O_APPEND | libc::O_NONBLOCK,
+            mode: 0,
+        },
+        OpenFile::CreateAppend { mode } => Opening {
+            flags: libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_EXCL,
+            mode,
+        },
     };
-    let file = File::from(open_fd(dir.as_raw_fd(), &cstr(name)?, flags | libc::O_NOFOLLOW, mode)?);
-    if matches!(how, OpenFile::Read) && !file.metadata()?.is_file() {
-        return Err(Refusal::NotRegular.into_io_error());
+    let fd = match open_fd(
+        dir.as_raw_fd(),
+        &cstr(name)?,
+        opening.flags | libc::O_NOFOLLOW,
+        opening.mode,
+    ) {
+        Ok(fd) => fd,
+        // `O_NOFOLLOW` fails on a symlink at the name: it is the refusal the variant gives a symlink, if it has one.
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(match how.refusal_of(|| Ok(EntryKind::Symlink))? {
+                Some(refusal) => refusal.into_io_error(),
+                None => err,
+            });
+        }
+        Err(err) => return Err(err),
+    };
+    let file = File::from(fd);
+    if !how.looks_after_a_nofollow_open() {
+        return Ok(file);
     }
-    Ok(file)
+    match how.refusal_of(|| Ok(fstat(file.as_raw_fd())?.kind()))? {
+        Some(refusal) => Err(refusal.into_io_error()),
+        None => Ok(file),
+    }
 }
 
 /// Whether the folder's owner can vouch for `file`, a file read from `dir`: see [`super::trail::may_read`].

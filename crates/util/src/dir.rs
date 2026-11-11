@@ -135,26 +135,88 @@ impl fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-/// How [`Dir::open_file`] opens a name.
+/// How [`Dir::open_file`] opens a name. Except for `Read`, a Windows open of a name whose file is delete-pending is
+/// `PermissionDenied`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenFile {
     /// Create the file; `AlreadyExists` if the name is taken, by anything. Never follows a symlink.
-    /// Unix: created with `mode` (before the umask). Windows ignores `mode`.
+    /// Unix: created with `mode` (before the umask); Windows ignores it.
     CreateNew { mode: u32 },
     /// Open what is there, `NotFound` if nothing. A symlink (Windows: reparse point) is opened as itself, not followed.
     Existing,
-    /// Open what is there to read, `NotFound` if nothing. Never follows a symlink, and never blocks on a FIFO
-    /// (unix): anything that is not a regular file is [`Refusal::NotRegular`]. Shares everything with other
+    /// Open what is there to read, `NotFound` if nothing. Windows: also `NotFound` for a file being deleted or just
+    /// deleted whose name is still taken. A symlink is [`Refusal::Symlink`] and anything else that is not a regular
+    /// file (a FIFO on unix) is [`Refusal::NotRegular`]; a FIFO is never waited for. Shares everything with other
     /// handles, delete included, so a replace of the file does not wait for the reader.
     Read,
     /// Open what is there to append to, `NotFound` if nothing: it does not create the file, so that the caller
-    /// knows whether it made it. Never follows a symlink. Shares everything with other handles, delete included,
-    /// so a reader or a rename of the name does not wait for the writer. A FIFO is opened without blocking (unix),
-    /// which fails while nothing reads it.
+    /// knows whether it made it. A symlink is [`Refusal::Symlink`], never followed. Shares everything with other
+    /// handles, delete included, so a reader or a rename of the name does not wait for the writer. A FIFO is opened
+    /// without blocking (unix), which fails while nothing reads it.
     Append,
     /// Create the file to append to; `AlreadyExists` if the name is taken, by anything. Never follows a symlink.
-    /// Unix: created with `mode` (before the umask). Windows ignores `mode`. Shares as [`Self::Append`].
+    /// Unix: created with `mode` (before the umask); Windows ignores it. Shares as [`Self::Append`].
     CreateAppend { mode: u32 },
+}
+
+impl OpenFile {
+    /// What the open refuses to hold, given `kind`, which reads what it opened. Only a read and an append refuse
+    /// anything: a create makes the file it holds, and `Existing` hands its caller whatever is at the name. `kind` is
+    /// called only by the variants whose answer depends on it, so a create never fails on a look it does not need.
+    pub(crate) fn refusal_of(self, kind: impl FnOnce() -> io::Result<EntryKind>) -> io::Result<Option<Refusal>> {
+        Ok(match self {
+            OpenFile::Read => match kind()? {
+                EntryKind::Symlink => Some(Refusal::Symlink),
+                EntryKind::Directory => Some(Refusal::NotRegular),
+                EntryKind::Other => Some(Refusal::NotRegular),
+                EntryKind::File => None,
+            },
+            OpenFile::Append => match kind()? {
+                EntryKind::Symlink => Some(Refusal::Symlink),
+                EntryKind::Directory => None,
+                EntryKind::Other => None,
+                EntryKind::File => None,
+            },
+            OpenFile::CreateNew { .. } => None,
+            OpenFile::Existing => None,
+            OpenFile::CreateAppend { .. } => None,
+        })
+    }
+
+    /// Whether the file a `O_NOFOLLOW` open holds still needs [`Self::refusal_of`]: that open already refused a
+    /// symlink, so only a variant that refuses another kind does.
+    #[cfg(unix)]
+    pub(crate) fn looks_after_a_nofollow_open(self) -> bool {
+        [EntryKind::Directory, EntryKind::Other]
+            .into_iter()
+            .any(|kind| matches!(self.refusal_of(|| Ok(kind)), Ok(Some(_))))
+    }
+
+    /// Whether a name whose file is gone or going (Windows: deleted but still held open) reads as `NotFound`. Only a
+    /// read asks what the file holds; every other open asks about the name, which a file going away still takes.
+    #[cfg(windows)]
+    pub(crate) fn gone_is_not_found(self) -> bool {
+        match self {
+            OpenFile::Read => true,
+            OpenFile::CreateNew { .. } => false,
+            OpenFile::Existing => false,
+            OpenFile::Append => false,
+            OpenFile::CreateAppend { .. } => false,
+        }
+    }
+
+    /// Whether the caller names the access rights (Windows). A variant that uses the handle itself fixes its own,
+    /// which include `FILE_READ_ATTRIBUTES` for the `Append` look and `append_own_file_with`'s ownership check.
+    #[cfg(windows)]
+    pub(crate) fn takes_caller_rights(self) -> bool {
+        match self {
+            OpenFile::CreateNew { .. } => true,
+            OpenFile::Existing => true,
+            OpenFile::Read => false,
+            OpenFile::Append => false,
+            OpenFile::CreateAppend { .. } => false,
+        }
+    }
 }
 
 /// What a name in a [`Dir`] is, not following a symlink.

@@ -724,7 +724,8 @@ re-derive them.
 
    `ReadDir::read_vouched`, which `VersionedFile::observe` reads with, also refuses a file the folder's owner cannot vouch for (`Refusal::ForeignFile`, decided by
    `trail::may_read` on both platforms): the file must be owned by the folder's own user, or by the system (root,
-   SYSTEM, Administrators) with exactly one link. A user can hard-link any file the system can read at a state name
+   SYSTEM, Administrators) with at most one link (none when a rename has just replaced the open file, which has no name
+   left for a user to have planted). A user can hard-link any file the system can read at a state name
    (macOS has no `protected_hardlinks`), and the planted name has two links. The rule stops that and nothing else
    about ownership: a file the system owns that the user moved into the folder keeps its owner and its one link
    (a rename moves the inode), so it is read. What the user could learn from it is limited by the readers, below.

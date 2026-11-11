@@ -133,14 +133,18 @@ impl<S> Loaded<S> {
 
 impl<S: VersionedState> Loaded<S> {
     /// Classifies one read of `S`'s file. Logs a `warn!` for each unusual
-    /// outcome and a `debug!` for a migrated one: name, versions and cause,
+    /// outcome and a `debug!` for a migrated one or one read as absent: name, versions and cause,
     /// never a value. `at` says where a read that failed (other than by a
     /// missing file) failed, or `None` when the name turned out not to be there; it is asked only then.
     pub(crate) fn from_read(read: std::io::Result<Vec<u8>>, at: impl FnOnce() -> Option<UnreadableKind>) -> Self {
         let file = S::FILE_NAME;
         let bytes = match read {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Absent,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // On Windows this can stand for a file that exists (a delete in flight); the error is the only trace.
+                tracing::debug!(file, error = &e as &dyn std::error::Error, "state file read as absent");
+                return Loaded::Absent;
+            }
             Err(e) => {
                 tracing::warn!(file, kind = ?e.kind(), error = &e as &dyn std::error::Error, "state file could not be read");
                 return match at() {

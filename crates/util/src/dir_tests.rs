@@ -563,9 +563,9 @@ fn read_vouched_does_not_read_through_a_symlink_at_the_name() {
     std::fs::write(&target, b"{\"theirs\":true}").unwrap();
     plant_file_symlink(&target, &state.join("bridge-x.json"));
 
-    let result = read_vouched(&state, &name("bridge-x.json"));
+    let err = read_vouched(&state, &name("bridge-x.json")).unwrap_err();
 
-    assert!(result.is_err(), "read through a symlink: {result:?}");
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::Symlink), "{err:?}");
 }
 
 #[skuld::test]
@@ -612,6 +612,64 @@ fn read_vouched_reads_a_second_name_for_a_file_unless_the_runner_is_the_system()
         }
         false => assert_eq!(read.unwrap(), b"theirs"),
     }
+}
+
+// What an open refuses to hold ----------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn only_a_read_and_an_append_look_at_what_they_opened() {
+    let looked = |how: OpenFile| {
+        let calls = std::cell::Cell::new(0);
+        let refusal = how
+            .refusal_of(|| {
+                calls.set(calls.get() + 1);
+                Ok(EntryKind::File)
+            })
+            .unwrap();
+        assert_eq!(refusal, None, "a regular file is never refused");
+        calls.get()
+    };
+
+    assert_eq!(looked(OpenFile::Read), 1);
+    assert_eq!(looked(OpenFile::Append), 1);
+    assert_eq!(looked(OpenFile::Existing), 0);
+    assert_eq!(looked(OpenFile::CreateNew { mode: 0o600 }), 0);
+    assert_eq!(looked(create_append()), 0);
+}
+
+#[skuld::test]
+fn a_failed_look_fails_only_the_opens_that_look() {
+    let failing = || Err(io::Error::new(io::ErrorKind::TimedOut, "the look timed out"));
+    let passed_through = |err: io::Error| {
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "the look timed out",
+            "not the look's own error: {err:?}"
+        );
+        assert_eq!(
+            Refusal::from_error(&err),
+            None,
+            "a failed look is not a refusal: {err:?}"
+        );
+    };
+
+    passed_through(OpenFile::Read.refusal_of(failing).unwrap_err());
+    passed_through(OpenFile::Append.refusal_of(failing).unwrap_err());
+    assert_eq!(OpenFile::Existing.refusal_of(failing).unwrap(), None);
+    assert_eq!(OpenFile::CreateNew { mode: 0o600 }.refusal_of(failing).unwrap(), None);
+    assert_eq!(create_append().refusal_of(failing).unwrap(), None);
+}
+
+/// `O_NOFOLLOW` already refuses a symlink at the open, so only a variant that refuses another kind is looked at.
+#[cfg(unix)]
+#[skuld::test]
+fn only_a_read_looks_at_a_file_a_nofollow_open_holds() {
+    assert!(OpenFile::Read.looks_after_a_nofollow_open());
+    assert!(!OpenFile::Append.looks_after_a_nofollow_open());
+    assert!(!OpenFile::Existing.looks_after_a_nofollow_open());
+    assert!(!OpenFile::CreateNew { mode: 0o600 }.looks_after_a_nofollow_open());
+    assert!(!create_append().looks_after_a_nofollow_open());
 }
 
 // open_file: CreateAppend and Append ----------------------------------------------------------------------------------
@@ -669,7 +727,8 @@ fn append_does_not_follow_a_symlink_at_the_name() {
     std::fs::write(&target, b"theirs").unwrap();
     plant_file_symlink(&target, &tmp.path().join(LOG));
 
-    assert!(dir.open_file(&name(LOG), OpenFile::Append).is_err());
+    let err = dir.open_file(&name(LOG), OpenFile::Append).unwrap_err();
+    assert_eq!(Refusal::from_error(&err), Some(&Refusal::Symlink), "{err:?}");
     assert!(dir.open_file(&name(LOG), create_append()).is_err());
     assert_eq!(std::fs::read(&target).unwrap(), b"theirs");
 }
@@ -1205,4 +1264,35 @@ fn unlink_frees_the_name_at_once_even_while_a_reader_holds_the_file() {
 
     assert!(recreated.is_ok(), "the name is still taken: {:?}", recreated.err());
     drop(reader);
+}
+
+// A file replaced under a reader ======================================================================================
+
+#[cfg(unix)]
+fn links_of(file: &std::fs::File) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().unwrap().nlink()
+}
+
+#[cfg(windows)]
+fn links_of(file: &std::fs::File) -> u64 {
+    u64::from(platform::info(file).unwrap().nNumberOfLinks)
+}
+
+#[skuld::test]
+fn a_file_replaced_after_it_was_opened_is_read_whole_and_vouched_for() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("name"), b"old").unwrap();
+    std::fs::write(tmp.path().join("next"), b"new").unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let old = platform::open_file(&dir.file, "name".as_ref(), OpenFile::Read).unwrap();
+
+    dir.rename("next".as_ref(), "name".as_ref()).unwrap();
+
+    // The old file keeps its bytes and has no name left. `trail_tests` pins that the privileged branch of the vouch
+    // reads a file with no name, so a runner of any privilege reaches it through this count.
+    assert_eq!(platform::read_to_end(old.try_clone().unwrap()).unwrap(), b"old");
+    assert_eq!(links_of(&old), 0);
+    assert!(platform::is_vouched_for(&dir.file, &old).unwrap());
+    assert_eq!(dir.reader().unwrap().read_vouched("name".as_ref()).unwrap(), b"new");
 }
