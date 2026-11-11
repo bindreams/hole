@@ -161,8 +161,9 @@ pub enum OpenFile {
 
 impl OpenFile {
     /// What the open refuses to hold, given `kind`, which reads what it opened. Only a read and an append refuse
-    /// anything: a create makes the file it holds, and `Existing` hands its caller whatever is at the name. `kind` is
-    /// called only by the variants whose answer depends on it, so a create never fails on a look it does not need.
+    /// anything: a create makes the file it holds, and `Existing` hands its caller whatever is at the name.
+    /// `kind` is called only by the variants whose answer depends on it, so a create never fails on a look it does
+    /// not need.
     pub(crate) fn refusal_of(self, kind: impl FnOnce() -> io::Result<EntryKind>) -> io::Result<Option<Refusal>> {
         Ok(match self {
             OpenFile::Read => match kind()? {

@@ -141,7 +141,7 @@ impl<S: VersionedState> Loaded<S> {
         let bytes = match read {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // On Windows this can stand for a file that exists (a delete in flight); the error is the only trace.
+                // On Windows this can stand for a file that exists; see the module doc of `crate::versioned_file`.
                 tracing::debug!(file, error = &e as &dyn std::error::Error, "state file read as absent");
                 return Loaded::Absent;
             }
