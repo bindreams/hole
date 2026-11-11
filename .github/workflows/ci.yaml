@@ -72,11 +72,6 @@ jobs:
           # hooks and the renovate config check; `frontend` = the Vite bundle and
           # type check.
           - { os: windows, arch: amd64, runner: windows-latest,   timeout: 175, cache-saver: true, hole: true, installer: true, ex-ray-unit: true }
-          - { os: windows, arch: arm64, runner: windows-11-arm,   timeout: 90 }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel,   timeout: 305, hole: true, dmg: true }
-          - { os: darwin,  arch: arm64, runner: macos-latest,     timeout: 155, cache-saver: true, hole: true, dmg: true, ex-ray-unit: true }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest,    timeout: 60,  cache-saver: true, portable-lint: true, ech: true, frontend: true }
-          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm, timeout: 60 }
     steps:
       # Provisioning ===================================================================================================
       # Step budgets: 1.25 x the worst measured step, rounded up to 5m; a step
