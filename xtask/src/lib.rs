@@ -339,6 +339,9 @@ pub enum Command {
         /// Target OS (defaults to the host).
         #[arg(long)]
         os: Option<manifest::Os>,
+        /// Print what the app bundle holds: the set without the plugins `hole` embeds (macOS).
+        #[arg(long)]
+        bundle: bool,
     },
     /// Generate `ui/generated.ts` from Rust constants (single source of truth).
     GenUiConstants {
@@ -501,11 +504,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Build { target, all } => run_build(target, all),
         Command::Run { target } => run_run(target),
         Command::List => run_list(),
-        Command::BindirNames { os } => {
+        Command::BindirNames { os, bundle } => {
             let os = os
                 .or_else(manifest::Os::host)
                 .ok_or_else(|| anyhow!("unknown host OS"))?;
-            println!("{}", render_bindir_names(os));
+            println!("{}", render_bindir_names(os, bundle));
             Ok(())
         }
         Command::GenUiConstants { check } => gen_ui_constants::write_or_check(&repo_root()?, check),
@@ -543,9 +546,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 }
 
 /// Serialize the canonical BINDIR filenames for `os` as a JSON array. Consumed
-/// by `cargo xtask bindir-names` and the installer conformance tests.
-pub fn render_bindir_names(os: manifest::Os) -> String {
-    serde_json::to_string(&bindir::bindir_dest_names(os)).expect("Vec<String> serializes")
+/// by `cargo xtask bindir-names` and the installer conformance tests. With `bundle`, the names the app bundle holds
+/// (the plugins `hole` embeds are not among them).
+pub fn render_bindir_names(os: manifest::Os, bundle: bool) -> String {
+    let names = match bundle {
+        true => bindir::bundle_payload_names(os),
+        false => bindir::bindir_dest_names(os),
+    };
+    serde_json::to_string(&names).expect("Vec<String> serializes")
 }
 
 pub fn run_stage(profile: Profile, out_dir: &Path) -> Result<()> {

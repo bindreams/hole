@@ -137,3 +137,34 @@ fn kind_of_says_what_a_name_is_without_following_it() {
     assert_eq!(dir.kind_of(&name("link")).unwrap(), Some(EntryKind::Symlink));
     assert_eq!(dir.kind_of(&name("absent")).unwrap(), None);
 }
+
+#[cfg(unix)]
+#[skuld::test]
+fn names_lists_every_entry_of_every_kind_and_not_dot_or_dotdot() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("file"), b"x").unwrap();
+    std::fs::write(tmp.path().join(".hidden"), b"x").unwrap();
+    std::fs::create_dir(tmp.path().join("folder")).unwrap();
+    plant_file_symlink(&tmp.path().join("file"), &tmp.path().join("link"));
+    let dir = ReadDir::open(tmp.path()).unwrap();
+
+    let mut names = dir.names().unwrap();
+    names.sort();
+
+    assert_eq!(names, [".hidden", "file", "folder", "link"].map(name));
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn names_of_an_empty_directory_is_empty_and_lists_it_again_after_a_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let reader = dir.reader().unwrap();
+    assert!(reader.names().unwrap().is_empty());
+
+    std::fs::write(tmp.path().join("new"), b"x").unwrap();
+
+    // A second listing starts from the top whatever the first left behind.
+    assert_eq!(reader.names().unwrap(), [name("new")]);
+    assert_eq!(reader.names().unwrap(), [name("new")]);
+}

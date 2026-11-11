@@ -66,7 +66,7 @@ async fn serve_until_signal_returns_when_signal_fires() {
 
 // `ensure_stopped`'s absent-job classification ========================================================================
 //
-// The macOS half of #1003's "stop, then deregister" rule, and the mirror of
+// The macOS half of the "stop, then deregister" rule, and the mirror of
 // the Windows `ServiceGone` classification (`service_scm/call_error.rs`). Both
 // platforms answer the same question — does the service manager still have a
 // job for this label? — and both must answer it BY CAUSE, about the world the
@@ -117,8 +117,7 @@ fn a_registration_probe_classifies_by_cause() {
 fn an_unanswerable_probe_is_never_a_stopped_bridge() {
     // The silent-success hole itself. `uninstall_bridge_with` gates
     // deregistration on this returning Ok, and deleting the plist over a
-    // still-loaded job is the macOS dead end #1003 is about: `is_installed()`
-    // then reads false and no later uninstall ever tries to stop it again.
+    // still-loaded job leaves a running bridge nothing names.
     let err = ensure_stopped_verdict(Registration::Unknown("launchctl not found".into()))
         .expect_err("an unanswerable probe must fail loud");
     assert!(format!("{err}").contains("launchctl not found"), "{err}");
@@ -197,7 +196,7 @@ fn a_failed_bootout_over_a_job_launchd_no_longer_has_is_a_stopped_bridge() {
     // and being reaped — and the bootout then fails over a bridge that is in
     // fact stopped. `uninstall_bridge_with` refuses to deregister on an
     // unconfirmed stop, so the plist and the privileged helper stay on disk
-    // and every later uninstall skips its teardown (#1003).
+    // and the uninstall fails instead of succeeding.
     for code in [Some(3), Some(LAUNCHD_NO_SUCH_SERVICE), Some(1), None] {
         let result = ensure_stopped_with(|| Ok(code), || Registration::Absent);
         assert!(
@@ -306,4 +305,96 @@ fn a_bootout_records_what_launchd_said_above_the_default_filter() {
         "launchd's own words are what the record is for, so its stderr must be in it; \
          captured: {captured:?}"
     );
+}
+
+#[skuld::test]
+fn the_plugin_folder_and_the_runtime_folder_are_the_documented_system_paths() {
+    // Spelled out: the DMG test and the docs name these literally.
+    assert_eq!(PLUGIN_DIR, "/Library/Application Support/Hole");
+    assert_eq!(SERVICE_RUNTIME_DIR, "/var/run/hole");
+}
+
+#[skuld::test]
+fn the_service_source_is_managed_at_the_plugin_folder_and_never_beside_the_executable() {
+    match service_plugin_source(RepairVerdict::default()) {
+        PluginSource::Managed {
+            layout, runtime_dir, ..
+        } => {
+            assert_eq!(layout.dir, Path::new(PLUGIN_DIR));
+            assert_eq!(layout.owner, (0, 0));
+            assert_eq!(runtime_dir, Path::new(SERVICE_RUNTIME_DIR));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[skuld::test]
+fn an_explicit_folder_is_refused_unless_it_is_a_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+
+    assert!(explicit_plugin_source(file).is_err());
+    assert!(explicit_plugin_source(tmp.path().join("absent")).is_err());
+    assert!(explicit_plugin_source(tmp.path().to_path_buf()).is_ok());
+}
+
+#[skuld::test]
+fn anything_left_at_a_path_counts_as_installed_for_the_uninstall_and_nothing_does_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let absent = tmp.path().join("absent");
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+    let folder = tmp.path().join("folder");
+    std::fs::create_dir(&folder).unwrap();
+    let dangling = tmp.path().join("dangling");
+    std::os::unix::fs::symlink(tmp.path().join("nowhere"), &dangling).unwrap();
+
+    assert!(!any_present(&[]));
+    assert!(!any_present(&[&absent]));
+    // Each kind of leftover alone, with an absent path beside it.
+    for left in [&file, &folder, &dangling] {
+        assert!(any_present(&[&absent, left]), "{left:?}");
+    }
+}
+
+#[skuld::test]
+fn every_removal_that_failed_is_named_in_the_error_and_none_is_an_ok() {
+    assert!(remove_all([("one", Ok(())), ("two", Ok(()))]).is_ok());
+
+    let err = remove_all([
+        ("remove the folder", Err(std::io::Error::other("busy"))),
+        ("remove the plist", Ok(())),
+        ("remove the runtime folder", Err(std::io::Error::other("immutable"))),
+    ])
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("remove the folder: busy"), "{err}");
+    assert!(err.contains("remove the runtime folder: immutable"), "{err}");
+    assert!(!err.contains("plist"), "{err}");
+}
+
+#[skuld::test]
+fn a_plugin_runtime_folder_that_cannot_be_made_leaves_a_verdict_that_refuses_plugins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = PluginDirLayout {
+        dir: tmp.path().join("Hole"),
+        owner: {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(tmp.path()).unwrap();
+            (meta.uid(), meta.gid())
+        },
+    };
+    // A file where the runtime folder's parent should be: making the folder fails.
+    let blocker = tmp.path().join("file");
+    std::fs::write(&blocker, b"x").unwrap();
+    let verdict = RepairVerdict::default();
+
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(prepare_plugins(layout.clone(), blocker.join("run"), &[], &verdict));
+
+    assert_eq!(verdict.standing(), crate::plugin_repair::Standing::RuntimeDirNotMade);
 }

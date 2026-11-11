@@ -144,9 +144,13 @@ impl<P: Proxy, R: Routing> IpcState<P, R> {
     /// `try_lock` is safe here: `proxy` is freshly constructed and not yet shared with any other task at this call
     /// site, in every production and test caller, so it is uncontended by construction.
     pub(crate) fn new(proxy: Arc<Mutex<ProxyManager<P, R>>>, version: &str, log_dir: PathBuf) -> Self {
-        let (routing, unblock_generation) = {
+        let (routing, unblock_generation, plugin_source) = {
             let pm = proxy.try_lock().expect("proxy mutex must be uncontended at bind time");
-            (pm.routing_handle(), pm.unblock_generation_handle())
+            (
+                pm.routing_handle(),
+                pm.unblock_generation_handle(),
+                pm.plugin_source_handle(),
+            )
         };
         Self {
             proxy,
@@ -159,7 +163,7 @@ impl<P: Proxy, R: Routing> IpcState<P, R> {
             persist_gate: None,
             #[cfg(test)]
             persist_entered: std::sync::Mutex::new(None),
-            test_server_config: TestConfig::production(),
+            test_server_config: TestConfig::production(plugin_source),
         }
     }
 }

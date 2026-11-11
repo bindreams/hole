@@ -46,7 +46,7 @@ pub struct TestConfig {
     /// Two sentinel `host:port` strings (the second is the fallback).
     pub sentinels: [String; 2],
     /// Where bundled plugins resolve; a test can stage an install directory.
-    pub plugin_lookup: crate::proxy::config::PluginLookup,
+    pub plugin_source: crate::proxy::PluginSource,
     /// User's resolver config for the private-DoH server bootstrap.
     pub dns: hole_common::config::DnsConfig,
     /// How the server hostname resolves; a test can inject a DoH querier to
@@ -67,14 +67,14 @@ impl std::fmt::Debug for TestConfig {
 }
 
 impl TestConfig {
-    pub fn production() -> Self {
+    pub fn production(plugin_source: crate::proxy::PluginSource) -> Self {
         Self {
             preflight_timeout: PREFLIGHT_TIMEOUT,
             ss_connect_timeout: Duration::from_secs(5),
             sentinel_read_timeout: Duration::from_secs(5),
             sentinels: ["1.1.1.1:80".to_string(), "1.0.0.1:80".to_string()],
             dns: hole_common::config::DnsConfig::default(),
-            plugin_lookup: Default::default(),
+            plugin_source,
             bootstrap: Default::default(),
         }
     }
@@ -100,7 +100,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
     let plugin = match entry
         .plugin
         .as_deref()
-        .map(|name| cfg.plugin_lookup.resolve(name))
+        .map(|name| cfg.plugin_source.resolve(name))
         .transpose()
     {
         Ok(plugin) => plugin,

@@ -6,19 +6,24 @@
 //! which Tauri cross-checks against the BINDIR source of truth:
 //! `bundle.externalBin` (sidecars → `Contents/MacOS/`), `bundle.resources`
 //! (→ `Contents/Resources/`), and `bundle.macOS.files` (→ `Contents/<dest>`).
-//! A file dropped from all three is silently missing from the DMG — exactly how
-//! galoshes (#512) and `hole.dSYM` (#512 defer-1) went missing.
+//! A file dropped from all three is silently missing from the DMG.
 
 use std::collections::BTreeSet;
 
-use crate::bindir::{bindir_dest_names, plugin_sidecar_names};
+use crate::bindir::{bindir_dest_names, bundle_payload_names, plugin_sidecar_names};
 use crate::manifest::Os;
 
-/// Parse `crates/hole/tauri.conf.json`.
-fn tauri_conf() -> serde_json::Value {
+/// The config `tauri-build` reads for `os`: `crates/hole/tauri.conf.json` with the platform file merged over it.
+fn tauri_conf(os: Os) -> serde_json::Value {
+    let triple = match os {
+        Os::Darwin => "aarch64-apple-darwin",
+        Os::Windows => "x86_64-pc-windows-msvc",
+        Os::Linux => "x86_64-unknown-linux-gnu",
+    };
     let root = crate::repo_root().expect("repo root");
-    let text = std::fs::read_to_string(root.join("crates/hole/tauri.conf.json")).expect("read tauri.conf.json");
-    serde_json::from_str(&text).expect("parse tauri.conf.json")
+    xtask_lib::tauri_config::merged_tauri_config(triple, &root.join("crates/hole"))
+        .expect("read the merged Tauri config")
+        .0
 }
 
 /// Last path segment of a Tauri config path (they use `/`). `rsplit` always
@@ -30,12 +35,15 @@ fn basename(s: &str) -> String {
 /// Basenames of `bundle.externalBin` (sidecars → `Contents/MacOS/`). Each entry
 /// is a `<dir>/<name>` source stem; the shipped file is `<name>`.
 fn external_bin_basenames(conf: &serde_json::Value) -> Vec<String> {
-    conf["bundle"]["externalBin"]
-        .as_array()
-        .expect("bundle.externalBin array")
-        .iter()
-        .map(|e| basename(e.as_str().expect("externalBin entry is a string")))
-        .collect()
+    match conf["bundle"].get("externalBin") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(entries) => entries
+            .as_array()
+            .expect("bundle.externalBin array")
+            .iter()
+            .map(|e| basename(e.as_str().expect("externalBin entry is a string")))
+            .collect(),
+    }
 }
 
 /// Dest basenames of `bundle.resources` (→ `Contents/Resources/`). The map form
@@ -68,33 +76,44 @@ fn macos_files_dest_basenames(conf: &serde_json::Value) -> Vec<String> {
 }
 
 #[skuld::test]
-fn external_bin_covers_every_plugin_sidecar() {
-    // Tauri's bundler ships only `externalBin` sidecars into Contents/MacOS/, so
-    // every plugin binary must be listed there or the macOS DMG can't run it
-    // (this is how galoshes was missing from the DMG — #512).
-    let external = external_bin_basenames(&tauri_conf());
-    for sidecar in plugin_sidecar_names() {
-        assert!(
-            external.contains(&sidecar.to_string()),
-            "tauri.conf.json externalBin is missing plugin sidecar {sidecar:?} — the macOS DMG \
-             would not ship it (#512). Have: {external:?}"
-        );
+fn macos_merged_config_has_no_external_bin() {
+    // macOS embeds both plugins in `hole`: the app bundle must not also ship them as sidecars (the service would
+    // not run them from there).
+    let external = external_bin_basenames(&tauri_conf(Os::Darwin));
+
+    assert!(
+        external.is_empty(),
+        "the macOS bundle still ships sidecars: {external:?}"
+    );
+}
+
+#[skuld::test]
+fn windows_and_linux_merged_configs_keep_the_plugin_sidecars() {
+    // Tauri's bundler ships only `externalBin` sidecars next to the binary, so on the platforms that run the
+    // plugins from files every plugin binary must be listed there.
+    for os in [Os::Windows, Os::Linux] {
+        let external = external_bin_basenames(&tauri_conf(os));
+        for sidecar in plugin_sidecar_names() {
+            assert!(
+                external.contains(&sidecar.to_string()),
+                "tauri.conf.json externalBin is missing plugin sidecar {sidecar:?} on {os}. Have: {external:?}"
+            );
+        }
     }
 }
 
 #[skuld::test]
-fn tauri_bundle_covers_full_darwin_bindir() {
-    // Every canonical macOS BINDIR file must ship through some Tauri mechanism or
-    // the DMG silently drops it (#512). The first entry is the app's own binary,
-    // which Tauri bundles implicitly as Contents/MacOS/<bin>; every other entry
-    // must appear in externalBin, resources, or macOS.files.
-    let conf = tauri_conf();
-    let names = bindir_dest_names(Os::Darwin);
-    let (main_binary, payload) = names.split_first().expect("bindir_dest_names is non-empty");
+fn bundle_covers_the_bundle_payload_names_for_darwin() {
+    // Every file the macOS bundle must hold ships through some Tauri mechanism or the DMG silently drops it.
+    // The first entry is the app's own binary, which Tauri bundles implicitly as Contents/MacOS/<bin>; every other
+    // entry must appear in externalBin, resources, or macOS.files. The plugins are not among them: `hole` embeds them.
+    let conf = tauri_conf(Os::Darwin);
+    let names = bundle_payload_names(Os::Darwin);
+    let (main_binary, payload) = names.split_first().expect("bundle_payload_names is non-empty");
     assert_eq!(
         main_binary.as_str(),
         "hole",
-        "expected the app binary first in bindir_dest_names(Darwin); got {main_binary:?}"
+        "expected the app binary first in bundle_payload_names(Darwin); got {main_binary:?}"
     );
 
     let mut shipped: BTreeSet<String> = BTreeSet::new();
@@ -105,9 +124,7 @@ fn tauri_bundle_covers_full_darwin_bindir() {
     let missing: Vec<&String> = payload.iter().filter(|n| !shipped.contains(*n)).collect();
     assert!(
         missing.is_empty(),
-        "tauri.conf.json bundle has no DMG home for canonical macOS BINDIR file(s) {missing:?} — \
-         add each to externalBin (sidecars), resources, or macOS.files (e.g. hole.dSYM as a \
-         sibling of the binary at MacOS/hole.dSYM). Shipped basenames: {shipped:?}"
+        "the macOS bundle config has no DMG home for file(s) {missing:?} — add each to resources or macOS.files          (e.g. hole.dSYM as a sibling of the binary at MacOS/hole.dSYM). Shipped basenames: {shipped:?}"
     );
 }
 
@@ -120,7 +137,7 @@ fn dsym_ships_as_a_sibling_of_the_binary() {
     // Contents/MacOS/hole) or production backtraces never resolve. Lock the dest
     // directory here so a misroute fails on any host, not just the darwin DMG
     // lane (which proves it on the real bundle via test_dsym_is_sibling_of_binary).
-    let conf = tauri_conf();
+    let conf = tauri_conf(Os::Darwin);
     let dsym = bindir_dest_names(Os::Darwin)
         .into_iter()
         .find(|n| n.ends_with(".dSYM"))

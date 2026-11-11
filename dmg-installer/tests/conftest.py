@@ -19,23 +19,32 @@ REPO_ROOT = dmg_installer._find_repo_root()
 QUARANTINE_VALUE = "0381;6a0b6446;Brave;FAKE0000-0000-0000-0000-000000000000"
 
 
-def canonical_darwin_bindir() -> set[str]:
-    """Canonical macOS BINDIR filenames, from the single source of truth.
-
-    Runs `cargo xtask bindir-names --os darwin` so the DMG payload is checked
-    against `bindir::bindir_dest_names`, not a hand-restated copy (mirrors
-    `msi-installer/tests/conftest.py::canonical_windows_bindir`). The dmg lane
-    builds via cargo, so the toolchain is present; `check=True` surfaces a
-    missing toolchain loudly rather than silently skipping.
-    """
+def _bindir_names(*flags: str) -> set[str]:
+    """`cargo xtask bindir-names --os darwin <flags>`: the dmg lane builds via cargo, so the toolchain is present;
+    `check=True` surfaces a missing toolchain loudly rather than silently skipping."""
     out = subprocess.run(
-        ["cargo", "xtask", "bindir-names", "--os", "darwin"],
+        ["cargo", "xtask", "bindir-names", "--os", "darwin", *flags],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=True,
     )
     return set(json.loads(out.stdout))
+
+
+def canonical_darwin_bindir() -> set[str]:
+    """What the macOS app bundle must hold, from the single source of truth.
+
+    Runs `cargo xtask bindir-names --os darwin --bundle` so the DMG payload is checked against
+    `bindir::bundle_payload_names`, not a hand-restated copy (mirrors
+    `msi-installer/tests/conftest.py::canonical_windows_bindir`). The plugins are not in it: `hole` embeds them.
+    """
+    return _bindir_names("--bundle")
+
+
+def embedded_plugin_names() -> set[str]:
+    """The plugins `hole` carries inside itself on macOS: the full BINDIR set minus the bundle set."""
+    return _bindir_names() - _bindir_names("--bundle")
 
 
 @pytest.fixture(scope="module")
