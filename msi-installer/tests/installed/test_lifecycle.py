@@ -21,6 +21,12 @@ def test_installed_files_match_canonical_bindir(installed_hole: Path):
     assert not canonical_windows_bindir() - present, "files the installer must install are missing"
 
 
+def test_scratch_hang_to_force_a_step_timeout(installed_hole: Path):
+    import threading
+
+    threading.Event().wait()
+
+
 def test_bridge_service_registered(installed_hole: Path):
     assert service_registered(), "HoleBridge service not registered"
 

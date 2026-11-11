@@ -626,7 +626,7 @@ jobs:
       - id: installer-tests
         name: Install, E2E and uninstall the MSI
         if: ${{ !cancelled() && steps.installer-build-msi.outcome == 'success' }}
-        timeout-minutes: 75
+        timeout-minutes: 12
         shell: bash
         env:
           # See install-nextest: the unauthenticated GitHub API limit is 60 req/h.
