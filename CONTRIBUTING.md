@@ -400,13 +400,13 @@ in CI (the privileged lanes) is attended and keeps bare names.
 
 The plugin spawn follows the same rule by a different mechanism: the privileged
 bridge runs only the plugins Hole ships (`hole_common::plugin::KNOWN_PLUGINS`),
-resolved next to the bridge executable and nowhere else. `resolve_plugin` (which
-reads `current_exe()` itself) is the only production producer of a `BundledPlugin`
-(a shipped plugin's descriptor bound to the absolute path of its binary beside the
-executable), and `start_plugin_chain` takes only that, so a bare name for
+found in the one folder its `PluginSource` names
+([where each platform gets them](#plugin-binaries-where-each-platform-gets-them)).
+`PluginSource::resolve` is the only production producer of a `BundledPlugin`
+(a shipped plugin's descriptor bound to the absolute path of its binary),
+and `start_plugin_chain` takes only that, so a bare name for
 `garter::BinaryPlugin` to look up on `PATH` cannot be written on the bridge's path.
-`resolve_plugin_beside` takes the executable explicitly for tests that stage an
-install. It is the one gate for "may this plugin run", asked first in
+A test stages an install with `PluginSource::build_dir(Some(exe))`. It is the one gate for "may this plugin run", asked first in
 `start_cancellable` and `run_server_test`, before any DoH bootstrap, cover or
 dial: an unbundled name or a missing binary is refused with nothing touched and
 reaches the user as the usual start error. Import already rejects such plugins, so
@@ -417,6 +417,78 @@ SIP003 plugins are not supported.
 and inner per-platform backend (`MockBackend` at `SystemDns::new_with_backend`).
 Both are necessary: an outer-only mock can pass while `SystemDns::apply` ignores
 cancel internally.
+
+### Plugin binaries: where each platform gets them
+
+The privileged bridge runs only the plugins Hole ships (`hole_common::plugin::KNOWN_PLUGINS`), found in one
+folder its [`PluginSource`](crates/bridge/src/proxy/plugin_source.rs) names. `PluginSource` is the one owner of
+"where are the plugins" for every platform and mode; a caller asks it to `resolve` a name and gets a `BundledPlugin`
+(a shipped plugin's descriptor bound to the absolute path of its binary) or a typed error. Per-variant behaviour is a
+method of the type, one exhaustive match each; no other file names a variant except the per-platform constructors
+(`plugin_source_policy_lives_on_the_type_not_at_call_sites`).
+
+| Platform and mode                       | `PluginSource`    | Where the plugins are                                                                     | Who writes them                                    | How they are verified                                                                                                                     | How they are repaired                    |
+| --------------------------------------- | ----------------- | ----------------------------------------------------------------------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| macOS service                           | `Managed`         | `/Library/Application Support/Hole` (root-owned, 0755), never derived from the executable | the service, from the bytes embedded in `hole`     | SHA-256 of each file, owner, mode and link count, read through the open handle, against the hashes compiled into `hole`; the layout stamp | at every service start, before it serves |
+| Windows service                         | `InstallDir`      | beside the installed bridge executable                                                    | the installer                                      | the installer's (Program Files is not user-writable)                                                                                      | by reinstalling                          |
+| foreground, any platform                | `BuildDir`        | beside the bridge executable (a staged build directory)                                   | `cargo xtask stage`                                | none                                                                                                                                      | `cargo xtask stage`                      |
+| foreground `--plugin-dir DIR` (Windows) | `Explicit`        | `DIR`, read, never written                                                                | the admin                                          | none                                                                                                                                      | the admin                                |
+| foreground `--plugin-dir DIR` (macOS)   | `ExplicitStamped` | `DIR`, read, never written; its layout stamp must be current                              | the admin (the service wrote the installed folder) | the layout stamp                                                                                                                          | none                                     |
+
+On macOS `hole` carries both plugin binaries (`crates/hole/build/embed_plugins.rs` reads
+`.cache/<name>/<name>-<triple>`, copies those bytes to `$OUT_DIR/<name>` and hashes the same read, and writes
+`$OUT_DIR/embedded_plugins.rs`; `src/embedded_plugins.rs` is in the binary, not the bridge library) and the app bundle ships none of them (`crates/hole/tauri.macos.conf.json` removes
+`externalBin`). A dev or test build with stub sidecars embeds empty payloads, which repair never converges toward and never
+removes anything for; a release build with an empty payload fails in `embed_plugins.rs`, and the DMG test
+`test_hole_carries_the_plugin_bytes` still compares the bytes with `.cache`. The name sets are in [`bindir.rs`](xtask-lib/src/bindir.rs): `embedded_plugin_names` and `bundle_payload_names`
+state the platform difference once.
+
+Repair (`crates/bridge/src/plugin_repair.rs`) is a pure `decide_repair(Survey, carried) -> RepairPlan` and a thin
+unix `apply`. A repair converges after a crash at any step: each file is a staged temp renamed over its name
+(`util::dir::Dir`), and the stamp is stored last, and only when every step before it succeeded. A folder that is not sound (a link or file at its name, another
+owner or group, a mode that group or others can write) is not trusted, and the stamp inside it is never read: it is rebuilt. A sound
+folder with another mode is set to 0755. Unexpected names are removed, folders with everything below them
+(`Dir::remove_tree`); a name that differs from a carried name or the stamp only in case is the same entry when the volume
+says it is the same file (case-insensitive APFS), and a stray otherwise. A repair whose steps all succeeded is judged by
+surveying the folder again, so a step the volume did not carry out as asked leaves the repair `Degraded`. The repair runs in `platform::macos::run` after the IPC bind and the liveness lock and before DNS and
+route recovery, because repairs come first (the Windows `registration::run_startup_steps` does the same); its
+duration is logged at `info`. It never stops the start, and the one bridge that holds the liveness lock is the only
+repairer. How the start prepared is recorded as a `Prepared` (the repair's `RepairOutcome` and whether the runtime folder
+was made) in a `RepairVerdict` that the `Managed` source holds: a plugin resolves only when the repair of this start
+`Converged` or `Repaired` the folder and the runtime folder exists. A start whose repair ended `Degraded` (a failed write,
+an unreadable folder, a build with no payload), whose runtime folder could not be made, or that has not prepared yet
+refuses every plugin start and server test, naming the cause (the runtime folder's failure has its own error, naming
+`/var/run/hole`), and the stamp of a folder no repair vouched for is never read. Both failures are logged even when the
+folder's outcome is the one the error names.
+
+The layout stamp is `layout.json` (`{"version": 1}`), a `util::versioned_file` OS record. A stamp this release cannot
+read (newer, corrupt, or unreadable) is never replaced or removed: repair changes nothing, and every plugin start and
+server test refuses with an error naming the stamp. The remedy has no in-app escape: stop Hole and move the named
+file aside. The connect gate that would refuse before anything is mutated is not built yet (1096-b); until then the
+refusal happens when the plugin is resolved.
+
+`hole bridge run --plugin-dir DIR` runs a foreground bridge from `DIR`, which must be a directory (made absolute,
+never canonicalized). The bridge runs, with its own privileges, the plugin binaries in the named folder. On macOS it
+checks only that `DIR` is a Hole plugin folder (a current layout stamp, which tells a wrong folder from a right one), not
+who can write it: name only a folder only root can write, such as `/Library/Application Support/Hole`. The stamp is read
+under the bridge's vouched-read rules (`util::dir::ReadDir`), so name the real folder, not a user's link to a folder
+somebody else owns, and a stamp another user owns is refused too: the error says the stamp was refused, and why. A
+folder that is gone after the bridge started is reported as not found. A plugin that
+unpacks itself (galoshes) uses the environment the bridge was started with, not `/var/run/hole`. `--service` does not
+take it. The foreground default (`BuildDir`) likewise runs whatever sits beside the executable.
+
+A plugin that extracts itself at run time (galoshes unpacks its embedded ex-ray) is given a root-only folder:
+`PluginSource::runtime_dir` is `/var/run/hole` for `Managed` and none elsewhere, and the plugin spawn sets
+`XDG_RUNTIME_DIR` to it, whether or not launchd supplies a `HOME`. Uninstall removes it with the plugin folder and the registration, attempting
+every removal and naming each that failed, so a folder that cannot be removed never keeps the registration from going.
+`bridge uninstall` is gated on `os::has_anything_to_uninstall` (the plist, the helper or either folder is still there),
+not on the registration alone, so a retry reaches the leftovers of an uninstall whose folder removal failed after the plist
+went; `is_installed` (the status readout) stays the plist.
+
+Not yet measured, and measurable only on CI: that the linker-signed plugin bytes run as root under launchd on both
+architectures (the `dmg-installer` install-and-connect e2e, which has to pass on this change before the claim holds);
+`/Library/Application Support`'s owner and mode on a stock macOS; the duration of a repair on the first start after an
+install.
 
 ### Bridge cancellation contract
 
@@ -3646,9 +3718,10 @@ cargo xtask run hole-dmg-tests   # mount + assert payload + code signature are i
 ```
 
 The DMG does not use `cargo xtask stage`; Tauri bundles the canonical BINDIR via
-`crates/hole/tauri.conf.json` — `externalBin` (plugin sidecars → `Contents/MacOS/`),
-`resources` (`NOTICES.md` → `Contents/Resources/`), and `macOS.files` (`hole.dSYM`
-→ `Contents/MacOS/hole.dSYM`). The dSYM ships **next to the binary** because std's
+`crates/hole/tauri.conf.json` — `resources` (`NOTICES.md` → `Contents/Resources/`), and `macOS.files` (`hole.dSYM`
+→ `Contents/MacOS/hole.dSYM`). The plugin sidecars are not in the app: `hole` embeds them
+(`crates/hole/tauri.macos.conf.json` drops `externalBin` on macOS, see
+[plugin binaries](#plugin-binaries-where-each-platform-gets-them)). The dSYM ships **next to the binary** because std's
 backtrace symbolizer locates a `*.dSYM` by scanning the running binary's directory
 and matching its Mach-O UUID — so production panic backtraces resolve frame names +
 line numbers (the Windows `hole.pdb` analog; see #393). `bundle.macOS.files` is
@@ -3670,7 +3743,8 @@ committed file therefore already has the CLI's form, and `hole-dmg-tests` fails 
 build modifies any tracked file or the binary embeds `<version>.dirty`.
 
 The `hole-dmg-tests` pytest derives its expected payload from
-`cargo xtask bindir-names --os darwin`, so the Tauri config can't silently drift.
+`cargo xtask bindir-names --os darwin --bundle`, so the Tauri config can't silently drift, and checks that the
+plugins are absent from the app and present, byte for byte, inside `hole`.
 
 ## Development
 
@@ -3771,8 +3845,8 @@ HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 plugin sidecars + `NOTICES.md` + per-platform debug symbols + `wintun.dll` on
 Windows) matching the installed `Program Files\hole\bin\`. The bridge must be
 staged out of the cargo target dir because the running bridge file-locks its own
-exe; the plugin sidecars must be siblings, the only place `resolve_plugin`
-looks. The canonical file list (the single source of truth, per-OS) is
+exe; the plugin sidecars must be siblings, the only place a foreground bridge
+(`PluginSource::BuildDir`) looks unless `--plugin-dir` names a folder. The canonical file list (the single source of truth, per-OS) is
 [`bindir_dest_names`](xtask-lib/src/bindir.rs); the installer manifests are
 checked against it by conformance tests (`cargo xtask bindir-names`).
 
@@ -4449,6 +4523,7 @@ User-facing commands are in [README.md](README.md#commands). The rest:
 
 ```
 hole bridge run [--socket-path P] [--log-dir DIR] [--state-dir DIR]   run bridge (foreground, needs elevation)
+hole bridge run --plugin-dir DIR [...]                                 run the plugins found in DIR (read, never written; macOS: needs a current layout stamp)
 hole bridge run --service [--log-dir DIR] [--state-dir DIR]           run as service (invoked by SCM/launchd)
 hole bridge install | uninstall [--log-dir DIR] | status             register/start | stop/remove | status (elevation)
 hole bridge enable [--log-dir DIR]                                     enable + start a disabled service (elevation)

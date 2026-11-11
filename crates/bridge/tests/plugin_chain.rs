@@ -29,8 +29,8 @@ mod plugin_install;
 
 use std::path::PathBuf;
 
-use hole_bridge::proxy::config::{resolve_plugin_beside, BundledPlugin};
 use hole_bridge::proxy::plugin::start_plugin_chain;
+use hole_bridge::proxy::{BridgeExe, BundledPlugin, PluginSource};
 use tokio_util::sync::CancellationToken;
 
 /// An install dir holding a bridge exe and an `ex-ray` beside it, resolved the
@@ -55,7 +55,9 @@ fn test_plugin_bin() -> PathBuf {
 fn install_with(ex_ray: impl FnOnce(&std::path::Path)) -> Install {
     let dir = tempfile::tempdir().expect("tempdir");
     let exe = plugin_install::install_with_ex_ray(dir.path(), ex_ray);
-    let plugin = resolve_plugin_beside("v2ray-plugin", Ok(exe)).expect("the install holds ex-ray");
+    let plugin = PluginSource::build_dir(BridgeExe::At(exe))
+        .resolve("v2ray-plugin")
+        .expect("the install holds ex-ray");
     Install { _dir: dir, plugin }
 }
 

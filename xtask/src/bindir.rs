@@ -18,7 +18,7 @@ use anyhow::{anyhow, Result};
 use crate::manifest::Os;
 use crate::Profile;
 
-pub use xtask_lib::bindir::{bindir_dest_names, plugin_sidecar_names};
+pub use xtask_lib::bindir::{bindir_dest_names, bundle_payload_names, embedded_plugin_names, plugin_sidecar_names};
 
 /// Source kind for a BINDIR entry. Files use hard-link-then-copy;
 /// directory bundles (macOS `.dSYM`) recurse a copy.

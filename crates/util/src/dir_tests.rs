@@ -1250,6 +1250,44 @@ fn unlink_refuses_a_directory_and_leaves_it() {
     assert!(tmp.path().join("sub").is_dir());
 }
 
+#[cfg(unix)]
+#[skuld::test]
+fn remove_tree_removes_a_folder_with_everything_below_it_and_nothing_a_link_points_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"theirs").unwrap();
+    let tree = tmp.path().join("tree");
+    std::fs::create_dir_all(tree.join("a").join("b")).unwrap();
+    std::fs::write(tree.join("top"), b"x").unwrap();
+    std::fs::write(tree.join("a").join("b").join("deep"), b"x").unwrap();
+    plant_link(&outside, &tree.join("a").join("link"));
+
+    dir.remove_tree(&name("tree")).unwrap();
+
+    assert!(std::fs::symlink_metadata(&tree).is_err());
+    assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"theirs");
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn remove_tree_of_a_file_or_a_link_is_an_unlink_and_of_nothing_is_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = Dir::open(tmp.path(), false, None).unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(tmp.path().join("file"), b"x").unwrap();
+    plant_link(&outside, &tmp.path().join("link"));
+
+    dir.remove_tree(&name("file")).unwrap();
+    dir.remove_tree(&name("link")).unwrap();
+
+    assert_eq!(names(tmp.path()), [name("outside")]);
+    assert_eq!(kind(dir.remove_tree(&name("absent"))), Some(io::ErrorKind::NotFound));
+    assert_eq!(kind(dir.remove_tree(&name("a/b"))), Some(io::ErrorKind::InvalidInput));
+}
+
 #[skuld::test]
 fn unlink_frees_the_name_at_once_even_while_a_reader_holds_the_file() {
     // A reader that shares delete, as `std` opens: on Windows a delete that waits for the last handle leaves

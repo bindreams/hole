@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 
 
-from conftest import REPO_ROOT, canonical_darwin_bindir
+from conftest import REPO_ROOT, canonical_darwin_bindir, embedded_plugin_names
 
 # Canonical Mach-O UUID shape (8-4-4-4-12 hex), matching
 # msi-installer/tests/test_hole_wxs.py. Unanchored for use with finditer.
@@ -24,7 +24,7 @@ _HOLE_VERSION_TIMEOUT_SECS = 60
 
 
 def test_dmg_ships_full_canonical_bindir(installed_app: Path) -> None:
-    """Every canonical macOS BINDIR file must ship in the .app payload (#512).
+    """Every file the macOS bundle must hold ships in the .app payload (#512).
 
     Derives the expected set from the single source of truth so a future bindir
     addition nobody wired into the Tauri config fails here. We scan only the two
@@ -42,8 +42,37 @@ def test_dmg_ships_full_canonical_bindir(installed_app: Path) -> None:
     assert not missing, (
         f"Hole.app payload is missing canonical BINDIR file(s) {sorted(missing)} "
         f"(searched Contents/MacOS + Contents/Resources). Expected (from "
-        f"`cargo xtask bindir-names --os darwin`): {sorted(expected)}."
+        f"`cargo xtask bindir-names --os darwin --bundle`): {sorted(expected)}."
     )
+
+
+def test_plugins_are_not_in_the_app(installed_app: Path) -> None:
+    """The app carries no plugin binary: `hole` embeds them and the service writes them to a root-owned folder.
+
+    A plugin left in Contents/MacOS would be one the service never runs, and
+    `test_dmg_ships_full_canonical_bindir` only reports missing names, so it cannot say this.
+    """
+    plugins = embedded_plugin_names()
+    assert plugins, "`cargo xtask bindir-names` lists no embedded plugin: the macOS tables changed"
+    contents = installed_app / "Contents"
+    present = {p.name for p in (contents / "MacOS").iterdir()}
+    present |= {p.name for p in (contents / "Resources").iterdir()}
+    assert not (plugins & present), f"Hole.app still ships plugin(s) {sorted(plugins & present)}"
+
+
+def test_hole_carries_the_plugin_bytes(installed_app: Path) -> None:
+    """Each plugin's build output occurs inside `hole`, byte for byte, and is not an empty stub.
+
+    The inputs are what `cargo xtask deps` left in `.cache/<name>/<name>-<triple>`, found by the single-match glob
+    the staging code uses. An empty input means `hole` embeds nothing and the service would have no plugin to write.
+    """
+    hole = (installed_app / "Contents" / "MacOS" / "hole").read_bytes()
+    for name in sorted(embedded_plugin_names()):
+        matches = sorted((REPO_ROOT / ".cache" / name).glob(f"{name}-*"))
+        assert len(matches) == 1, f"expected one .cache/{name}/{name}-<triple>, found {matches}"
+        payload = matches[0].read_bytes()
+        assert payload, f"{matches[0]} is empty: `cargo xtask deps` did not run before the build"
+        assert payload in hole, f"hole does not contain the bytes of {matches[0].name}"
 
 
 def test_bundle_is_menu_bar_app(installed_app: Path) -> None:

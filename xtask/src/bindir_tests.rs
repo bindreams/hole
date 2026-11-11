@@ -9,7 +9,7 @@ use std::fs;
 
 #[skuld::test]
 fn bindir_names_command_emits_json_for_os() {
-    let json = crate::render_bindir_names(Os::Windows);
+    let json = crate::render_bindir_names(Os::Windows, false);
     let parsed: Vec<String> = serde_json::from_str(&json).unwrap();
     assert!(parsed.contains(&"galoshes.exe".to_string()));
     assert_eq!(parsed, bindir_dest_names(Os::Windows));
@@ -178,4 +178,14 @@ fn bindir_errors_when_the_host_ex_ray_is_an_empty_stub() {
         msg.contains(&crate::ex_ray::output_name()) && msg.contains("cargo xtask deps"),
         "expected the deps-did-not-run error for an empty host stub, got: {msg}"
     );
+}
+
+#[skuld::test]
+fn bindir_names_bundle_flag_prints_the_bundle_set() {
+    let bundle: Vec<String> = serde_json::from_str(&crate::render_bindir_names(Os::Darwin, true)).unwrap();
+    let full: Vec<String> = serde_json::from_str(&crate::render_bindir_names(Os::Darwin, false)).unwrap();
+
+    assert_eq!(bundle, bundle_payload_names(Os::Darwin));
+    assert!(full.contains(&"ex-ray".to_string()) && !bundle.contains(&"ex-ray".to_string()));
+    assert!(full.contains(&"galoshes".to_string()) && !bundle.contains(&"galoshes".to_string()));
 }

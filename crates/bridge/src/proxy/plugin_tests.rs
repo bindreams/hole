@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 
 use tokio_util::sync::CancellationToken;
 
-use super::{proxy_err_to_io_err, start_plugin_chain, ChainTask};
+use super::{proxy_err_to_io_err, runtime_dir_env, start_plugin_chain, ChainTask};
 use crate::proxy::config::BundledPlugin;
 use crate::proxy::ProxyError;
 
@@ -312,4 +312,54 @@ fn pid_sink_warns_when_the_append_fails() {
         output.contains(&pid.to_string()) && output.to_lowercase().contains("persist"),
         "a lost spawn record must name the pid and the failure; got:\n{output}"
     );
+}
+
+// A plugin's runtime directory ========================================================================================
+
+/// A source of the given kind holding a stamped folder with `ex-ray` in it. The folder lives as long as the guard.
+fn resolved_ex_ray(managed: bool) -> (tempfile::TempDir, BundledPlugin) {
+    use crate::plugin_repair::PluginDirLayout;
+    use crate::proxy::PluginSource;
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().to_path_buf();
+    std::fs::write(folder.join(format!("ex-ray{}", std::env::consts::EXE_SUFFIX)), b"fake").unwrap();
+    std::fs::write(folder.join("layout.json"), r#"{"version": 1}"#).unwrap();
+    let layout = PluginDirLayout {
+        dir: folder.clone(),
+        owner: (0, 0),
+    };
+    let source = match managed {
+        true => PluginSource::Managed {
+            layout,
+            runtime_dir: folder.join("run"),
+            verdict: {
+                let verdict = crate::plugin_repair::RepairVerdict::default();
+                verdict.record(crate::plugin_repair::Prepared::new(
+                    crate::plugin_repair::RepairOutcome::Converged,
+                    Ok(()),
+                ));
+                verdict
+            },
+        },
+        false => PluginSource::Explicit { dir: folder },
+    };
+    let plugin = source.resolve("v2ray-plugin").unwrap();
+    (tmp, plugin)
+}
+
+#[skuld::test]
+fn a_managed_plugin_is_pointed_at_the_runtime_directory_through_xdg_runtime_dir() {
+    let (_folder, plugin) = resolved_ex_ray(true);
+
+    let (key, value) = runtime_dir_env(&plugin).expect("a managed plugin has a runtime directory");
+
+    assert_eq!(key, "XDG_RUNTIME_DIR");
+    assert_eq!(std::path::Path::new(&value), plugin.runtime_dir().unwrap());
+}
+
+#[skuld::test]
+fn a_plugin_from_any_other_source_is_given_no_override() {
+    let (_folder, plugin) = resolved_ex_ray(false);
+
+    assert_eq!(runtime_dir_env(&plugin), None);
 }

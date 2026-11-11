@@ -462,6 +462,20 @@ pub(super) fn kind_of(dir: &File, name: &OsStr) -> io::Result<Option<EntryKind>>
     }
 }
 
+/// The names in `dir`. `read_from` reads through a new open of `.` made from the handle, so the listing has its own
+/// offset and starts at the top; only a directory that was removed falls back to a duplicate, and lists nothing.
+pub(super) fn names(dir: &File) -> io::Result<Vec<OsString>> {
+    let listing = rustix::fs::Dir::read_from(dir)?;
+    let mut names = Vec::new();
+    for entry in listing {
+        let name = entry?.file_name().to_bytes().to_vec();
+        if name != b"." && name != b".." {
+            names.push(OsString::from_vec(name));
+        }
+    }
+    Ok(names)
+}
+
 pub(super) fn file_id(file: &File) -> io::Result<FileId> {
     let meta = file.metadata()?;
     Ok((meta.dev(), meta.ino()))
@@ -470,6 +484,94 @@ pub(super) fn file_id(file: &File) -> io::Result<FileId> {
 pub(super) fn unlink(dir: &File, name: &OsStr) -> io::Result<()> {
     // SAFETY: the name is a valid NUL-terminated string and `dir` an open directory.
     check(unsafe { libc::unlinkat(dir.as_raw_fd(), cstr(name)?.as_ptr(), 0) }).map(|_| ())
+}
+
+/// One directory of a tree being removed: its open handle, the names not yet visited and the first failure below it.
+struct Level {
+    dir: File,
+    name: OsString,
+    pending: Vec<OsString>,
+    failure: Option<io::Error>,
+}
+
+/// What a name in an open directory turned out to be.
+enum Entered {
+    /// A file or a link, now unlinked.
+    Unlinked,
+    /// A directory, opened and listed.
+    Directory(Level),
+}
+
+/// Unlinks `name` in `parent` if it is not a directory; otherwise opens it, with no link followed, and lists it.
+fn enter(parent: &File, name: &OsStr) -> io::Result<Entered> {
+    let cname = cstr(name)?;
+    if fstatat_nofollow(parent.as_raw_fd(), &cname)?.kind() != EntryKind::Directory {
+        unlink(parent, name)?;
+        return Ok(Entered::Unlinked);
+    }
+    let dir = File::from(open_fd(
+        parent.as_raw_fd(),
+        &cname,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        0,
+    )?);
+    let pending = names(&dir)?;
+    Ok(Entered::Directory(Level {
+        dir,
+        name: name.to_owned(),
+        pending,
+        failure: None,
+    }))
+}
+
+/// `name` in `dir` and, if it is a directory, everything below it. Each level is opened through its parent's handle
+/// with no link followed, and one failing entry does not stop the others: the first failure is returned once the rest
+/// were tried. The levels wait on the heap, one descriptor each, so a tree deeper than the process has descriptors
+/// fails at an open, and the stack never grows with the depth.
+pub(super) fn remove_tree(dir: &File, name: &OsStr) -> io::Result<()> {
+    let mut levels = match enter(dir, name)? {
+        Entered::Unlinked => return Ok(()),
+        Entered::Directory(root) => vec![root],
+    };
+    loop {
+        let Some(top) = levels.last_mut() else {
+            return Ok(());
+        };
+        if let Some(entry) = top.pending.pop() {
+            match enter(&top.dir, &entry) {
+                Ok(Entered::Unlinked) => {}
+                Ok(Entered::Directory(level)) => levels.push(level),
+                Err(e) => {
+                    top.failure.get_or_insert(e);
+                }
+            }
+            continue;
+        }
+        // Everything below this level was tried: remove it, if nothing below it failed.
+        let Some(done) = levels.pop() else {
+            return Ok(());
+        };
+        let outcome = match done.failure {
+            Some(e) => Err(e),
+            None => {
+                let parent = levels.last().map_or(dir, |level| &level.dir);
+                // SAFETY: the name is a valid NUL-terminated string and `parent` an open directory.
+                cstr(&done.name)
+                    .and_then(|cname| {
+                        check(unsafe { libc::unlinkat(parent.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR) })
+                    })
+                    .map(|_| ())
+            }
+        };
+        match levels.last_mut() {
+            Some(parent) => {
+                if let Err(e) = outcome {
+                    parent.failure.get_or_insert(e);
+                }
+            }
+            None => return outcome,
+        }
+    }
 }
 
 /// `from` to `to`, both in `dir`, replacing `to`. `_temp` is the open file at `from`: Windows renames by its handle.

@@ -12,10 +12,8 @@ use shadowsocks_service::config::{
     Config, ConfigType, LocalConfig, LocalInstanceConfig, ProtocolType, ServerInstanceConfig,
 };
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use thiserror::Error;
-
-use hole_common::plugin;
 
 // Errors ==============================================================================================================
 
@@ -483,7 +481,7 @@ pub fn build_ss_config(
 
 /// Typed, side-effect-free validation of everything [`build_ss_config`]
 /// checks: listener invariants and cipher method. Whether the configured plugin
-/// may run is [`resolve_plugin`]'s question, asked before any start work.
+/// may run is [`PluginSource::resolve`]'s question, asked before any start work.
 /// `proxy_manager::start_inner` runs this before the Full-mode preamble
 /// when the config can only be built later (pure-VPN: the internal
 /// SOCKS5 port arrives from `bind_ephemeral`), so rejects stay fast and
@@ -543,173 +541,7 @@ fn build_local_instance(protocol: ProtocolType, addr: SocketAddr, mode: Mode) ->
 
 // Plugin resolution ===================================================================================================
 
-/// A plugin Hole ships, bound to the binary the bridge runs for it: the only
-/// thing the plugin spawner accepts.
-///
-/// The bridge runs as root (or SYSTEM), and a bare name handed to the spawner
-/// is looked up on the inherited `PATH`, which is user-writable when the bridge
-/// is elevated from the GUI. Only [`resolve_plugin`] builds one (through
-/// [`PluginLookup`], or [`resolve_plugin_beside`] for a test that stages an
-/// install), so a value proves `descriptor` is a shipped plugin and `path` is
-/// the absolute file that descriptor's binary name selects beside the bridge
-/// executable.
-#[derive(Debug, Clone)]
-pub struct BundledPlugin {
-    descriptor: &'static plugin::PluginDescriptor,
-    path: PathBuf,
-}
-
-impl BundledPlugin {
-    pub fn descriptor(&self) -> &'static plugin::PluginDescriptor {
-        self.descriptor
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// A shipped plugin pointed at an arbitrary binary, for tests that spawn a
-    /// stub or run without an install dir.
-    #[cfg(test)]
-    pub(crate) fn for_test(name: &str, path: impl Into<PathBuf>) -> Self {
-        let descriptor = bundled_descriptor(name).unwrap_or_else(|e| panic!("for_test: {e}"));
-        Self::for_test_descriptor(descriptor, path)
-    }
-
-    /// [`for_test`](Self::for_test) with a descriptor that is not in the table,
-    /// for a test that needs a plugin whose descriptor says something none of
-    /// the shipped ones do.
-    #[cfg(test)]
-    pub(crate) fn for_test_descriptor(descriptor: &'static plugin::PluginDescriptor, path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        assert!(path.is_absolute(), "for_test: {path:?} is not absolute");
-        Self { descriptor, path }
-    }
-}
-
-/// Why a configured plugin cannot be resolved to a binary Hole will run.
-///
-/// Every `Display` reaches the GUI toast verbatim. It shows the plugin name as
-/// the user configured it, escaped so that whatever characters it holds stay
-/// inert, and a binary by file name; none shows a path of the installation.
-#[derive(Debug, Error)]
-pub enum PluginResolveError {
-    /// The name is not in [`plugin::known_plugin_names`].
-    #[error(
-        "plugin {name:?} is not bundled with Hole, and Hole runs only its bundled plugins. Bundled plugins: {}",
-        plugin::known_plugin_names_joined()
-    )]
-    NotBundled { name: String },
-    /// A bundled plugin whose binary is absent from the install directory — a
-    /// damaged installation, not a configuration problem. `binary` is the file
-    /// name looked for (`ex-ray.exe` on Windows).
-    #[error("Hole's bundled plugin \"{plugin}\" is missing from the installation ({binary} not found next to the Hole executable). Reinstall Hole.")]
-    BinaryMissing { plugin: String, binary: String },
-    /// The bridge could not establish which directory it is installed in, so
-    /// there is nowhere to look for the bundled plugin. `cause` is the OS error
-    /// from `current_exe()`; it stays off the `Display`, which may not name a path.
-    #[error("cannot locate the directory Hole is installed in, so its bundled plugin \"{plugin}\" cannot be found")]
-    ExeUnknown {
-        plugin: String,
-        #[source]
-        cause: Option<std::io::Error>,
-    },
-}
-
-/// The one gate for "may this plugin run": it must be one Hole ships.
-fn bundled_descriptor(name: &str) -> Result<&'static plugin::PluginDescriptor, PluginResolveError> {
-    plugin::lookup(name).ok_or_else(|| PluginResolveError::NotBundled { name: name.to_string() })
-}
-
-/// Resolve a bundled plugin to its binary next to the running bridge
-/// executable.
-///
-/// Refuses any plugin Hole does not ship ([`PluginResolveError::NotBundled`]),
-/// then looks only in the executable's directory. Returns a [`BundledPlugin`]
-/// or a typed error, never a bare name.
-pub fn resolve_plugin(name: &str) -> Result<BundledPlugin, PluginResolveError> {
-    resolve_plugin_beside(name, std::env::current_exe())
-}
-
-/// Where bundled plugins are looked up: beside the running executable. A test
-/// can stage an install directory instead.
-#[derive(Debug, Clone, Default)]
-pub struct PluginLookup {
-    /// `Some(None)`: the executable's path is unknown (`current_exe()` failed).
-    #[cfg(test)]
-    staged_exe: Option<Option<PathBuf>>,
-}
-
-impl PluginLookup {
-    /// Look up plugins beside `exe`, the bridge executable of a staged install.
-    #[cfg(test)]
-    pub(crate) fn beside(exe: PathBuf) -> Self {
-        Self {
-            staged_exe: Some(Some(exe)),
-        }
-    }
-
-    /// Look up plugins when the bridge cannot tell where it is installed.
-    #[cfg(test)]
-    pub(crate) fn exe_unknown() -> Self {
-        Self { staged_exe: Some(None) }
-    }
-
-    /// [`resolve_plugin`], or [`resolve_plugin_beside`] the staged executable.
-    pub(crate) fn resolve(&self, name: &str) -> Result<BundledPlugin, PluginResolveError> {
-        #[cfg(test)]
-        if let Some(exe) = &self.staged_exe {
-            let exe = exe
-                .clone()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "staged: no bridge executable"));
-            return resolve_plugin_beside(name, exe);
-        }
-        resolve_plugin(name)
-    }
-}
-
-/// [`resolve_plugin`] against an explicit executable (or the error that
-/// `current_exe()` answered with), for a test that stages an install directory.
-pub fn resolve_plugin_beside(
-    name: &str,
-    bridge_exe: std::io::Result<PathBuf>,
-) -> Result<BundledPlugin, PluginResolveError> {
-    // A friendly name (`v2ray-plugin`) resolves to its `binary_name` (`ex-ray`).
-    let descriptor = bundled_descriptor(name)?;
-    let exe_unknown = |cause| PluginResolveError::ExeUnknown {
-        plugin: name.to_string(),
-        cause,
-    };
-    let exe = bridge_exe.map_err(|e| exe_unknown(Some(e)))?;
-    // Before canonicalizing: that resolves a relative path against the cwd,
-    // which would put the plugin lookup wherever the process happens to be.
-    if !exe.is_absolute() {
-        return Err(exe_unknown(None));
-    }
-    // Canonicalize to resolve symlinks — the bridge may be registered via symlink,
-    // but the sibling plugin binary is next to the real binary.
-    let exe = match std::fs::canonicalize(&exe) {
-        Ok(real) => real,
-        Err(e) => {
-            tracing::debug!(
-                error = &e as &dyn std::error::Error,
-                "bridge executable not canonicalized; resolving the plugin beside it as given"
-            );
-            exe
-        }
-    };
-    let dir = exe.parent().ok_or_else(|| exe_unknown(None))?;
-    let file_name = format!("{}{}", descriptor.binary_name, std::env::consts::EXE_SUFFIX);
-    let path = dir.join(&file_name);
-    if path.is_file() {
-        Ok(BundledPlugin { descriptor, path })
-    } else {
-        Err(PluginResolveError::BinaryMissing {
-            plugin: name.to_string(),
-            binary: file_name,
-        })
-    }
-}
+pub use super::plugin_source::{BridgeExe, BundledPlugin, PluginResolveError, PluginSource};
 
 #[cfg(test)]
 #[path = "config_tests.rs"]

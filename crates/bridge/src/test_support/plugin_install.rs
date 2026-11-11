@@ -1,5 +1,6 @@
-//! Install directories (a fake bridge exe with plugin binaries beside it) for
-//! tests that resolve through `PluginLookup`.
+//! Install directories for tests that resolve a bundled plugin through
+//! `PluginSource`, the one seam both `ProxyManager` and the server test
+//! use: a bridge executable path whose directory holds the plugin binaries.
 //!
 //! Shared into integration targets by `#[path]` (`test_support` is a private
 //! module).
