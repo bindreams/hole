@@ -357,9 +357,6 @@ def main() -> int:
         required=True,
         help="JSON array of {os, arch, asset} objects describing shipped platforms (`cargo xtask release-assets`, verbatim)",
     )
-    parser.add_argument(
-        "--version", required=True, help="Bare release version (e.g. 0.4.0), used to build asset filenames"
-    )
     parser.add_argument("--head", default="HEAD", help="Git ref representing the new release commit (default: HEAD)")
     parser.add_argument(
         "--repo-root",
@@ -661,8 +658,6 @@ def test_integration_filtering_against_real_history():
             "HEAD",
             "--platforms",
             '[{"os": "linux", "arch": "amd64", "asset": "ex-ray-999.0.0-linux-amd64"}]',
-            "--version",
-            "999.0.0",
         ],
         cwd=repo_root,
         capture_output=True,
@@ -919,8 +914,6 @@ def test_main_initial_release_includes_downloads_table(tmp_path, capsys, monkeyp
             str(repo),
             "--platforms",
             '[{"os": "windows", "arch": "amd64", "asset": "hole-0.1.0-windows-amd64.msi"}]',
-            "--version",
-            "0.1.0",
         ],
     )
     assert main() == 0
@@ -948,8 +941,6 @@ def test_main_normal_release_includes_downloads_table(tmp_path, capsys, monkeypa
             str(repo),
             "--platforms",
             '[{"os": "windows", "arch": "amd64", "asset": "hole-0.2.0-windows-amd64.msi"}]',
-            "--version",
-            "0.2.0",
         ],
     )
     assert main() == 0

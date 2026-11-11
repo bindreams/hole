@@ -360,20 +360,21 @@ jobs:
         shell: bash
         run: cargo xtask run plugin-e2e-tests
 
-      # Release calls: the garter CLI is the one shipped binary no lane builds in the release profile.
+      # A garter release: the garter CLI is the one shipped binary no lane builds in the release profile.
       # Built here, before the stage below, which runs it.
       - id: release-build-garter
         name: Build the garter CLI a release ships
-        if: ${{ inputs.release-tag != '' && steps.test-plugin-e2e.outcome == 'success' }}
+        if: ${{ startsWith(inputs.release-tag, 'releases/garter/') && steps.test-plugin-e2e.outcome == 'success' }}
         timeout-minutes: 15
         shell: bash
         run: cargo xtask build garter-bin
 
-      # Release calls: stage the binaries plugin-e2e just ran on (galoshes, ex-ray) and the garter CLI,
-      # which is probed for the release version since nothing else runs it. See RELEASE ASSETS.
+      # Release calls: stage the binaries plugin-e2e just ran on (galoshes, ex-ray) or, for a garter release,
+      # the garter CLI built above, which is probed for the release version since nothing else runs it.
+      # See RELEASE ASSETS.
       - id: release-stage-plugins
         name: Stage the plugin binaries a release ships
-        if: ${{ inputs.release-tag != '' && steps.release-build-garter.outcome == 'success' }}
+        if: ${{ inputs.release-tag != '' && steps.test-plugin-e2e.outcome == 'success' && (!startsWith(inputs.release-tag, 'releases/garter/') || steps.release-build-garter.outcome == 'success') }}
         timeout-minutes: 5
         shell: bash
         env:

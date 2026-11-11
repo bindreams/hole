@@ -4,7 +4,8 @@ use xtask_lib::version::Group;
 
 use crate::manifest::{Arch, Manifest, Os, Platform};
 use crate::stage_release::{
-    check_probe_output, plan, shipped, Asset, Lane, PlatformAssets, Probe, Shipment, UpdateArchiveSource,
+    check_installer_override, check_probe_output, plan, shipped, Asset, Lane, PlatformAssets, Probe, Shipment,
+    UpdateArchiveSource,
 };
 
 const WIN: Platform = Platform {
@@ -207,4 +208,25 @@ fn an_installer_lane_refuses_the_wrong_os() {
         || unreachable!()
     )
     .is_err());
+}
+
+#[skuld::test]
+fn an_installer_override_must_be_the_build_stage_release_packs_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let built = dir.path().join("hole.msi");
+    let other = dir.path().join("other.msi");
+    std::fs::write(&built, b"built").unwrap();
+    std::fs::write(&other, b"other").unwrap();
+
+    let err = check_installer_override("MSI_UNDER_TEST", &other, &built).unwrap_err();
+    assert!(err.to_string().contains("MSI_UNDER_TEST"), "{err}");
+
+    check_installer_override("MSI_UNDER_TEST", &built, &built).unwrap();
+    // The same file under another spelling.
+    let respelled = dir
+        .path()
+        .join("..")
+        .join(dir.path().file_name().unwrap())
+        .join("hole.msi");
+    check_installer_override("MSI_UNDER_TEST", &respelled, &built).unwrap();
 }

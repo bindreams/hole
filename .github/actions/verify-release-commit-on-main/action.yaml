@@ -2,7 +2,7 @@ name: Verify the release commit is on main
 description: Fail unless the commit this workflow runs on is an ancestor of origin/main
 
 # `workflow_dispatch` accepts --ref, so without this a draft can be pinned to unmerged code and every
-# later check still passes. The caller checks out with `fetch-depth: 0` first so the ancestry can be resolved.
+# later check still passes. The ancestry needs full history, which this action fetches when the checkout is shallow.
 
 runs:
   using: composite
@@ -13,6 +13,9 @@ runs:
         SHA: ${{ github.sha }}
       run: |
         set -euo pipefail
+        if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+          git fetch --quiet --unshallow origin
+        fi
         git fetch --quiet origin main
 
         set +e

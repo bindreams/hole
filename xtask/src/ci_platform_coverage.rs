@@ -17,7 +17,7 @@
 //! `success()` does, and the failed step's outcome is `failure`. It does not
 //! model cancellation, `continue-on-error`, or a second failure. The expression
 //! subset is deliberately small (`&&`, `||`, `!`, `==`, `!=`, parentheses, the
-//! four status functions, `matrix.*`, `steps.<id>.outcome` and `inputs.release-tag`);
+//! four status functions, `startsWith(a, b)`, `matrix.*`, `steps.<id>.outcome` and `inputs.release-tag`);
 //! anything else is an error, so the grammar cannot silently widen. Every modelled
 //! run is an ordinary (push or pull-request) run: `inputs.release-tag` is empty, so
 //! the steps only a release call runs are skipped.
@@ -410,6 +410,15 @@ impl Val {
         }
     }
 
+    fn string(&self) -> String {
+        match self {
+            Val::Null => String::new(),
+            Val::Bool(b) => b.to_string(),
+            Val::Num(n) => n.to_string(),
+            Val::Str(s) => s.clone(),
+        }
+    }
+
     fn number(&self) -> f64 {
         match self {
             Val::Null => 0.0,
@@ -472,6 +481,7 @@ enum Tok {
     Ne,
     LParen,
     RParen,
+    Comma,
     Str(String),
     Ident(String),
 }
@@ -511,6 +521,10 @@ fn tokenize(text: &str) -> Result<Vec<Tok>> {
             }
             (')', _) => {
                 out.push(Tok::RParen);
+                i += 1;
+            }
+            (',', _) => {
+                out.push(Tok::Comma);
                 i += 1;
             }
             ('\'', _) => {
@@ -608,12 +622,14 @@ impl Parser<'_> {
             Tok::Str(s) => Ok(Val::Str(s)),
             Tok::Ident(name) => {
                 if self.eat(&Tok::LParen) {
-                    ensure!(
-                        self.eat(&Tok::RParen),
-                        "function {name:?} takes arguments, which are not supported"
-                    );
-                    self.used_status_function = true;
-                    return call(&name, self.ctx.failed.is_some());
+                    let mut args = Vec::new();
+                    while !self.eat(&Tok::RParen) {
+                        if !args.is_empty() {
+                            ensure!(self.eat(&Tok::Comma), "missing `,` or `)` in the call to {name:?}");
+                        }
+                        args.push(self.or()?);
+                    }
+                    return self.call(&name, &args);
                 }
                 self.ctx.lookup(&name)
             }
@@ -622,14 +638,32 @@ impl Parser<'_> {
     }
 }
 
-/// Status functions, for a run in which an earlier step has failed or not.
-fn call(name: &str, an_earlier_step_failed: bool) -> Result<Val> {
-    match name {
-        "success" => Ok(Val::Bool(!an_earlier_step_failed)),
-        "always" => Ok(Val::Bool(true)),
-        "failure" => Ok(Val::Bool(an_earlier_step_failed)),
-        "cancelled" => Ok(Val::Bool(false)),
-        other => bail!("function {other:?}() is not supported in an `if:` expression"),
+impl Parser<'_> {
+    /// Status functions (for a run in which an earlier step has failed or not) and `startsWith`.
+    fn call(&mut self, name: &str, args: &[Val]) -> Result<Val> {
+        let an_earlier_step_failed = self.ctx.failed.is_some();
+        let status = match name {
+            "success" => Some(!an_earlier_step_failed),
+            "always" => Some(true),
+            "failure" => Some(an_earlier_step_failed),
+            "cancelled" => Some(false),
+            _ => None,
+        };
+        if let Some(status) = status {
+            ensure!(args.is_empty(), "function {name:?}() takes no arguments");
+            self.used_status_function = true;
+            return Ok(Val::Bool(status));
+        }
+        match (name, args) {
+            // Case-insensitive, as GitHub's is.
+            ("startsWith", [text, prefix]) => Ok(Val::Bool(
+                text.string()
+                    .to_ascii_lowercase()
+                    .starts_with(&prefix.string().to_ascii_lowercase()),
+            )),
+            ("startsWith", _) => bail!("function \"startsWith\" takes two arguments"),
+            (other, _) => bail!("function {other:?}() is not supported in an `if:` expression"),
+        }
     }
 }
 

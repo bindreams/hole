@@ -2,7 +2,7 @@ use garter::{BinaryPlugin, ChainRunner, Mode, PluginEnv};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if let Some(text) = garter_bin::cli::info_output(std::env::args().skip(1)) {
+    if let Some(text) = garter_bin::cli::info_output(std::env::args_os().skip(1)) {
         println!("{text}");
         return Ok(());
     }

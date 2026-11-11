@@ -4723,22 +4723,24 @@ Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
   runs the shipped executables that report a version: `hole.exe version` (the MSI's
   payload) and `garter --version` must print the tag's version, so a build of a
   dirty tree (`X.Y.Z.dirty`) fails; `garter --help` must exit 0. The garter CLI is
-  the one binary no earlier lane builds in the release profile, so `ci.yaml` builds
-  it (`release-build-garter`) before staging, and these probes are the only test
+  the one binary no earlier lane builds in the release profile, so a garter release's
+  `ci.yaml` call builds it (`release-build-garter`) before staging, and these probes are the only test
   that runs on it. galoshes and ex-ray have no version command, so their version
   stamp is not checked (the galoshes and ex-ray sidecars inside the MSI and DMG are
   covered by their installer tests). Only a passing leg uploads
   `release-<os>-<arch>`; the draft job needs the whole of CI to have passed, checks
-  that the downloaded files are exactly what `cargo xtask release-assets --tag <tag>`
-  lists (the one definition of what a track ships, `stage_release::plan` over the
+  (`.github/actions/check-release-assets`) that the downloaded files are exactly what
+  `cargo xtask release-assets --tag <tag>` lists (`list-release-assets`; the one definition of what a track ships, `stage_release::plan` over the
   platforms `build.yaml` runs each lane's target on), builds the release notes'
   Downloads table from the same list, then hashes and uploads the files; it builds
   nothing. A leg's wall in `ci.yaml` includes the budgets of its release-only steps.
 - **Installer under test.** The DMG tests take the DMG from `DMG_UNDER_TEST`
   (default: the release build's single `.dmg`), the MSI lifecycle tests the MSI from
-  `MSI_UNDER_TEST` (default: `target/release/hole.msi`), and `stage-release` stages
-  the same files. A relative path in either variable is from the repo root, in the
-  Python harnesses and in xtask alike.
+  `MSI_UNDER_TEST` (default: `target/release/hole.msi`). A relative path in either
+  variable is from the repo root, in the Python harnesses and in xtask alike.
+  `stage-release` stages only this checkout's own build (the update archive and the
+  `hole.exe` probe come from it), so it refuses a variable that names any other
+  file.
 
 Rollback, minisign key rotation, and the crates.io dry-run TOCTOU note are in
 [RELEASE-OPS.md](RELEASE-OPS.md).

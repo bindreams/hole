@@ -82,7 +82,9 @@ jobs:
       # What this release ships, per platform, from the plan `stage-release` stages by.
       - name: List the release assets
         id: assets
-        run: echo "platforms=$(cargo xtask release-assets --tag "releases/${{ inputs.track }}/v${{ steps.version.outputs.version }}")" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/list-release-assets
+        with:
+          tag: releases/${{ inputs.track }}/v${{ steps.version.outputs.version }}
 
   # CI's whole test track on the release commit, with the release tag created locally so the binaries
   # carry the release version. Each leg stages the binary it tested and uploads it as
@@ -102,21 +104,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          path: source
+
       - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           merge-multiple: true
 
-      # The files must be exactly what the release ships (`cargo xtask release-assets`): a leg that staged
-      # nothing, or something extra, fails here.
-      - name: Check the assets are what the release ships
-        env:
-          PLATFORMS: ${{ needs.validate.outputs.platforms }}
-        run: |
-          set -euo pipefail
-          jq -r '.[].assets[]' <<<"$PLATFORMS" | sort > "$RUNNER_TEMP/expected-assets.txt"
-          find . -maxdepth 1 -type f -printf '%f\n' | sort > "$RUNNER_TEMP/actual-assets.txt"
-          diff -u "$RUNNER_TEMP/expected-assets.txt" "$RUNNER_TEMP/actual-assets.txt"
+      # Checks the working directory, which holds only the downloaded files.
+      - uses: ./source/.github/actions/check-release-assets
+        with:
+          platforms: ${{ needs.validate.outputs.platforms }}
 
       # Hash on ubuntu (single platform) so SHA256SUMS is uniformly
       # text-mode regardless of which per-matrix runner built each
@@ -129,11 +130,6 @@ jobs:
 
           echo "SHA256SUMS:"
           cat SHA256SUMS
-
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          path: source
 
       - uses: astral-sh/setup-uv@v10.3.3
 

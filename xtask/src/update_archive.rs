@@ -143,11 +143,13 @@ pub fn verify_app_signature(archive: &Path) -> Result<()> {
     payload_archive::unpack_targz(archive, workdir.path()).with_context(|| format!("unpack {}", archive.display()))?;
     let app = payload_archive::find_single_app(workdir.path())
         .map_err(|e| anyhow::anyhow!("select the .app unpacked from {}: {e}", archive.display()))?;
-    crate::command::run_captured(
+    let output = crate::command::run_captured(
         std::process::Command::new("codesign")
             .args(["--verify", "--deep", "--strict", "--verbose=2"])
             .arg(&app),
     )?;
+    // codesign reports on stderr, even on success.
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
     Ok(())
 }
 

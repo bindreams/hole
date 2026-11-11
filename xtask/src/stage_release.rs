@@ -3,7 +3,7 @@
 //!
 //! A lane is the point in `ci.yaml` where one kind of shipped file has just passed its tests, and each
 //! (group, lane) pair says what to stage there. [`plan`] is the one definition of what a release ships:
-//! `--list` derives the asset set the draft workflow checks and the notes' Downloads table from it.
+//! `cargo xtask release-assets` ([`list`]) derives the asset set the draft workflow checks and the notes' Downloads table from it.
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
@@ -284,23 +284,40 @@ pub fn list(tag: &str) -> Result<()> {
     Ok(())
 }
 
-/// The installer a lane stages: `env_var`'s path when set (a relative one is from the repo root), else the single
-/// `.dmg` in the release bundle dir / the release MSI.
+/// The installer a lane stages: the single `.dmg` in the release bundle dir / the release MSI, the build this
+/// checkout's update archive and payload probe are taken from.
+///
+/// `MSI_UNDER_TEST` / `DMG_UNDER_TEST` may be set (a relative path is from the repo root) but only to that same
+/// file: staging another installer next to this build's archive would ship two builds as one release.
 fn resolve_installer(lane: Lane, repo_root: &Path) -> Result<PathBuf> {
     let release = repo_root.join("target").join("release");
-    let (env_var, default) = match lane {
+    let (env_var, built) = match lane {
         Lane::Msi => (MSI_ENV, release.join("hole.msi")),
-        Lane::Dmg => (DMG_ENV, release.join("bundle").join("dmg")),
+        Lane::Dmg => (DMG_ENV, single_dmg(&release.join("bundle").join("dmg"))?),
         Lane::Plugins => bail!("the plugins lane stages no installer"),
     };
-    if let Some(path) = std::env::var_os(env_var).filter(|p| !p.is_empty()) {
-        return Ok(repo_root.join(path));
+    if let Some(given) = std::env::var_os(env_var).filter(|p| !p.is_empty()) {
+        check_installer_override(env_var, &repo_root.join(given), &built)?;
     }
-    if lane != Lane::Dmg {
-        return Ok(default);
-    }
+    Ok(built)
+}
+
+/// `given` (the value of `env_var`) must be the file `built` names.
+fn check_installer_override(env_var: &str, given: &Path, built: &Path) -> Result<()> {
+    let resolve = |path: &Path| std::fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()));
+    ensure!(
+        resolve(given)? == resolve(built)?,
+        "{env_var} is {}, but stage-release stages only this checkout's own build, {}: the update archive and the          version probe come from that build. Unset {env_var} or point it at that file",
+        given.display(),
+        built.display()
+    );
+    Ok(())
+}
+
+/// The one `.dmg` in `dir`.
+fn single_dmg(dir: &Path) -> Result<PathBuf> {
     let mut dmgs = Vec::new();
-    for entry in std::fs::read_dir(&default).with_context(|| format!("read {}", default.display()))? {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let path = entry?.path();
         if path.extension().is_some_and(|e| e == "dmg") {
             dmgs.push(path);
@@ -309,8 +326,8 @@ fn resolve_installer(lane: Lane, repo_root: &Path) -> Result<PathBuf> {
     match <[PathBuf; 1]>::try_from(dmgs) {
         Ok([only]) => Ok(only),
         Err(found) => bail!(
-            "expected exactly one .dmg in {}, found {}; remove stale ones or set {DMG_ENV}",
-            default.display(),
+            "expected exactly one .dmg in {}, found {}; remove the stale ones",
+            dir.display(),
             found.len()
         ),
     }

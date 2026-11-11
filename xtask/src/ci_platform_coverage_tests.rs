@@ -263,12 +263,13 @@ fn each_malformed_expression_is_an_error_naming_the_problem() {
         ("matrix.flag matrix.flag", "trailing input"),
         ("matrix.name == 'Win", "unterminated string"),
         ("(matrix.flag", "missing `)`"),
-        ("always(1)", "takes arguments"),
+        ("always('x')", "takes no arguments"),
+        ("startsWith('a')", "takes two arguments"),
         ("steps.first.conclusion == 'success'", "only `steps.<id>.outcome`"),
         ("matrix.flag &&", "unexpected end"),
         ("matrix.flag & matrix.flag", "unsupported character"),
         ("github.ref == 'x'", "unsupported context reference"),
-        ("hashFiles('x')", "takes arguments"),
+        ("hashFiles('x')", "not supported"),
         ("contains()", "contains"),
     ] {
         let err = probe_error(condition);
@@ -291,6 +292,14 @@ fn and_binds_tighter_than_or_without_parentheses() {
 fn not_binds_tighter_than_equality() {
     assert!(!probe_runs("!'x' == 'false'").unwrap());
     assert!(probe_runs("!'x' == '0'").unwrap());
+}
+
+/// `startsWith` ignores case, as GitHub's does, and an empty `inputs.release-tag` (an ordinary run) has no prefix.
+#[skuld::test]
+fn starts_with_ignores_case_and_an_ordinary_run_has_no_release_tag() {
+    assert!(probe_runs("startsWith(matrix.name, 'WIN')").unwrap());
+    assert!(!probe_runs("startsWith(matrix.name, 'dows')").unwrap());
+    assert!(!probe_runs("startsWith(inputs.release-tag, 'releases/garter/')").unwrap());
 }
 
 /// String equality ignores case, as GitHub's does.
