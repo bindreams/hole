@@ -1,44 +1,29 @@
-//! Host target-triple resolution, shared by the sidecar builders.
+//! Target-triple resolution, shared by the sidecar builders.
 //!
 //! Tauri's bundler and the ex-ray/galoshes sidecar layouts both name files
 //! `<stem>-<target-triple>{.exe}`, so the triple lives in one place.
 
-/// The Rust target triple for the host platform (e.g. `x86_64-pc-windows-msvc`,
-/// `aarch64-apple-darwin`). Covers every triple in the workspace CI matrix
-/// (Hole's Windows/macOS release set plus the standalone-plugin Linux /
+use crate::manifest::{Arch, Os, Platform};
+
+/// The Rust target triple of `platform` (e.g. `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`). Covers every
+/// platform in the workspace CI matrix (Hole's Windows/macOS release set plus the standalone-plugin Linux /
 /// Windows-arm64 test matrix).
-pub fn host_target_triple() -> &'static str {
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    {
-        "x86_64-pc-windows-msvc"
+pub fn target_triple(platform: Platform) -> &'static str {
+    match (platform.os, platform.arch) {
+        (Os::Windows, Arch::Amd64) => "x86_64-pc-windows-msvc",
+        (Os::Windows, Arch::Arm64) => "aarch64-pc-windows-msvc",
+        (Os::Darwin, Arch::Amd64) => "x86_64-apple-darwin",
+        (Os::Darwin, Arch::Arm64) => "aarch64-apple-darwin",
+        (Os::Linux, Arch::Amd64) => "x86_64-unknown-linux-gnu",
+        (Os::Linux, Arch::Arm64) => "aarch64-unknown-linux-gnu",
     }
-    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-    {
-        "aarch64-pc-windows-msvc"
-    }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        "aarch64-apple-darwin"
-    }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        "x86_64-apple-darwin"
-    }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        "x86_64-unknown-linux-gnu"
-    }
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    {
-        "aarch64-unknown-linux-gnu"
-    }
-    #[cfg(not(any(
-        all(target_os = "windows", target_arch = "x86_64"),
-        all(target_os = "windows", target_arch = "aarch64"),
-        all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "macos", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
-    )))]
-    compile_error!("unsupported platform for host target triple");
 }
+
+/// The Rust target triple for the host platform.
+pub fn host_target_triple() -> &'static str {
+    target_triple(Platform::host().expect("unsupported platform for host target triple"))
+}
+
+#[cfg(test)]
+#[path = "target_tests.rs"]
+mod target_tests;

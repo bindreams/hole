@@ -8,8 +8,6 @@
 //! resolves each name to a host source path, and the installer-manifest
 //! conformance tests derive their expected payload from `bindir_dest_names` (via
 //! `cargo xtask bindir-names`).
-//!
-//! See issue #143 for the motivation.
 
 use std::fmt;
 use std::str::FromStr;
@@ -75,38 +73,89 @@ impl FromStr for Os {
     }
 }
 
-/// On-disk filenames that must sit next to the bridge binary on `os`, in staging
-/// order. **Single source of truth for the BINDIR payload.** Pure: no disk
-/// access, callable for any `os` from any host — so the installer conformance
-/// tests (`cargo xtask bindir-names`), `xtask::bindir::bindir_files`, and the
-/// Windows update-cutover swap share one definition of what ships.
-///
-/// Add or remove a BINDIR file here. `bindir_tests.rs` asserts the exact set
-/// per OS, and the WiX / Tauri conformance tests fail loudly if a manifest stops
-/// covering it.
-pub fn bindir_dest_names(os: Os) -> Vec<String> {
+/// What a shipped file is: whether it is an executable and, if so, what builds it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FileKind {
+    /// An executable cargo builds from a package whose `build.rs` calls `libsearch_guard::bins()`.
+    RustExecutable,
+    /// An executable another toolchain builds (ex-ray, from Go).
+    ForeignExecutable,
+    /// Not run: a library, debug symbols, a notice file.
+    NotExecutable,
+}
+
+impl FileKind {
+    /// Whether a file of this kind is an executable.
+    pub fn is_executable(self) -> bool {
+        match self {
+            FileKind::RustExecutable | FileKind::ForeignExecutable => true,
+            FileKind::NotExecutable => false,
+        }
+    }
+
+    /// Whether `libsearch_guard::verify` must pass on a file of this kind shipped for `os`.
+    pub fn is_verified_on(self, os: Os) -> bool {
+        match self {
+            FileKind::NotExecutable => false,
+            FileKind::RustExecutable => true,
+            // The Go linker sets no `DEPENDENTLOADFLAG`, so a Windows build of it is not hardened.
+            FileKind::ForeignExecutable => os != Os::Windows,
+        }
+    }
+}
+
+/// One file or bundle of the BINDIR: its on-disk name and what it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindirEntry {
+    pub name: String,
+    pub kind: FileKind,
+}
+
+/// The file name of the Hole executable itself in a BINDIR on `os`: the entry of [`bindir_entries`] that is the app, not one
+/// of its plugins or data files.
+pub fn app_executable_name(os: Os) -> String {
     let exe = if os == Os::Windows { ".exe" } else { "" };
-    let mut names = vec![format!("hole{exe}")];
+    format!("hole{exe}")
+}
+
+/// The BINDIR payload for `os`, in staging order. **Single source of truth for the BINDIR payload and for what each
+/// file is.** Pure: no disk access, callable for any `os` from any host.
+pub fn bindir_entries(os: Os) -> Vec<BindirEntry> {
+    let exe = if os == Os::Windows { ".exe" } else { "" };
+    let entry = |name: String, kind| BindirEntry { name, kind };
+    let mut entries = vec![entry(app_executable_name(os), FileKind::RustExecutable)];
     // Debug symbols, staged alongside the binary so panic backtraces resolve
-    // frame names + line numbers (else `<unknown>`; see #393). The workspace
+    // frame names + line numbers (else `<unknown>`). The workspace
     // `[profile.release] debug = "limited"` + `split-debuginfo = "packed"`
     // produce a portable PDB/dSYM for this purpose.
     match os {
-        Os::Windows => names.push("hole.pdb".to_string()),
-        Os::Darwin => names.push("hole.dSYM".to_string()),
+        Os::Windows => entries.push(entry("hole.pdb".to_string(), FileKind::NotExecutable)),
+        Os::Darwin => entries.push(entry("hole.dSYM".to_string(), FileKind::NotExecutable)),
         Os::Linux => {}
     }
-    names.push(format!("ex-ray{exe}"));
-    names.push(format!("galoshes{exe}"));
+    entries.push(entry(format!("ex-ray{exe}"), FileKind::ForeignExecutable));
+    entries.push(entry(format!("galoshes{exe}"), FileKind::RustExecutable));
     // wintun.dll — Windows-only DLL loaded by the bridge's TUN path.
     if os == Os::Windows {
-        names.push("wintun.dll".to_string());
+        entries.push(entry("wintun.dll".to_string(), FileKind::NotExecutable));
     }
     // NOTICES.md — Apache-2.0 §4(d) attribution for the bundled galoshes/garter
     // components; the installer license dialog shows only GPL-3.0 text, so the
     // NOTICE file must accompany the binaries on disk.
-    names.push("NOTICES.md".to_string());
-    names
+    entries.push(entry("NOTICES.md".to_string(), FileKind::NotExecutable));
+    entries
+}
+
+/// On-disk filenames that must sit next to the bridge binary on `os`, in staging
+/// order: the names of [`bindir_entries`]. The installer conformance tests
+/// (`cargo xtask bindir-names`), `xtask::bindir::bindir_files`, and the
+/// Windows update-cutover swap share this one definition of what ships.
+///
+/// Add or remove a BINDIR file in [`bindir_entries`]. `bindir_tests.rs` asserts the exact set
+/// per OS, and the WiX / Tauri conformance tests fail loudly if a manifest stops
+/// covering it.
+pub fn bindir_dest_names(os: Os) -> Vec<String> {
+    bindir_entries(os).into_iter().map(|e| e.name).collect()
 }
 
 /// SIP003 plugin binaries (no extension) Hole ships. The Windows installer puts them
@@ -127,13 +176,27 @@ pub fn embedded_plugin_names(os: Os) -> &'static [&'static str] {
     }
 }
 
-/// What the app bundle holds on `os`: [`bindir_dest_names`] without the plugins `hole` embeds.
-pub fn bundle_payload_names(os: Os) -> Vec<String> {
+/// The entries of [`bindir_entries`] `hole` embeds on `os` ([`embedded_plugin_names`]).
+pub fn embedded_plugin_entries(os: Os) -> Vec<BindirEntry> {
     let embedded = embedded_plugin_names(os);
-    bindir_dest_names(os)
+    bindir_entries(os)
         .into_iter()
-        .filter(|name| !embedded.contains(&name.as_str()))
+        .filter(|e| embedded.contains(&e.name.as_str()))
         .collect()
+}
+
+/// What the app bundle holds on `os`: [`bindir_entries`] without the plugins `hole` embeds.
+pub fn bundle_payload_entries(os: Os) -> Vec<BindirEntry> {
+    let embedded = embedded_plugin_names(os);
+    bindir_entries(os)
+        .into_iter()
+        .filter(|e| !embedded.contains(&e.name.as_str()))
+        .collect()
+}
+
+/// The names of [`bundle_payload_entries`].
+pub fn bundle_payload_names(os: Os) -> Vec<String> {
+    bundle_payload_entries(os).into_iter().map(|e| e.name).collect()
 }
 
 /// The file name a plugin takes in `.cache/<name>/`: `<name>-<triple>{.exe}`, what Tauri appends to an `externalBin`

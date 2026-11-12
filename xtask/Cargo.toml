@@ -65,6 +65,10 @@ tempfile = "3"
 # dev-) dependency because the check runs in the subcommand, not in tests.
 skuld = { workspace = true }
 
+# `stage-release` verifies each staged Rust executable is hardened against loading libraries from its own folder
+# (`libsearch_guard::verify`, the check the crates' own tests run on their debug binaries).
+libsearch-guard = { workspace = true }
+
 # `verify-global-net-state-executed` (bindreams/hole#999) parses nextest's
 # JUnit report to confirm the `global_net_state`-labeled tests it expects
 # actually ran, not merely that they were selectable. Pinned to "0.21" so it

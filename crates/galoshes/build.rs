@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
 fn main() {
+    // Static VC runtime and no DLL search of the executable's folder.
+    libsearch_guard::bins();
+
     println!("cargo:rustc-check-cfg=cfg(ex_ray_missing)");
 
     let target = std::env::var("TARGET").unwrap();

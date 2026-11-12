@@ -6,6 +6,9 @@ use std::time::SystemTime;
 mod embed_plugins;
 
 fn main() {
+    // Static VC runtime and no DLL search of the executable's folder.
+    libsearch_guard::bins();
+
     let icons_dir = Path::new("icons");
 
     // Rerun on any SVG change in icons/, not just the ones the active

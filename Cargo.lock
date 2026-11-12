@@ -170,7 +170,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4087686b4b0a3427190bae57a1d9a478dbb2d40c5dc1bd6e2b6d797913bdd348"
 dependencies = [
- "object",
+ "object 0.37.3",
 ]
 
 [[package]]
@@ -2416,6 +2416,7 @@ dependencies = [
  "garter",
  "hole-test-observability",
  "libc",
+ "libsearch-guard",
  "serde_json",
  "sha2 0.11.0",
  "skuld",
@@ -2464,6 +2465,7 @@ dependencies = [
  "anyhow",
  "garter",
  "hole-test-observability",
+ "libsearch-guard",
  "serde",
  "skuld",
  "tokio",
@@ -3274,6 +3276,7 @@ dependencies = [
  "icns",
  "ico 0.5.0",
  "libc",
+ "libsearch-guard",
  "minisign-verify",
  "objc2",
  "objc2-app-kit",
@@ -4273,6 +4276,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsearch-guard"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88f4c430d94fa0e7f54937601682fa5e724145b8d637fe1c8bd22116fb072e3f"
+dependencies = [
+ "object 0.41.0",
+]
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5175,6 +5187,15 @@ name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "object"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11dbdb66876026054e4ffc8d757d862bdf5df5aebd5c0b95a41f17832a94f7d2"
 dependencies = [
  "memchr",
 ]
@@ -10556,6 +10577,7 @@ dependencies = [
  "httpdate",
  "indexmap 2.14.0",
  "libc",
+ "libsearch-guard",
  "payload-archive",
  "petgraph",
  "png 0.18.1",

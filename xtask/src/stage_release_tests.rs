@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 
 use xtask_lib::version::Group;
 
+use crate::bindir::{cache_sidecar_path, FileKind};
 use crate::manifest::{Arch, Manifest, Os, Platform};
 use crate::stage_release::{
-    check_installer_override, check_probe_output, ensure_built, plan, resolve_installer, run_probes, shipped,
-    single_dmg, Asset, Lane, PlatformAssets, Probe, Shipment, UpdateArchiveSource,
+    check_installer_override, check_probe_output, ensure_built, hardening_failure, payload_executable_paths,
+    payload_root, plan, resolve_installer, run_probes, shipped, single_dmg, verify_hardened, Asset, AssetKind,
+    Executable, Lane, PlatformAssets, Probe, Shipment, UpdateArchive, UpdateArchiveSource,
 };
 use crate::test_child::PROBE_TARGET_ARG;
 
@@ -78,17 +80,201 @@ fn the_garter_cli_is_probed_for_the_tags_version_and_help() {
     );
 }
 
+fn payload(group: Group, lane: Lane, platform: Platform) -> UpdateArchive {
+    shipment(group, lane, platform).update_archive.unwrap()
+}
+
+fn exe(name: &str, kind: FileKind, probes: Vec<Probe>) -> Executable {
+    Executable {
+        name: name.into(),
+        kind,
+        probes,
+    }
+}
+
+/// The MSI's stage dir holds six files and the three executables among them are payload executables, whatever builds
+/// them; `wintun.dll` and the notice file are not. `hole` alone is probed, for the tag's version.
 #[skuld::test]
-fn the_msi_payload_binary_is_probed_for_the_tags_version() {
-    let exe = shipment(Group::Hole, Lane::Msi, WIN).payload_binary.unwrap();
-    assert_eq!(exe.path, Path::new("repo/target/release/installer-stage/hole.exe"));
+fn the_msi_payload_executables_are_the_exes_of_the_bindir() {
     assert_eq!(
-        exe.probes,
-        [Probe {
-            args: &["version"],
-            prints: Some("hole 1.2.3".into())
-        }]
+        payload(Group::Hole, Lane::Msi, WIN).executables,
+        [
+            exe(
+                "hole.exe",
+                FileKind::RustExecutable,
+                vec![Probe {
+                    args: &["version"],
+                    prints: Some("hole 1.2.3".into())
+                }]
+            ),
+            exe("ex-ray.exe", FileKind::ForeignExecutable, Vec::new()),
+            exe("galoshes.exe", FileKind::RustExecutable, Vec::new()),
+        ]
     );
+}
+
+/// The app holds `hole` alone as an executable: the plugins are embedded in it, and checked as the files it embeds.
+#[skuld::test]
+fn the_dmg_payload_executable_is_hole_and_its_embedded_plugins_are_checked_too() {
+    let dmg = payload(Group::Hole, Lane::Dmg, MAC);
+    assert_eq!(dmg.executables, [exe("hole", FileKind::RustExecutable, Vec::new())]);
+    assert_eq!(
+        dmg.embedded,
+        [
+            exe("ex-ray", FileKind::ForeignExecutable, Vec::new()),
+            exe("galoshes", FileKind::RustExecutable, Vec::new())
+        ]
+    );
+    // Windows ships the plugins as files of the stage dir, so it embeds none.
+    assert!(payload(Group::Hole, Lane::Msi, WIN).embedded.is_empty());
+}
+
+#[skuld::test]
+fn only_hole_ships_a_payload() {
+    for (group, lane, platform) in [
+        (Group::Galoshes, Lane::Plugins, WIN),
+        (Group::Garter, Lane::Plugins, LINUX),
+        (Group::ExRay, Lane::Plugins, MAC),
+    ] {
+        assert!(shipment(group, lane, platform).update_archive.is_none());
+    }
+}
+
+/// What each shipped file is: the installers are not binaries, ex-ray is built by Go, the rest by cargo. The
+/// executables' kinds are the BINDIR's own, on every OS.
+#[skuld::test]
+fn a_shipped_file_knows_what_built_it() {
+    let kinds = |group, lane, platform| -> Vec<AssetKind> {
+        shipment(group, lane, platform).files.iter().map(|a| a.kind).collect()
+    };
+    let rust = AssetKind::Executable(FileKind::RustExecutable);
+    let foreign = AssetKind::Executable(FileKind::ForeignExecutable);
+    assert_eq!(kinds(Group::Galoshes, Lane::Plugins, WIN), [rust]);
+    assert_eq!(kinds(Group::Galoshes, Lane::Plugins, LINUX), [rust]);
+    assert_eq!(kinds(Group::Garter, Lane::Plugins, LINUX), [rust]);
+    assert_eq!(kinds(Group::ExRay, Lane::Plugins, MAC), [foreign]);
+    assert_eq!(kinds(Group::ExRay, Lane::Plugins, WIN), [foreign]);
+    assert_eq!(kinds(Group::Hole, Lane::Msi, WIN), [AssetKind::Installer]);
+    assert_eq!(kinds(Group::Hole, Lane::Dmg, MAC), [AssetKind::Installer]);
+}
+
+/// An installer is not run by xtask and has no hardening of its own to check; an executable is checked as its kind says.
+#[skuld::test]
+fn only_an_executable_asset_has_a_kind_to_check() {
+    assert_eq!(AssetKind::Installer.executable(), None);
+    assert_eq!(
+        AssetKind::Executable(FileKind::ForeignExecutable).executable(),
+        Some(FileKind::ForeignExecutable)
+    );
+}
+
+/// The payload's executables are found in the dir the update archive is packed from, and the ones `hole` embeds where its
+/// build reads them, by the triple of the platform being staged.
+#[skuld::test]
+fn payload_executables_are_looked_up_in_the_archives_source() {
+    let repo = tempfile::tempdir().unwrap();
+    let macos = repo.path().join("target/release/bundle/macos");
+    std::fs::create_dir_all(macos.join("Hole.app/Contents/MacOS")).unwrap();
+    let hole = macos.join("Hole.app/Contents/MacOS/hole");
+    let dmg = UpdateArchive {
+        name: "hole.tar.gz".into(),
+        source: UpdateArchiveSource::BuiltApp,
+        executables: vec![exe("hole", FileKind::RustExecutable, Vec::new())],
+        embedded: vec![exe("galoshes", FileKind::RustExecutable, Vec::new())],
+    };
+    let paths = |archive: &UpdateArchive| -> anyhow::Result<Vec<PathBuf>> {
+        let root = payload_root(&archive.source, repo.path())?;
+        let found = payload_executable_paths(archive, &root, repo.path(), MAC)?;
+        Ok(found.into_iter().map(|(path, _)| path).collect())
+    };
+
+    // A file that is not there is named, not verified.
+    let err = paths(&dmg).unwrap_err().to_string();
+    assert!(err.contains("is not a file") && err.contains("Hole.app"), "{err}");
+
+    std::fs::write(&hole, b"hole, with galoshes inside, built").unwrap();
+    let err = paths(&dmg).unwrap_err().to_string();
+    assert!(err.contains("is not a file") && err.contains("galoshes"), "{err}");
+
+    let embedded = cache_sidecar_path(repo.path(), "galoshes", "aarch64-apple-darwin", false);
+    std::fs::create_dir_all(embedded.parent().unwrap()).unwrap();
+    // A `.cache` file replaced after `hole` was built is not what `hole` embeds.
+    std::fs::write(&embedded, b"galoshes, rebuilt").unwrap();
+    let err = paths(&dmg).unwrap_err().to_string();
+    assert!(err.contains("is not what") && err.contains("rebuild `hole`"), "{err}");
+
+    std::fs::write(&embedded, b"galoshes inside").unwrap();
+    assert_eq!(paths(&dmg).unwrap(), [hole, embedded]);
+
+    let msi = UpdateArchive {
+        name: "hole.zip".into(),
+        source: UpdateArchiveSource::StagedBindir(repo.path().to_path_buf()),
+        executables: vec![exe("hole.exe", FileKind::RustExecutable, Vec::new())],
+        embedded: Vec::new(),
+    };
+    std::fs::write(repo.path().join("hole.exe"), b"built").unwrap();
+    assert_eq!(paths(&msi).unwrap()[0], repo.path().join("hole.exe"));
+
+    // Two bundles: the same "exactly one .app" error the archive is packed with.
+    std::fs::create_dir_all(macos.join("Other.app")).unwrap();
+    let err = paths(&dmg).unwrap_err().to_string();
+    assert!(err.contains("exactly one .app"), "{err}");
+}
+
+/// A file that cannot be checked says so; only a violation tells the developer how to fix the build, and the fix is the
+/// one for the toolchain that built the file.
+#[skuld::test]
+fn only_a_violation_blames_the_build_and_names_the_right_one() {
+    use libsearch_guard::{VerifyError, Violation, ViolationKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("galoshes");
+    std::fs::write(&file, b"not an executable").unwrap();
+    let missing = dir.path().join("missing");
+    for kind in [FileKind::RustExecutable, FileKind::ForeignExecutable] {
+        for path in [&file, &missing] {
+            let err = verify_hardened(path, kind).unwrap_err().to_string();
+            assert!(err.contains(&path.display().to_string()), "{err}");
+            assert!(err.contains("cannot check"), "{err}");
+            assert!(!err.contains("bins()"), "{err}");
+        }
+    }
+
+    let found = vec![Violation {
+        kind: ViolationKind::PeRuntimeImport,
+        detail: "imports VCRUNTIME140.dll".into(),
+    }];
+    // A violation found before the rest of the file turned unreadable is still a violation.
+    let violations = || {
+        [
+            VerifyError::Violations(found.clone()),
+            VerifyError::Unreadable {
+                why: "a library path is not UTF-8".into(),
+                found: found.clone(),
+            },
+        ]
+    };
+    for violation in violations() {
+        let err = hardening_failure(&file, FileKind::RustExecutable, &violation).to_string();
+        assert!(err.contains(&file.display().to_string()), "{err}");
+        assert!(err.contains("libsearch_guard::bins()"), "{err}");
+        assert!(err.contains("imports VCRUNTIME140.dll"), "{err}");
+        assert!(!err.contains("cannot check"), "{err}");
+    }
+    // A Go build has no `bins()` to call: the message names its own build.
+    for violation in violations() {
+        let err = hardening_failure(&file, FileKind::ForeignExecutable, &violation).to_string();
+        assert!(err.contains("imports VCRUNTIME140.dll"), "{err}");
+        assert!(!err.contains("bins()"), "{err}");
+        assert!(err.contains("Go build") && err.contains("ex_ray.rs"), "{err}");
+    }
+
+    let unreadable = VerifyError::Unreadable {
+        why: "a library path is not UTF-8".into(),
+        found: Vec::new(),
+    };
+    let err = hardening_failure(&file, FileKind::RustExecutable, &unreadable).to_string();
+    assert!(err.contains("cannot check") && !err.contains("bins()"), "{err}");
 }
 
 #[skuld::test]

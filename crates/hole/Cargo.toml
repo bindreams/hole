@@ -110,6 +110,7 @@ util = { path = "../util", features = ["test-support"] }
 icns = "0.4"
 png = "0.18"
 hole-test-observability = { path = "../test-observability" }
+libsearch-guard = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["json"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
@@ -128,11 +129,17 @@ regex = "1"
 xtask-lib = { path = "../../xtask-lib" }
 
 [[test]]
+name = "hardened_binary"
+path = "tests/hardened_binary.rs"
+harness = false
+
+[[test]]
 name = "elevated_ownership_privileged"
 path = "tests/elevated_ownership_privileged.rs"
 harness = false
 
 [build-dependencies]
+libsearch-guard = { workspace = true }
 # `codegen`: build.rs generates the Tauri context (`tauri::tauri_build_context!()` in main.rs).
 # Spelled as the Tauri CLI rewrites it; any other form dirties the tree (and `HOLE_VERSION`) on build.
 tauri-build = { version = "2", features = ["codegen"] }

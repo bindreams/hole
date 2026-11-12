@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
 fn main() {
+    // Static VC runtime and no DLL search of the executable's folder.
+    libsearch_guard::bins();
+
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     // `CARGO_MANIFEST_DIR` is `<repo>/crates/garter-bin`; walk up twice.
     let repo_root = PathBuf::from(&manifest_dir)

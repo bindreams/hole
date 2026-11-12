@@ -1,9 +1,11 @@
 //! Resolve the canonical BINDIR file *set* to host source paths.
 //!
-//! The set itself — [`bindir_dest_names`] + the [`Os`] it keys on — is the
-//! single source of truth and lives in `xtask-lib` (shared with the bridge
-//! cutover + build.rs). This module re-exports it and adds the disk-resolving
-//! [`bindir_files`]. dev-console and
+//! The set itself — [`bindir_entries`] (each file's name and [`FileKind`]) and the
+//! names derived from it, [`bindir_dest_names`] among them, + the [`Os`] it keys
+//! on — is the single source of truth and lives in `xtask-lib` (shared with the
+//! bridge cutover + build.rs). This module re-exports all of it, so xtask code
+//! imports BINDIR items from here and from nowhere else, and adds the
+//! disk-resolving [`bindir_files`]. dev-console and
 //! `msi-installer/src/msi_installer/__init__.py:stage_files()` stage via
 //! `cargo xtask stage`; the installer-manifest conformance tests derive their
 //! expected payload from `bindir_dest_names` (via `cargo xtask bindir-names`)
@@ -18,7 +20,10 @@ use anyhow::{anyhow, Result};
 use crate::manifest::Os;
 use crate::Profile;
 
-pub use xtask_lib::bindir::{bindir_dest_names, bundle_payload_names, embedded_plugin_names, plugin_sidecar_names};
+pub use xtask_lib::bindir::{
+    app_executable_name, bindir_dest_names, bindir_entries, bundle_payload_entries, bundle_payload_names,
+    cache_sidecar_path, embedded_plugin_entries, embedded_plugin_names, plugin_sidecar_names, BindirEntry, FileKind,
+};
 
 /// Source kind for a BINDIR entry. Files use hard-link-then-copy;
 /// directory bundles (macOS `.dSYM`) recurse a copy.

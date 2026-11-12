@@ -34,15 +34,27 @@ pub fn build_update_archive(profile: Profile, repo_root: &Path, out: &Path) -> R
     }
     #[cfg(target_os = "macos")]
     {
-        use anyhow::Context;
-
-        let app = find_built_app(profile, repo_root)?;
-        payload_archive::pack_targz(&app, out).context("pack macos update tar.gz")
+        build_update_archive_from_app(&find_built_app(profile, repo_root)?, out)
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = (profile, repo_root, out);
         anyhow::bail!("update-archive is only built on windows/macos")
+    }
+}
+
+/// Build the macOS update tar.gz from the built `app`. Every other host bails.
+pub fn build_update_archive_from_app(app: &Path, out: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use anyhow::Context;
+
+        payload_archive::pack_targz(app, out).context("pack macos update tar.gz")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, out);
+        anyhow::bail!("an update tar.gz is only built on macos")
     }
 }
 
@@ -156,8 +168,7 @@ pub fn verify_app_signature(archive: &Path) -> Result<()> {
 /// The single built `.app` under `target/<profile>/bundle/macos`, via the shared
 /// `payload_archive::find_single_app` — bridge and xtask enforce the "exactly one
 /// .app" invariant with ONE implementation.
-#[cfg(target_os = "macos")]
-fn find_built_app(profile: Profile, repo_root: &Path) -> Result<std::path::PathBuf> {
+pub(crate) fn find_built_app(profile: Profile, repo_root: &Path) -> Result<std::path::PathBuf> {
     let dir = repo_root.join("target").join(profile.dir_name()).join("bundle/macos");
     // Flat message (not `.context()`): anyhow's `Display`/`to_string()` shows only
     // the outermost message, so wrapping would hide `find_single_app`'s

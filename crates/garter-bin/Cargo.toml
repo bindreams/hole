@@ -30,8 +30,10 @@ yaml_serde = "0.10"
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
+libsearch-guard = { workspace = true }
 
 [build-dependencies]
+libsearch-guard = { workspace = true }
 xtask-lib = { path = "../../xtask-lib", features = ["version"] }
 
 [[test]]
