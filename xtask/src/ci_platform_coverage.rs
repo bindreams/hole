@@ -610,7 +610,7 @@ impl Parser<'_> {
                 if self.eat(&Tok::LParen) {
                     ensure!(
                         self.eat(&Tok::RParen),
-                        "function {name:?} takes arguments, which are not supported"
+                        "a call to {name:?} with arguments is not supported by this evaluator"
                     );
                     self.used_status_function = true;
                     return call(&name, self.ctx.failed.is_some());

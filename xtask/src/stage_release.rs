@@ -17,8 +17,9 @@ use xtask_lib::version::{parse_release_tag, Group};
 use crate::manifest::{Manifest, Os, Platform};
 use crate::Profile;
 
-/// The installer tests' variables; if set, each must name this checkout's own installer build (see [`resolve_installer`]).
+/// The Windows installer test's variable; if set, it must name this checkout's own installer build (see [`resolve_installer`]).
 const MSI_ENV: &str = "MSI_UNDER_TEST";
+/// The macOS installer test's variable; if set, it must name this checkout's own DMG build (see [`resolve_installer`]).
 const DMG_ENV: &str = "DMG_UNDER_TEST";
 
 /// Where `msi-installer` stages the BINDIR the MSI is built from, relative to the repo root.
@@ -365,6 +366,18 @@ fn run_probes(exe: &Path, probes: &[Probe]) -> Result<()> {
     Ok(())
 }
 
+/// Run the shipment's `build_first` target through `build`, then require every file it ships to exist.
+/// The existence check is only here, after the build, so no path can check before building.
+fn ensure_built(shipment: &Shipment, build: impl FnOnce(&str) -> Result<()>) -> Result<()> {
+    if let Some(target) = shipment.build_first {
+        build(target).with_context(|| format!("build target {target}"))?;
+    }
+    for asset in &shipment.files {
+        ensure!(asset.src.is_file(), "{} is not a file", asset.src.display());
+    }
+    Ok(())
+}
+
 /// Stage what `lane` ships for the release `tag` into `out`.
 pub fn stage(repo_root: &Path, tag: &str, lane: Lane, out: &Path) -> Result<()> {
     let (group, version) = parse_release_tag(tag)?;
@@ -378,15 +391,10 @@ pub fn stage(repo_root: &Path, tag: &str, lane: Lane, out: &Path) -> Result<()> 
         return Ok(());
     }
 
-    if let Some(target) = shipment.build_first {
-        let mut build = std::process::Command::new("cargo");
-        build.args(["xtask", "build", target]).current_dir(repo_root);
-        crate::command::run_inherited(&mut build)?;
-    }
+    ensure_built(&shipment, |target| crate::build_target_in(repo_root, target))?;
 
     std::fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;
     for asset in &shipment.files {
-        ensure!(asset.src.is_file(), "{} is not a file", asset.src.display());
         let dest = out.join(&asset.name);
         std::fs::copy(&asset.src, &dest)
             .with_context(|| format!("copy {} to {}", asset.src.display(), dest.display()))?;

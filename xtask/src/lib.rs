@@ -822,12 +822,31 @@ pub fn run_list() -> Result<()> {
     Ok(())
 }
 
+/// Build `target` and its dependencies for the host, as `cargo xtask build <target>` does, with `repo_root` as the
+/// checkout; for callers that already run inside xtask and must not spawn a second one.
+pub fn build_target_in(repo_root: &Path, target: &str) -> Result<()> {
+    relocate_self_if_windows()?;
+    let manifest = load_manifest_at(repo_root)?;
+    let host = Platform::host().ok_or_else(|| anyhow!("host platform not in the known set"))?;
+    let plan = Plan::new(&manifest)?;
+    let target = manifest
+        .get(target)
+        .ok_or_else(|| anyhow!("unknown target: {target:?}"))?;
+    let order = plan.order_for(&[target.name.as_str()], host)?;
+    execute(&plan, &order, repo_root)
+}
+
 fn load_manifest() -> Result<(Manifest, PathBuf)> {
     let repo_root = repo_root()?;
+    let manifest = load_manifest_at(&repo_root)?;
+    Ok((manifest, repo_root))
+}
+
+fn load_manifest_at(repo_root: &Path) -> Result<Manifest> {
     let path = repo_root.join("build.yaml");
     let text = std::fs::read_to_string(&path).with_context(|| format!("reading manifest at {}", path.display()))?;
     let manifest = Manifest::parse(&text).with_context(|| format!("parsing manifest at {}", path.display()))?;
-    Ok((manifest, repo_root))
+    Ok(manifest)
 }
 
 fn parse_group_arg(s: &str) -> Result<xtask_lib::version::Group, String> {

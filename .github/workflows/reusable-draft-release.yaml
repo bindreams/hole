@@ -51,7 +51,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Full history so the version stamp finds the earlier release tags.
+          # `cargo xtask version --check` lists the group's release tags and keeps those that are ancestors
+          # of HEAD, so it needs the tags and the full history.
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-rust

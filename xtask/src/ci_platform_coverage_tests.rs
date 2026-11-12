@@ -263,12 +263,12 @@ fn each_malformed_expression_is_an_error_naming_the_problem() {
         ("matrix.flag matrix.flag", "trailing input"),
         ("matrix.name == 'Win", "unterminated string"),
         ("(matrix.flag", "missing `)`"),
-        ("always(1)", "takes arguments"),
+        ("always(1)", "with arguments is not supported"),
         ("steps.first.conclusion == 'success'", "only `steps.<id>.outcome`"),
         ("matrix.flag &&", "unexpected end"),
         ("matrix.flag & matrix.flag", "unsupported character"),
         ("github.ref == 'x'", "unsupported context reference"),
-        ("hashFiles('x')", "takes arguments"),
+        ("hashFiles('x')", "with arguments is not supported"),
         ("contains()", "contains"),
     ] {
         let err = probe_error(condition);

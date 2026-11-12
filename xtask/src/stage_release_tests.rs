@@ -4,8 +4,8 @@ use xtask_lib::version::Group;
 
 use crate::manifest::{Arch, Manifest, Os, Platform};
 use crate::stage_release::{
-    check_installer_override, check_probe_output, plan, shipped, Asset, Lane, PlatformAssets, Probe, Shipment,
-    UpdateArchiveSource,
+    check_installer_override, check_probe_output, ensure_built, plan, shipped, Asset, Lane, PlatformAssets, Probe,
+    Shipment, UpdateArchiveSource,
 };
 
 const WIN: Platform = Platform {
@@ -241,4 +241,81 @@ fn only_the_garter_plugins_lane_builds_before_staging() {
     assert_eq!(shipment(Group::ExRay, Lane::Plugins, LINUX).build_first, None);
     assert_eq!(shipment(Group::Hole, Lane::Msi, WIN).build_first, None);
     assert_eq!(shipment(Group::Hole, Lane::Dmg, MAC).build_first, None);
+}
+
+#[skuld::test]
+fn every_build_first_names_a_build_target_for_the_platform_it_ships_on() {
+    let manifest = repo_manifest();
+    let mut named = 0;
+    for group in Group::all() {
+        for lane in [Lane::Msi, Lane::Dmg, Lane::Plugins] {
+            for os in [Os::Windows, Os::Linux, Os::Darwin] {
+                for arch in [Arch::Amd64, Arch::Arm64] {
+                    let platform = Platform { os, arch };
+                    let Ok(shipment) = plan(*group, lane, "1.2.3", platform, Path::new("repo"), || {
+                        Ok(PathBuf::from("the-installer"))
+                    }) else {
+                        continue;
+                    };
+                    let Some(target) = shipment.build_first else { continue };
+                    named += 1;
+                    let found = manifest
+                        .get(target)
+                        .unwrap_or_else(|| panic!("{group} {lane:?} on {platform}: no build.yaml target {target:?}"));
+                    assert!(
+                        found.applies_to(platform),
+                        "{group} {lane:?}: target {target:?} does not build on {platform}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(named > 0, "no shipment names a build_first target");
+}
+
+#[skuld::test]
+fn the_build_runs_before_the_files_are_required_to_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    let garter = plan(Group::Garter, Lane::Plugins, "1.2.3", LINUX, repo, || unreachable!()).unwrap();
+    let binary = garter.files[0].src.clone();
+    assert!(!binary.exists());
+
+    let mut built = Vec::new();
+    ensure_built(&garter, |target| {
+        built.push(target.to_owned());
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"built").unwrap();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(built, ["garter-bin"]);
+
+    // A build that produces nothing leaves the file missing, and that is an error.
+    std::fs::remove_file(&binary).unwrap();
+    let err = ensure_built(&garter, |_| Ok(())).unwrap_err();
+    assert!(err.to_string().contains("is not a file"), "{err}");
+
+    // A failed build is reported with its target and is not followed by the file check.
+    let err = ensure_built(&garter, |_| anyhow::bail!("cargo failed")).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("build target garter-bin: cargo failed"),
+        "{err:#}"
+    );
+}
+
+#[skuld::test]
+fn a_shipment_without_build_first_only_checks_its_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let galoshes = plan(
+        Group::Galoshes,
+        Lane::Plugins,
+        "1.2.3",
+        LINUX,
+        dir.path(),
+        || unreachable!(),
+    )
+    .unwrap();
+    let err = ensure_built(&galoshes, |_| unreachable!("nothing to build")).unwrap_err();
+    assert!(err.to_string().contains("is not a file"), "{err}");
 }
