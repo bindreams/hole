@@ -1,12 +1,14 @@
+use skuld::env;
 use std::path::{Path, PathBuf};
 
 use xtask_lib::version::Group;
 
 use crate::manifest::{Arch, Manifest, Os, Platform};
 use crate::stage_release::{
-    check_installer_override, check_probe_output, ensure_built, plan, shipped, Asset, Lane, PlatformAssets, Probe,
-    Shipment, UpdateArchiveSource,
+    check_installer_override, check_probe_output, ensure_built, plan, resolve_installer, run_probes, shipped,
+    single_dmg, Asset, Lane, PlatformAssets, Probe, Shipment, UpdateArchiveSource,
 };
+use crate::test_child::PROBE_TARGET_ARG;
 
 const WIN: Platform = Platform {
     os: Os::Windows,
@@ -324,4 +326,138 @@ fn a_shipment_without_build_first_only_checks_its_files() {
     .unwrap();
     let err = ensure_built(&galoshes, |_| unreachable!("nothing to build")).unwrap_err();
     assert!(err.to_string().contains("is not a file"), "{err}");
+}
+
+/// A repo root holding `target/release/hole.msi`.
+fn repo_with_msi() -> (tempfile::TempDir, PathBuf) {
+    let repo = tempfile::tempdir().unwrap();
+    let release = repo.path().join("target").join("release");
+    std::fs::create_dir_all(&release).unwrap();
+    let msi = release.join("hole.msi");
+    std::fs::write(&msi, b"built").unwrap();
+    (repo, msi)
+}
+
+#[skuld::test]
+fn a_relative_installer_override_is_from_the_repo_root(#[fixture] env: &skuld::EnvGuard) {
+    let (repo, msi) = repo_with_msi();
+    std::fs::write(repo.path().join("target/release/other.msi"), b"other").unwrap();
+
+    env.set("MSI_UNDER_TEST", "target/release/hole.msi");
+    assert_eq!(resolve_installer(Lane::Msi, repo.path()).unwrap(), msi);
+
+    env.set("MSI_UNDER_TEST", "target/release/other.msi");
+    let err = resolve_installer(Lane::Msi, repo.path()).unwrap_err();
+    assert!(err.to_string().contains("MSI_UNDER_TEST"), "{err}");
+}
+
+#[skuld::test]
+fn an_empty_installer_override_is_unset(#[fixture] env: &skuld::EnvGuard) {
+    let (repo, msi) = repo_with_msi();
+    env.set("MSI_UNDER_TEST", "");
+    assert_eq!(resolve_installer(Lane::Msi, repo.path()).unwrap(), msi);
+    env.remove("MSI_UNDER_TEST");
+    assert_eq!(resolve_installer(Lane::Msi, repo.path()).unwrap(), msi);
+}
+
+#[skuld::test]
+fn the_dmg_lane_resolves_the_one_built_dmg_and_checks_its_override(#[fixture] env: &skuld::EnvGuard) {
+    let repo = tempfile::tempdir().unwrap();
+    let dmg_dir = repo.path().join("target/release/bundle/dmg");
+    std::fs::create_dir_all(&dmg_dir).unwrap();
+    let dmg = dmg_dir.join("Hole_1.2.3_aarch64.dmg");
+    std::fs::write(&dmg, b"built").unwrap();
+
+    env.remove("DMG_UNDER_TEST");
+    assert_eq!(resolve_installer(Lane::Dmg, repo.path()).unwrap(), dmg);
+    env.set("DMG_UNDER_TEST", "target/release/bundle/dmg/Hole_1.2.3_aarch64.dmg");
+    assert_eq!(resolve_installer(Lane::Dmg, repo.path()).unwrap(), dmg);
+    env.set("DMG_UNDER_TEST", "target/release/bundle/dmg/missing.dmg");
+    assert!(resolve_installer(Lane::Dmg, repo.path()).is_err());
+}
+
+#[skuld::test]
+fn the_plugins_lane_has_no_installer() {
+    let (repo, _) = repo_with_msi();
+    assert!(resolve_installer(Lane::Plugins, repo.path()).is_err());
+}
+
+#[skuld::test]
+fn single_dmg_wants_exactly_one_dmg_and_ignores_other_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = single_dmg(dir.path()).unwrap_err();
+    assert!(err.to_string().contains("found 0"), "{err}");
+
+    std::fs::write(dir.path().join("rw.Hole.dmg.log"), b"not a dmg").unwrap();
+    std::fs::write(dir.path().join("Hole.dmg"), b"one").unwrap();
+    assert_eq!(single_dmg(dir.path()).unwrap(), dir.path().join("Hole.dmg"));
+
+    std::fs::write(dir.path().join("Stale.dmg"), b"two").unwrap();
+    let err = single_dmg(dir.path()).unwrap_err();
+    assert!(err.to_string().contains("found 2"), "{err}");
+}
+
+/// A probe that runs this test binary as the shipped executable (see `test_child::probe_target`).
+fn probe(args: &'static [&'static str], prints: Option<&str>) -> Probe {
+    Probe {
+        args,
+        prints: prints.map(str::to_owned),
+    }
+}
+
+#[skuld::test]
+fn a_probe_that_exits_0_and_prints_the_expected_version_passes() {
+    let exe = std::env::current_exe().unwrap();
+    run_probes(
+        &exe,
+        &[
+            probe(&[PROBE_TARGET_ARG, "print", "hole 1.2.3"], Some("hole 1.2.3")),
+            probe(&[PROBE_TARGET_ARG, "print", "anything"], None),
+        ],
+    )
+    .unwrap();
+}
+
+#[skuld::test]
+fn a_probe_that_exits_non_zero_fails() {
+    let exe = std::env::current_exe().unwrap();
+    let err = run_probes(&exe, &[probe(&[PROBE_TARGET_ARG, "exit", "3"], None)]).unwrap_err();
+    assert!(err.to_string().contains("failed"), "{err}");
+}
+
+#[skuld::test]
+fn a_probe_whose_stdout_is_another_version_fails() {
+    let exe = std::env::current_exe().unwrap();
+    let err = run_probes(
+        &exe,
+        &[probe(
+            &[PROBE_TARGET_ARG, "print", "hole 1.2.3.dirty"],
+            Some("hole 1.2.3"),
+        )],
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("1.2.3.dirty"), "{err}");
+}
+
+/// `generate-release-notes.py` reads `os`, `arch` and `asset` of each platform and `check-release-assets` reads
+/// `assets` (`jq '.[].assets[]'`): the serialised keys are their contract.
+#[skuld::test]
+fn the_release_assets_json_has_the_keys_its_consumers_read() {
+    let platforms = shipped(Group::Hole, "1.2.3", &repo_manifest()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&serde_json::to_string(&platforms).unwrap()).unwrap();
+    assert_eq!(
+        json[0],
+        serde_json::json!({
+            "os": "windows",
+            "arch": "amd64",
+            "asset": "hole-1.2.3-windows-amd64.msi",
+            "assets": ["hole-1.2.3-windows-amd64.msi", "hole-1.2.3-windows-amd64.zip"],
+        })
+    );
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let keys: Vec<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["arch", "asset", "assets", "os"]);
+    }
 }

@@ -6,7 +6,7 @@ on:
   pull_request:
   workflow_dispatch:
   # A draft-release workflow runs the whole workflow on the release commit. With `release-tag` set,
-  # each leg stages what it ships (RELEASE ASSETS below) so the draft uploads files that passed these tests.
+  # each leg stages what it ships (RELEASE ASSETS below).
   workflow_call:
     inputs:
       release-tag:
@@ -16,9 +16,10 @@ on:
         default: ""
 
 # A release call is its own group: `github.workflow` and `github.ref` are the caller's, so two dispatches of one draft
-# workflow would otherwise share a group and a third would silently cancel the pending second.
+# workflow would otherwise share a group and a third would silently cancel the pending second. The tag also keeps
+# two drafts called from one run apart, since `github.run_id` is then the same.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.release-tag != '' && format('-{0}', github.run_id) || '' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.release-tag != '' && format('-{0}-{1}', github.run_id, inputs.release-tag) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -69,7 +70,7 @@ jobs:
   # ordinary-run model skips. Each wall is the ordinary wall plus the budgets of the
   # release steps that run on the leg: the tag 5, the plugin stage 20 (it builds
   # the garter CLI on a garter release), the upload 10, and on installer legs the installer stage 10 (35 on
-  # a leg without an installer, 45 with one). These budgets are estimates, not measured.
+  # a leg without an installer, 45 with one).
   ci:
     name: Build, lint, test (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -115,7 +116,11 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.release-tag }}
-        run: git tag "$RELEASE_TAG"
+        run: |
+          git tag "$RELEASE_TAG"
+          # `releases/<group>/vX.Y.Z`: the group names the upload, which cannot hold the tag's slashes.
+          GROUP="${RELEASE_TAG#releases/}"
+          echo "group=${GROUP%%/*}" >> "$GITHUB_OUTPUT"
 
       - id: setup-python
         uses: actions/setup-python@v7
@@ -131,7 +136,7 @@ jobs:
         uses: ./.github/actions/setup-build
         timeout-minutes: 30
         with:
-          save-cache: ${{ matrix.cache-saver == true }}
+          save-cache: ${{ matrix.cache-saver == true && inputs.release-tag == '' }}
 
       - id: cargo-binstall
         uses: cargo-bins/cargo-binstall@v1.26.2
@@ -360,9 +365,7 @@ jobs:
         shell: bash
         run: cargo xtask run plugin-e2e-tests
 
-      # Release calls: stage the binaries plugin-e2e just ran on (galoshes, ex-ray) or, for a garter release,
-      # the garter CLI, which `stage-release` builds itself and probes for the release version since nothing
-      # else runs it. See RELEASE ASSETS.
+      # Release calls: stage the binaries plugin-e2e ran on; see RELEASE ASSETS.
       - id: release-stage-plugins
         name: Stage the plugin binaries a release ships
         if: ${{ inputs.release-tag != '' && steps.test-plugin-e2e.outcome == 'success' }}
@@ -689,8 +692,7 @@ jobs:
       # msi-installer harness (`msi-installer/tests/installed/`). It drives the INSTALLED binary
       # through WebDriver over loopback, so it runs before the TUN lane.
       #
-      # The harness uninstalls after a failed check, but a step timeout kills it with Hole still
-      # installed, so `installer-cleanup` runs `always()` after it: an idempotent uninstall that
+      # `installer-cleanup` runs `always()` after `installer-tests`: an idempotent uninstall that
       # verifies nothing is left. That step is the TUN lane's gate: the lane runs only once nothing
       # is installed (cleanup passed, or the MSI was never built), else the MSI's SYSTEM `HoleBridge`
       # service would share WFP, routes and the adapter with the TUN tests and confound their
@@ -932,7 +934,7 @@ jobs:
         timeout-minutes: 10
         uses: actions/upload-artifact@v7
         with:
-          name: release-${{ matrix.os }}-${{ matrix.arch }}
+          name: release-${{ steps.release-tag.outputs.group }}-${{ matrix.os }}-${{ matrix.arch }}
           path: release-assets/*
           if-no-files-found: ignore
 

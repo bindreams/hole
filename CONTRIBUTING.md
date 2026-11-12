@@ -4715,25 +4715,14 @@ Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
   `ci.yaml` on it with `release-tag` set (the call has its own concurrency group, so
   two drafts never cancel each other). Each leg creates the tag locally before
   building, so the binaries carry the release version, and stages what the tag's
-  product ships right after the tests of those files (`cargo xtask stage-release --lane msi|dmg|plugins`, steps `release-stage-*`): the MSI or DMG plus the update
-  archive (checked for its contents and, on macOS, its code signature, extracted as
-  the updater extracts it), or the galoshes / garter / ex-ray binary. The Windows
-  update zip is packed from `target/release/installer-stage`, the directory the MSI
-  is built from, not from whatever `target/release` holds by then. Staging also
-  runs the shipped executables that report a version: `hole.exe version` (the MSI's
-  payload) and `garter --version` must print the tag's version, so a build of a
-  dirty tree (`X.Y.Z.dirty`) fails; `garter --help` must exit 0. The garter CLI is
-  the one binary no earlier lane builds in the release profile, so staging it builds it first
-  (`Shipment::build_first`, `cargo xtask build garter-bin`), and these probes are the only test
-  that runs on it. galoshes and ex-ray have no version command, so their version
-  stamp is not checked (the galoshes and ex-ray sidecars inside the MSI and DMG are
-  covered by their installer tests). Only a passing leg uploads
-  `release-<os>-<arch>`; the draft job needs the whole of CI to have passed, checks
+  product ships right after the tests of those files
+  (`cargo xtask stage-release --lane msi|dmg|plugins`, steps `release-stage-*`; see
+  `xtask/src/stage_release.rs`). Only a passing leg uploads
+  `release-<track>-<os>-<arch>`; the draft job needs the whole of CI to have passed, checks
   (`.github/actions/check-release-assets`) that the downloaded files are exactly what
-  `cargo xtask release-assets --tag <tag>` lists (`list-release-assets`; the one definition of what a track ships, `stage_release::plan` over the
-  platforms `build.yaml` runs each lane's target on), builds the release notes'
+  `cargo xtask release-assets --tag <tag>` lists, builds the release notes'
   Downloads table from the same list, then hashes and uploads the files; it builds
-  nothing. A leg's wall in `ci.yaml` includes the budgets of its release-only steps.
+  nothing.
 - **Installer under test.** The DMG tests take the DMG from `DMG_UNDER_TEST`
   (default: the release build's single `.dmg`), the MSI lifecycle tests the MSI from
   `MSI_UNDER_TEST` (default: `target/release/hole.msi`). A relative path in either

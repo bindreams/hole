@@ -3,7 +3,8 @@
 //!
 //! A lane is the point in `ci.yaml` where one kind of shipped file has just passed its tests, and each
 //! (group, lane) pair says what to stage there. [`plan`] is the one definition of what a release ships:
-//! `cargo xtask release-assets` ([`list`]) derives the asset set the draft workflow checks and the notes' Downloads table from it.
+//! `cargo xtask release-assets` ([`list`]) derives the asset set the draft workflow checks and the notes' Downloads
+//! table from it.
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
@@ -17,9 +18,9 @@ use xtask_lib::version::{parse_release_tag, Group};
 use crate::manifest::{Manifest, Os, Platform};
 use crate::Profile;
 
-/// The Windows installer test's variable; if set, it must name this checkout's own installer build (see [`resolve_installer`]).
+/// Names the MSI the installer tests ran on.
 const MSI_ENV: &str = "MSI_UNDER_TEST";
-/// The macOS installer test's variable; if set, it must name this checkout's own DMG build (see [`resolve_installer`]).
+/// Names the DMG the installer tests ran on.
 const DMG_ENV: &str = "DMG_UNDER_TEST";
 
 /// Where `msi-installer` stages the BINDIR the MSI is built from, relative to the repo root.
@@ -92,7 +93,8 @@ pub struct Shipment {
     pub update_archive: Option<UpdateArchive>,
     /// An executable inside the installer's payload that is probed, since the installer itself cannot be.
     pub payload_binary: Option<Executable>,
-    /// The `build.yaml` target to build first, when no earlier lane built the files in the release profile.
+    /// The `build.yaml` target to build first, when no earlier lane built the files in the release profile: the probes
+    /// are then the only test of the staged file.
     pub build_first: Option<&'static str>,
 }
 
@@ -115,7 +117,6 @@ impl Shipment {
     }
 }
 
-/// `<group>-<version>-<os>-<arch><ext>`, the name every release asset carries.
 fn asset_name(group: Group, version: &str, platform: Platform, ext: &str) -> String {
     format!("{group}-{version}-{}-{}{ext}", platform.os, platform.arch)
 }
@@ -128,7 +129,7 @@ fn exe_suffix(platform: Platform) -> &'static str {
     }
 }
 
-/// `<program> <version>`, what `--version` / `version` prints.
+/// A probe that `args` prints `<program> <version>`.
 fn version_probe(args: &'static [&'static str], program: &str, version: &str) -> Probe {
     Probe {
         args,
@@ -206,8 +207,7 @@ pub fn plan(
             payload_binary: None,
             build_first: None,
         }),
-        // No earlier lane builds the garter CLI in the release profile, and nothing else runs it: the probes are the
-        // only test of the staged file.
+        // See `Shipment::build_first`: the probes are the only test of this file.
         (Group::Garter, Lane::Plugins) => Ok(Shipment {
             files: vec![binary(
                 release.join(format!("garter{}", exe_suffix(platform))),
@@ -367,8 +367,6 @@ fn run_probes(exe: &Path, probes: &[Probe]) -> Result<()> {
 }
 
 /// Run the shipment's `build_first` target through `build`, then require every file in `files` to exist.
-/// The existence check is only here, after the build, so no path can check before building. A failed build's error is
-/// returned as is: the build already names its target.
 fn ensure_built(shipment: &Shipment, build: impl FnOnce(&str) -> Result<()>) -> Result<()> {
     if let Some(target) = shipment.build_first {
         build(target)?;

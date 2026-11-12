@@ -2,7 +2,7 @@ name: Verify the release commit is on main
 description: Fail unless the commit this workflow runs on is an ancestor of origin/main
 
 # `workflow_dispatch` accepts --ref, so without this a draft can be pinned to unmerged code and every
-# later check still passes. The ancestry needs full history, which this action fetches when the checkout is shallow.
+# later check still passes.
 
 runs:
   using: composite

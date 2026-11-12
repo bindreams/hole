@@ -380,9 +380,7 @@ pub enum Command {
     /// named as the release names them, for the draft workflow to upload.
     ///
     /// `--lane` is the point in `ci.yaml` the files have just passed their
-    /// tests; a group the lane ships nothing for stages nothing. For hole it
-    /// also packs and verifies the update archive. The staged executables that
-    /// report a version (hole, garter) must report the tag's. The installer is
+    /// tests; a group the lane ships nothing for stages nothing. The installer is
     /// `MSI_UNDER_TEST` / `DMG_UNDER_TEST` when set (a relative path is from the
     /// repo root), else the release build.
     StageRelease {
@@ -399,8 +397,7 @@ pub enum Command {
     /// Print the files a release `--tag` ships, per platform, as a JSON array.
     ///
     /// The draft-release workflows check the downloaded assets against it and
-    /// build the notes' Downloads table from it; it comes from the same plan
-    /// `stage-release` stages by.
+    /// build the notes' Downloads table from it.
     ReleaseAssets {
         /// Release tag, `releases/<group>/vX.Y.Z`.
         #[arg(long)]
@@ -779,7 +776,12 @@ pub fn run_build(target: Option<String>, all: bool) -> Result<()> {
             let roots: Vec<&str> = plan
                 .target_names()
                 .into_iter()
-                .filter(|name| manifest.get(name).map(|t| t.applies_to(host)).unwrap_or(false))
+                .filter(|name| {
+                    manifest
+                        .get(name)
+                        .expect("plan target names come from the manifest")
+                        .applies_to(host)
+                })
                 .collect();
             if roots.is_empty() {
                 println!("xtask: no targets apply to host platform {host}");
@@ -820,9 +822,8 @@ pub fn run_list() -> Result<()> {
 /// Build `target` and its dependencies for `host` in the checkout at `repo_root`, as `cargo xtask build <target>` does;
 /// for callers that already run inside xtask and must not spawn a second one.
 ///
-/// Does not relocate the running `xtask.exe` (see [`relocate_self_if_windows`]): that guards a build step that runs
-/// `cargo xtask`, which can make cargo relink it. The caller relocates first if the target's closure has one; the only
-/// caller today builds `garter-bin`, whose steps are plain `cargo build`s of crates that do not depend on xtask.
+/// Does not relocate the running `xtask.exe` (see [`relocate_self_if_windows`]); relocate first if the target's closure
+/// depends on xtask.
 pub fn build_target_in(repo_root: &Path, host: Platform, target: &str) -> Result<()> {
     build_target_from(&load_manifest_at(repo_root)?, repo_root, host, target)
 }

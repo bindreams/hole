@@ -108,7 +108,7 @@
       "automerge": true
     },
     {
-      "description": "gsudo (installer-E2E de-elevation): auto-merge; the installer lifecycle step of the required Build, lint, test (windows/amd64) check gates it.",
+      "description": "gsudo (installer-E2E de-elevation): auto-merge; the installer step of the required Build, lint, test (windows/amd64) check gates it.",
       "matchDepNames": ["gerardog/gsudo"],
       "automerge": true
     },

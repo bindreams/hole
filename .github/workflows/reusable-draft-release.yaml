@@ -1,19 +1,17 @@
 name: Reusable Draft Release
 
-# Common scaffolding for the draft-release workflows of "simple"
-# tracks: a single binary per platform. Galoshes and garter fit.
+# Common scaffolding for the draft-release workflows of every track (hole,
+# ex-ray, galoshes, garter); each is a thin caller.
 #
-# The binaries come from ci.yaml: it runs on the release commit and each leg
-# stages the binary its tests ran on (`cargo xtask stage-release`). Hole
-# and ex-ray have their own draft workflows.
+# The binaries come from ci.yaml (`cargo xtask stage-release`).
 #
-# See #321 (introduction) and CLAUDE.md "Releases" for context.
+# See CLAUDE.md "Releases" for context.
 
 on:
   workflow_call:
     inputs:
       track:
-        description: "Release track (galoshes | garter); used in tag, asset, artifact names"
+        description: "Release track (hole | ex-ray | galoshes | garter); used in tag, asset, artifact names"
         required: true
         type: string
       version:
@@ -51,8 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # `cargo xtask version --check` lists the group's release tags and keeps those that are ancestors
-          # of HEAD, so it needs the tags and the full history.
+          # Full history and tags: `version --check` walks ancestor release tags.
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-rust
@@ -87,9 +84,7 @@ jobs:
         with:
           tag: releases/${{ inputs.track }}/v${{ steps.version.outputs.version }}
 
-  # CI's whole test track on the release commit, with the release tag created locally so the binaries
-  # carry the release version. Each leg stages the binary it tested and uploads it as
-  # `release-<os>-<arch>` (ci.yaml, "Release assets"); no draft exists unless every leg passed.
+  # CI's test track on the release commit; each leg uploads what it staged (ci.yaml, "Release assets").
   ci:
     name: CI
     needs: validate
@@ -112,7 +107,7 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          pattern: release-*
+          pattern: release-${{ inputs.track }}-*
           merge-multiple: true
 
       # Checks the working directory, which holds only the downloaded files.
