@@ -17,13 +17,18 @@ use tokio::net::{TcpStream, UdpSocket};
 /// Used by e2e tests to send a tiny HTTP/1.0 GET through the bridge's
 /// SOCKS5 local and verify the upstream HTTP target responds with the
 /// expected sentinel.
+///
+/// No timeout: the far end is ours, so a wedged plugin chain parks the call (CI's job timeout is the
+/// bound). Stage lines on stderr show where it stopped.
 pub(crate) async fn socks5_request(
     proxy_addr: SocketAddr,
     target: SocketAddr,
     request_bytes: &[u8],
     max_bytes: usize,
 ) -> std::io::Result<Vec<u8>> {
+    eprintln!("socks5_request: connecting to {proxy_addr}");
     let mut sock = TcpStream::connect(proxy_addr).await?;
+    eprintln!("socks5_request: connected to {proxy_addr}");
 
     // 1. Greeting: VER=5, NMETHODS=1, METHODS=[0x00 NoAuth]
     sock.write_all(&[0x05, 0x01, 0x00]).await?;
@@ -31,6 +36,7 @@ pub(crate) async fn socks5_request(
     // 2. Method selection reply: VER=5, METHOD=0x00
     let mut greet = [0u8; 2];
     sock.read_exact(&mut greet).await?;
+    eprintln!("socks5_request: greeting reply {greet:?}");
     if greet != [0x05, 0x00] {
         return Err(std::io::Error::other(format!("SOCKS5 greeting rejected: {greet:?}")));
     }
@@ -49,10 +55,12 @@ pub(crate) async fn socks5_request(
     }
     req.extend_from_slice(&target.port().to_be_bytes());
     sock.write_all(&req).await?;
+    eprintln!("socks5_request: wrote the CONNECT request to {target}");
 
     // 4. CONNECT reply: VER=5, REP, RSV=0, ATYP, BND.ADDR, BND.PORT
     let mut reply_head = [0u8; 4];
     sock.read_exact(&mut reply_head).await?;
+    eprintln!("socks5_request: CONNECT reply {reply_head:?}");
     if reply_head[0] != 0x05 {
         return Err(std::io::Error::other(format!(
             "SOCKS5 reply has wrong VER: {}",
@@ -73,6 +81,7 @@ pub(crate) async fn socks5_request(
             // DOMAINNAME: 1 length byte + N bytes + 2 port
             let mut len_byte = [0u8; 1];
             sock.read_exact(&mut len_byte).await?;
+            eprintln!("socks5_request: read the bound domain name's length");
             len_byte[0] as usize + 2
         }
         other => {
@@ -81,9 +90,11 @@ pub(crate) async fn socks5_request(
     };
     let mut bnd = vec![0u8; bnd_len];
     sock.read_exact(&mut bnd).await?;
+    eprintln!("socks5_request: read the rest of BND.ADDR and BND.PORT ({bnd_len} bytes)");
 
     // 5. Tunnel is open. Send the request bytes and read until EOF.
     sock.write_all(request_bytes).await?;
+    eprintln!("socks5_request: wrote {} request bytes", request_bytes.len());
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
     while response.len() < max_bytes {
@@ -92,7 +103,9 @@ pub(crate) async fn socks5_request(
             break;
         }
         response.extend_from_slice(&buf[..n.min(max_bytes - response.len())]);
+        eprintln!("socks5_request: {} response bytes so far", response.len());
     }
+    eprintln!("socks5_request: response complete, {} bytes", response.len());
     Ok(response)
 }
 
