@@ -2642,9 +2642,11 @@ Two more properties are load-bearing:
   bookkeeping only warns, since failing there would roll an uninstall back over
   a host that is in fact already open. Recording the target `Off` *before* the
   release is what makes that safe — whatever happens after, a later start
-  reconciles toward `Off` and sweeps. `HOLE_KEEP_COVERS=1` is the documented
-  escape from the gate itself, so a release that can never succeed cannot make
-  the product unremovable (see RELEASE-OPS.md).
+  reconciles toward `Off` and sweeps. `LEAVE_NETWORK_BLOCKED=1` (skips the release
+  entirely, so every cover stays and the network can stay blocked) is the
+  documented escape from the gate itself, so a release that can never succeed
+  cannot make the product unremovable (see RELEASE-OPS.md, which says how to
+  clear what it leaves).
 
 ###### A Disabled service: whose disable it is
 
