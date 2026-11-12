@@ -1747,6 +1747,10 @@ pub trait Routing: Send + Sync {
     /// removed, which is `cutover::release_covers` — and that caller reaches
     /// the free function directly, not this trait.
     ///
+    /// That includes the clearance's refused strangers ([`failclosed::Clearance::refused_strangers`]): a filter whose
+    /// delete the OS refused fails none of these callers, and reaches only the bridge log from here, through the
+    /// warning the provider sweep writes. `bridge unlock` and `release-covers` print it from the clearance they read.
+    ///
     /// What it does NOT drop is the evidence, and that correction is
     /// bindreams/hole#1010's F1. The old justification added "the next engage
     /// re-arms and pre-deletes the key", which is false for the two callers

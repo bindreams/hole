@@ -656,7 +656,7 @@ pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Err
         // how the two drift.
         || {
             let clearance = hole_bridge::cutover::release_covers()?;
-            if let Some(report) = hole_bridge::cutover::release_clearance_report(&clearance) {
+            if let Some(report) = hole_bridge::cutover::release_clearance_report(&clearance, hole::version::VERSION) {
                 cli_log!(warn, "{report}");
             }
             Ok(())

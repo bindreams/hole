@@ -34,6 +34,97 @@ fn unlock_failing_disengage_does_not_flip_intent() {
 }
 
 #[skuld::test]
+fn unlock_over_a_stranger_the_firewall_would_not_delete_still_turns_the_intent_off_and_names_it() {
+    // A live boot-time filter blocks nothing once BFE has started, so a refused delete of an unrecognised one must
+    // not keep the kill switch's intent on: the next start would re-engage it, a lockout over a filter that does
+    // nothing. The sweep hands back the refusal in its clearance, and the operator is told which filter.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
+    let guid = "unrecognised boot-time filter {7a110000-0000-4000-8000-000000000001}";
+
+    let clearance = unlock_with(dir.path(), |_lock| {
+        Ok(Clearance::from_observations(
+            &[KeyObservation {
+                key: guid.into(),
+                lifetime: KeyLifetime::BootTime,
+                outcome: KeyOutcome::Failed,
+                role: KeyRole::Unlisted,
+                code: Some(5),
+            }],
+            ArmingWitness::Unset,
+        ))
+    })
+    .expect("a refused stranger delete is not a failed unlock");
+
+    assert!(!lockdown_state::load_enabled(dir.path()), "the intent must flip off");
+    let report = release_clearance_report(&clearance, RUNNING_VERSION).expect("the refusal is reported");
+    assert!(report.contains(guid), "{report}");
+}
+
+/// A clearance whose only finding is an unrecognised boot-time filter the OS refused to delete, with `code`.
+fn refused_stranger_clearance(code: Option<u32>) -> Clearance {
+    Clearance::from_observations(
+        &[KeyObservation {
+            key: "unrecognised boot-time filter {7a110000-0000-4000-8000-000000000001}".into(),
+            lifetime: KeyLifetime::BootTime,
+            outcome: KeyOutcome::Failed,
+            role: KeyRole::Unlisted,
+            code,
+        }],
+        ArmingWitness::Unset,
+    )
+}
+
+#[skuld::test]
+fn the_uninstall_gate_does_not_fail_over_a_stranger_the_firewall_would_not_delete_and_reports_it() {
+    // A refusal may never clear, and failing the uninstall over one would leave the product unremovable: a boot-time
+    // filter is live only between kernel start and BFE start, a bounded harm. So the gate returns the clearance, and
+    // the CLI reports the filter.
+    let dir = tempfile::tempdir().unwrap();
+    let clearance = release_covers_with(dir.path(), &[], |_lock| {
+        Ok(refused_stranger_clearance(Some(0x8032_0003)))
+    })
+    .expect("a refused stranger must not fail the uninstall gate");
+    let report = release_clearance_report(&clearance, RUNNING_VERSION).expect("the refusal is reported");
+    assert!(report.contains("{7a110000-0000-4000-8000-000000000001}"), "{report}");
+    assert!(report.contains("0x80320003"), "{report}");
+}
+
+#[skuld::test]
+fn a_refused_stranger_is_worded_as_a_refusal_with_its_code_and_a_remedy_that_is_not_the_sweep_that_failed() {
+    let report =
+        release_clearance_report(&refused_stranger_clearance(Some(5)), RUNNING_VERSION).expect("a refusal is reported");
+    assert!(
+        report.contains(
+            "the OS refused to delete unrecognised boot-time filter {7a110000-0000-4000-8000-000000000001} (code 0x00000005)"
+        ),
+        "{report}"
+    );
+    assert!(!report.contains("could not be proven empty"), "{report}");
+    assert!(
+        !report.contains("release-covers"),
+        "the delete that just failed is no remedy: {report}"
+    );
+    assert!(
+        report.contains("later `hole bridge unlock`") && report.contains("FwpmFilterDeleteByKey0"),
+        "a refusal may be transient, and the external route is the fallback: {report}"
+    );
+}
+
+#[skuld::test]
+fn a_refused_stranger_without_a_code_is_still_a_refusal_and_is_worded_without_one() {
+    let report =
+        release_clearance_report(&refused_stranger_clearance(None), RUNNING_VERSION).expect("a refusal is reported");
+    assert!(
+        report.contains(
+            "the OS refused to delete unrecognised boot-time filter {7a110000-0000-4000-8000-000000000001}. "
+        ),
+        "{report}"
+    );
+    assert!(!report.contains("(code"), "{report}");
+}
+
+#[skuld::test]
 fn unlock_successful_disengage_flips_intent_off() {
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
@@ -63,9 +154,16 @@ fn unlock_hands_back_what_the_disengage_could_not_prove() {
     })
     .expect("an unproven disengage is not a failure");
 
-    assert_eq!(clearance.unproven_keys(), ["lockdown boot-time block-all V4"]);
+    assert_eq!(
+        clearance
+            .unproven_keys()
+            .iter()
+            .map(|k| (k.label(), k.role()))
+            .collect::<Vec<_>>(),
+        [("lockdown boot-time block-all V4", KeyRole::Plain)]
+    );
     assert!(
-        release_clearance_report(&clearance).is_some(),
+        release_clearance_report(&clearance, RUNNING_VERSION).is_some(),
         "the CLI prints this report; a dropped clearance leaves it with nothing to print"
     );
     assert!(
@@ -635,16 +733,18 @@ fn unproven_clearance(keys: &[&'static str]) -> Clearance {
 /// answered spelled out.
 fn clearance_with_sibling(sibling: KeyOutcome, keys: &[&'static str]) -> Clearance {
     let mut obs = vec![KeyObservation {
-        key: "lockdown filter",
+        key: "lockdown filter".into(),
         lifetime: KeyLifetime::Persistent,
         outcome: sibling,
         role: KeyRole::BootTimeSibling,
+        code: None,
     }];
     obs.extend(keys.iter().map(|&key| KeyObservation {
-        key,
+        key: key.into(),
         lifetime: KeyLifetime::BootTime,
         outcome: KeyOutcome::NotFound,
         role: KeyRole::Plain,
+        code: None,
     }));
     // `Unset`: no persisted boot-time record, which is what every host that
     // never armed the kill switch is in. The sibling is the only evidence
@@ -664,7 +764,14 @@ fn release_covers_reports_what_the_sweep_could_not_prove() {
     .expect("an unproven clearance is not a failure");
 
     assert!(!clearance.is_proven());
-    assert_eq!(clearance.unproven_keys(), ["lockdown boot-time block-all V4"]);
+    assert_eq!(
+        clearance
+            .unproven_keys()
+            .iter()
+            .map(|k| (k.label(), k.role()))
+            .collect::<Vec<_>>(),
+        [("lockdown boot-time block-all V4", KeyRole::Plain)]
+    );
 }
 
 #[skuld::test]
@@ -684,7 +791,7 @@ fn the_uninstall_gate_reads_a_twin_recorded_in_a_peer_state_dir() {
     })
     .expect("an unproven clearance is not a failure");
     assert_eq!(
-        release_clearance_report(&quiet),
+        release_clearance_report(&quiet, RUNNING_VERSION),
         None,
         "no evidence anywhere: this is what almost every uninstall looks like"
     );
@@ -694,7 +801,7 @@ fn the_uninstall_gate_reads_a_twin_recorded_in_a_peer_state_dir() {
         Ok(clearance_with_sibling(KeyOutcome::NotFound, &twins))
     })
     .expect("an unproven clearance is not a failure");
-    let report = release_clearance_report(&loud).expect("the peer's record must reach the operator");
+    let report = release_clearance_report(&loud, RUNNING_VERSION).expect("the peer's record must reach the operator");
     assert!(report.contains("lockdown boot-time block-all V4"), "{report}");
 }
 
@@ -702,7 +809,7 @@ fn the_uninstall_gate_reads_a_twin_recorded_in_a_peer_state_dir() {
 fn a_proven_release_says_nothing_extra() {
     // The common case by far — no cover, or one this sweep watched go away. A
     // warning here would train operators to ignore the one that matters.
-    assert_eq!(release_clearance_report(&Clearance::proven()), None);
+    assert_eq!(release_clearance_report(&Clearance::proven(), RUNNING_VERSION), None);
 }
 
 #[skuld::test]
@@ -727,7 +834,7 @@ fn an_unproven_release_on_a_host_that_holds_no_cover_says_nothing_either() {
         !clearance.is_proven(),
         "the sweep still proved nothing about the twins — only the REPORT is suppressed"
     );
-    assert_eq!(release_clearance_report(&clearance), None);
+    assert_eq!(release_clearance_report(&clearance, RUNNING_VERSION), None);
 }
 
 #[skuld::test]
@@ -735,7 +842,8 @@ fn an_unreadable_sibling_still_reports() {
     // `Failed` is the unelevated or DACL-denied sweep: it rules nothing out,
     // so it must not buy the silence an empty answer does.
     let clearance = clearance_with_sibling(KeyOutcome::Failed, &["lockdown boot-time block-all V4"]);
-    let report = release_clearance_report(&clearance).expect("a sibling that could not be read rules nothing out");
+    let report = release_clearance_report(&clearance, RUNNING_VERSION)
+        .expect("a sibling that could not be read rules nothing out");
     assert!(report.contains("lockdown boot-time block-all V4"), "{report}");
 }
 
@@ -747,8 +855,11 @@ fn an_unproven_release_names_the_keys_and_a_command_that_exists() {
     // administration/windows-commands/netsh-wfp). `show filters` lists what is
     // active NOW, which by definition excludes a boot-time filter after BFE
     // has started — the only moment this message is ever read.
-    let report = release_clearance_report(&unproven_clearance(&["lockdown boot-time block-all V4"]))
-        .expect("an unproven clearance must be reported");
+    let report = release_clearance_report(
+        &unproven_clearance(&["lockdown boot-time block-all V4"]),
+        RUNNING_VERSION,
+    )
+    .expect("an unproven clearance must be reported");
     assert!(
         report.contains("lockdown boot-time block-all V4"),
         "the key must be named — with the binary gone, the label is all an operator can look it up by: {report}"
@@ -759,13 +870,31 @@ fn an_unproven_release_names_the_keys_and_a_command_that_exists() {
     );
 }
 
+/// The version the report is built for in these tests; no release's number, so a remedy that names any other one
+/// fails.
+const RUNNING_VERSION: &str = "9.8.7";
+
+#[skuld::test]
+fn the_remedy_names_the_build_that_ran_the_sweep_not_a_fixed_release() {
+    // A boot-time key is addressed only by a build whose list names it, and the running build's list names every key
+    // it installs, so any key added in a later release is covered by "this release or later" with no edit here.
+    for clearance in [unproven_clearance(&["k"]), unenumerated_clearance("view")] {
+        let report = release_clearance_report(&clearance, RUNNING_VERSION).expect("reported");
+        assert!(
+            report.contains("this release, 9.8.7, or later"),
+            "the remedy must name the running build: {report}"
+        );
+        assert!(!report.contains("0.7.0"), "no fixed release may be named: {report}");
+    }
+}
+
 #[skuld::test]
 fn an_unproven_release_does_not_send_the_operator_to_a_command_that_cannot_help() {
     // `netsh wfp` is diagnostics-only — its verbs are capture, dump, help, set
     // and show; there is no delete. Telling a user in the one state where they
     // have no other tool that "`netsh wfp` can remove it" is a dead end
     // dressed as a remedy, and the previous test pinned that exact string.
-    let report = release_clearance_report(&unproven_clearance(&["k"])).expect("reported");
+    let report = release_clearance_report(&unproven_clearance(&["k"]), RUNNING_VERSION).expect("reported");
     let lowered = report.to_lowercase();
     for claim in ["netsh wfp` can remove", "netsh wfp can remove", "netsh wfp delete"] {
         assert!(
@@ -784,7 +913,7 @@ fn an_unproven_release_names_something_that_can_actually_remove_the_filter() {
     // Removing a WFP filter takes an FWPM call. Once `RemoveFiles` has run,
     // no such caller is left on the host — so the honest remedy is to put one
     // back, and the message must say so rather than trail off.
-    let report = release_clearance_report(&unproven_clearance(&["k"])).expect("reported");
+    let report = release_clearance_report(&unproven_clearance(&["k"]), RUNNING_VERSION).expect("reported");
     assert!(
         report.contains("release-covers"),
         "the remedy must name the command that addresses these keys: {report}"
@@ -801,7 +930,7 @@ fn an_unproven_release_does_not_claim_a_cover_is_present() {
     // "Could not be proven absent" is not "is there". Asserting the latter
     // would send an operator hunting a filter that most likely never existed,
     // on every clean uninstall of a build that ships a boot-time key.
-    let report = release_clearance_report(&unproven_clearance(&["k"])).expect("reported");
+    let report = release_clearance_report(&unproven_clearance(&["k"]), RUNNING_VERSION).expect("reported");
     let lowered = report.to_lowercase();
     assert!(
         !lowered.contains("still blocking") && !lowered.contains("is still installed"),
@@ -813,10 +942,13 @@ fn an_unproven_release_does_not_claim_a_cover_is_present() {
 fn an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name() {
     // The message is read after `RemoveFiles` has deleted the binary, so the
     // one thing it must not do is hedge about what the operator is holding.
-    // Every key it can EVER name is a boot-time twin, and this pins both
+    // Every FILTER key it can ever name is a boot-time twin or stranger, and this pins both
     // halves of that: the wording, and the premise underneath it.
-    let report = release_clearance_report(&unproven_clearance(&["lockdown boot-time block-all V4"]))
-        .expect("an unproven clearance must be reported");
+    let report = release_clearance_report(
+        &unproven_clearance(&["lockdown boot-time block-all V4"]),
+        RUNNING_VERSION,
+    )
+    .expect("an unproven clearance must be reported");
     assert!(
         report.contains("boot-time filter key"),
         "the keys are boot-time twins and the message must say so, not hedge: {report}"
@@ -838,10 +970,11 @@ fn an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_
     // which asserts the same clearance's `into_result().is_err()`.
     for outcome in [KeyOutcome::Removed, KeyOutcome::NotFound, KeyOutcome::Failed] {
         let obs = KeyObservation {
-            key: "lockdown app-id filter",
+            key: "lockdown app-id filter".into(),
             lifetime: KeyLifetime::Persistent,
             outcome,
             role: KeyRole::Plain,
+            code: None,
         };
         assert_eq!(
             obs.proves_empty(),
@@ -855,10 +988,79 @@ fn an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_
 
 #[skuld::test]
 fn an_unproven_release_names_every_key_not_just_the_first() {
-    let report = release_clearance_report(&unproven_clearance(&["alpha-key", "beta-key"])).expect("reported");
+    let report =
+        release_clearance_report(&unproven_clearance(&["alpha-key", "beta-key"]), RUNNING_VERSION).expect("reported");
     assert!(
         report.contains("alpha-key") && report.contains("beta-key"),
         "every unproven key must be named: {report}"
+    );
+}
+
+/// A clearance whose only finding is a view the sweep could not enumerate.
+fn unenumerated_clearance(label: &'static str) -> Clearance {
+    Clearance::from_observations(
+        &[KeyObservation {
+            key: label.into(),
+            lifetime: KeyLifetime::BootTime,
+            outcome: KeyOutcome::Failed,
+            role: KeyRole::Enumeration,
+            code: None,
+        }],
+        ArmingWitness::Unset,
+    )
+}
+
+#[skuld::test]
+fn a_view_that_could_not_be_enumerated_is_reported_as_that_and_names_no_boot_time_lookup() {
+    // Nothing else speaks (no sibling, no record), so only the always-reported view does. It is not a boot-time
+    // filter key, and `netsh wfp show boottimepolicy` would not show a filter it never looked at.
+    let label = "boot-time filters under Hole's provider";
+    let report = release_clearance_report(&unenumerated_clearance(label), RUNNING_VERSION).expect("always reported");
+    assert!(report.contains(label), "{report}");
+    assert!(report.contains("could not enumerate"), "{report}");
+    assert!(!report.contains("boot-time filter key"), "{report}");
+    assert!(!report.contains("netsh"), "{report}");
+    assert!(report.contains("release-covers"), "{report}");
+}
+
+#[skuld::test]
+fn a_report_with_a_filter_and_an_unenumerated_view_words_each_for_what_it_is() {
+    let mut obs = vec![
+        KeyObservation {
+            key: "lockdown filter".into(),
+            lifetime: KeyLifetime::Persistent,
+            outcome: KeyOutcome::Removed,
+            role: KeyRole::BootTimeSibling,
+            code: None,
+        },
+        KeyObservation {
+            key: "lockdown boot-time block-all V4".into(),
+            lifetime: KeyLifetime::BootTime,
+            outcome: KeyOutcome::NotFound,
+            role: KeyRole::Plain,
+            code: None,
+        },
+    ];
+    obs.push(KeyObservation {
+        key: "boot-time filters under Hole's provider".into(),
+        lifetime: KeyLifetime::BootTime,
+        outcome: KeyOutcome::Failed,
+        role: KeyRole::Enumeration,
+        code: None,
+    });
+    let report = release_clearance_report(
+        &Clearance::from_observations(&obs, ArmingWitness::Unset),
+        RUNNING_VERSION,
+    )
+    .expect("reported");
+    assert!(
+        report.contains("1 boot-time filter key(s) could not be proven empty: lockdown boot-time block-all V4."),
+        "the count and the list name only the filter: {report}"
+    );
+    assert!(report.contains("netsh wfp show boottimepolicy"), "{report}");
+    assert!(
+        report.contains("could not enumerate boot-time filters under Hole's provider"),
+        "{report}"
     );
 }
 

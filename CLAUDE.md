@@ -206,7 +206,14 @@ before editing; the sections linked below are the authoritative source.
   the read-back that can fail over a cover already in force), and
   `leftover_keys` reports when **either** source says a twin is possible — the
   sibling survives a wiped state dir, the record survives the sweep that
-  consumes the sibling, and only a watched removal retracts it. The
+  consumes the sibling, and only a watched removal retracts it. The full
+  sweeps (`release_all`, `disengage_lockdown`) also delete every boot-time filter under
+  `PROVIDER_GUID` that no key list names (`failclosed::windows::provider_sweep`), so a
+  downgrade cannot strand another build's twin; a persistent one is left on purpose. A
+  refused delete of such a stranger, or an unreadable view, never fails a sweep (a
+  live boot-time filter is not enforced once BFE has started, measured): it is
+  reported with its GUID and code and arms the record (`KeyRole::Unlisted`,
+  `KeyRole::Enumeration`). The
   transient one is swept unconditionally on next start, the standing one only
   on an explicit recorded off — full reconciliation table (`decide_cover_recovery`)
   and disclosed residuals in CONTRIBUTING.md. A single persisted `Target`
