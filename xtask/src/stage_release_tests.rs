@@ -230,3 +230,15 @@ fn an_installer_override_must_be_the_build_stage_release_packs_from() {
         .join("hole.msi");
     check_installer_override("MSI_UNDER_TEST", &respelled, &built).unwrap();
 }
+
+#[skuld::test]
+fn only_the_garter_plugins_lane_builds_before_staging() {
+    assert_eq!(
+        shipment(Group::Garter, Lane::Plugins, LINUX).build_first,
+        Some("garter-bin")
+    );
+    assert_eq!(shipment(Group::Galoshes, Lane::Plugins, LINUX).build_first, None);
+    assert_eq!(shipment(Group::ExRay, Lane::Plugins, LINUX).build_first, None);
+    assert_eq!(shipment(Group::Hole, Lane::Msi, WIN).build_first, None);
+    assert_eq!(shipment(Group::Hole, Lane::Dmg, MAC).build_first, None);
+}

@@ -17,7 +17,7 @@ use xtask_lib::version::{parse_release_tag, Group};
 use crate::manifest::{Manifest, Os, Platform};
 use crate::Profile;
 
-/// Overrides for the installer to stage, the same variables the installer tests read.
+/// The installer tests' variables; if set, each must name this checkout's own installer build (see [`resolve_installer`]).
 const MSI_ENV: &str = "MSI_UNDER_TEST";
 const DMG_ENV: &str = "DMG_UNDER_TEST";
 
@@ -91,6 +91,8 @@ pub struct Shipment {
     pub update_archive: Option<UpdateArchive>,
     /// An executable inside the installer's payload that is probed, since the installer itself cannot be.
     pub payload_binary: Option<Executable>,
+    /// The `build.yaml` target to build first, when no earlier lane built the files in the release profile.
+    pub build_first: Option<&'static str>,
 }
 
 impl Shipment {
@@ -99,6 +101,7 @@ impl Shipment {
             files: Vec::new(),
             update_archive: None,
             payload_binary: None,
+            build_first: None,
         }
     }
 
@@ -176,6 +179,7 @@ pub fn plan(
                     path: stage_dir.join("hole.exe"),
                     probes: vec![version_probe(&["version"], "hole", version)],
                 }),
+                build_first: None,
             })
         }
         // The DMG tests check the shipped version themselves (`test_shipped_version_is_exact`).
@@ -189,6 +193,7 @@ pub fn plan(
                 }],
                 update_archive: Some(update_archive(UpdateArchiveSource::BuiltApp)),
                 payload_binary: None,
+                build_first: None,
             })
         }
         (Group::Galoshes, Lane::Plugins) => Ok(Shipment {
@@ -198,9 +203,10 @@ pub fn plan(
             )],
             update_archive: None,
             payload_binary: None,
+            build_first: None,
         }),
-        // `ci.yaml` builds the garter CLI in the release profile right before this lane, since no earlier lane does,
-        // and nothing else runs it: the probes are the only test of the staged file.
+        // No earlier lane builds the garter CLI in the release profile, and nothing else runs it: the probes are the
+        // only test of the staged file.
         (Group::Garter, Lane::Plugins) => Ok(Shipment {
             files: vec![binary(
                 release.join(format!("garter{}", exe_suffix(platform))),
@@ -214,6 +220,7 @@ pub fn plan(
             )],
             update_archive: None,
             payload_binary: None,
+            build_first: Some("garter-bin"),
         }),
         (Group::ExRay, Lane::Plugins) => Ok(Shipment {
             files: vec![binary(
@@ -225,6 +232,7 @@ pub fn plan(
             )],
             update_archive: None,
             payload_binary: None,
+            build_first: None,
         }),
         (Group::Hole, Lane::Plugins)
         | (Group::Galoshes | Group::Garter | Group::ExRay, Lane::Msi)
@@ -307,7 +315,7 @@ fn check_installer_override(env_var: &str, given: &Path, built: &Path) -> Result
     let resolve = |path: &Path| std::fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()));
     ensure!(
         resolve(given)? == resolve(built)?,
-        "{env_var} is {}, but stage-release stages only this checkout's own build, {}: the update archive and the          version probe come from that build. Unset {env_var} or point it at that file",
+        "{env_var} is {}, but stage-release stages only this checkout's own build, {}: the update archive and the version probe come from that build. Unset {env_var} or point it at that file",
         given.display(),
         built.display()
     );
@@ -368,6 +376,12 @@ pub fn stage(repo_root: &Path, tag: &str, lane: Lane, out: &Path) -> Result<()> 
     if shipment.files.is_empty() {
         println!("xtask: {group} ships nothing from the {lane:?} lane on {platform}");
         return Ok(());
+    }
+
+    if let Some(target) = shipment.build_first {
+        let mut build = std::process::Command::new("cargo");
+        build.args(["xtask", "build", target]).current_dir(repo_root);
+        crate::command::run_inherited(&mut build)?;
     }
 
     std::fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;

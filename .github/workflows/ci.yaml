@@ -67,8 +67,8 @@ jobs:
   #
   # RELEASE PATH: a release call also runs the `release-*` steps, which the audit's
   # ordinary-run model skips. Each wall is the ordinary wall plus the budgets of the
-  # release steps that run on the leg: the tag 5, the garter build 15, the plugin
-  # stage 5, the upload 10, and on installer legs the installer stage 10 (35 on
+  # release steps that run on the leg: the tag 5, the plugin stage 20 (it builds
+  # the garter CLI on a garter release), the upload 10, and on installer legs the installer stage 10 (35 on
   # a leg without an installer, 45 with one). These budgets are estimates, not measured.
   ci:
     name: Build, lint, test (${{ matrix.os }}/${{ matrix.arch }})
@@ -360,22 +360,13 @@ jobs:
         shell: bash
         run: cargo xtask run plugin-e2e-tests
 
-      # A garter release: the garter CLI is the one shipped binary no lane builds in the release profile.
-      # Built here, before the stage below, which runs it.
-      - id: release-build-garter
-        name: Build the garter CLI a release ships
-        if: ${{ startsWith(inputs.release-tag, 'releases/garter/') && steps.test-plugin-e2e.outcome == 'success' }}
-        timeout-minutes: 15
-        shell: bash
-        run: cargo xtask build garter-bin
-
       # Release calls: stage the binaries plugin-e2e just ran on (galoshes, ex-ray) or, for a garter release,
-      # the garter CLI built above, which is probed for the release version since nothing else runs it.
-      # See RELEASE ASSETS.
+      # the garter CLI, which `stage-release` builds itself and probes for the release version since nothing
+      # else runs it. See RELEASE ASSETS.
       - id: release-stage-plugins
         name: Stage the plugin binaries a release ships
-        if: ${{ inputs.release-tag != '' && steps.test-plugin-e2e.outcome == 'success' && (!startsWith(inputs.release-tag, 'releases/garter/') || steps.release-build-garter.outcome == 'success') }}
-        timeout-minutes: 5
+        if: ${{ inputs.release-tag != '' && steps.test-plugin-e2e.outcome == 'success' }}
+        timeout-minutes: 20
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.release-tag }}

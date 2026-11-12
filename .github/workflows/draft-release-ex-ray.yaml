@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Full history so the ancestry check can resolve origin/main.
+          # Full history so the version stamp finds the earlier release tags.
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-rust
@@ -116,7 +116,6 @@ jobs:
             --head "${{ github.sha }}" \
             --repo-root source \
             --platforms '${{ needs.validate.outputs.platforms }}' \
-            --version "$VERSION" \
             > release-notes.md
           echo "--- release-notes.md ---"
           cat release-notes.md

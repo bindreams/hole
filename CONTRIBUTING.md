@@ -4723,8 +4723,8 @@ Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
   runs the shipped executables that report a version: `hole.exe version` (the MSI's
   payload) and `garter --version` must print the tag's version, so a build of a
   dirty tree (`X.Y.Z.dirty`) fails; `garter --help` must exit 0. The garter CLI is
-  the one binary no earlier lane builds in the release profile, so a garter release's
-  `ci.yaml` call builds it (`release-build-garter`) before staging, and these probes are the only test
+  the one binary no earlier lane builds in the release profile, so staging it builds it first
+  (`Shipment::build_first`, `cargo xtask build garter-bin`), and these probes are the only test
   that runs on it. galoshes and ex-ray have no version command, so their version
   stamp is not checked (the galoshes and ex-ray sidecars inside the MSI and DMG are
   covered by their installer tests). Only a passing leg uploads
