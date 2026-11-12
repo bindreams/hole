@@ -3,10 +3,9 @@
 # no console, so the CLI log in the MSI's log directory and the System log's Service
 # Control Manager events are the only record of why `bridge uninstall` exited 1.
 param(
-    # The install log's creation time opens the event window: everything the
-    # service did since the install is relevant, and nothing before it is.
-    [Parameter(Mandatory)]
-    [string]$MsiInstallLog
+    # Opens the event window: everything the service did since the install is
+    # relevant, and nothing before it is.
+    [datetime]$Since = (Get-Date).AddHours(-1)
 )
 
 # The MSI's actions pass `--log-dir "[CommonAppDataFolder]hole\logs"`; the SYSTEM
@@ -29,10 +28,9 @@ foreach ($cliLogDir in $cliLogDirs) {
 
 Write-Host "--- Service Control Manager events for HoleBridge ---"
 try {
-    $since = if (Test-Path $MsiInstallLog) { (Get-Item $MsiInstallLog).CreationTime } else { (Get-Date).AddHours(-1) }
     # 7031/7034: the service terminated unexpectedly (a kill) and the recovery
     # action taken; 7036: a state change.
-    Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; StartTime = $since } -ErrorAction Stop |
+    Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; StartTime = $Since } -ErrorAction Stop |
         Where-Object { $_.Message -match 'Hole' } |
         Sort-Object TimeCreated |
         ForEach-Object { "{0:HH:mm:ss.fff}  {1}  {2}" -f $_.TimeCreated, $_.Id, $_.Message }

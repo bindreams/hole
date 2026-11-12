@@ -9,6 +9,7 @@ import ctypes
 import os
 import platform
 import subprocess
+import sys
 from collections.abc import Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,7 @@ DUMP_UNINSTALL = SCRIPTS / "dump-uninstall-diagnostics.ps1"
 # uninstall still runs inside the CI step's own (much larger) timeout.
 GSUDO_SELFTEST_TIMEOUT_SECONDS = 5 * 60
 DASHBOARD_E2E_TIMEOUT_SECONDS = 5 * 60
+DIAGNOSTICS_TIMEOUT_SECONDS = 5 * 60
 
 SERVICE = "HoleBridge"
 INSTALL_DIR = Path(os.environ.get("ProgramW6432", r"C:\Program Files")) / "hole"
@@ -110,15 +112,29 @@ def run_ps(
     try:
         return child.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
-        # The phase's children (gsudo, node, tauri-driver, the GUI) outlive pwsh alone.
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(child.pid)], capture_output=True)
-        child.wait()
-        raise TimeoutError(
-            f"{phase or script.name} did not finish within {timeout_seconds:.0f}s; its process tree was killed"
-        ) from None
+        outcome = _kill_process_tree(child)
+        raise TimeoutError(f"{phase or script.name} did not finish within {timeout_seconds:.0f}s; {outcome}") from None
     except BaseException:
-        child.kill()
+        _kill_process_tree(child)
         raise
+
+
+def _kill_process_tree(child: subprocess.Popen) -> str:
+    """Kill `child` and its descendants (the phase's gsudo, node, tauri-driver and GUI outlive pwsh alone).
+
+    Returns what happened, for an error message. If `taskkill` fails, `child` itself is still killed, so the wait
+    below cannot hang on it.
+    """
+    result = subprocess.run(["taskkill", "/T", "/F", "/PID", str(child.pid)], capture_output=True, text=True)
+    if result.returncode == 0:
+        child.wait()
+        return "its process tree was killed"
+    detail = (result.stderr or result.stdout).strip()
+    outcome = f"taskkill exited {result.returncode} ({detail}); processes of the phase may still be running"
+    print(outcome, file=sys.stderr)
+    child.kill()
+    child.wait()
+    return outcome
 
 
 def kill_installed_hole_processes() -> None:
@@ -183,6 +199,20 @@ def marker_path() -> Path:
     return log_dir() / INSTALLED_MARKER
 
 
+def mark_install_started() -> None:
+    """Write the marker, holding when this install began: the diagnostics' event window opens there."""
+    marker_path().write_text(datetime.now().astimezone().isoformat())
+
+
+def install_started() -> datetime | None:
+    """When the marked install began; `None` without a marker. Not the install log's creation time: a recreated file
+    keeps the creation time of the one it replaces (NTFS tunnelling)."""
+    try:
+        return datetime.fromisoformat(marker_path().read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
 def require_windows_elevated() -> None:
     assert platform.system() == "Windows", "the installed-Hole suite runs on Windows only"
     assert is_elevated(), (
@@ -190,27 +220,57 @@ def require_windows_elevated() -> None:
     )
 
 
-def refuse_a_machine_with_hole() -> None:
-    """Fail before changing anything when Hole is installed: it is not ours to install over or uninstall.
+def running_hole_exe_paths() -> list[str]:
+    """The image path of every running `hole.exe`, as `Get-Process` reports it."""
+    out = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            "Get-Process hole -ErrorAction SilentlyContinue | ForEach-Object { if ($_.Path) { $_.Path } else { '(path unreadable)' } }; exit 0",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return out.splitlines()
 
-    A hole.exe running from the install dir implies the dir; one running from elsewhere (a development build) is not
-    the installed product and does not refuse.
+
+def refuse_a_machine_with_hole() -> None:
+    """Fail before changing anything when Hole is installed or any `hole.exe` runs: none of it is ours to disturb.
+
+    A `hole.exe` from anywhere (a development GUI or `bridge run`) shares the single-instance id and the bridge
+    socket with the build under test, so the E2E would route into it and fail misleadingly. It is not killed.
     """
     found = []
     if service_registered():
         found.append(f"the {SERVICE} service is registered")
     if INSTALL_DIR.exists():
         found.append(f"{INSTALL_DIR} exists")
+    if running := running_hole_exe_paths():
+        found.append(f"hole.exe is running: {', '.join(running)}")
     assert not found, (
-        f"Hole is already on this machine ({'; '.join(found)}). The suite will not install over it or uninstall it: "
-        "quit and uninstall Hole yourself first"
+        f"Hole is already on this machine ({'; '.join(found)}). The suite will not install over it, uninstall it or "
+        "kill it: quit Hole and uninstall it yourself first"
     )
 
 
 def dump_failure_diagnostics() -> None:
-    """What the uninstall's own processes and the SCM recorded, plus the install log's tail."""
+    """What the uninstall's own processes and the SCM recorded, plus the install log's tail.
+
+    A timeout is printed, not raised: this runs while another failure propagates, which it must not replace.
+    """
     install_log = install_log_path()
-    run_ps(DUMP_UNINSTALL, {"MsiInstallLog": str(install_log)})
+    params = {} if (since := install_started()) is None else {"Since": since.isoformat()}
+    try:
+        run_ps(
+            DUMP_UNINSTALL,
+            params,
+            timeout_seconds=DIAGNOSTICS_TIMEOUT_SECONDS,
+            phase="the failure diagnostics dump",
+        )
+    except TimeoutError as e:
+        print(e, file=sys.stderr)
     if install_log.is_file():
         print(f"--- {install_log} (tail) ---")
         print("\n".join(install_log.read_text(errors="replace").splitlines()[-200:]))
@@ -239,7 +299,7 @@ def installed_hole(msi_path: Path, request: pytest.FixtureRequest) -> Iterator[P
 
     failed_before = request.session.testsfailed
     install_completed = False
-    marker_path().touch()
+    mark_install_started()
     try:
         code = run_ps(
             INVOKE_MSIEXEC,

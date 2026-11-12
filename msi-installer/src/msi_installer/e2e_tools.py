@@ -21,7 +21,7 @@ from pathlib import Path
 import httpx
 from rich.console import Console
 
-from msi_installer import _PKG_DIR, BuildError, _download_and_hash, _find_repo_root
+from msi_installer import _PKG_DIR, BuildError, _download_and_hash, _download_file, _find_repo_root
 
 E2E_TOOLS_PATH = _PKG_DIR / "e2e-tools.toml"
 
@@ -46,7 +46,7 @@ def provision_e2e_tools(root: Path, console: Console) -> list[Path]:
     cache = cache_dir(root)
     cache.mkdir(parents=True, exist_ok=True)
     return [
-        _ensure_tauri_driver(cache, pins["tauri-driver"]["version"], console),
+        _ensure_tauri_driver(cache, pins["tauri-driver"], console),
         _ensure_msedgedriver(cache, console),
         _ensure_gsudo(cache, pins["gsudo"], console),
     ]
@@ -89,19 +89,20 @@ def _require_file(path: Path, what: str) -> None:
 # tauri-driver ---------------------------------------------------------------------------------------------------------
 
 
-def _ensure_tauri_driver(cache: Path, version: str, console: Console) -> Path:
-    """The prebuilt tauri-driver at a pinned version, downloaded like every other tool here.
+def _ensure_tauri_driver(cache: Path, pin: Mapping[str, str], console: Console) -> Path:
+    """The prebuilt tauri-driver at a pinned version, its archive verified against the pinned sha256.
 
-    A download that cannot succeed (no prebuilt for `version`) fails once, naming the URL; only a transient network
+    A download that cannot succeed (no prebuilt for the version) fails once, naming the URL; only a transient network
     failure is retried (see `_download_and_hash`).
     """
+    version = pin["version"]
     out = cache / f"tauri-driver-v{version}"
     if (out / "tauri-driver.exe").is_file():
         return out
     console.print(f"[bold]Installing tauri-driver {version}[/] into {out}")
     with _staged(out) as stage:
         archive = stage / "tauri-driver.tar.gz"
-        _download_and_hash(_TAURI_DRIVER_URL.format(version=version), archive, console)
+        _download_file(_TAURI_DRIVER_URL.format(version=version), archive, pin["sha256"], console)
         with tarfile.open(archive) as t:
             t.extractall(stage, filter="data")
         archive.unlink()

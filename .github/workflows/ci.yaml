@@ -623,8 +623,8 @@ jobs:
       #
       # Budget 75: the 8 lifecycle steps it replaced (15+5+5+5+5+5+15+5) plus the 3 tool-install
       # steps (5 each). One number; the audit checks only budget <= wall. The harness bounds each
-      # phase itself (msiexec 3 min, gsudo self-test and dashboard E2E 5 min each, about 25 min
-      # with the diagnostics), so a wedged phase fails by name and the fixture still uninstalls
+      # phase itself (msiexec 3 min, gsudo self-test, dashboard E2E and each diagnostics dump 5 min:
+      # about 35 min in all), so a wedged phase fails by name and the fixture still uninstalls
       # long before this last-resort kill, which skips the teardown.
       - id: installer-tests
         name: Install, E2E and uninstall the MSI

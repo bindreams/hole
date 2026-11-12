@@ -39,11 +39,13 @@ def test_machine_path_has_bin_dir(installed_hole: Path):
     assert machine_path_has_bin_dir(), f"{BIN_DIR} not in the Machine PATH"
 
 
-def test_gsudo_deelevation_contract(installed_hole: Path, e2e_environment: dict[str, str]):
-    """De-elevation preserves what the E2E needs: Medium integrity, env, PATH (npm), streamed stdout, the exit code.
+@pytest.fixture(scope="module")
+def gsudo_deelevation_verified(installed_hole: Path, e2e_environment: dict[str, str]) -> None:
+    """Run the gsudo self-test once; fail every test that needs it, by name, when it does not pass.
 
     The child exits 7 only when every contract check passes: a nonzero sentinel that also proves the exit code
-    survives the launcher. Fails here, loudly, rather than as an opaque session timeout in the E2E.
+    survives the launcher. A module fixture caches its failure, so the dashboard E2E fails at once instead of wedging
+    a second time on the same broken launcher.
     """
     env = {**e2e_environment, "HOLE_SELFTEST_CANARY": "canary-ok"}
     code = run_ps(
@@ -53,14 +55,24 @@ def test_gsudo_deelevation_contract(installed_hole: Path, e2e_environment: dict[
         timeout_seconds=GSUDO_SELFTEST_TIMEOUT_SECONDS,
         phase="the gsudo de-elevation self-test",
     )
-    assert code == 7, f"gsudo de-elevation contract failed (exit {code}); see the child output above"
+    assert code == 7, f"gsudo self-test failed (exit {code}); see the child output above"
 
 
-def test_dashboard_e2e_at_medium_integrity(installed_hole: Path, e2e_environment: dict[str, str]):
+def test_gsudo_deelevation_contract(gsudo_deelevation_verified: None):
+    """De-elevation preserves what the E2E needs: Medium integrity, env, PATH (npm), streamed stdout, the exit code.
+
+    The assertion is the fixture's: a failure is loud here, not an opaque session timeout in the E2E.
+    """
+
+
+def test_dashboard_e2e_at_medium_integrity(
+    installed_hole: Path, e2e_environment: dict[str, str], gsudo_deelevation_verified: None
+):
     """WebDriverIO smoke test of the INSTALLED binary: the dashboard loads the bundled frontend (#372).
 
     `e2e-medium.ps1` checks inside the de-elevated child that `HOLE_TEST_APP_PATH` arrived and points at a real
-    binary, rather than letting wdio fall back to the uninstalled workspace build.
+    binary, rather than letting wdio fall back to the uninstalled workspace build. It needs the gsudo self-test to
+    pass (`gsudo_deelevation_verified`).
     """
     env = {**e2e_environment, "HOLE_TEST_APP_PATH": str(BIN_DIR / "hole.exe")}
     code = run_ps(
