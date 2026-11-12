@@ -559,8 +559,8 @@ fn a_migrated_load_logs_at_debug_and_a_current_one_does_not() {
     assert!(log.contains("supported=3"), "{log}");
 }
 
-/// A `NotFound` is `Absent`, and on Windows it can stand for a file that exists (a delete in flight): the debug line
-/// is the only trace of which one it was.
+/// A `NotFound` is `Absent`, and on Windows it can stand for a file that exists (see [`crate::versioned_file`]): the
+/// debug line is the only trace of which one it was.
 #[skuld::test]
 fn a_not_found_read_logs_the_error_text_at_debug() {
     struct NotThere;

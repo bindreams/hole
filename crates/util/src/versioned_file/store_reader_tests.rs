@@ -1,5 +1,6 @@
 //! A reader that takes no lock never makes a `store` or a `move_aside` fail, and is never told the file is unreadable
-//! by the replace. `Absent` is accepted because, on Windows, a read inside a replace can answer it for a file that
+//! by the replace. `Absent` is accepted where the file legitimately goes away or is not there yet (`move_aside`, which
+//! also reads before the first store), and on Windows, where a read inside a replace can answer it for a file that
 //! exists.
 //!
 //! These are smoke tests: the loader races the writer and meets a replace only by chance. A read of a delete-pending
@@ -26,8 +27,12 @@ fn record(n: usize) -> OsRecordFile {
 
 /// Runs `write` on this thread while another thread reads the file in a loop
 /// without the in-process lock, until `write` is done. Returns what `write`
-/// collected, the number of loads, and the loads that were neither `Current` nor `Absent`.
-fn while_loading<T>(file: &VersionedFile<OsRecordFile>, write: impl FnOnce() -> T) -> (T, usize, Vec<String>) {
+/// collected, the number of loads, and the loads other than `Current` (and `Absent`, if `allow_absent`).
+fn while_loading<T>(
+    file: &VersionedFile<OsRecordFile>,
+    allow_absent: bool,
+    write: impl FnOnce() -> T,
+) -> (T, usize, Vec<String>) {
     /// Sets the flag when dropped, so a panicking `write` still stops the loader.
     struct Done<'a>(&'a AtomicBool);
 
@@ -49,7 +54,8 @@ fn while_loading<T>(file: &VersionedFile<OsRecordFile>, write: impl FnOnce() -> 
             let (mut loads, mut torn) = (0usize, Vec::new());
             while !written.load(Ordering::Acquire) {
                 match file.read_through(&reader) {
-                    Loaded::Current { .. } | Loaded::Absent => {}
+                    Loaded::Current { .. } => {}
+                    Loaded::Absent if allow_absent => {}
                     other => torn.push(format!("{other:?}")),
                 }
                 loads += 1;
@@ -76,7 +82,8 @@ fn an_unlocked_reader_never_makes_a_store_fail() {
     let file = VersionedFile::<OsRecordFile>::new(dir.path());
     file.store(&record(0), &DefaultPlacement::default()).unwrap();
 
-    let (store_errors, loads, torn) = while_loading(&file, || {
+    // The file exists for the whole run, so only Windows can answer `Absent`.
+    let (store_errors, loads, torn) = while_loading(&file, cfg!(windows), || {
         (1..=STORES)
             .filter_map(|n| file.store(&record(n), &DefaultPlacement::default()).err())
             .map(|e| format!("{e:?}"))
@@ -92,7 +99,7 @@ fn an_unlocked_reader_never_makes_a_store_fail() {
     );
     assert!(
         torn.is_empty(),
-        "{} loads were neither Current nor Absent; first: {}",
+        "{} loads were not what a replace allows; first: {}",
         torn.len(),
         torn[0]
     );
@@ -103,7 +110,7 @@ fn an_unlocked_reader_never_makes_a_move_aside_fail() {
     let dir = dir();
     let file = VersionedFile::<OsRecordFile>::new(dir.path());
 
-    let (move_errors, loads, torn) = while_loading(&file, || {
+    let (move_errors, loads, torn) = while_loading(&file, true, || {
         let mut errors = Vec::new();
         for n in 1..=MOVES {
             file.store(&record(n), &DefaultPlacement::default()).unwrap();
@@ -124,7 +131,7 @@ fn an_unlocked_reader_never_makes_a_move_aside_fail() {
     );
     assert!(
         torn.is_empty(),
-        "{} loads were not Current or Absent; first: {}",
+        "{} loads were not what a move_aside allows; first: {}",
         torn.len(),
         torn[0]
     );
