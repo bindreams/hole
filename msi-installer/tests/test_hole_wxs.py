@@ -654,10 +654,13 @@ def test_bridge_release_has_an_override(package: ET.Element) -> None:
     otherwise block every uninstall attempt forever.
     """
     entries = {c.get("Action", ""): c for c in _get_custom_entries(package)}
-    assert "NOT HOLE_KEEP_COVERS" in entries["BridgeRelease"].get("Condition", "")
+    condition = entries["BridgeRelease"].get("Condition", "")
+    assert 'NOT (LEAVE_NETWORK_BLOCKED="1")' in condition, (
+        f"only LEAVE_NETWORK_BLOCKED=1 may skip the release (=0 must not): {condition!r}"
+    )
 
     props = {p.get("Id"): p for p in package.iter(f"{{{NS['wix']}}}Property")}
-    prop = props.get("HOLE_KEEP_COVERS")
+    prop = props.get("LEAVE_NETWORK_BLOCKED")
     assert prop is not None, "the override property must be declared"
     assert prop.get("Secure") == "yes", (
         "a public property must be Secure to survive into the deferred execute sequence under UAC"
@@ -1122,9 +1125,9 @@ def _netsh_claims_without_qualifier(comment: str) -> list[str]:
     return [p for p in _paragraphs(comment) if "netsh wfp" in p and not any(q in p for q in _NETSH_IS_NOT_A_REMEDY)]
 
 
-def _keep_covers_claims_without_remedy(comment: str) -> list[str]:
-    """Paragraphs naming HOLE_KEEP_COVERS without naming, in that paragraph, what clears it."""
-    return [p for p in _paragraphs(comment) if "HOLE_KEEP_COVERS" in p and "reinstall" not in p.lower()]
+def _leave_network_blocked_claims_without_remedy(comment: str) -> list[str]:
+    """Paragraphs naming LEAVE_NETWORK_BLOCKED without naming, in that paragraph, what clears it."""
+    return [p for p in _paragraphs(comment) if "LEAVE_NETWORK_BLOCKED" in p and "reinstall" not in p.lower()]
 
 
 def test_wxs_comments_offer_no_remedy_that_does_not_exist() -> None:
@@ -1133,7 +1136,7 @@ def test_wxs_comments_offer_no_remedy_that_does_not_exist() -> None:
     `netsh wfp` is a diagnostics-only netsh context: capture, dump, help, set,
     show, and no delete verb. A comment that offers it as the way back from a
     stranded cover tells whoever is weighing "should this really block the
-    uninstall?" that there is a safety net under HOLE_KEEP_COVERS. There is
+    uninstall?" that there is a safety net under LEAVE_NETWORK_BLOCKED. There is
     not. Source-side mirror of cutover_tests.rs's guard on the shipped
     operator message,
     `an_unproven_release_does_not_send_the_operator_to_a_command_that_cannot_help`.
@@ -1146,18 +1149,20 @@ def test_wxs_comments_offer_no_remedy_that_does_not_exist() -> None:
         )
 
 
-def test_keep_covers_comment_names_the_only_way_back() -> None:
-    """HOLE_KEEP_COVERS strands the block; the paragraph that names it must say what clears it.
+def test_leave_network_blocked_comment_names_the_only_way_back() -> None:
+    """LEAVE_NETWORK_BLOCKED strands the block; the paragraph that names it must say what clears it.
 
     Removing a WFP filter takes an FWPM call and hole.exe is the only caller
     of one on the host, so reinstalling Hole is the whole remedy. Saying
     nothing leaves the escape looking cheaper than it is.
     """
-    assert any("HOLE_KEEP_COVERS" in c for c in _wxs_comments()), "no hole.wxs comment explains HOLE_KEEP_COVERS"
+    assert any("LEAVE_NETWORK_BLOCKED" in c for c in _wxs_comments()), (
+        "no hole.wxs comment explains LEAVE_NETWORK_BLOCKED"
+    )
     for comment in _wxs_comments():
-        silent = _keep_covers_claims_without_remedy(comment)
+        silent = _leave_network_blocked_claims_without_remedy(comment)
         assert not silent, (
-            "the HOLE_KEEP_COVERS rationale must name reinstalling Hole as the way back, in the "
+            "the LEAVE_NETWORK_BLOCKED rationale must name reinstalling Hole as the way back, in the "
             "paragraph that names the property\n---\n" + "\n---\n".join(p.strip() for p in silent)
         )
 
@@ -1165,19 +1170,20 @@ def test_keep_covers_comment_names_the_only_way_back() -> None:
 # The shape both guards above missed: a qualified, remedy-naming paragraph
 # followed by one that claims neither. A guard scoped to the whole comment
 # lets an earlier paragraph's qualifier or remedy silently answer for a later
-# paragraph that names netsh/HOLE_KEEP_COVERS on its own.
+# paragraph that names netsh/LEAVE_NETWORK_BLOCKED on its own.
 _QUALIFIED_PARAGRAPH = """\
          `netsh wfp` is diagnostics-only — capture, dump, help, set, show, and
          no delete verb — and removing a WFP filter takes an FWPM call, whose
          only caller on the host is the hole.exe this uninstall is about to
          delete. Reinstalling Hole is the way back (#1003)."""
 
-_PRE_PR_KEEP_COVERS_PARAGRAPH = """\
-         HOLE_KEEP_COVERS is the escape from the escape: Return="check" means a
-         release that can never succeed (BFE stopped, hole.exe quarantined)
-         would otherwise make the product permanently unremovable. Documented
-         in RELEASE-OPS.md as a last resort; it leaves the block in
-         place, so `netsh wfp` is the only thing left after it."""
+_PRE_PR_LEAVE_NETWORK_BLOCKED_PARAGRAPH = """\
+         LEAVE_NETWORK_BLOCKED is the escape from the escape: Return="check"
+         means a release that can never succeed (BFE stopped, hole.exe
+         quarantined) would otherwise make the product permanently
+         unremovable. Documented in RELEASE-OPS.md as a last resort; it
+         leaves the block in place, so `netsh wfp` is the only thing left
+         after it."""
 
 
 def test_the_guards_reject_the_wording_they_exist_to_delete() -> None:
@@ -1187,13 +1193,13 @@ def test_the_guards_reject_the_wording_they_exist_to_delete() -> None:
     guards and a revert to comment scope, where the qualifier and the remedy
     in the first paragraph answer for every paragraph after it.
     """
-    comment = _QUALIFIED_PARAGRAPH + "\n\n" + _PRE_PR_KEEP_COVERS_PARAGRAPH
+    comment = _QUALIFIED_PARAGRAPH + "\n\n" + _PRE_PR_LEAVE_NETWORK_BLOCKED_PARAGRAPH
 
-    assert _netsh_claims_without_qualifier(comment) == [_PRE_PR_KEEP_COVERS_PARAGRAPH], (
+    assert _netsh_claims_without_qualifier(comment) == [_PRE_PR_LEAVE_NETWORK_BLOCKED_PARAGRAPH], (
         "a `netsh wfp` claim must be qualified where it is made; a qualifier in an earlier "
         "paragraph of the same comment does not answer for it"
     )
-    assert _keep_covers_claims_without_remedy(comment) == [_PRE_PR_KEEP_COVERS_PARAGRAPH], (
-        "the HOLE_KEEP_COVERS remedy must be named where the property is named; 'reinstall' in "
+    assert _leave_network_blocked_claims_without_remedy(comment) == [_PRE_PR_LEAVE_NETWORK_BLOCKED_PARAGRAPH], (
+        "the LEAVE_NETWORK_BLOCKED remedy must be named where the property is named; 'reinstall' in "
         "an earlier paragraph of the same comment does not answer for it"
     )
