@@ -294,7 +294,7 @@ upgrade.
 returns whichever `ProxyError` the run's evidence supports — `NoTunnelConnection`
 (every connect failed outright), `TunnelSetupIncomplete` (one was still
 outstanding when its budget fired), `TunnelSilent`, or the generic
-`ForwarderSelfTestFailed` — and the RAII guards unwind without touching routes,
+`ForwarderSelfTestFailed` — and the session's teardown runs without touching routes,
 system DNS, or the wintun adapter. `classify_failure` picks between them from
 counted evidence, never from a cause code. Guarded by
 `start_blocks_on_forwarder_self_test_failure`.
@@ -507,13 +507,44 @@ still reach it after the proxy is running. State that lives as long as the
 session therefore must not descend from it: the plugin chain owns its own
 shutdown token (`spawn_plugin_runner_at`) and honours the start token explicitly
 while the start is in progress. The chain's task and token live in one
-`ChainTask` whose `Drop` ends the chain, so every way out of a start, the start
-future being dropped included, tears the plugin down. Afterwards the chain ends
-only when the session drops the chain or when a plugin exits, which
-`check_health` reads as a death. garter's `ChainRunner` given a `cancel_token`
+`ChainTask` whose `Drop` ends the chain, so a start future being dropped tears the
+plugin down. Every failure inside the start awaits `ChainTask::end` before it is
+reported: the token is signalled and the task aborted and awaited, so the runner starts no
+further plugin before the teardown's reap (see the limit below), and a Cancel never waits for
+garter's drain. The
+plugins get no graceful stop: the abort drops garter's `kill_on_drop`, contained plugin child, which
+hard-kills the plugin's process tree, and the reap is the backstop that kills by recorded identity. Afterwards the chain
+ends only through `PluginChain::end` or when a plugin exits, which `check_health` reads as a
+death. garter's `ChainRunner` given a `cancel_token`
 registers no signal handler of its own (one without a token keeps it), so a
 SIGTERM or Ctrl+C reaches the chain only through the bridge's own shutdown, never
 as an apparent plugin death.
+
+**Every exit of a start ends in one teardown.** `start_inner` builds a
+[`Session`](crates/bridge/src/session.rs) that owns each resource from the moment it is
+acquired. A failed start, a stop and a health-check give-up all run `Session::teardown`: DNS
+restore, engine, the plugin chain ended (`PluginChain::end`: cancelled, aborted, its runner awaited) and then its
+plugins reaped, `proxy.stop().await`, routes, and the standing cover handed back for the caller to
+settle (a stop) or release under the cover lock (a failed start). The reap runs whenever a
+plugin is configured, by the recorded identities in the state directory, so a chain that
+spawned and then failed to become ready is reaped too; it runs on a blocking thread (inline if
+the runtime cancelled that task before it ran). No phase of the teardown observes a cancel
+token.
+
+The chain's end waits for garter's runner, not for the per-plugin tasks it spawned: a plugin being
+started at that instant may still spawn and record itself after `end` returns. Its own drop kills
+the process tree, and its record stays in the state file for the next reap to remove by identity.
+This happens only to a start cancelled, or failing readiness, mid-spawn. Joining those tasks is
+tracked in [#1244](https://github.com/bindreams/hole/issues/1244).
+
+`Drop` is only the net for a panic or a dropped future, and it is not the teardown run
+implicitly. `Session` declares its fields in the teardown's release order (DNS, dispatcher,
+plugins, proxy, routes, standing cover) and a drop releases them in that order, awaiting
+nothing: a DNS guard or dispatcher dropped without its awaited `shutdown()` is a drop bomb in
+debug builds and falls back to a synchronous release in release builds, the plugin chain is
+aborted without a join (its plugin child's drop kills the tree, but nothing waits for that and no
+reap runs, so a plugin it recorded may outlive it) and
+`proxy.stop()` is not awaited (the running proxy's own `Drop` closes its sockets).
 
 Three invariants:
 
@@ -1121,7 +1152,7 @@ interface-scoped IPv4 bypass form; an on-link default route is refused there
 before `install` is ever reached (`gateway::reject_macos_on_link`).
 
 Provenance is the one handle that outlives the interface, which matters because
-the utun is always already gone by teardown: `RunningState` closes the TUN at
+the utun is always already gone by teardown: `Session::teardown` closes the TUN at
 step 1 and drops the routes guard at step 4, and a crashed run's utun died with
 its control-socket fd.
 
@@ -3322,8 +3353,9 @@ from it any more. Two structural tests replace the deleted
 `the_standing_cover_field_has_exactly_one_reader`
 (`proxy_manager/cover_tests.rs`, gone along with the model it guarded):
 `no_bridge_source_derives_cover_state_from_a_session`
-(`proxy_manager_tests.rs`) counts reads of `RunningState.lockdown` outside its
-one sanctioned site (`stop_with`'s own teardown), and
+(`proxy_manager_tests.rs`) counts reads of `Session.lockdown` (a private field,
+written only by `hold_standing_cover`) outside its one sanctioned site
+(`Session::teardown`, which hands the cover back), and
 `cover_release_has_the_known_sanctioned_caller_set`
 (`reconciler_tests.rs`) whitelists every real caller of the unconditional
 `release_all_covers()` — `handle_unblock`, `turn_lockdown_off`,

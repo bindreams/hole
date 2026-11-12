@@ -35,6 +35,9 @@ pub(crate) mod socks5_dns_upstream;
 pub(crate) mod target_records;
 pub(crate) mod udp_echo;
 
+/// An ordered log several mocks append to, so a test reads the order their resources were released in.
+pub(crate) type EventLog = std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>;
+
 /// The cause text inside [`mock_gateway_failure`].
 pub(crate) const MOCK_GATEWAY_CAUSE: &str = "mock default-net cause";
 

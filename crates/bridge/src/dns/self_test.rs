@@ -104,7 +104,7 @@ pub(crate) const TAP_DISABLED_HINT: &str =
 ///
 /// A blocking gate: called from `start_inner` BEFORE `Dispatcher::new` /
 /// `routing.install` / `Dns::apply`. A failure short-circuits the start;
-/// the locally-owned `running_proxy` + `plugin_chain` RAII guards unwind
+/// the session's teardown releases the proxy + plugin chain
 /// without ever hijacking system DNS into a dead tunnel.
 pub(crate) async fn run_forwarder_self_test(
     forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,

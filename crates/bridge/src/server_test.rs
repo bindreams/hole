@@ -351,8 +351,8 @@ fn build_server_config(entry: &ServerEntry, server_ip: IpAddr) -> Result<ServerC
 /// chain's local port.
 ///
 /// Returns `Ok(None)` if no plugin is configured (plain shadowsocks). Returns
-/// the [`PluginChain`](crate::proxy::plugin::PluginChain) guard otherwise — its [`Drop`] cancels the chain
-/// (SIP003u graceful shutdown).
+/// the [`PluginChain`](crate::proxy::plugin::PluginChain) guard otherwise — its [`Drop`] aborts the chain's
+/// task, which kills the plugin's process tree.
 async fn maybe_start_plugin(
     plugin: Option<&BundledPlugin>,
     plugin_opts: Option<&str>,

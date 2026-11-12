@@ -6,7 +6,7 @@
 // composition support.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,17 +22,20 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A running plugin chain managed by Garter.
 ///
-/// Owns the tokio task running the chain and a cancellation token for
-/// graceful shutdown. Drop cancels the token (SIP003u: SIGTERM on Unix,
-/// CTRL_BREAK on Windows, garter's 12s default drain timeout) and aborts the
-/// task as a safety net.
+/// Owns the tokio task running the chain and a cancellation token. [`Self::end`]
+/// cancels the token, aborts the task and waits until the runner is gone, so no
+/// further plugin starts. Each plugin runs in a task of garter's own, which the
+/// abort drops without waiting for: a plugin being started at that moment may
+/// still spawn and record itself, and its own drop then kills it (it is
+/// `kill_on_drop` and contained, so its whole process tree is hard-killed with no
+/// grace). The record stays in the state file, and the next reap removes it by
+/// identity. A drop does the same without waiting for the runner either.
 ///
 /// The token is the chain's own, not a child of the start's, so a late Cancel
 /// of the start never ends a ready chain.
 ///
-/// `Drop` does not touch the plugin state file. It aborts the chain's task
-/// without knowing whether garter's teardown finished, so the plugins it
-/// records may outlive it; only [`PluginChain::kill_tracked`]'s reap removes them.
+/// Neither path touches the plugin state file; only `Session::teardown`'s reap
+/// removes records.
 pub struct PluginChain {
     task: ChainTask,
     local_addr: SocketAddr,
@@ -40,7 +43,6 @@ pub struct PluginChain {
     /// the end-to-end intersection across every hop. The UDP-drop policy in
     /// `proxy_manager.rs` reads this as the authoritative runtime signal.
     transports: garter::Transports,
-    state_dir: Option<PathBuf>,
     log: Arc<crate::proxy::plugin_log::PluginLog>,
     /// The plugin the chain was spawned from.
     plugin: BundledPlugin,
@@ -58,6 +60,13 @@ impl std::fmt::Debug for PluginChain {
 impl PluginChain {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// End the chain and wait until its runner is gone, so no further plugin starts. Plugins already being
+    /// started are aborted, not waited for (see the type doc). Unlike a plain drop, which does not wait. Does
+    /// not touch the state file.
+    pub async fn end(self) {
+        self.task.end().await;
     }
 
     /// The chain's task ends as soon as any plugin in the chain exits, so
@@ -101,7 +110,6 @@ impl PluginChain {
     pub(crate) fn for_test(
         log: Arc<crate::proxy::plugin_log::PluginLog>,
         cancel: CancellationToken,
-        state_dir: Option<PathBuf>,
         plugin: BundledPlugin,
     ) -> Self {
         Self {
@@ -111,7 +119,6 @@ impl PluginChain {
             },
             local_addr: SocketAddr::from(([127, 0, 0, 1], 1)),
             transports: garter::Transports::TCP,
-            state_dir,
             log,
             plugin,
         }
@@ -130,27 +137,30 @@ impl PluginChain {
             task: ChainTask { handle, cancel },
             local_addr: SocketAddr::from(([127, 0, 0, 1], 1)),
             transports: garter::Transports::TCP,
-            state_dir: None,
             log: crate::proxy::plugin_log::PluginLog::new(),
             plugin,
         }
-    }
-
-    /// Reap every tracked plugin process and remove the records it accounted
-    /// for from the state file. Called from `ProxyManager::stop` before
-    /// dropping the chain, so the stop path doesn't race with the OS reaping.
-    pub fn kill_tracked(&self) {
-        let Some(ref dir) = self.state_dir else { return };
-        crate::plugin_recovery::reap_recorded_plugins(dir);
     }
 }
 
 /// A chain's task and its shutdown token. Dropping it ends the chain, so every
 /// way out of a start (an error, a cancel, the start future dropped) tears the
-/// plugin down without a call site remembering to.
+/// plugin down without a call site remembering to. A drop does not wait for the
+/// task; [`Self::end`] does.
 struct ChainTask {
     handle: tokio::task::JoinHandle<garter::Result<()>>,
     cancel: CancellationToken,
+}
+
+impl ChainTask {
+    /// Cancel the chain, abort its task and wait until the runner is gone. The plugins get no grace period: garter's
+    /// own drain would hold a cancelled start, and a stop, for up to 12 s. The abort drops each plugin's task,
+    /// possibly after this returns; a plugin's child goes when its task is dropped.
+    async fn end(mut self) {
+        self.cancel.cancel();
+        self.handle.abort();
+        let _ = (&mut self.handle).await;
+    }
 }
 
 impl Drop for ChainTask {
@@ -267,7 +277,6 @@ pub async fn start_plugin_chain(
         task,
         local_addr: ready_addr,
         transports,
-        state_dir: state_dir.map(Path::to_path_buf),
         log,
         plugin: plugin.clone(),
     })
@@ -342,9 +351,9 @@ fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
 /// (with optional `pid_sink`), wraps in `TapPlugin` when
 /// `HOLE_BRIDGE_PLUGIN_TAP=1`, builds the `ChainRunner`, spawns it,
 /// and awaits readiness with a 30-second timeout. The chain's task is owned
-/// by a [`ChainTask`] from the spawn on, so a failure, or the future being
-/// dropped, ends it and a retried attempt by `bind_ephemeral` doesn't leak the
-/// previous attempt's task. On success returns `(task, ready_addr, transports)`
+/// by a [`ChainTask`] from the spawn on: a failure ends it before it returns
+/// (see [`ready_or_end`]), and the future being dropped ends it, so a retried attempt by `bind_ephemeral` doesn't
+/// leak the previous attempt's task. On success returns `(task, ready_addr, transports)`
 /// — the caller wraps these in a [`PluginChain`]. The `transports` is the
 /// sitrep-reported end-to-end transport set (#414), threaded into the
 /// bridge's UDP-drop policy.
@@ -421,48 +430,65 @@ async fn spawn_plugin_runner_at(
         .cancel_token(chain_cancel.clone())
         .on_ready(ready_tx);
 
-    // Owned from the spawn on: every return below, and a drop of this future, ends the chain.
+    // Owned from the spawn on: a failed readiness ends the chain (awaited), and a drop of this future ends it too.
     let task = ChainTask {
         handle: tokio::spawn(async move { runner.run(env).await }),
         cancel: chain_cancel,
     };
 
-    // Race readiness against the bridge cancel: if the user cancels the
-    // start mid-spawn, abort the partially-spawned chain and return
-    // ProxyError::Cancelled so the caller short-circuits cleanly instead
-    // of waiting up to READINESS_TIMEOUT for a chain it no longer wants.
-    // `ready_rx` now yields `Result<ChainReady, StartError>` (per-plugin
-    // readiness aggregated by the runner — #414); the timeout adds one
-    // `Result` layer and the channel another. Flatten and extract the
-    // chain-public listen address + reported transports.
-    let chain_ready = tokio::select! {
+    let (task, ready) = ready_or_end(task, ready_rx, &start_cancel).await?;
+    Ok((task, ready.listen, ready.transports))
+}
+
+/// The chain's readiness, or an error after the chain has ended: every failure awaits [`ChainTask::end`] before it
+/// returns, so the chain's runner is gone and starts no further plugin by the time the start reports the failure
+/// and the teardown reaps.
+async fn ready_or_end(
+    task: ChainTask,
+    ready_rx: oneshot::Receiver<Result<garter::ChainReady, garter::StartError>>,
+    start_cancel: &CancellationToken,
+) -> Result<(ChainTask, garter::ChainReady), ProxyError> {
+    match await_ready(ready_rx, start_cancel).await {
+        Ok(ready) => Ok((task, ready)),
+        Err(e) => {
+            task.end().await;
+            Err(e)
+        }
+    }
+}
+
+/// Race readiness against the bridge cancel: if the user cancels the start mid-spawn, return
+/// [`ProxyError::Cancelled`] so the caller short-circuits cleanly instead of waiting up to [`READINESS_TIMEOUT`]
+/// for a chain it no longer wants. `ready_rx` yields `Result<ChainReady, StartError>` (per-plugin readiness
+/// aggregated by the runner); the timeout adds one `Result` layer and the channel another.
+async fn await_ready(
+    ready_rx: oneshot::Receiver<Result<garter::ChainReady, garter::StartError>>,
+    start_cancel: &CancellationToken,
+) -> Result<garter::ChainReady, ProxyError> {
+    tokio::select! {
         biased;
-        _ = start_cancel.cancelled() => return Err(ProxyError::Cancelled),
+        _ = start_cancel.cancelled() => Err(ProxyError::Cancelled),
         // sync-exception(external-event, CLAUDE.md class 2): READINESS_TIMEOUT is the
         // terminal failure-to-human bound for a plugin subprocess that may never become
         // ready (wedged child); it is NOT intra-process sync. Cooperative cancel via the
         // biased cancel arm above is the primary escape; this timeout only bounds the
         // genuinely-stuck case.
         r = tokio::time::timeout(READINESS_TIMEOUT, ready_rx) => match r {
-            Ok(Ok(Ok(chain_ready))) => chain_ready,
+            Ok(Ok(Ok(chain_ready))) => Ok(chain_ready),
             // The only retryable start class: a plugin reported it could
             // not bind its listener. Surface as `ProxyError::BindRace` so
             // `bind_ephemeral` (via `proxy_err_to_io_err`) retries on a
             // fresh port. The errno is preserved for `bridge.log`.
-            Ok(Ok(Err(garter::StartError::BindConflict { errno, addr }))) => {
-                return Err(ProxyError::BindRace { errno, addr });
-            }
+            Ok(Ok(Err(garter::StartError::BindConflict { errno, addr }))) => Err(ProxyError::BindRace { errno, addr }),
             // Terminal start failure (config error, upstream-dial failure,
             // bare process exit) — never retried.
             Ok(Ok(Err(garter::StartError::Fatal { detail, .. }))) => {
-                return Err(ProxyError::Plugin(format!("plugin failed to start: {detail}")));
+                Err(ProxyError::Plugin(format!("plugin failed to start: {detail}")))
             }
-            Ok(Err(_)) => return Err(ProxyError::Plugin("plugin exited before becoming ready".into())),
-            Err(_) => return Err(ProxyError::Plugin("plugin did not become ready within 30s".into())),
+            Ok(Err(_)) => Err(ProxyError::Plugin("plugin exited before becoming ready".into())),
+            Err(_) => Err(ProxyError::Plugin("plugin did not become ready within 30s".into())),
         },
-    };
-
-    Ok((task, chain_ready.listen, chain_ready.transports))
+    }
 }
 
 /// Convert a [`ProxyError`] from `spawn_plugin_runner_at` into an
