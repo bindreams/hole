@@ -1,12 +1,13 @@
 [project]
 name = "msi-installer"
 version = "0.0.0"
-requires-python = ">=3.11"
+requires-python = ">=3.11.4"
 dependencies = ["httpx", "rich", "tenacity"]
 
 [project.scripts]
 build = "msi_installer:main"
 upgrade-wix = "msi_installer:upgrade_wix"
+provision-e2e-tools = "msi_installer.e2e_tools:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -20,6 +21,8 @@ testpaths = ["tests"]
 markers = [
     "wix: tests requiring the WiX toolchain (skip with -m 'not wix')",
     "cdb: tests requiring the Windows SDK Debugging Tools and the Microsoft symbol server (skip with -m 'not cdb')",
+    "system_wide: installs Hole system-wide and opens windows; needs an elevated shell (run with -m system_wide)",
+    "cleanup: uninstalls what an interrupted system_wide run left (run with -m cleanup)",
 ]
 
 [dependency-groups]

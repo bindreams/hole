@@ -393,67 +393,6 @@ jobs:
         shell: pwsh
         run: target\release\hole.exe version
 
-      # tauri-driver is installed from cargo-quickinstall's prebuilt binary at a pinned
-      # version, so the only thing retried is a download: a compile inside the retry
-      # would retry a build error. It, the driver and gsudo are tool installs that
-      # need nothing from the MSI, so they sit before `hole-build` with the rest of
-      # the toolchain users.
-      - id: installer-tauri-driver
-        name: Install tauri-driver
-        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.installer == true }}
-        timeout-minutes: 5
-        shell: bash
-        env:
-          # See install-nextest: the unauthenticated GitHub API limit is 60 req/h.
-          GITHUB_TOKEN: ${{ github.token }}
-        run: .github/scripts/retry.sh cargo binstall --no-confirm --disable-strategies compile --version 2.0.6 tauri-driver
-
-      # tauri-driver speaks to WebView2 via Microsoft Edge's WebDriver. The
-      # runner's bundled msedgedriver (`$EDGEWEBDRIVER`) targets the Edge BROWSER
-      # version on the image, but the WebView2 RUNTIME (which hole.exe actually
-      # loads) auto-updates independently and is typically a higher version;
-      # msedgedriver then rejects the session with "only supports Microsoft Edge
-      # version N". Detect the installed runtime version and download the
-      # matching msedgedriver from Microsoft's CDN. See bindreams/hole#372.
-      - id: installer-msedgedriver
-        name: Install msedgedriver matching WebView2 runtime
-        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.installer == true }}
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          $key = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
-          $webview2 = (Get-ItemProperty -Path $key -Name pv).pv
-          Write-Host "WebView2 runtime version: $webview2"
-          $url = "https://msedgedriver.microsoft.com/$webview2/edgedriver_win64.zip"
-          $zip = "$env:RUNNER_TEMP\edgedriver.zip"
-          $out = "$env:RUNNER_TEMP\edgedriver"
-          & .github/scripts/retry.ps1 -What 'download msedgedriver' -Script { Invoke-WebRequest -Uri $url -OutFile $zip }
-          Expand-Archive -Path $zip -DestinationPath $out -Force
-          Add-Content -Path $env:GITHUB_PATH -Value $out
-
-      # gsudo runs the dashboard E2E at Medium integrity. GitHub runners run
-      # every process at High integrity (admin + UAC disabled), and WebView2
-      # Runtime 150 broke the DevTools loopback for High-integrity hosts
-      # (MicrosoftEdge/WebView2Feedback#5640) so tauri-driver can't attach.
-      # Real users run the GUI unprivileged (Medium), where 150 works.
-      - id: installer-gsudo
-        name: Install gsudo (de-elevation for the E2E)
-        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.installer == true }}
-        timeout-minutes: 5
-        shell: pwsh
-        env:
-          # renovate: datasource=github-releases depName=gerardog/gsudo
-          GSUDO_VERSION: "2.6.1"
-        run: |
-          $zip = "$env:RUNNER_TEMP\gsudo.zip"
-          $dir = "$env:RUNNER_TEMP\gsudo"
-          $url = "https://github.com/gerardog/gsudo/releases/download/v$env:GSUDO_VERSION/gsudo.portable.zip"
-          & .github/scripts/retry.ps1 -What 'download gsudo' -Script { Invoke-WebRequest -Uri $url -OutFile $zip }
-          Expand-Archive -Path $zip -DestinationPath $dir -Force
-          $exe = "$dir\x64\gsudo.exe"
-          if (-not (Test-Path $exe)) { throw "gsudo.exe not found at $exe after extract" }
-          "$dir\x64" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-
       # DMG assembly + signature-consistency tests (`dmg-installer/`): catches an
       # unsigned .app bundle that launches "damaged" under Gatekeeper quarantine
       # (#364). One build+test via the run-cascade (builds hole-dmg once, then the
@@ -668,154 +607,42 @@ jobs:
               + package(handle-holders) + package(tombstone)
               + package(hole-test-observability)'
 
-      # Installer install + E2E (Windows) ===============================================================================
-      # The E2E drives the INSTALLED binary through WebDriver over loopback, so
-      # it runs before the TUN lane. The block is self-cleaning (Uninstall and
-      # Verify uninstall run `always()`), and the TUN lane runs only once nothing
-      # is left installed: Verify uninstall passed, or the MSI was never
-      # installed. Otherwise the MSI's SYSTEM `HoleBridge` service would share
-      # WFP, routes and the adapter with the TUN tests and confound their
-      # verdicts.
-
-      - id: installer-install
-        name: Install
+      # Installer lifecycle (Windows) ===================================================================================
+      # The sequence (install, verify, de-elevated dashboard E2E, uninstall, verify) is the
+      # msi-installer harness (`msi-installer/tests/installed/`). It drives the INSTALLED binary
+      # through WebDriver over loopback, so it runs before the TUN lane.
+      #
+      # The harness uninstalls after a failed check, but a step timeout kills it with Hole still
+      # installed, so `installer-cleanup` runs `always()` after it: an idempotent uninstall that
+      # verifies nothing is left. That step is the TUN lane's gate: the lane runs only once nothing
+      # is installed (cleanup passed, or the MSI was never built), else the MSI's SYSTEM `HoleBridge`
+      # service would share WFP, routes and the adapter with the TUN tests and confound their
+      # verdicts. A failed lifecycle with a clean cleanup does not hide the TUN lane.
+      #
+      # Last-resort kill: the harness bounds each phase itself (msiexec 3 min; gsudo self-test,
+      # dashboard E2E and each diagnostics dump 5 min), so a wedged phase fails by name and the
+      # fixture still uninstalls first. Those bounds sum to about 25 min; 75 leaves margin for the
+      # unbounded phases (tool provisioning, the build, process listing).
+      - id: installer-tests
+        name: Install, E2E and uninstall the MSI
         if: ${{ !cancelled() && steps.installer-build-msi.outcome == 'success' }}
+        timeout-minutes: 75
+        shell: bash
+        run: cargo xtask run hole-msi-install-tests
+
+      - id: installer-cleanup
+        name: Clean up the installer lifecycle
+        if: ${{ always() && matrix.installer == true && steps.installer-build-msi.outcome == 'success' }}
         timeout-minutes: 15
-        shell: pwsh
-        run: |
-          & .github/scripts/invoke-msiexec-bounded.ps1 -Verb /i -MsiPath target\release\hole.msi -LogPath "$env:RUNNER_TEMP\msi-install.log" -FailOnNonZeroExit
-
-      - id: installer-verify-install
-        name: Verify install
-        if: ${{ !cancelled() && steps.installer-install.outcome == 'success' }}
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          $binDir = "C:\Program Files\hole\bin"
-          foreach ($f in @("hole.exe", "ex-ray.exe", "galoshes.exe", "wintun.dll")) {
-            if (!(Test-Path "$binDir\$f")) { throw "$f not found" }
-          }
-          $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue
-          if (!$svc) { throw "HoleBridge service not registered" }
-          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
-          if ($path -notmatch [regex]::Escape($binDir)) { throw "$binDir not in PATH" }
-
-      # The MSI's `LaunchApp` custom action runs `hole.exe --show-dashboard`
-      # after a fresh install. Tauri's single-instance plugin would route
-      # tauri-driver's new launch into that already-running instance, so we
-      # need a clean slate. The shared script kills the GUI only, not the
-      # HoleBridge service process: the bridge is not in the way, and killing
-      # it starts the SCM's 1s restart clock.
-      - id: installer-kill-launch
-        name: Kill any running hole.exe (post-install LaunchApp)
-        if: ${{ !cancelled() && steps.installer-install.outcome == 'success' }}
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          & .github/scripts/kill-hole-processes.ps1
-
-      # Prove on the real runner that de-elevation preserves everything the E2E
-      # needs — integrity (Medium), env vars, PATH (npm), streamed stdout, and
-      # the exact exit code — via the SAME gsudo -> powershell -File launcher
-      # the E2E uses. Fails loud here rather than as an opaque session timeout.
-      - id: installer-verify-gsudo
-        name: Verify gsudo de-elevation contract
-        if: ${{ !cancelled() && steps.installer-install.outcome == 'success' && steps.installer-gsudo.outcome == 'success' }}
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          $env:HOLE_SELFTEST_CANARY = "canary-ok"
-          # The child streams its IL=.../PROBE_OK line straight to the log and
-          # exits 7 only when every contract check passes -- a nonzero sentinel
-          # that also proves the exit code survives the launcher. Gate on that
-          # and set the step's exit code explicitly (a lingering $LASTEXITCODE=7
-          # would otherwise fail the step under GitHub's pwsh wrapper).
-          pwsh -NoProfile -File .github/scripts/run-at-medium.ps1 -Script .github/scripts/verify-gsudo-deelevation.ps1
-          $code = $LASTEXITCODE
-          if ($code -ne 7) { Write-Host "::error::gsudo de-elevation contract failed (exit $code); see child output above"; exit 1 }
-          Write-Host "OK: de-elevation verified (Medium + env + PATH + stdout + exit code)"
-          exit 0
-
-      # WebDriverIO smoke test against the INSTALLED binary, gating
-      # bindreams/hole#372 (dashboard loads bundled frontend, not the WebView2
-      # "localhost refused" error page). Runs at Medium integrity through the
-      # shared launcher. The installed-binary guard lives in e2e-medium.ps1
-      # (inside the child), so it runs where wdio actually reads
-      # HOLE_TEST_APP_PATH. `node_modules/` is reused from the `frontend-build`
-      # that produced the MSI.
-      - id: installer-e2e
-        name: E2E dashboard test (Medium integrity)
-        if: ${{ !cancelled() && steps.installer-verify-gsudo.outcome == 'success' && steps.installer-tauri-driver.outcome == 'success' && steps.installer-msedgedriver.outcome == 'success' }}
-        timeout-minutes: 5
-        shell: pwsh
-        env:
-          HOLE_TEST_APP_PATH: 'C:\Program Files\hole\bin\hole.exe'
-        run: |
-          pwsh -NoProfile -File .github/scripts/run-at-medium.ps1 -Script .github/scripts/e2e-medium.ps1
-          exit $LASTEXITCODE
-
-      # Same TerminateProcess-returns-before-reap gap as the earlier "Kill any
-      # running hole.exe" step above, and the same script: without the wait,
-      # the Uninstall step's msiexec can start while hole.exe still holds
-      # file/service handles it needs to release. The bridge stays up, so the
-      # Uninstall step stops it the way a user's uninstall does.
-      - id: installer-kill
-        name: Kill hole.exe after E2E
-        if: ${{ always() && matrix.installer == true && steps.installer-install.outcome != 'skipped' }}
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          & .github/scripts/kill-hole-processes.ps1
-
-      - id: installer-dump-log
-        name: Dump install log on failure
-        if: ${{ failure() && matrix.installer == true }}
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          $log = "$env:RUNNER_TEMP\msi-install.log"
-          if (Test-Path $log) { Get-Content $log -Tail 200 }
-
-      - id: installer-uninstall
-        name: Uninstall
-        if: ${{ always() && matrix.installer == true && steps.installer-install.outcome != 'skipped' }}
-        timeout-minutes: 15
-        shell: pwsh
-        run: |
-          & .github/scripts/invoke-msiexec-bounded.ps1 -Verb /x -MsiPath target\release\hole.msi -LogPath "$env:RUNNER_TEMP\msi-uninstall.log"
-
-      - id: installer-verify-uninstall
-        name: Verify uninstall
-        if: ${{ always() && matrix.installer == true && steps.installer-install.outcome != 'skipped' }}
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          $binDir = "C:\Program Files\hole\bin"
-          if (Test-Path $binDir) { throw "$binDir still exists" }
-          $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue
-          if ($svc) { throw "HoleBridge service still registered" }
-          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
-          if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
-
-      # What the uninstall's own processes did. The MSI's custom actions run
-      # `hole bridge uninstall` / `release-covers` as SYSTEM with no console, so
-      # their only record is the CLI log in `%ProgramData%\hole\logs`; the SCM
-      # events in the System log give the service's kills, restarts and state
-      # changes. A failed uninstall otherwise reports only an exit code.
-      - id: installer-dump-uninstall-diagnostics
-        name: Dump uninstall diagnostics on failure
-        if: ${{ failure() && matrix.installer == true }}
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          & .github/scripts/dump-uninstall-diagnostics.ps1 -MsiInstallLog "$env:RUNNER_TEMP\msi-install.log"
+        shell: bash
+        run: cargo xtask run hole-msi-cleanup
 
       # Evidence outlives the runner. The bounded wait in
       # invoke-msiexec-bounded.ps1 is what lets a wedged msiexec fail its step
       # instead of the whole job, so this step is reached to upload it.
-      # `/l*vx` writes both logs regardless of exit code once Install/
-      # Uninstall start msiexec, so `if-no-files-found: ignore` only covers a
-      # job that failed before either did. `*-stack-*.txt` are the per-thread
+      # `/l*vx` writes both logs regardless of exit code once the harness
+      # starts msiexec, so `if-no-files-found: ignore` only covers a job that
+      # failed before it did. `*-stack-*.txt` are the per-thread
       # native stacks a wedge captures; they are echoed into the job log too,
       # and exist only when a step wedged; `*-cdbout-*.log` is the debugger's
       # stdout, the backstop for a capture whose log file never opened.
@@ -827,10 +654,8 @@ jobs:
         with:
           name: msi-logs-windows-amd64
           path: |
-            ${{ runner.temp }}/msi-install.log
-            ${{ runner.temp }}/msi-uninstall.log
-            ${{ runner.temp }}/*-stack-*.txt
-            ${{ runner.temp }}/*-cdbout-*.log
+            target/msi-test-logs/*.log
+            target/msi-test-logs/*-stack-*.txt
           if-no-files-found: ignore
           retention-days: 14
 
@@ -858,7 +683,7 @@ jobs:
       # Quoted: an unquoted ` #` opens a YAML comment and truncates the name.
       - id: hole-test-tun
         name: "Test (TUN, last test lane for #200)"
-        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' && matrix.os == 'windows' && matrix.arch == 'amd64' && (steps.installer-install.outcome == 'skipped' || steps.installer-verify-uninstall.outcome == 'success') }}
+        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' && matrix.os == 'windows' && matrix.arch == 'amd64' && (steps.installer-cleanup.outcome == 'skipped' || steps.installer-cleanup.outcome == 'success') }}
         timeout-minutes: 25
         shell: bash
         env:

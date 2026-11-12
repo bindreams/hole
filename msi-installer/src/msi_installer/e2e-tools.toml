@@ -1,0 +1,13 @@
+# Tools the installer E2E needs, provisioned into <repo>/.cache/installer-e2e by
+# `uv run --directory msi-installer provision-e2e-tools`. msedgedriver is not
+# pinned: it must match the WebView2 runtime on the machine, which auto-updates.
+
+# Third-party prebuilt (cargo-quickinstall asset), pinned by hash; Renovate does not track it. To bump: edit `version`,
+# run `provision-e2e-tools`, and copy the sha256 from the mismatch error (after checking it against the release).
+[tauri-driver]
+version = "2.0.6"
+sha256 = "9c207f120daf1963d3c3972fac6690c371debcecee8cc511220a22e83617c402"
+
+[gsudo]
+version = "2.6.1"
+url = "https://github.com/gerardog/gsudo/releases/download/v{version}/gsudo.portable.zip"
