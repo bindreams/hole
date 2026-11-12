@@ -383,6 +383,11 @@ pub enum Command {
     /// tests; a group the lane ships nothing for stages nothing. The installer is
     /// `MSI_UNDER_TEST` / `DMG_UNDER_TEST` when set (a relative path is from the
     /// repo root), else the release build.
+    ///
+    /// The Windows update zip is packed from `target/release/installer-stage`.
+    /// `hole.exe version` and `garter --version` must print the tag's version (a
+    /// `.dirty` build fails) and `garter --help` must exit 0; the galoshes and
+    /// ex-ray versions are not checked.
     StageRelease {
         /// Release tag, `releases/<group>/vX.Y.Z`.
         #[arg(long)]

@@ -70,7 +70,7 @@ jobs:
   # ordinary-run model skips. Each wall is the ordinary wall plus the budgets of the
   # release steps that run on the leg: the tag 5, the plugin stage 20 (it builds
   # the garter CLI on a garter release), the upload 10, and on installer legs the installer stage 10 (35 on
-  # a leg without an installer, 45 with one).
+  # a leg without an installer, 45 with one). These budgets are estimates, not measured.
   ci:
     name: Build, lint, test (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -118,7 +118,8 @@ jobs:
           RELEASE_TAG: ${{ inputs.release-tag }}
         run: |
           git tag "$RELEASE_TAG"
-          # `releases/<group>/vX.Y.Z`: the group names the upload, which cannot hold the tag's slashes.
+          # `releases/<group>/vX.Y.Z`: the group names the uploads (release and diagnostics, so two drafts in one run
+          # cannot collide), which cannot hold the tag's slashes.
           GROUP="${RELEASE_TAG#releases/}"
           echo "group=${GROUP%%/*}" >> "$GITHUB_OUTPUT"
 
@@ -517,7 +518,7 @@ jobs:
         timeout-minutes: 5
         uses: ./.github/actions/upload-diagnostics
         with:
-          name: dmg-flake-diag-${{ matrix.os }}-${{ matrix.arch }}
+          name: dmg-flake-diag-${{ matrix.os }}-${{ matrix.arch }}${{ steps.release-tag.outputs.group && format('-{0}', steps.release-tag.outputs.group) || '' }}
           path: ${{ runner.temp }}/dmg-flake-diag/**
           if-no-files-found: ignore
           retention-days: 14
@@ -742,7 +743,7 @@ jobs:
         timeout-minutes: 5
         uses: ./.github/actions/upload-diagnostics
         with:
-          name: msi-logs-windows-amd64
+          name: msi-logs-windows-amd64${{ steps.release-tag.outputs.group && format('-{0}', steps.release-tag.outputs.group) || '' }}
           path: |
             target/msi-test-logs/*.log
             target/msi-test-logs/*-stack-*.txt
@@ -762,7 +763,7 @@ jobs:
         timeout-minutes: 5
         uses: ./.github/actions/upload-diagnostics
         with:
-          name: bridge-logs-installer-windows-amd64
+          name: bridge-logs-installer-windows-amd64${{ steps.release-tag.outputs.group && format('-{0}', steps.release-tag.outputs.group) || '' }}
           path: |
             C:\ProgramData\hole\logs\**
             C:\Windows\System32\config\systemprofile\AppData\Local\hole\logs\**
@@ -952,7 +953,7 @@ jobs:
         timeout-minutes: 5
         uses: ./.github/actions/upload-diagnostics
         with:
-          name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}
+          name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}${{ steps.release-tag.outputs.group && format('-{0}', steps.release-tag.outputs.group) || '' }}
           path: ${{ runner.temp }}/**/bridge.log
           if-no-files-found: ignore
           retention-days: 14

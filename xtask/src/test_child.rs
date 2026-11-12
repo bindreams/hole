@@ -23,9 +23,9 @@ pub const CHILD_ERROR_EXIT: i32 = 99;
 pub const PROBE_TARGET_ARG: &str = "--xtask-probe-target";
 
 pub fn maybe_run() {
-    let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some(PROBE_TARGET_ARG) {
-        probe_target(args);
+    // `args_os`: `args` panics on a non-UTF-8 argument, which every test binary's own arguments may be.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(PROBE_TARGET_ARG)) {
+        probe_target(std::env::args().skip(2));
     }
     let Ok(mode) = std::env::var(MODE_ENV) else { return };
     match mode.as_str() {

@@ -457,7 +457,8 @@ fn the_release_assets_json_has_the_keys_its_consumers_read() {
     let rows = json.as_array().unwrap();
     assert_eq!(rows.len(), 3);
     for row in rows {
-        let keys: Vec<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
         assert_eq!(keys, ["arch", "asset", "assets", "os"]);
     }
 }

@@ -41,7 +41,3 @@ jobs:
     with:
       track: garter
       version: ${{ inputs.version }}
-      version-regex: '^[0-9]+\.[0-9]+\.[0-9]+$'
-      cargo-version-group: garter
-      release-title: garter v${{ inputs.version }}
-      latest: false

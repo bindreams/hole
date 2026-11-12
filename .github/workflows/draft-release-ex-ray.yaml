@@ -21,7 +21,3 @@ jobs:
     with:
       track: ex-ray
       version: ${{ inputs.version }}
-      version-regex: '^[0-9]+\.[0-9]+\.[0-9]+$'
-      cargo-version-group: ex-ray
-      release-title: ex-ray v${{ inputs.version }}
-      latest: false

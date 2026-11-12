@@ -166,7 +166,7 @@ targets:
     # The MSI is an input, never built here: `MSI_UNDER_TEST`, else
     # target\release\hole.msi (`cargo xtask build hole-msi`). Run it from an
     # ELEVATED shell: it changes the machine (CONTRIBUTING.md, "Windows
-    # installer").
+    # installer"). `cargo xtask run hole-msi-cleanup` finishes an interrupted run.
     #
     # No `depends`: `frontend-build` would `npm ci` and rebuild ui/dist, which
     # CI's `hole-build` has already compiled in. The E2E needs the `node_modules`

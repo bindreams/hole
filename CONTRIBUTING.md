@@ -4723,6 +4723,11 @@ Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
   `cargo xtask release-assets --tag <tag>` lists, builds the release notes'
   Downloads table from the same list, then hashes and uploads the files; it builds
   nothing.
+- **What staging requires.** The Windows update zip is packed from
+  `target/release/installer-stage` (the MSI's payload directory), not from
+  `target/release`. `hole.exe version` and `garter --version` must print the tag's
+  version, so a build of a dirty tree (`X.Y.Z.dirty`) fails; `garter --help` must
+  exit 0. The galoshes and ex-ray versions are not checked.
 - **Installer under test.** The DMG tests take the DMG from `DMG_UNDER_TEST`
   (default: the release build's single `.dmg`), the MSI lifecycle tests the MSI from
   `MSI_UNDER_TEST` (default: `target/release/hole.msi`). A relative path in either

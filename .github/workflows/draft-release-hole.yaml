@@ -21,7 +21,4 @@ jobs:
     with:
       track: hole
       version: ${{ inputs.version }}
-      version-regex: '^[0-9]+\.[0-9]+\.[0-9]+$'
-      cargo-version-group: hole
-      release-title: hole v${{ inputs.version }}
       latest: true
