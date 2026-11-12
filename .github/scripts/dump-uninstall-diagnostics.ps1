@@ -16,13 +16,21 @@ $cliLogDirs = @(
 )
 foreach ($cliLogDir in $cliLogDirs) {
     Write-Host "--- CLI logs: $cliLogDir ---"
-    if (Test-Path $cliLogDir) {
-        foreach ($file in Get-ChildItem $cliLogDir -File) {
-            Write-Host "== $($file.FullName)"
-            Get-Content $file.FullName -Tail 200
+    try {
+        if (Test-Path $cliLogDir) {
+            foreach ($file in Get-ChildItem $cliLogDir -File -ErrorAction Stop) {
+                Write-Host "== $($file.FullName)"
+                try {
+                    Get-Content $file.FullName -Tail 200 -ErrorAction Stop
+                } catch {
+                    Write-Host "(failed to read $($file.FullName): $($_.Exception.Message))"
+                }
+            }
+        } else {
+            Write-Host "(directory not found)"
         }
-    } else {
-        Write-Host "(directory not found)"
+    } catch {
+        Write-Host "(failed to list ${cliLogDir}: $($_.Exception.Message))"
     }
 }
 
@@ -39,4 +47,12 @@ try {
 }
 
 Write-Host "--- HoleBridge SCM status ---"
-sc.exe queryex HoleBridge
+try {
+    sc.exe queryex HoleBridge
+} catch {
+    Write-Host "(failed to run sc.exe queryex HoleBridge: $($_.Exception.Message))"
+}
+
+# A diagnostics dump is not a verdict: `sc.exe` exits 1060 for an unregistered
+# service, which is the usual state after a failed uninstall.
+exit 0

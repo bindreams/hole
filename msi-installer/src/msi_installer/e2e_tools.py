@@ -65,10 +65,7 @@ def e2e_env(base: Mapping[str, str], tool_dirs: list[Path]) -> dict[str, str]:
 
 @contextmanager
 def _staged(final: Path) -> Iterator[Path]:
-    """A scratch directory beside `final`, renamed to it only when the block completes.
-
-    A run killed mid-extract leaves no `final` for a later run to take as a finished install.
-    """
+    """A scratch directory beside `final`, renamed to it only when the block completes."""
     final.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{final.name}-", dir=final.parent))
     try:
@@ -149,12 +146,8 @@ def _webview2_runtime_version() -> str:
 
 
 def _ensure_gsudo(cache: Path, pin: Mapping[str, str], console: Console) -> Path:
-    """gsudo runs the dashboard E2E at Medium integrity.
-
-    Runners run every process at High integrity, and WebView2 Runtime 150 broke the DevTools loopback for
-    High-integrity hosts (MicrosoftEdge/WebView2Feedback#5640), so tauri-driver cannot attach; real users run the
-    GUI unprivileged (Medium), where 150 works.
-    """
+    """gsudo runs the dashboard E2E at Medium integrity: runners are High integrity, which WebView2 Runtime 150+
+    refuses a DevTools loopback to (MicrosoftEdge/WebView2Feedback#5640), so tauri-driver cannot attach."""
     version = pin["version"]
     out = cache / f"gsudo-v{version}"
     exe = out / "x64" / "gsudo.exe"

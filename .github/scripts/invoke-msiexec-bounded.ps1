@@ -12,24 +12,21 @@
 #
 # `-ExePath`/`-ExeArgs` are a test seam: they substitute the process actually
 # started, so the bound + diagnostic-capture path can be exercised against a
-# stand-in that never exits, without a real MSI transaction. The harness
-# leaves them at their defaults.
+# stand-in that never exits, without a real MSI transaction.
 param(
     [Parameter(Mandatory)]
     [ValidateSet('/i', '/x')]
     [string]$Verb,
 
+    # What msiexec is given: an .msi path, or for /x a `{ProductCode}`.
     [Parameter(Mandatory)]
-    [string]$MsiPath,
+    [string]$Package,
 
     [Parameter(Mandatory)]
     [string]$LogPath,
 
     # A failure bound, not an expected duration: install and uninstall
-    # normally complete in 2-4 seconds. The harness runs both inside one CI
-    # step (75 minutes, ci.yaml `installer-tests`) that also bounds each
-    # E2E phase, so a wedge on both costs about 2 x (3 + the capture below)
-    # and the step's timeout is nowhere near.
+    # normally complete in 2-4 seconds.
     [ValidateRange(0.0, 60.0)]
     [double]$BoundMinutes = 3,
 
@@ -47,7 +44,7 @@ param(
     #
     # Measured cost is far under the cap: 33s for one process against a cold
     # symbol cache and 0.3s against a warm one (Windows 11 26100, SDK
-    # 10.0.26100 cdb), with the install and the uninstall sharing one cache beside the log.
+    # 10.0.26100 cdb).
     # Every one of these is a failure bound, not an expected duration.
     [ValidateRange(0.0, 3600.0)]
     [double]$StackCaptureSeconds = 60,
@@ -62,13 +59,12 @@ param(
 
     # Second test seam, same shape as -ExePath: substitutes the debugger the
     # capture shells out to, so a stand-in that never exits drives the
-    # capture's own bound. Empty means "find the real cdb" -- the harness
-    # leaves it that way.
+    # capture's own bound. Empty means "find the real cdb".
     [string]$CdbPath
 )
 
 if (-not $ExeArgs) {
-    $ExeArgs = @($Verb, $MsiPath, "/quiet", "/norestart", "/l*vx", $LogPath)
+    $ExeArgs = @($Verb, $Package, "/quiet", "/norestart", "/l*vx", $LogPath)
 }
 
 # The wedge branch's helpers: the process-tree walk and the native thread-stack
@@ -235,8 +231,8 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     }
 
     # Kill the tree so a wedged msiexec doesn't outlive this step: on Install
-    # it would hold the `_MSIExecute` mutex against the uninstall that
-    # the harness runs next (its teardown), and on Uninstall it would keep appending to
+    # it would hold the `_MSIExecute` mutex against the harness's uninstall,
+    # and on Uninstall it would keep appending to
     # the log while "Upload MSI logs" reads it. Best-effort and isolated like
     # the probes above -- a failure here must not swallow the wedge `throw`.
     # Deferred by the whole capture above -- its budget plus the reaps -- so

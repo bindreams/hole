@@ -609,10 +609,8 @@ jobs:
 
       # Installer lifecycle (Windows) ===================================================================================
       # The sequence (install, verify, de-elevated dashboard E2E, uninstall, verify) is the
-      # msi-installer harness (`msi-installer/tests/installed/`), runnable locally from an
-      # elevated shell on any MSI via `MSI_UNDER_TEST`; this file only calls it. It drives the
-      # INSTALLED binary through WebDriver over loopback, so it runs before the TUN lane, and it
-      # takes the MSI as an input: it never builds one.
+      # msi-installer harness (`msi-installer/tests/installed/`). It drives the INSTALLED binary
+      # through WebDriver over loopback, so it runs before the TUN lane.
       #
       # The harness uninstalls after a failed check, but a step timeout kills it with Hole still
       # installed, so `installer-cleanup` runs `always()` after it: an idempotent uninstall that
@@ -621,11 +619,9 @@ jobs:
       # service would share WFP, routes and the adapter with the TUN tests and confound their
       # verdicts. A failed lifecycle with a clean cleanup does not hide the TUN lane.
       #
-      # Budget 75: the 8 lifecycle steps it replaced (15+5+5+5+5+5+15+5) plus the 3 tool-install
-      # steps (5 each). One number; the audit checks only budget <= wall. The harness bounds each
-      # phase itself (msiexec 3 min, gsudo self-test, dashboard E2E and each diagnostics dump 5 min:
-      # about 35 min in all), so a wedged phase fails by name and the fixture still uninstalls
-      # long before this last-resort kill, which skips the teardown.
+      # Last-resort kill: the harness bounds each phase itself (msiexec 3 min; gsudo self-test,
+      # dashboard E2E and each diagnostics dump 5 min), so a wedged phase fails by name and the
+      # fixture still uninstalls first.
       - id: installer-tests
         name: Install, E2E and uninstall the MSI
         if: ${{ !cancelled() && steps.installer-build-msi.outcome == 'success' }}

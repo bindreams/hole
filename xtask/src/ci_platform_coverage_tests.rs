@@ -654,8 +654,8 @@ const NON_HOLE_LEGS: [&str; 3] = ["windows/arm64", "linux/amd64", "linux/arm64"]
 /// new-step mapping table in the PR description, independently of ci.yaml, so a
 /// matrix flag lost in an edit fails here instead of silently dropping a lane.
 ///
-/// Failure-only steps (installer bridge-log upload, DMG diagnostics) are off in a healthy run by construction and are listed in
-/// `FAILURE_ONLY`.
+/// Failure-only steps (installer bridge-log upload, DMG diagnostics) are off in a healthy run
+/// by construction and are listed in `FAILURE_ONLY`.
 fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
     let mut g: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
     for id in [

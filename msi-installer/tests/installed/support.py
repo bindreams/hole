@@ -1,16 +1,16 @@
 """Support for the installed-Hole suite: the MSI under test, the Windows state it changes, the `.github/scripts` it drives.
 
-The suite installs Hole system-wide (`C:\\Program Files\\hole`, the `HoleBridge` service, the Machine PATH) and opens
-windows, so it runs only under `-m system_wide` / `-m cleanup` from an elevated shell. It never uninstalls a Hole it
-did not install: see `installed_hole` and `INSTALLED_MARKER`.
+It never uninstalls a Hole it did not install: see `installed_hole` and `INSTALLED_MARKER`.
 """
 
 import ctypes
+import json
 import os
 import platform
 import subprocess
 import sys
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -19,6 +19,7 @@ from rich.console import Console
 
 from conftest import REPO_ROOT
 from msi_installer.e2e_tools import e2e_env, provision_e2e_tools
+from windows_installer import installed_hole_product_codes, msi_product_code
 
 SCRIPTS = REPO_ROOT / ".github" / "scripts"
 INVOKE_MSIEXEC = SCRIPTS / "invoke-msiexec-bounded.ps1"
@@ -96,8 +97,7 @@ def run_ps(
 ) -> int:
     """Run `script` as a CI `shell: pwsh` step would (`$ErrorActionPreference = 'Stop'`); return its exit code.
 
-    The child's output streams to this process's. A `None` value emits a bare `-Name` (a switch). The working
-    directory is the repo root, where the CI steps run. With `timeout_seconds`, a child still running then has its
+    A `None` value emits a bare `-Name` (a switch). With `timeout_seconds`, a child still running then has its
     whole process tree killed and `TimeoutError` names `phase` (default: the script).
     """
     parts = ["$ErrorActionPreference = 'Stop';", f"& {_ps_quote(str(script))}"]
@@ -171,24 +171,43 @@ def machine_path_has_bin_dir() -> bool:
     return str(BIN_DIR).casefold() in machine_path().casefold()
 
 
-def assert_nothing_installed() -> None:
-    problems = []
-    if BIN_DIR.exists():
-        problems.append(f"{BIN_DIR} still exists")
+def installed_traces() -> list[str]:
+    """What shows Hole on this machine: an installed MSI product, the service, the bin dir, the Machine PATH entry.
+
+    The one definition of "Hole is installed", shared by the preflight refusal, the verification after an uninstall
+    and the cleanup.
+    """
+    traces = []
+    if products := installed_hole_product_codes():
+        traces.append(f"MSI product {', '.join(products)} is registered")
     if service_registered():
-        problems.append(f"{SERVICE} service still registered")
+        traces.append(f"the {SERVICE} service is registered")
+    if BIN_DIR.exists():
+        traces.append(f"{BIN_DIR} exists")
     if machine_path_has_bin_dir():
-        problems.append(f"{BIN_DIR} still in the Machine PATH")
-    assert not problems, "; ".join(problems)
+        traces.append(f"{BIN_DIR} is in the Machine PATH")
+    return traces
+
+
+def assert_nothing_installed() -> None:
+    traces = installed_traces()
+    assert not traces, "Hole is still installed: " + "; ".join(traces)
 
 
 # Install and uninstall ================================================================================================
 
 INSTALL_LOG_NAME = "msi-install.log"
 
-# Written once a run is about to install, removed once the machine is verified empty. The cleanup uninstalls only
-# when it is there, so a Hole the harness did not install is never removed.
+# Written once a run is about to install, removed once the machine is verified empty. It sits at a fixed place under
+# `target\`, not in `MSI_TEST_LOG_DIR`, so the cleanup finds it whatever log dir the run used. The cleanup uninstalls
+# only the product it names, so a Hole the harness did not install is never removed.
 INSTALLED_MARKER = ".hole-installed-by-the-msi-test-harness"
+
+
+@dataclass(frozen=True)
+class InstallMarker:
+    started: datetime
+    product_code: str
 
 
 def install_log_path() -> Path:
@@ -196,21 +215,35 @@ def install_log_path() -> Path:
 
 
 def marker_path() -> Path:
-    return log_dir() / INSTALLED_MARKER
+    return REPO_ROOT / "target" / INSTALLED_MARKER
 
 
-def mark_install_started() -> None:
-    """Write the marker, holding when this install began: the diagnostics' event window opens there."""
-    marker_path().write_text(datetime.now().astimezone().isoformat())
+def mark_install_started(product_code: str) -> None:
+    """Record the ProductCode about to be installed and when: the diagnostics' event window opens there."""
+    path = marker_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"started": datetime.now().astimezone().isoformat(), "product_code": product_code}))
+
+
+def read_marker() -> InstallMarker | None:
+    """The marker, or `None` without one. A marker that cannot be read raises `ValueError`."""
+    try:
+        raw = json.loads(marker_path().read_text())
+        return InstallMarker(datetime.fromisoformat(raw["started"]), raw["product_code"])
+    except FileNotFoundError:
+        return None
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"{marker_path()} is not a marker this suite wrote ({e!r}): delete it") from e
 
 
 def install_started() -> datetime | None:
-    """When the marked install began; `None` without a marker. Not the install log's creation time: a recreated file
-    keeps the creation time of the one it replaces (NTFS tunnelling)."""
+    """The marker's start time, not the install log's creation time: a recreated file keeps the creation time of the
+    one it replaces (NTFS tunnelling)."""
     try:
-        return datetime.fromisoformat(marker_path().read_text())
-    except (FileNotFoundError, ValueError):
+        marker = read_marker()
+    except ValueError:
         return None
+    return None if marker is None else marker.started
 
 
 def require_windows_elevated() -> None:
@@ -242,11 +275,7 @@ def refuse_a_machine_with_hole() -> None:
     A `hole.exe` from anywhere (a development GUI or `bridge run`) shares the single-instance id and the bridge
     socket with the build under test, so the E2E would route into it and fail misleadingly. It is not killed.
     """
-    found = []
-    if service_registered():
-        found.append(f"the {SERVICE} service is registered")
-    if INSTALL_DIR.exists():
-        found.append(f"{INSTALL_DIR} exists")
+    found = installed_traces()
     if running := running_hole_exe_paths():
         found.append(f"hole.exe is running: {', '.join(running)}")
     assert not found, (
@@ -258,34 +287,48 @@ def refuse_a_machine_with_hole() -> None:
 def dump_failure_diagnostics() -> None:
     """What the uninstall's own processes and the SCM recorded, plus the install log's tail.
 
-    A timeout is printed, not raised: this runs while another failure propagates, which it must not replace.
+    Any error is printed, not raised: this runs while another failure propagates, which it must not replace.
     """
-    install_log = install_log_path()
-    params = {} if (since := install_started()) is None else {"Since": since.isoformat()}
     try:
-        run_ps(
+        params = {} if (since := install_started()) is None else {"Since": since.isoformat()}
+        code = run_ps(
             DUMP_UNINSTALL,
             params,
             timeout_seconds=DIAGNOSTICS_TIMEOUT_SECONDS,
             phase="the failure diagnostics dump",
         )
-    except TimeoutError as e:
-        print(e, file=sys.stderr)
-    if install_log.is_file():
-        print(f"--- {install_log} (tail) ---")
-        print("\n".join(install_log.read_text(errors="replace").splitlines()[-200:]))
+        if code != 0:
+            print(f"the failure diagnostics dump exited {code}", file=sys.stderr)
+        install_log = install_log_path()
+        if install_log.is_file():
+            print(f"--- {install_log} (tail) ---")
+            print("\n".join(install_log.read_text(errors="replace").splitlines()[-200:]))
+    except Exception as e:
+        print(f"the failure diagnostics failed: {e!r}", file=sys.stderr)
 
 
-def ensure_uninstalled(msi: Path, uninstall_log: Path) -> None:
-    """Kill the installed GUI, uninstall with `msi`, and verify nothing is left. Fine when nothing is installed.
+def ensure_uninstalled(product_code: str, uninstall_log: Path) -> None:
+    """Kill the installed GUI, uninstall `product_code`, and verify nothing is left. Fine when nothing is installed.
 
-    A failure dumps the diagnostics (`dump_failure_diagnostics`) before it propagates.
+    Each step runs even when an earlier one failed, and the first failure is the one raised.
     """
     try:
-        kill_installed_hole_processes()
-        # A failing uninstall is reported by msiexec's own output and by the verification below, which reads the machine.
-        run_ps(INVOKE_MSIEXEC, {"Verb": "/x", "MsiPath": str(msi), "LogPath": str(uninstall_log)})
-        assert_nothing_installed()
+        first_failure = None
+        for step in (
+            kill_installed_hole_processes,
+            # The exit code is ignored: msiexec's output and the verification below report a failed uninstall.
+            lambda: run_ps(INVOKE_MSIEXEC, {"Verb": "/x", "Package": product_code, "LogPath": str(uninstall_log)}),
+            assert_nothing_installed,
+        ):
+            try:
+                step()
+            except Exception as e:
+                if first_failure is None:
+                    first_failure = e
+                else:
+                    print(f"also failed: {e!r}", file=sys.stderr)
+        if first_failure is not None:
+            raise first_failure
     except BaseException:
         dump_failure_diagnostics()
         raise
@@ -299,25 +342,27 @@ def installed_hole(msi_path: Path, request: pytest.FixtureRequest) -> Iterator[P
 
     failed_before = request.session.testsfailed
     install_completed = False
-    mark_install_started()
+    product_code = msi_product_code(msi_path)
+    mark_install_started(product_code)
     try:
         code = run_ps(
             INVOKE_MSIEXEC,
             {
                 "Verb": "/i",
-                "MsiPath": str(msi_path),
+                "Package": str(msi_path),
                 "LogPath": str(install_log_path()),
                 "FailOnNonZeroExit": None,
             },
         )
         assert code == 0, f"installing {msi_path} failed (exit {code})"
-        # The MSI's `LaunchApp` starts the GUI; tauri-driver's own launch would route into it via single-instance.
+        # The MSI's `LaunchApp` starts the GUI.
         kill_installed_hole_processes()
         install_completed = True
         yield INSTALL_DIR
     finally:
-        ensure_uninstalled(msi_path, log_dir() / "msi-uninstall.log")
-        marker_path().unlink(missing_ok=True)
+        ensure_uninstalled(product_code, log_dir() / "msi-uninstall.log")
         # A test's failure never reaches this generator; the session's count is the only trace of it.
         if not install_completed or request.session.testsfailed > failed_before:
             dump_failure_diagnostics()
+        # Last, so the dumps above read the marker's start time. An `ensure_uninstalled` that raised leaves it for the cleanup.
+        marker_path().unlink(missing_ok=True)
