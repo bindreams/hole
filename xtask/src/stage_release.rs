@@ -15,6 +15,10 @@ use clap::ValueEnum;
 use serde::Serialize;
 use xtask_lib::version::{parse_release_tag, Group};
 
+use crate::bindir::{
+    app_executable_name, bindir_entries, bundle_payload_entries, cache_sidecar_path, embedded_plugin_entries,
+    BindirEntry, FileKind,
+};
 use crate::manifest::{Manifest, Os, Platform};
 use crate::Profile;
 
@@ -55,10 +59,31 @@ pub struct Probe {
     pub prints: Option<String>,
 }
 
-/// A shipped executable and the probes that run on it.
+/// What a file the release uploads is, apart from the files of an update archive, which are [`Executable`]s.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AssetKind {
+    /// An MSI or DMG. xtask does not open it: the installer tests check what it installs, and the executables it is built
+    /// from are checked in [`UpdateArchive::executables`].
+    Installer,
+    /// A standalone plugin binary.
+    Executable(FileKind),
+}
+
+impl AssetKind {
+    /// The kind to check the file as, or `None` for a file that is not a binary.
+    fn executable(self) -> Option<FileKind> {
+        match self {
+            AssetKind::Installer => None,
+            AssetKind::Executable(kind) => Some(kind),
+        }
+    }
+}
+
+/// An executable inside a payload, by its file name there, and the probes that run on it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Executable {
-    pub path: PathBuf,
+    pub name: String,
+    pub kind: FileKind,
     pub probes: Vec<Probe>,
 }
 
@@ -68,6 +93,7 @@ pub struct Asset {
     pub src: PathBuf,
     pub name: String,
     pub probes: Vec<Probe>,
+    pub kind: AssetKind,
 }
 
 /// Which files an update archive is packed from.
@@ -79,11 +105,16 @@ pub enum UpdateArchiveSource {
     BuiltApp,
 }
 
-/// The Hole update archive that ships beside the installer.
+/// The Hole update archive that ships beside the installer. The installer is built from the same payload.
 #[derive(Debug, PartialEq, Eq)]
 pub struct UpdateArchive {
     pub name: String,
     pub source: UpdateArchiveSource,
+    /// The executables in the payload, which are checked in `source`: the installer built from it cannot be.
+    pub executables: Vec<Executable>,
+    /// The executables `hole` embeds instead (the macOS plugins), checked at the `.cache` files `hole`'s build embeds
+    /// from, once those bytes are found in the built `hole`.
+    pub embedded: Vec<Executable>,
 }
 
 /// What a (group, lane) pair ships on one platform.
@@ -91,8 +122,6 @@ pub struct UpdateArchive {
 pub struct Shipment {
     pub files: Vec<Asset>,
     pub update_archive: Option<UpdateArchive>,
-    /// An executable inside the installer's payload that is probed, since the installer itself cannot be.
-    pub payload_binary: Option<Executable>,
     /// The `build.yaml` target to build first, when no earlier lane built the files in the release profile: the probes
     /// are then the only test of the staged file.
     pub build_first: Option<&'static str>,
@@ -103,7 +132,6 @@ impl Shipment {
         Self {
             files: Vec::new(),
             update_archive: None,
-            payload_binary: None,
             build_first: None,
         }
     }
@@ -115,6 +143,19 @@ impl Shipment {
             .map(|a| a.name.as_str())
             .chain(self.update_archive.iter().map(|a| a.name.as_str()))
     }
+}
+
+/// The executables among a payload's `entries`, as each entry's own kind says. `probes` says which probes run on each.
+fn payload_executables(entries: Vec<BindirEntry>, probes: &dyn Fn(&str) -> Vec<Probe>) -> Vec<Executable> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.kind.is_executable())
+        .map(|entry| Executable {
+            probes: probes(&entry.name),
+            kind: entry.kind,
+            name: entry.name,
+        })
+        .collect()
 }
 
 fn asset_name(group: Group, version: &str, platform: Platform, ext: &str) -> String {
@@ -146,19 +187,31 @@ pub fn plan(
     repo_root: &Path,
     installer: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<Shipment> {
-    let binary = |src: PathBuf, probes: Vec<Probe>| Asset {
+    let binary = |src: PathBuf, kind: FileKind, probes: Vec<Probe>| Asset {
         src,
         name: asset_name(group, version, platform, exe_suffix(platform)),
         probes,
+        kind: AssetKind::Executable(kind),
     };
-    let release = repo_root.join("target").join("release");
-    let update_archive = |source| UpdateArchive {
+    // A plugin that is also a BINDIR file is what `bindir_entries` says it is, so that is stated once.
+    let bindir_kind = || -> Result<FileKind> {
+        let file = format!("{group}{}", exe_suffix(platform));
+        bindir_entries(platform.os)
+            .into_iter()
+            .find(|entry| entry.name == file)
+            .map(|entry| entry.kind)
+            .with_context(|| format!("{file} is not a BINDIR file on {}", platform.os))
+    };
+    let update_archive = |source, entries: Vec<BindirEntry>, probes: &dyn Fn(&str) -> Vec<Probe>| UpdateArchive {
         name: format!(
             "{group}-{version}-{}",
             xtask_lib::asset::update_asset_suffix(platform.os, &platform.arch.to_string())
         ),
         source,
+        executables: payload_executables(entries, probes),
+        embedded: payload_executables(embedded_plugin_entries(platform.os), &|_| Vec::new()),
     };
+    let release = repo_root.join("target").join("release");
     match (group, lane) {
         (Group::Hole, Lane::Msi) => {
             ensure!(
@@ -173,14 +226,21 @@ pub fn plan(
                     src: installer()?,
                     name: asset_name(group, version, platform, ".msi"),
                     probes: Vec::new(),
+                    kind: AssetKind::Installer,
                 }],
                 // The zip is packed from the directory the MSI was built from, not from whatever `target/release`
                 // holds by the time this lane runs.
-                update_archive: Some(update_archive(UpdateArchiveSource::StagedBindir(stage_dir.clone()))),
-                payload_binary: Some(Executable {
-                    path: stage_dir.join("hole.exe"),
-                    probes: vec![version_probe(&["version"], "hole", version)],
-                }),
+                update_archive: Some(update_archive(
+                    UpdateArchiveSource::StagedBindir(stage_dir),
+                    bindir_entries(platform.os),
+                    &|name| {
+                        if name == app_executable_name(platform.os) {
+                            vec![version_probe(&["version"], "hole", version)]
+                        } else {
+                            Vec::new()
+                        }
+                    },
+                )),
                 build_first: None,
             })
         }
@@ -192,25 +252,32 @@ pub fn plan(
                     src: installer()?,
                     name: asset_name(group, version, platform, ".dmg"),
                     probes: Vec::new(),
+                    kind: AssetKind::Installer,
                 }],
-                update_archive: Some(update_archive(UpdateArchiveSource::BuiltApp)),
-                payload_binary: None,
+                // The app's executables are only checked for hardening: the DMG tests check the shipped version.
+                update_archive: Some(update_archive(
+                    UpdateArchiveSource::BuiltApp,
+                    bundle_payload_entries(platform.os),
+                    &|_| Vec::new(),
+                )),
                 build_first: None,
             })
         }
         (Group::Galoshes, Lane::Plugins) => Ok(Shipment {
             files: vec![binary(
                 release.join(format!("galoshes{}", exe_suffix(platform))),
+                bindir_kind()?,
                 Vec::new(),
             )],
             update_archive: None,
-            payload_binary: None,
             build_first: None,
         }),
-        // See `Shipment::build_first`: the probes are the only test of this file.
+        // See `Shipment::build_first`: the probes are the only test of this file. garter is no BINDIR file: it is the
+        // standalone CLI, built by cargo from `garter-bin`.
         (Group::Garter, Lane::Plugins) => Ok(Shipment {
             files: vec![binary(
                 release.join(format!("garter{}", exe_suffix(platform))),
+                FileKind::RustExecutable,
                 vec![
                     version_probe(&["--version"], "garter", version),
                     Probe {
@@ -220,7 +287,6 @@ pub fn plan(
                 ],
             )],
             update_archive: None,
-            payload_binary: None,
             build_first: Some("garter-bin"),
         }),
         (Group::ExRay, Lane::Plugins) => Ok(Shipment {
@@ -229,10 +295,10 @@ pub fn plan(
                     .join(".cache")
                     .join("ex-ray")
                     .join(crate::ex_ray::output_name()),
+                bindir_kind()?,
                 Vec::new(),
             )],
             update_archive: None,
-            payload_binary: None,
             build_first: None,
         }),
         (Group::Hole, Lane::Plugins)
@@ -356,6 +422,110 @@ fn check_probe_output(exe: &Path, probe: &Probe, stdout: &str) -> Result<()> {
     Ok(())
 }
 
+/// `exe` must pass `libsearch_guard::verify`: the staged bytes are checked, not a debug test binary.
+fn verify_hardened(exe: &Path, kind: FileKind) -> Result<()> {
+    libsearch_guard::verify(exe).map_err(|e| hardening_failure(exe, kind, &e))?;
+    println!("xtask: {} is hardened", exe.display());
+    Ok(())
+}
+
+/// The error for a failed [`verify_hardened`]: a violation names the build remedy; an unreadable file does not.
+fn hardening_failure(exe: &Path, kind: FileKind, error: &libsearch_guard::VerifyError) -> anyhow::Error {
+    use libsearch_guard::VerifyError;
+
+    let remedy = match kind {
+        FileKind::RustExecutable => "A shipped Rust binary's build.rs must call `libsearch_guard::bins()`",
+        FileKind::ForeignExecutable => {
+            "This file is not built by cargo, so no build.rs can harden it: change its Go build (xtask/src/ex_ray.rs)"
+        }
+        FileKind::NotExecutable => {
+            unreachable!("a file that is not an executable is never verified: {}", exe.display())
+        }
+    };
+    let violated = || {
+        anyhow::anyhow!(
+            "{} is not hardened against loading libraries from its own folder: {error}
+{remedy}",
+            exe.display()
+        )
+    };
+    match error {
+        VerifyError::Violations(_) => violated(),
+        VerifyError::Unreadable { found, .. } if !found.is_empty() => violated(),
+        VerifyError::Unreadable { .. } | VerifyError::Io(_) => {
+            anyhow::anyhow!("cannot check whether {} is hardened: {error}", exe.display())
+        }
+        // `VerifyError` is non-exhaustive.
+        _ => anyhow::anyhow!(
+            "cannot check whether {} is hardened: libsearch-guard returned an error xtask does not recognise: {error}",
+            exe.display()
+        ),
+    }
+}
+
+/// The directory `source` packs the update archive from: the staged BINDIR, or the single built `.app`.
+fn payload_root(source: &UpdateArchiveSource, repo_root: &Path) -> Result<PathBuf> {
+    match source {
+        UpdateArchiveSource::StagedBindir(dir) => Ok(dir.clone()),
+        UpdateArchiveSource::BuiltApp => crate::update_archive::find_built_app(Profile::Release, repo_root),
+    }
+}
+
+/// Where each of `archive`'s executables is: in `root` (see [`payload_root`]), or for the ones `hole` embeds, where
+/// `hole`'s build reads them. Each must be a file, as the files of the shipment must be (see [`ensure_built`]); an
+/// embedded one must also be the very bytes the built `hole` embeds (`include_bytes!` stores them contiguously).
+fn payload_executable_paths<'a>(
+    archive: &'a UpdateArchive,
+    root: &Path,
+    repo_root: &Path,
+    platform: Platform,
+) -> Result<Vec<(PathBuf, &'a Executable)>> {
+    let dir = match &archive.source {
+        UpdateArchiveSource::StagedBindir(_) => root.to_path_buf(),
+        UpdateArchiveSource::BuiltApp => root.join("Contents").join("MacOS"),
+    };
+    let in_payload = archive.executables.iter().map(|exe| (dir.join(&exe.name), exe));
+    // Only macOS embeds plugins, as `embed_plugins.rs` reads them: `.cache/<name>/<name>-<triple>`, no `.exe`, the
+    // triple of the platform `hole` is built for.
+    let triple = crate::target::target_triple(platform);
+    let embedded = archive
+        .embedded
+        .iter()
+        .map(|exe| (cache_sidecar_path(repo_root, &exe.name, triple, false), exe));
+    let found = in_payload
+        .chain(embedded)
+        .map(|(path, exe)| {
+            ensure!(path.is_file(), "{} is not a file", path.display());
+            Ok((path, exe))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if archive.embedded.is_empty() {
+        return Ok(found);
+    }
+    let hole_path = dir.join(app_executable_name(platform.os));
+    let hole = std::fs::read(&hole_path).with_context(|| format!("read {}", hole_path.display()))?;
+    for (path, _) in found.iter().skip(archive.executables.len()) {
+        let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        ensure!(
+            hole.windows(bytes.len().max(1)).any(|window| window == bytes),
+            "{} is not what {} embeds: it changed after `hole` was built; rebuild `hole`",
+            path.display(),
+            hole_path.display()
+        );
+    }
+    Ok(found)
+}
+
+/// `exe` ships as `kind` on `os`: it must be hardened when the kind says so, then pass its probes.
+fn check_executable(exe: &Path, kind: FileKind, probes: &[Probe], os: Os) -> Result<()> {
+    if kind.is_verified_on(os) {
+        verify_hardened(exe, kind)?;
+    } else {
+        println!("xtask: {}: hardening not checked ({kind:?} on {os:?})", exe.display());
+    }
+    run_probes(exe, probes)
+}
+
 /// Run each probe on `exe`: it must exit 0 and print what the probe says.
 fn run_probes(exe: &Path, probes: &[Probe]) -> Result<()> {
     for probe in probes {
@@ -398,21 +568,23 @@ pub fn stage(repo_root: &Path, tag: &str, lane: Lane, out: &Path) -> Result<()> 
         std::fs::copy(&asset.src, &dest)
             .with_context(|| format!("copy {} to {}", asset.src.display(), dest.display()))?;
         println!("xtask: staged {} as {}", asset.src.display(), asset.name);
-        run_probes(&dest, &asset.probes)?;
-    }
-    if let Some(exe) = &shipment.payload_binary {
-        run_probes(&exe.path, &exe.probes)?;
+        if let Some(kind) = asset.kind.executable() {
+            check_executable(&dest, kind, &asset.probes, platform.os)?;
+        }
     }
 
     if let Some(update_archive) = &shipment.update_archive {
+        // Resolved once: the executables checked are in the directory the archive is packed from.
+        let root = payload_root(&update_archive.source, repo_root)?;
+        for (path, exe) in payload_executable_paths(update_archive, &root, repo_root, platform)? {
+            check_executable(&path, exe.kind, &exe.probes, platform.os)?;
+        }
         let archive = out.join(&update_archive.name);
         match &update_archive.source {
-            UpdateArchiveSource::StagedBindir(dir) => {
-                crate::update_archive::build_update_archive_from_stage(dir, &archive)?
+            UpdateArchiveSource::StagedBindir(_) => {
+                crate::update_archive::build_update_archive_from_stage(&root, &archive)?
             }
-            UpdateArchiveSource::BuiltApp => {
-                crate::update_archive::build_update_archive(Profile::Release, repo_root, &archive)?
-            }
+            UpdateArchiveSource::BuiltApp => crate::update_archive::build_update_archive_from_app(&root, &archive)?,
         }
         crate::update_archive::verify_update_archive(&archive)?;
         #[cfg(target_os = "macos")]

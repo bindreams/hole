@@ -3793,6 +3793,26 @@ default-feature build from that tree (`cargo build --release`, `uv run --directo
 blank dashboard without an error.
 The pre-commit hook lints with `--no-default-features`. See #372.
 
+### Hardened binaries
+
+The shipped Rust binaries (`hole`, `galoshes`, `garter`) call `libsearch_guard::bins()` in their `build.rs`. On Windows that links
+the VC runtime statically (the MSI ships no Visual C++ redistributable, so a dynamic import would stop the binary from starting on a
+machine without one) and stops the loader from searching the executable's folder for DLLs, so a file planted beside the binary is
+not run. `wintun.dll` is preloaded by absolute path (`tun-engine/src/device/wintun.rs`) before the `tun` crate loads it by bare name,
+and that later load resolves to the module already loaded. Any other sidecar DLL must be loaded by absolute path too. `ex-ray` is a Go
+binary and is not hardened on Windows: it has no `DEPENDENTLOADFLAG`, and it imports only `kernel32.dll`.
+
+Two checks run `libsearch_guard::verify`, which fails when a binary imports a VC runtime DLL or opts into an executable-relative
+search (on Linux and macOS: `$ORIGIN`, `@executable_path`, `@rpath`). The crates' tests check their debug binaries
+(`crates/{hole,galoshes}/tests/hardened_binary.rs`, `garter_is_hardened` in `crates/garter-bin/tests/cli_binary.rs`);
+`cargo xtask stage-release` checks the release files it stages, so the bytes uploaded are the bytes verified: galoshes and garter,
+and the executables of the payload each installer is built from (the MSI's stage dir: `hole.exe`, `galoshes.exe`; the DMG's app:
+`hole`, plus the plugins `hole` embeds), with `ex-ray` checked everywhere but on Windows. The installers are not opened: the
+check is on the directory they are built from, not on the MSI's or DMG's own contents. The embedded plugins are checked at the
+`.cache` files `hole`'s build embeds from, after requiring that each file's exact bytes occur in the built `hole`, so a `.cache`
+file replaced after the build fails the lane. Which files are executables, and built by
+what, is stated once per file in `xtask_lib::bindir::bindir_entries`.
+
 ### Windows installer
 
 ```sh

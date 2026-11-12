@@ -25,6 +25,19 @@ fn help_exits_0_and_prints() {
     exits_0_and_prints("--help");
 }
 
+/// The shipped `garter` binary does not search its own folder for libraries (`build.rs` calls `libsearch_guard::bins()`).
+/// Reads `CARGO_BIN_EXE_garter` at run time first: a nextest archive run remaps it.
+#[skuld::test]
+fn garter_is_hardened() {
+    let exe = std::env::var_os("CARGO_BIN_EXE_garter").unwrap_or_else(|| env!("CARGO_BIN_EXE_garter").into());
+    libsearch_guard::verify(&exe).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e}; the crate's build.rs must call libsearch_guard::bins()",
+            exe.to_string_lossy()
+        )
+    });
+}
+
 hole_test_observability::register!();
 
 fn main() {

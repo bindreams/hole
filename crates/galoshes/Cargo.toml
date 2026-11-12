@@ -50,6 +50,7 @@ windows = { version = "0.62", features = ["Win32_Networking_WinSock", "Win32_Sys
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
+libsearch-guard = { workspace = true }
 # Enable garter's `test_utils::WaitableWriter` for the E2E relay tests
 # (the module is gated behind garter's `test-utils` feature).
 garter = { path = "../garter", features = ["test-utils"] }
@@ -59,5 +60,11 @@ garter = { path = "../garter", features = ["test-utils"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [build-dependencies]
+libsearch-guard = { workspace = true }
 sha2 = "0.11"
 xtask-lib = { path = "../../xtask-lib", features = ["version"] }
+
+[[test]]
+name = "hardened_binary"
+path = "tests/hardened_binary.rs"
+harness = false

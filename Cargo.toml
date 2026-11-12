@@ -13,6 +13,8 @@ edition = "2021"
 
 [workspace.dependencies]
 skuld = { version = "0.2", features = ["tokio"] }
+# Shipped bins: `bins()` in build.rs (DLL search hardening, static VC runtime); `verify` in their tests.
+libsearch-guard = "0.1"
 # Process identity: `(pid, raw kernel start token)` compared exactly, plus the
 # versioned `ProcessIdRecord` the bridge persists across a restart; and, with the
 # `tokio` feature, process-tree containment and the graceful teardown signals.

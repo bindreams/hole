@@ -26,6 +26,14 @@ fn dest_names_per_os_are_exact() {
 }
 
 #[skuld::test]
+fn the_app_executable_is_the_first_entry_on_every_os() {
+    for (os, name) in [(Os::Windows, "hole.exe"), (Os::Darwin, "hole"), (Os::Linux, "hole")] {
+        assert_eq!(app_executable_name(os), name);
+        assert_eq!(bindir_entries(os)[0].name, name);
+    }
+}
+
+#[skuld::test]
 fn plugin_sidecars_are_ex_ray_and_galoshes() {
     assert_eq!(plugin_sidecar_names(), &["ex-ray", "galoshes"]);
 }
@@ -47,6 +55,25 @@ fn bundle_payload_names_drop_only_the_embedded_names() {
     for os in [Os::Windows, Os::Linux] {
         assert_eq!(bundle_payload_names(os), bindir_dest_names(os), "{os}");
     }
+}
+
+/// The bundle and the embedded plugins together are the whole BINDIR, each entry in one of them.
+#[skuld::test]
+fn embedded_plugin_entries_and_bundle_payload_entries_partition_the_bindir() {
+    for os in [Os::Windows, Os::Darwin, Os::Linux] {
+        let mut split = bundle_payload_entries(os);
+        split.extend(embedded_plugin_entries(os));
+        let mut all = bindir_entries(os);
+        let order = |entries: &mut Vec<BindirEntry>| entries.sort_by(|a, b| a.name.cmp(&b.name));
+        order(&mut split);
+        order(&mut all);
+        assert_eq!(split, all, "{os}");
+    }
+    let darwin: Vec<_> = embedded_plugin_entries(Os::Darwin)
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+    assert_eq!(darwin, [FileKind::ForeignExecutable, FileKind::RustExecutable]);
 }
 
 #[skuld::test]
