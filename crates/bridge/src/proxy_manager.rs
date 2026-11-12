@@ -8,10 +8,10 @@
 //
 // Both traits return RAII associated types on success (`P::Running` /
 // `R::Installed`) whose Drop impls clean up their respective side effects.
-// RAII unwind covers the Err-return path of `start_inner` — if any phase
-// returns Err, locally-owned guards drop in reverse-declaration order,
-// aborting the shadowsocks task and tearing down routes without the
-// ProxyManager fields ever being mutated.
+// `start_inner` builds a `Session` (see session.rs) that owns every resource
+// from the moment it is acquired. Every exit ends in `Session::teardown`: a
+// failed start runs it before returning the error, `stop` runs it on the
+// committed session. Drop is the panic / dropped-future net only.
 //
 // **Cancellation is cooperative.** A `CancellationToken` is threaded
 // *into* `start_inner` and every long-running phase observes it
@@ -22,12 +22,10 @@
 //
 // A cycle's transient state lives in `self.posture`, one of `Idle` /
 // `PendingStart` / `Session(RunningState<P, R>)` — see the `Posture` section
-// below. When `stop()` takes the state, the proxy handle is explicitly
-// `stop().await`ed (so errors are reported), then the routes guard drops
-// (tearing down). On a successful `start`, the full `RunningState` is
-// committed via `Posture::commit_session` strictly after `start_inner`
-// returns `Ok(state)`; the cooperative-cancel path returns `Err(Cancelled)`
-// before reaching the commit.
+// below. On a successful `start`, the full `RunningState` is committed via
+// `Posture::commit_session` strictly after `start_inner` returns `Ok(state)`;
+// the cooperative-cancel path returns `Err(Cancelled)` before reaching the
+// commit.
 //
 // There are deliberately no getters for `proxy` or `routing` — test access
 // to mock state happens via `Arc` clones captured before the mock is
@@ -50,14 +48,15 @@ use tun_engine::routing::{CoverGuard, CoverPresence, RoutesInstalled, Routing, S
 
 use crate::coverage::{CoverPlan, Coverage};
 use crate::reconciler::{teardown_cover_disposition, transient_cover_disposition, CoverDisposition};
-use crate::service_stop::{run_phase, StopPhase};
+use crate::service_stop::StopPhase;
+use crate::session::Session;
 use crate::target::{self, target_after, SessionEvent};
 
 use crate::dns::self_test::{
     build_local_dns, implicates_plugin_transport, report_plugin_output, run_forwarder_self_test, self_test_error_for,
     SelfTestOutcome,
 };
-use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
+use crate::dns::system::{Dns, DnsError, SystemDns};
 use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals};
 use tun_engine::RoutingError;
 use util::versioned_file::StoreError;
@@ -145,59 +144,10 @@ pub enum ProxyState {
 
 // Running state =======================================================================================================
 
-/// Per-cycle state owned only while a proxy is running.
-///
-/// **Tear-down order is load-bearing.** `ProxyManager::stop_with` runs the
-/// shutdown sequence in this order:
-/// 1. `dns_applied.shutdown().await` — restores OS DNS while routes +
-///    dispatcher + SS are still live so any in-flight OS DNS queries
-///    egress the restored path.
-/// 2. `dispatcher.shutdown().await` — closes TUN, cancels handlers.
-/// 3. `plugin_chain` drop — graceful stop via SIGTERM/CTRL_BREAK.
-/// 4. `proxy.stop().await` — releases SS task.
-/// 5. `routes` drop — RAII teardown.
-/// 6. `lockdown` — its fate comes from `teardown_cover_disposition(event, intent, presence, target)`,
-///    not from why the session ended: `Release` drops it (disengage; opens
-///    the host), `Hold`/`Engage` disarms it (the persistent filters survive).
-///    Last so the persistent filters outlive routes by Drop order.
-///
-/// `None` fields for SocksOnly mode where routing / dispatcher / DNS are
-/// skipped, or when no plugin is configured.
+/// Per-cycle state owned only while a proxy is running: the [`Session`] plus the run's metadata. Release order and
+/// the standing cover's fate are documented on [`Session::teardown`] and `ProxyManager::stop_with_progress`.
 struct RunningState<P: Proxy, R: Routing, D: Dns> {
-    /// DNS interception guard: holds the captured prior DNS state.
-    /// `stop()` awaits [`DnsApplied::shutdown`] on this BEFORE dropping
-    /// anything else so the OS sees its restored resolvers while routes
-    /// are still live. `None` when DNS forwarder is disabled or in
-    /// SocksOnly mode.
-    #[allow(dead_code)]
-    dns: Option<D::Applied>,
-    /// TCP dispatcher — owns TUN device, smoltcp, and per-connection
-    /// handler tasks. `None` in SocksOnly mode and under `#[cfg(test)]`.
-    #[allow(dead_code)]
-    dispatcher: Option<crate::dispatcher::Dispatcher>,
-    /// Garter-managed plugin chain; drop triggers SIP003u graceful
-    /// shutdown via the cancel token. `None` when no plugin is configured.
-    #[allow(dead_code)]
-    plugin_chain: Option<crate::proxy::plugin::PluginChain>,
-    /// Installed routes. `None` in SocksOnly mode.
-    #[allow(dead_code)]
-    routes: Option<R::Installed>,
-    /// Standing lockdown cover, engaged only when intent is on. `None` when
-    /// lockdown is off — then behavior is byte-identical to today. Whether a
-    /// cover is engaged is now a MEASURED fact
-    /// ([`ProxyManager::cover_presence`], an OS probe) — no site may derive
-    /// it from this field's presence; a structural guard in
-    /// `proxy_manager_tests.rs` catches a source that tries. `stop_with`
-    /// still CONSUMES this field to decide the cover's fate at teardown: a
-    /// `UserStop` disengages it and a `Cutover` disarms it (the persistent
-    /// filters survive), both after routes tear down (its Drop is the
-    /// catastrophic safety net).
-    lockdown: Option<R::Cover>,
-    /// Handle on the running proxy. Drop aborts the task (best-effort);
-    /// supported graceful shutdown is via `stop().await` from
-    /// [`ProxyManager::stop`].
-    proxy: P::Running,
-    server_ip: Option<IpAddr>,
+    session: Session<R, D, P::Running>,
     started_at: Instant,
     /// Whether UDP proxy relay is available (from plugin config).
     udp_proxy_available: bool,
@@ -208,6 +158,37 @@ struct RunningState<P: Proxy, R: Routing, D: Dns> {
     /// survive a stop/start cycle — the counters it derives deltas from
     /// reset with the `Server`.
     traffic_window: Option<TrafficWindow>,
+}
+
+/// What a completed start learned that is not a resource.
+struct RunMeta {
+    udp_proxy_available: bool,
+    ipv6_bypass_available: bool,
+}
+
+/// What the tunnel's phases need from the phases before them.
+struct TunnelPlan {
+    socks5_port: u16,
+    gw_info: GatewayInfo,
+    ruleset: crate::filter::rules::RuleSet,
+    udp_proxy_available: bool,
+}
+
+impl<P: Proxy, R: Routing, D: Dns> RunningState<P, R, D> {
+    fn new(session: Session<R, D, P::Running>, meta: RunMeta) -> Self {
+        Self {
+            session,
+            started_at: Instant::now(),
+            udp_proxy_available: meta.udp_proxy_available,
+            ipv6_bypass_available: meta.ipv6_bypass_available,
+            traffic_window: None,
+        }
+    }
+
+    /// The session, ready for [`Session::teardown`].
+    fn into_session(self) -> Session<R, D, Option<P::Running>> {
+        self.session.uncommit()
+    }
 }
 
 /// Previous [`ProxyManager::sample_traffic`] observation.
@@ -540,10 +521,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// when no session is running.
     #[cfg(test)]
     pub fn set_plugin_chain_for_test(&mut self, chain: crate::proxy::plugin::PluginChain) {
-        self.posture
+        let state_dir = self.routing.state_dir().to_path_buf();
+        let session = &mut self
+            .posture
             .session_mut()
             .expect("set_plugin_chain_for_test: no running session")
-            .plugin_chain = Some(chain);
+            .session;
+        session.expect_plugins(state_dir);
+        session.hold_plugin_chain(chain);
     }
 
     /// Sample cumulative tunnel-traffic totals and compute speeds over
@@ -552,7 +537,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// stopped; the first sample after a start reports 0 bps.
     pub fn sample_traffic(&mut self) -> Option<TrafficMetrics> {
         let running = self.posture.session_mut()?;
-        let totals = running.proxy.traffic_totals();
+        let totals = running.session.proxy.traffic_totals();
         let now = tokio::time::Instant::now();
         let (speed_in_bps, speed_out_bps) = match &running.traffic_window {
             None => (0, 0),
@@ -636,7 +621,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     pub fn invalid_filters(&self) -> Vec<hole_common::protocol::InvalidFilter> {
         self.posture
             .session()
-            .and_then(|r| r.dispatcher.as_ref())
+            .and_then(|r| r.session.dispatcher.as_ref())
             .map(|d| d.invalid_filters())
             .unwrap_or_default()
     }
@@ -836,7 +821,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// Start the proxy with a caller-supplied `CancellationToken`.
     /// Signaling the token at any point during `start_inner` returns
     /// `Err(ProxyError::Cancelled)` and rolls back partial state (via
-    /// the RAII guards inside `start_inner`) without mutating `self`.
+    /// `Session::teardown`, run inside `start_inner`) without mutating `self`.
     ///
     /// **Cooperative cancellation.** The token is threaded *into*
     /// `start_inner` and every long-running phase observes it
@@ -852,8 +837,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///    pre-flight fires immediately and returns `Cancelled` without doing
     ///    any work, whatever the pre-flight would have refused.
     /// 2. **Cancel mid-flight.** Each phase's cancel-aware wrapper
-    ///    returns `Cancelled` cooperatively; locally-owned RAII guards
-    ///    drop in reverse-declaration order as the function unwinds.
+    ///    returns `Cancelled` cooperatively, and `Session::teardown` then
+    ///    releases what the start had acquired.
     /// 3. **Cancel right after `start_inner` returns `Ok(started)`.**
     ///    Commit to `self` happens after `start_inner` yields, so the
     ///    late cancel cannot race the commit. The started session is left
@@ -1123,7 +1108,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // disengage; already None when lockdown subsumed it — the standing
                 // lockdown cover holds instead).
                 drop(self.posture.take_pending());
-                let server_ip = state.server_ip;
                 self.udp_proxy_available = state.udp_proxy_available;
                 self.ipv6_bypass_available = state.ipv6_bypass_available;
                 let udp_proxy_available = self.udp_proxy_available;
@@ -1134,8 +1118,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 let diag = ProxyStartedDiag {
                     server: token_for(&config.server.id),
                     server_kind: server_kind(config.server.server.expose()),
-                    server_family: server_ip.map(ip_family),
-                    server_scope: server_ip.map(ip_scope),
+                    server_family: Some(ip_family(server_ip)),
+                    server_scope: Some(ip_scope(server_ip)),
                     server_port: config.server.server_port,
                     local_port: config.local_port,
                     tunnel_mode: tunnel_mode_label(&config.tunnel_mode),
@@ -1339,59 +1323,31 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
     /// Produce a [`RunningState`] without touching `self`.
     ///
-    /// **Cooperative cancellation.** Each long-running phase
-    /// observes the supplied `cancel` token and returns
-    /// `Err(ProxyError::Cancelled)` cooperatively. Earlier RAII guards
-    /// drop in reverse-declaration order when the function returns Err,
-    /// tearing down anything that was constructed before the cancel
-    /// observation (listed in declaration order — later items drop first):
+    /// Every resource a phase acquires goes into one [`Session`] the moment it exists, so the `?` exits of
+    /// [`Self::acquire`] need no unwinding of their own: on any `Err` this runs `Session::teardown`, the same
+    /// release `stop` runs, before returning the error. A failed start drops its standing cover, no exception.
+    /// The teardown observes no cancel token, so a cancel that arrives during it cannot cut it short.
     ///
-    /// 1. `PluginChain` — on drop, cancels its garter token and clears
-    ///    the plugin state file.
-    /// 2. `P::Running` — on drop, aborts the spawned proxy task.
-    /// 3. `R::Installed` — on drop, tears down routes and clears the
-    ///    crash-recovery state file.
-    /// 4. `Option<R::Cover>` (lockdown) — declared last, so it drops first,
-    ///    before `R::Installed`; disengages the standing cover (only `Some`
-    ///    when intent is on and engage already succeeded). On the fail-FATAL
-    ///    engage `?` it is never constructed, so only `R::Installed` tears down.
-    ///    A failed start drops its standing cover, no exception.
-    ///
-    /// Per-phase cancellation strategy:
-    /// - **Phase 1 (plugin chain)**: the bridge cancel is threaded into
-    ///   `start_plugin_chain`, which derives child tokens for each
-    ///   attempt and races readiness against cancel.
-    /// - **Phase 2 (proxy.start)**: `tokio::select!` around
-    ///   `proxy.start(ss_config)`. Drop-on-cancel is sound — Proxy
-    ///   implementations own no async cleanup obligations on an
-    ///   in-flight start.
-    /// - **Phase 3 (build_local_dns)**: builds the in-TUN endpoint +
-    ///   forwarder synchronously; the outer `tokio::select!` against
-    ///   cancel re-emits Cancelled canonically.
-    /// - **Phase 4 (forwarder self-test)**: cooperative — the token is
-    ///   threaded into `run_forwarder_self_test`, which races its one walk
-    ///   against cancel in a `biased` `select!` (cancel checked first on
-    ///   every poll) and drops the in-flight walk on cancel rather than
-    ///   waiting for it.
-    /// - **Phase 5 (Dispatcher::new)**: cooperative — the token is threaded
-    ///   in, and the device build runs on `spawn_blocking` raced against it
-    ///   in a `biased` `select!`. It is no longer millisecond-scale: the
-    ///   build waits for the TUN interface's IPv6 half to appear, and on a
-    ///   covered start a Cancel the phase could not observe would extend the
-    ///   window during which the host is fail-closed. On cancel the blocking
-    ///   task finishes and drops its own `Device`; nothing is
-    ///   future-drop-cancelled.
-    /// - **Phase 6 (routing.install)**: sync; cancel observed at the phase
-    ///   boundary only (`if cancel.is_cancelled()`). Mid-call preemption
-    ///   isn't structurally possible — the netsh/route shell-outs are
-    ///   uninterruptible from our process.
-    /// - **Phase 7 (dns.apply)**: cooperative — the token is threaded
-    ///   into [`Dns::apply`], which observes cancel between per-adapter
-    ///   FFIs. A cancel arriving mid-apply triggers an inline-restore
-    ///   of any partially-applied adapters before `DnsError::Cancelled`
-    ///   propagates back as `ProxyError::Cancelled`. The
-    ///   `SystemDnsApplied` guard is returned only on the `Ok` path,
-    ///   so the `DebugDropBomb` is never armed during an Err unwind.
+    /// **Cooperative cancellation.** Each long-running phase of `acquire` observes the supplied `cancel` token and
+    /// returns `Err(ProxyError::Cancelled)` cooperatively:
+    /// - **Phase 1 (plugin chain)**: the token is threaded into `start_plugin_chain`, which derives child tokens
+    ///   for each attempt and races readiness against cancel.
+    /// - **Phase 2 (proxy.start)**: `tokio::select!` around `proxy.start(ss_config)`. Drop-on-cancel is sound:
+    ///   Proxy implementations own no async cleanup obligations on an in-flight start.
+    /// - **Phase 3 (build_local_dns)**: builds the in-TUN endpoint + forwarder synchronously; the outer
+    ///   `tokio::select!` against cancel re-emits Cancelled canonically.
+    /// - **Phase 4 (forwarder self-test)**: the token is threaded into `run_forwarder_self_test`, which races its
+    ///   one walk against cancel in a `biased` `select!` and drops the in-flight walk on cancel.
+    /// - **Phase 5 (Dispatcher::new)**: the token is threaded in, and the device build runs on `spawn_blocking`
+    ///   raced against it. The build waits for the TUN interface's IPv6 half, and on a covered start a Cancel the
+    ///   phase could not observe would extend the window during which the host is fail-closed. On cancel the
+    ///   blocking task finishes and drops its own `Device`; nothing is future-drop-cancelled.
+    /// - **Phase 6 (routing.install)**: sync; cancel observed at the phase boundary only. The netsh/route
+    ///   shell-outs are uninterruptible from our process.
+    /// - **Phase 7 (dns.apply)**: the token is threaded into [`Dns::apply`], which observes cancel between
+    ///   per-adapter FFIs. A cancel mid-apply restores any partially-applied adapters inline before
+    ///   `DnsError::Cancelled` propagates as `ProxyError::Cancelled`. The `DnsApplied` guard exists only on the
+    ///   `Ok` path, so its drop bomb is never armed on an `Err`.
     ///
     /// CRITICAL ORDERING: the routing provider is responsible for
     /// persisting the recovery state BEFORE mutating routes. A panic
@@ -1425,6 +1381,72 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         cancel: CancellationToken,
     ) -> Result<RunningState<P, R, D>, ProxyError> {
         debug!("start_inner entered");
+        let mut session = Session::empty();
+        let acquired = Self::acquire(
+            &mut session,
+            proxy,
+            routing,
+            dns,
+            config,
+            server_ip,
+            ech_doh,
+            transient_pending,
+            standing_cover_expected,
+            plugin,
+            cancel,
+        )
+        .await;
+        match acquired {
+            Ok(meta) => Ok(RunningState::new(session.commit(), meta)),
+            Err(error) => {
+                let torn = session.teardown(&mut |_| {}).await;
+                // The start's own error is what returns; a proxy that also failed to stop is logged, never masked.
+                if let Err(stop_err) = torn.proxy {
+                    warn!(
+                        error = &stop_err as &dyn std::error::Error,
+                        "proxy did not stop cleanly while releasing a failed start"
+                    );
+                }
+                Self::release_failed_start_cover(routing, torn.standing_cover);
+                Err(error)
+            }
+        }
+    }
+
+    /// A failed start's standing cover is released, never kept: one section under the cover lock, like every other
+    /// release of it. Never `.await`s.
+    fn release_failed_start_cover(routing: &R, cover: Option<R::Cover>) {
+        let Some(cover) = cover else { return };
+        let lock = routing.lock_covers();
+        cover.release(&lock);
+    }
+
+    /// The phases of a start, each acquisition recorded in `session` the moment it exists, the proxy included. A
+    /// `?` anywhere here leaves what was acquired in the session for [`Session::teardown`].
+    // DI params (the proxy/routing/dns seams + config + cancel + the
+    // test-querier seam); bundling into a struct adds more noise than the warning.
+    #[allow(clippy::too_many_arguments)]
+    async fn acquire(
+        session: &mut Session<R, D, Option<P::Running>>,
+        proxy: &P,
+        routing: &R,
+        dns: &D,
+        config: &ProxyConfig,
+        server_ip: IpAddr,
+        ech_doh: Option<crate::dns::ech::EchDoh>,
+        transient_pending: bool,
+        standing_cover_expected: bool,
+        plugin: Option<crate::proxy::BundledPlugin>,
+        cancel: CancellationToken,
+    ) -> Result<RunMeta, ProxyError> {
+        let cancel = &cancel;
+        let plugin = plugin.as_ref();
+        // Before any exit: a start that fails anywhere, even cancelled before its first phase, reaps what a
+        // configured plugin may have recorded.
+        if plugin.is_some() {
+            session.expect_plugins(routing.state_dir().to_path_buf());
+        }
+
         // Pre-flight: short-circuit a pre-cancelled token before any work.
         if cancel.is_cancelled() {
             return Err(ProxyError::Cancelled);
@@ -1439,7 +1461,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Phase 1: start plugin chain via Garter if a plugin is configured.
         // `start_plugin_chain` threads `cancel` through to its readiness
         // wait + bind_ephemeral retries.
-        let plugin_chain = if let Some(ref plugin) = plugin {
+        if let Some(plugin) = plugin {
             let chain = crate::proxy::plugin::start_plugin_chain(
                 plugin,
                 config.server.plugin_opts.as_deref(),
@@ -1448,14 +1470,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Some(routing.state_dir()),
                 routing.owner(),
                 config.diagnostic_plugin_tap,
-                &cancel,
+                cancel,
                 ech_doh.as_ref(),
             )
             .await?;
-            Some(chain)
-        } else {
-            None
-        };
+            session.hold_plugin_chain(chain);
+        }
 
         // Cancel observed between phases — required because a
         // pre-cancelled token can slip past `start_plugin_chain` when
@@ -1470,7 +1490,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // path carries UDP, so default to available. Computed once here (in
         // scope for both the SocksOnly and Full branches below) so all
         // three start sites read the same live value.
-        let udp_proxy_available = udp_available_from_chain(plugin_chain.as_ref().map(|c| c.transports()));
+        let udp_proxy_available = udp_available_from_chain(session.plugin_chain().map(|c| c.transports()));
 
         // Build shadowsocks config. When a plugin chain is running,
         // point ss-service at the chain's local port.
@@ -1480,7 +1500,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // allocated by bind_ephemeral in phase 2 — so run the same
         // typed validation now to keep rejects fast and typed, before
         // any Full-mode preamble work.
-        let plugin_local = plugin_chain.as_ref().map(|c| c.local_addr());
+        let plugin_local = session.plugin_chain().map(|c| c.local_addr());
         let pure_vpn = matches!(config.tunnel_mode, TunnelMode::Full) && !config.proxy_socks5;
         let ss_config = if pure_vpn {
             crate::proxy::validate_proxy_config(config)?;
@@ -1503,6 +1523,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 _ = cancel.cancelled() => return Err(ProxyError::Cancelled),
                 r = proxy.start(ss_config) => r?,
             };
+            session.proxy = Some(running_proxy);
             debug!("proxy.start returned Ok");
 
             // Harness-only (HOLE_BRIDGE_SELF_TEST): connect to our own SOCKS5
@@ -1541,18 +1562,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 });
             }
 
-            return Ok(RunningState {
-                dns: None,
-                dispatcher: None,
-                plugin_chain,
-                routes: None,
-                lockdown: None,
-                proxy: running_proxy,
-                server_ip: Some(server_ip),
-                started_at: Instant::now(),
+            return Ok(RunMeta {
                 udp_proxy_available,
                 ipv6_bypass_available: false,
-                traffic_window: None,
             });
         }
 
@@ -1570,15 +1582,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // CRITICAL ORDERING:
         //
         //   0. (above) plugin_chain spawn  — plugin subprocess is alive
-        //      from this point. NOT a system-state mutation (the chain
-        //      Drop SIGTERMs it on unwind) but the user sees the
-        //      plugin process briefly.
+        //      from this point. NOT a system-state mutation (the session
+        //      teardown reaps it) but the user sees the plugin process briefly.
         //   1. proxy.start  — binds local SS listener
         //   2. build_local_dns  — builds the in-TUN LocalDnsEndpoint +
         //      forwarder (Err on degenerate dns.enabled + empty servers)
         //   3. GATE: run_forwarder_self_test  — Err here means the plugin
-        //      chain cannot reach upstream. RAII unwind drops
-        //      running_proxy + plugin_chain locally. NO system state
+        //      chain cannot reach upstream. The session's teardown releases
+        //      the proxy + plugin chain. NO system state
         //      (routes / system DNS / TUN adapter) is mutated.
         //   4. Dispatcher::new  — only NOW does LocalDnsEndpoint become
         //      reachable through the cascade
@@ -1593,21 +1604,21 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // called when the gate fails).
 
         // Phase 2 (Full mode): start the SS SOCKS5 proxy, racing the
-        // start future against cancel. Drop on Running aborts the SS
-        // task on cancel via P::Running::drop.
+        // start future against cancel.
         //
         // The TUN data plane rides the user-facing SOCKS5 listener when
         // it is enabled. On a pure-VPN start (no user-facing listeners,
         // #459) the internal SOCKS5 instance binds an ephemeral loopback
         // port instead, so nothing is bound on the user-configured
         // ports. TCP+UDP: the SOCKS5 instance is always TcpAndUdp.
-        let (socks5_port, running_proxy) = if let Some(ss_config) = ss_config {
+        let socks5_port = if let Some(ss_config) = ss_config {
             let running = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(ProxyError::Cancelled),
                 r = proxy.start(ss_config) => r?,
             };
-            (config.local_port, running)
+            session.proxy = Some(running);
+            config.local_port
         } else {
             let bind = port_alloc::bind_ephemeral(
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -1622,12 +1633,57 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 biased;
                 _ = cancel.cancelled() => return Err(ProxyError::Cancelled),
                 r = bind => match r {
-                    Ok((port, running)) => (port, running),
+                    Ok((port, running)) => {
+                        session.proxy = Some(running);
+                        port
+                    }
                     Err(_) if cancel.is_cancelled() => return Err(ProxyError::Cancelled),
                     Err(e) => return Err(ProxyError::Runtime(e)),
                 },
             }
         };
+
+        Self::bring_up_tunnel(
+            session,
+            routing,
+            dns,
+            config,
+            server_ip,
+            transient_pending,
+            standing_cover_expected,
+            plugin,
+            TunnelPlan {
+                socks5_port,
+                gw_info,
+                ruleset,
+                udp_proxy_available,
+            },
+            cancel,
+        )
+        .await
+    }
+
+    /// The phases after the proxy runs: the DNS forwarder and its gate, the dispatcher, routes, the standing cover and
+    /// system DNS.
+    #[allow(clippy::too_many_arguments)] // DI params, as for `acquire`.
+    async fn bring_up_tunnel(
+        session: &mut Session<R, D, Option<P::Running>>,
+        routing: &R,
+        dns: &D,
+        config: &ProxyConfig,
+        server_ip: IpAddr,
+        transient_pending: bool,
+        standing_cover_expected: bool,
+        plugin: Option<&crate::proxy::BundledPlugin>,
+        plan: TunnelPlan,
+        cancel: &CancellationToken,
+    ) -> Result<RunMeta, ProxyError> {
+        let TunnelPlan {
+            socks5_port,
+            gw_info,
+            ruleset,
+            udp_proxy_available,
+        } = plan;
 
         // Phase 3: build the in-TUN DNS endpoint + forwarder. Err on the
         // degenerate `dns.enabled && servers.is_empty()` config. Returns the
@@ -1641,9 +1697,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // Phase 4: blocking forwarder self-test gate. Runs synchronously
         // BEFORE Dispatcher::new / routing.install / Dns::apply.
-        // On Err, the locally-owned `running_proxy` Drop aborts the SS
-        // task and `plugin_chain` (further up the stack) Drop SIGTERMs
-        // the chain. System state is untouched. `run_forwarder_self_test`
+        // On Err, the session's teardown stops the proxy and the plugin chain.
+        // System state is untouched. `run_forwarder_self_test`
         // observes cancel cooperatively: its one walk races cancel in a
         // biased `select!`, checked before every poll of the walk (#397).
         if let Some(fwd) = forwarder.as_ref() {
@@ -1746,7 +1801,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     // `ForwarderSelfTestFailed`, that value alone can no
                     // longer tell them apart — see `implicates_plugin_transport`'s doc.
                     if implicates_plugin_transport(&reason, verdict) {
-                        report_plugin_output(plugin_chain.as_ref().map(|c| &**c.log()));
+                        report_plugin_output(session.plugin_chain().map(|c| &**c.log()));
                     }
                     return Err(self_test_error_for(verdict, attempts, elapsed_ms, reason));
                 }
@@ -1761,27 +1816,28 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Start the dispatcher (owns TUN device + smoltcp). Skipped
         // under #[cfg(test)] because creating a TUN requires elevation.
         #[cfg(not(test))]
-        let mut dispatcher = match crate::dispatcher::Dispatcher::new(
-            socks5_port,
-            gw_info.interface_index,
-            gw_info.ipv6_available,
-            plugin.as_ref().map(|p| p.descriptor().name.to_string()),
-            udp_proxy_available,
-            ruleset,
-            local_dns_endpoint,
-            &cancel,
-        )
-        .await?
         {
-            Some(d) => Some(d),
-            None => return Err(ProxyError::Cancelled),
-        };
+            session.dispatcher = match crate::dispatcher::Dispatcher::new(
+                socks5_port,
+                gw_info.interface_index,
+                gw_info.ipv6_available,
+                plugin.as_ref().map(|p| p.descriptor().name.to_string()),
+                udp_proxy_available,
+                ruleset,
+                local_dns_endpoint,
+                cancel,
+            )
+            .await?
+            {
+                Some(d) => Some(d),
+                None => return Err(ProxyError::Cancelled),
+            };
+        }
         #[cfg(test)]
-        let mut dispatcher: Option<crate::dispatcher::Dispatcher> = {
+        {
             let _ = ruleset; // suppress unused warning
             let _ = local_dns_endpoint;
-            None
-        };
+        }
 
         // The identity of the TUN device this start opened — the LUID and
         // alias of the concrete OS object, never a name lookup. Threaded to
@@ -1798,7 +1854,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // adapter) and testability grounds (nothing to substitute in a
         // unit test).
         #[cfg(not(test))]
-        let tun_identity = dispatcher
+        let tun_identity = session
+            .dispatcher
             .as_ref()
             .expect("dispatcher is always Some on the production (#[cfg(not(test))]) path")
             .identity()
@@ -1811,27 +1868,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // operand of the route-install fatality rule: the IPv6 route adds are
         // non-fatal when the upstream has no IPv6 OR the TUN interface has no
         // IPv6 half.
-        let tun_ipv6 = dispatcher.as_ref().and_then(|d| d.ipv6_assigned());
+        let tun_ipv6 = session.dispatcher.as_ref().and_then(|d| d.ipv6_assigned());
 
         // Phase 6: cancel checkpoint before routing.install (sync; mid-
         // call preemption isn't structurally possible — netsh/route
         // shell-outs are uninterruptible from our process).
         if cancel.is_cancelled() {
-            if let Some(mut d) = dispatcher.take() {
-                d.shutdown().await;
-            }
             return Err(ProxyError::Cancelled);
         }
         // Install the routes — NOW traffic starts flowing to the TUN.
-        let routes = match routing.install(&tun_identity, server_ip, &gw_info) {
-            Ok(routes) => routes,
-            Err(e) => {
-                if let Some(mut d) = dispatcher.take() {
-                    d.shutdown().await;
-                }
-                return Err(e.into());
-            }
-        };
+        let routes = session
+            .routes
+            .insert(routing.install(&tun_identity, server_ip, &gw_info)?);
+        // The families `routes` itself confirmed landed; see `RoutesInstalled::routed_families`.
+        let routed = routes.routed_families();
         info!(
             ?tun_ipv6,
             ipv6_upstream = gw_info.ipv6_available,
@@ -1842,29 +1892,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // App-ID permit (`routing.install_lockdown` below) — see
         // `lockdown_app_ids`'s doc. The plugin's comes off the running chain, so
         // the permit names the file that ran.
-        let app_ids = lockdown_app_ids(plugin_chain.as_ref());
+        let app_ids = lockdown_app_ids(session.plugin_chain());
 
         // Standing lockdown cover (#527). Engaged only when intent is on; when
         // off this whole block is a no-op and the start is byte-identical to
         // today. Engaged AFTER routing.install (TUN exists => LUID resolvable)
         // and BEFORE Dns::apply, so the line is held the moment routes go live.
-        // FAIL-FATAL: an engage error under intent-on aborts the start; the
-        // locally-owned `routes` guard (declared above) Drops on the Err
-        // unwind, tearing down — the opposite of the transient cover's
-        // fail-open. Committed only on the Ok path (the field below).
-        let lockdown = if standing_cover_expected {
-            match install_standing_cover(routing, server_ip, &tun_identity, &app_ids) {
-                Ok(cover) => cover,
-                Err(e) => {
-                    if let Some(mut d) = dispatcher.take() {
-                        d.shutdown().await;
-                    }
-                    return Err(e);
-                }
-            }
-        } else {
-            None
-        };
+        // FAIL-FATAL: an engage error under intent-on aborts the start and the
+        // session's teardown releases the routes — the opposite of the transient
+        // cover's fail-open.
+        if standing_cover_expected {
+            session.hold_standing_cover(install_standing_cover(routing, server_ip, &tun_identity, &app_ids)?);
+        }
 
         // Phase 7: confine DNS egress to hole-tun and advertise the
         // configured resolver IPs on it, AFTER routes install so the OS
@@ -1882,54 +1921,24 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // ONLY thing standing between OS DNS and the LAN resolver — a
         // degraded-but-running session here would be a silent leak on a
         // session the UI reports as connected. `Cancelled` and every other
-        // `DnsError` unwind the locally-owned `lockdown` / `routes` guards.
-        let dns_applied = if forwarder.is_some() {
+        // `DnsError` fail the start and the session's teardown releases what it holds.
+        if forwarder.is_some() {
             let advertise_ips: Vec<IpAddr> = config.dns.servers.clone();
-            // Ground truth for D4's filter: exactly the families `routes`
-            // itself confirmed landed, read directly off the guard — no OS
-            // probe, no second measurement , decision D4; see `RoutesInstalled::routed_families`).
-            let routed = routes.routed_families();
-            match dns
+            session.dns = match dns
                 .apply(advertise_ips, routed, tun_identity, server_ip, cancel.clone())
                 .await
             {
                 Ok(a) => Some(a),
-                Err(DnsError::Cancelled) => {
-                    if let Some(mut d) = dispatcher.take() {
-                        d.shutdown().await;
-                    }
-                    return Err(ProxyError::Cancelled);
-                }
+                Err(DnsError::Cancelled) => return Err(ProxyError::Cancelled),
                 #[cfg(target_os = "windows")]
-                Err(DnsError::Confine(e)) => {
-                    if let Some(mut d) = dispatcher.take() {
-                        d.shutdown().await;
-                    }
-                    return Err(ProxyError::DnsConfinementFailed { source: Box::new(e) });
-                }
-                Err(DnsError::Io(e)) => {
-                    if let Some(mut d) = dispatcher.take() {
-                        d.shutdown().await;
-                    }
-                    return Err(ProxyError::Runtime(e));
-                }
-            }
-        } else {
-            None
-        };
+                Err(DnsError::Confine(e)) => return Err(ProxyError::DnsConfinementFailed { source: Box::new(e) }),
+                Err(DnsError::Io(e)) => return Err(ProxyError::Runtime(e)),
+            };
+        }
 
-        Ok(RunningState {
-            dns: dns_applied,
-            dispatcher,
-            plugin_chain,
-            routes: Some(routes),
-            lockdown,
-            proxy: running_proxy,
-            server_ip: Some(server_ip),
-            started_at: Instant::now(),
+        Ok(RunMeta {
             udp_proxy_available,
             ipv6_bypass_available: gw_info.ipv6_available,
-            traffic_window: None,
         })
     }
 
@@ -1986,74 +1995,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 self.death_reason = None;
                 Ok(())
             }
-            Posture::Session(mut state) => {
-                // Taken via a field access on `state`, not the destructuring
-                // pattern below, so this stays the ONE reader
-                // `no_bridge_source_derives_cover_state_from_a_session`'s
-                // guard matches — a pattern-destructuring read is invisible
-                // to that regex, and would leave it matching zero call
-                // sites instead of the sanctioned one.
-                let lockdown = state.lockdown.take();
-                let RunningState {
-                    dns,
-                    dispatcher,
-                    plugin_chain,
-                    proxy,
-                    routes,
-                    ..
-                } = *state;
-
-                // 0. Restore system DNS FIRST (while routes + SS are still live
-                // so any in-flight OS queries egress via the restored resolver).
-                // Async shutdown — defuses the `DebugDropBomb` in `SystemDnsApplied`
-                // before the field drops. Skipping the await would panic in debug
-                // builds (catching missed-shutdown bugs at first test run).
-                run_phase(&mut on_phase, StopPhase::RestoreDns, dns, |mut d| async move {
-                    d.shutdown().await
-                })
-                .await;
-
-                // 1. Shut down dispatcher (closes TUN, cancels all handlers).
-                let engine_exit = run_phase(&mut on_phase, StopPhase::StopEngine, dispatcher, |mut d| async move {
-                    d.shutdown().await
-                })
-                .await;
-                match engine_exit {
-                    Some(
-                        exit @ (crate::dispatcher::DriverExit::Drained | crate::dispatcher::DriverExit::AlreadyDrained),
-                    ) => debug!(?exit, "dispatcher driver exited"),
-                    Some(exit) => warn!(?exit, "dispatcher driver did not exit cleanly"),
-                    None => {}
-                }
-
-                // 2. Stop plugin chain: reap the tracked identities explicitly — only
-                // the reap removes records from the state file — then drop, which
-                // just cancels the chain's token and aborts its task. Drop must not touch
-                // the file: the abort cannot know whether teardown finished, so a
-                // clear there would forget still-live plugins.
-                run_phase(
-                    &mut on_phase,
-                    StopPhase::ReapPlugins,
-                    plugin_chain.as_ref(),
-                    |chain| async move { chain.kill_tracked() },
-                )
-                .await;
-                drop(plugin_chain);
-
-                // 3. Graceful proxy shutdown (stops SS SOCKS5).
-                on_phase(StopPhase::StopProxy);
-                let res = proxy.stop().await;
-
-                // 4. Routes tear down via RAII Drop.
-                run_phase(&mut on_phase, StopPhase::TearDownRoutes, routes, |routes| async move {
-                    drop(routes)
-                })
-                .await;
-
-                // 5. Standing lockdown cover: decided by `cover_step` against
-                // the target `event` just moved us to, not by `event` itself.
+            Posture::Session(state) => {
+                // The cover's fate is decided by `cover_step` against the target `event` just moved us to, not by
+                // `event` itself.
+                let torn = state.into_session().teardown(&mut on_phase).await;
                 on_phase(StopPhase::SettleCover);
-                self.settle_standing_cover(event, lockdown);
+                self.settle_standing_cover(event, torn.standing_cover);
+                let res = torn.proxy;
 
                 // Snapshot WFP + NDIS post-teardown. Emits warn when wintun-
                 // related references remain in either layer. Cheap and
@@ -2212,7 +2160,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             // Fast path: hot-swap filter rules without restart.
             let new_ruleset = crate::filter::rules::RuleSet::from_user_rules(&config.filters);
             if let Some(state) = self.posture.session() {
-                if let Some(ref dispatcher) = state.dispatcher {
+                if let Some(ref dispatcher) = state.session.dispatcher {
                     dispatcher.swap_rules(new_ruleset);
                 }
             }
@@ -2249,9 +2197,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// be made async too.
     pub fn check_health(&mut self) -> Option<SessionEvent> {
         let state = self.posture.session()?;
-        if !state.proxy.is_alive() {
+        if !state.session.proxy.is_alive() {
             error!("proxy task exited unexpectedly");
-        } else if state.plugin_chain.as_ref().is_some_and(|c| !c.is_alive()) {
+        } else if state.session.plugin_chain().is_some_and(|c| !c.is_alive()) {
             error!("plugin chain exited unexpectedly");
         } else {
             return None;

@@ -161,15 +161,16 @@ fn production_source_lines() -> Vec<(String, usize, String)> {
 /// Structural guard: the boot steps and the boot sequence itself are named
 /// outside their sanctioned files by no call, bare or qualified, and no `use`
 /// line, so an entry point cannot hand-write its own order.
-/// `reap_recorded_plugins` is also called by `PluginChain::kill_tracked`.
+/// `Session::teardown` runs the plugin reap too, through `reap_recorded_plugins_blocking`.
 /// Lexical: comment lines are skipped and a renamed path evades it.
 #[skuld::test]
 fn the_boot_steps_are_called_only_from_the_boot_sequence() {
     let entry_points = ["foreground.rs", "platform/macos.rs", "platform/windows.rs"];
-    let steps: [(&str, Vec<&str>); 5] = [
+    let steps: [(&str, Vec<&str>); 6] = [
         ("recover_and_record", vec!["boot.rs"]),
         ("reconcile_once", vec!["boot.rs"]),
-        ("reap_recorded_plugins", vec!["boot.rs", "proxy/plugin.rs"]),
+        ("reap_recorded_plugins", vec!["plugin_recovery.rs"]),
+        ("reap_recorded_plugins_blocking", vec!["boot.rs", "session.rs"]),
         ("recover_then_reconcile_with", vec!["boot.rs"]),
         (
             "recover_then_reconcile",

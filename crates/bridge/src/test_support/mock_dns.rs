@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::dns::system::{Dns, DnsApplied, DnsError, RoutedFamilies};
+use crate::test_support::EventLog;
 
 /// One recorded [`Dns::apply`] call. `targets` is named generically — not
 /// `apply_aliases` — because it carries the single `TunIdentity`'s alias
@@ -36,6 +37,8 @@ pub(crate) struct MockDnsState {
     /// `DnsError::Cancelled` / `DnsError::Io` failure without a real
     /// confinement or backend.
     fail_with: Mutex<Option<FailKind>>,
+    /// When `Some`, dropping a [`MockDnsApplied`] appends "dns" to this log.
+    drop_log: Mutex<Option<EventLog>>,
 }
 
 /// Which [`DnsError`] variant [`MockDns::apply`] should return, chosen by a
@@ -44,6 +47,7 @@ pub(crate) struct MockDnsState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailKind {
     Cancelled,
+    Io,
     #[cfg(target_os = "windows")]
     Confine,
 }
@@ -55,6 +59,11 @@ impl MockDnsState {
 
     pub(crate) fn shutdown_called(&self) -> bool {
         self.shutdown_called.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Record "dns" in `log` whenever an applied guard is dropped.
+    pub(crate) fn log_drops_to(&self, log: EventLog) {
+        *self.drop_log.lock().unwrap() = Some(log);
     }
 }
 
@@ -95,6 +104,7 @@ impl Dns for MockDns {
         if let Some(kind) = *self.state.fail_with.lock().unwrap() {
             return Err(match kind {
                 FailKind::Cancelled => DnsError::Cancelled,
+                FailKind::Io => DnsError::Io(std::io::Error::other("mock dns failure")),
                 #[cfg(target_os = "windows")]
                 FailKind::Confine => DnsError::Confine(tun_engine::dns_confine::DnsConfineError::EngineOpen(
                     std::io::Error::other("mock confine failure"),
@@ -125,5 +135,13 @@ impl DnsApplied for MockDnsApplied {
         self.state
             .shutdown_called
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for MockDnsApplied {
+    fn drop(&mut self) {
+        if let Some(log) = self.state.drop_log.lock().unwrap().as_ref() {
+            log.lock().unwrap().push("dns");
+        }
     }
 }

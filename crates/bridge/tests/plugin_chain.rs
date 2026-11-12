@@ -100,7 +100,6 @@ async fn the_merged_options_reach_the_child_and_its_output_reaches_the_ring() {
         "the merged options must reach the child verbatim; got: {echoed}"
     );
 
-    cancel.cancel();
     drop(chain);
 }
 
@@ -126,7 +125,6 @@ async fn the_chain_reports_the_file_it_was_spawned_from() {
 
     assert_eq!(chain.binary(), install.plugin.path());
 
-    cancel.cancel();
     drop(chain);
 }
 
@@ -153,7 +151,6 @@ async fn the_transports_are_the_ones_the_plugin_reports() {
 
     assert_eq!(chain.transports(), garter::Transports::TCP | garter::Transports::UDP);
 
-    cancel.cancel();
     drop(chain);
 }
 
@@ -191,7 +188,6 @@ async fn a_bind_conflict_is_retried_on_a_fresh_port() {
         "every attempt feeds the same ring; got: {lines:?}"
     );
 
-    cancel.cancel();
     drop(chain);
 }
 

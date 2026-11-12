@@ -30,10 +30,12 @@ use tun_engine::{RoutingError, TunIdentity};
 /// and the `MockRunning` handles it issues. Each test constructs one and
 /// clones `Arc` fields out before handing the mock to `ProxyManager::new`.
 #[derive(Default)]
-struct MockProxyState {
+pub(crate) struct MockProxyState {
     start_calls: AtomicU32,
     /// Completed `RunningProxy::stop` calls.
-    stop_calls: AtomicU32,
+    pub(crate) stop_calls: AtomicU32,
+    /// `RunningProxy::stop` counts the call and then reports an error.
+    pub(crate) fail_stop: AtomicBool,
     fail_start: AtomicBool,
     /// If true, `MockRunning::is_alive` returns false — used to simulate
     /// a crashed ss task for `check_health_detects_crashed_task`.
@@ -48,6 +50,8 @@ struct MockProxyState {
     /// shadowsocks `Server` creates.
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    /// When `Some`, dropping a [`MockRunning`] appends "proxy" to this log.
+    drop_log: std::sync::Mutex<Option<crate::test_support::EventLog>>,
 }
 
 pub(crate) struct MockProxy {
@@ -64,6 +68,13 @@ pub(crate) struct MockProxy {
     /// If Some, run on every `start` once it is past the gate — where
     /// production's plugin chain has already recorded its pid.
     start_hook: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl MockProxyState {
+    /// Record "proxy" in `log` whenever a running handle is dropped.
+    pub(crate) fn log_drops_to(&self, log: crate::test_support::EventLog) {
+        *self.drop_log.lock().unwrap() = Some(log);
+    }
 }
 
 impl MockProxy {
@@ -98,7 +109,7 @@ impl MockProxy {
         self
     }
 
-    fn state_handle(&self) -> Arc<MockProxyState> {
+    pub(crate) fn state_handle(&self) -> Arc<MockProxyState> {
         Arc::clone(&self.state)
     }
 }
@@ -157,6 +168,9 @@ impl RunningProxy for MockRunning {
             h.abort();
         }
         self.state.stop_calls.fetch_add(1, Ordering::SeqCst);
+        if self.state.fail_stop.load(Ordering::SeqCst) {
+            return Err(ProxyError::Runtime(io::Error::other("mock stop failure")));
+        }
         Ok(())
     }
 
@@ -170,6 +184,9 @@ impl RunningProxy for MockRunning {
 
 impl Drop for MockRunning {
     fn drop(&mut self) {
+        if let Some(log) = self.state.drop_log.lock().unwrap().as_ref() {
+            log.lock().unwrap().push("proxy");
+        }
         // Mirror `ShadowsocksRunning::drop` best-effort abort. Without this,
         // the 3600s sleeper leaks for the remainder of the test process.
         if let Some(h) = self.handle.take() {
@@ -185,7 +202,7 @@ type InstallHook = Box<dyn FnOnce() + Send>;
 
 pub(crate) struct MockRoutingState {
     install_calls: AtomicU32,
-    teardown_calls: AtomicU32,
+    pub(crate) teardown_calls: AtomicU32,
     fail_install: AtomicBool,
     fail_gateway: AtomicBool,
     pub(crate) cover_engage_calls: AtomicU32,
@@ -239,7 +256,7 @@ pub(crate) struct MockRoutingState {
     on_install: std::sync::Mutex<Option<(u32, InstallHook)>>,
     /// What happened, in order: an install's "engage begins" (the park hook) and "engage ends", a sweep's "release"
     /// (or "release failed"), a route teardown's "routes", and a standing guard's drop that deleted, "lockdown".
-    events: std::sync::Mutex<Vec<&'static str>>,
+    pub(crate) events: crate::test_support::EventLog,
     /// `install` excludes any [`RouteId`] in this set from the persisted
     /// `installed` list — simulates a route whose `add` failed (e.g. another
     /// VPN already holds that prefix), analogous to `fail_cover_for_resolvers`.
@@ -280,7 +297,7 @@ impl Default for MockRoutingState {
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
             cover_engage_attempts: AtomicU32::new(0),
             on_install: std::sync::Mutex::new(None),
-            events: std::sync::Mutex::new(Vec::new()),
+            events: Arc::default(),
             fail_routes_for: std::sync::Mutex::new(std::collections::HashSet::new()),
             last_teardown_installed: std::sync::Mutex::new(None),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
@@ -1201,6 +1218,396 @@ fn route_failure_rolls_back_proxy() {
         assert!(pm.last_error().is_some());
     });
 }
+#[skuld::test]
+fn route_failure_stops_the_proxy_it_started() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_install(dir.path().to_path_buf());
+        let routing_state = routing.state();
+
+        let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
+        pm.start(&test_config()).await.unwrap_err();
+
+        assert_eq!(
+            proxy_state.stop_calls.load(Ordering::SeqCst),
+            1,
+            "a start that fails after proxy.start must stop the proxy it started"
+        );
+        assert_eq!(routing_state.teardown_calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+// A failed start releases what it acquired ----------------------------------------------------------------------------
+
+/// What a failed start had acquired by the time it failed, and so what must have been released.
+struct Acquired {
+    proxy: bool,
+    routes: bool,
+    /// The order the routing mock saw the releases in.
+    events: &'static [&'static str],
+}
+
+/// The mock handles a failed-start row watches.
+struct Watched {
+    proxy: Arc<MockProxyState>,
+    routing: Arc<MockRoutingState>,
+    dns: Arc<crate::test_support::mock_dns::MockDnsState>,
+}
+
+type DnsManager = ProxyManager<MockProxy, MockRouting, crate::test_support::mock_dns::MockDns>;
+
+/// A manager over fresh mocks. `lockdown` seeds the kill-switch intent, so the start installs the standing cover.
+fn watched_manager(
+    proxy: MockProxy,
+    routing: MockRouting,
+    dns: crate::test_support::mock_dns::MockDns,
+    lockdown: bool,
+) -> (DnsManager, Watched) {
+    if lockdown {
+        lockdown_state::set_enabled(&routing.lock_covers(), true, None).unwrap();
+    }
+    let watched = Watched {
+        proxy: proxy.state_handle(),
+        routing: routing.state(),
+        dns: dns.state_handle(),
+    };
+    (ProxyManager::new_with_dns(proxy, routing, dns), watched)
+}
+
+/// What the start released must be exactly what it acquired, and a stop afterwards must find nothing left to stop.
+async fn assert_failed_start_released(label: &str, pm: &mut DnsManager, watched: &Watched, acquired: &Acquired) {
+    let proxy_stops = u32::from(acquired.proxy);
+    let route_teardowns = u32::from(acquired.routes);
+    assert_eq!(
+        pm.state(),
+        ProxyState::Stopped,
+        "{label}: a failed start leaves no session"
+    );
+    assert_eq!(
+        watched.proxy.stop_calls.load(Ordering::SeqCst),
+        proxy_stops,
+        "{label}: proxy.stop() runs once for a started proxy and never for one that was not"
+    );
+    assert_eq!(
+        watched.routing.teardown_calls.load(Ordering::SeqCst),
+        route_teardowns,
+        "{label}: routes are torn down iff they were installed"
+    );
+    assert!(
+        !watched.dns.shutdown_called(),
+        "{label}: DNS was never applied, so there is nothing to restore"
+    );
+    assert_eq!(
+        *watched.routing.events.lock().unwrap(),
+        acquired.events,
+        "{label}: release order"
+    );
+
+    pm.stop().await.unwrap();
+    assert_eq!(
+        watched.proxy.stop_calls.load(Ordering::SeqCst),
+        proxy_stops,
+        "{label}: stop after a failed start must not stop the proxy again"
+    );
+}
+
+/// `test_config` with the DNS forwarder on, pointed at `local_port`'s SOCKS5 listener.
+fn forwarder_config(local_port: u16) -> ProxyConfig {
+    let mut config = test_config();
+    config.local_port = local_port;
+    config.dns.enabled = true;
+    config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+    config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+    config
+}
+
+#[skuld::test]
+fn a_failed_start_stops_exactly_what_it_started() {
+    use crate::test_support::mock_dns::{FailKind, MockDns};
+    rt().block_on(async {
+        // The proxy itself fails: nothing was acquired.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut pm, watched) = watched_manager(
+                MockProxy::failing_start(),
+                MockRouting::new(dir.path().to_path_buf()),
+                MockDns::new(),
+                false,
+            );
+            pm.start(&test_config()).await.unwrap_err();
+            let acquired = Acquired {
+                proxy: false,
+                routes: false,
+                events: &[],
+            };
+            assert_failed_start_released("proxy start fails", &mut pm, &watched, &acquired).await;
+        }
+
+        // Cancelled while parked inside proxy.start: the start future is dropped before a handle exists.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let proxy = MockProxy::with_start_gate(gate.clone()).with_entered_signal(entered_tx);
+            let (mut pm, watched) =
+                watched_manager(proxy, MockRouting::new(dir.path().to_path_buf()), MockDns::new(), false);
+            let token = CancellationToken::new();
+            let config = test_config();
+            {
+                let start = pm.start_cancellable(&config, Coverage::Uncovered, token.clone());
+                tokio::pin!(start);
+                tokio::select! {
+                    _ = &mut start => panic!("start cannot finish while parked in proxy.start"),
+                    r = entered_rx => r.expect("MockProxy::start never entered"),
+                }
+                token.cancel();
+                assert!(matches!(start.await, Err(ProxyError::Cancelled)));
+            }
+            gate.notify_one();
+            let acquired = Acquired {
+                proxy: false,
+                routes: false,
+                events: &[],
+            };
+            assert_failed_start_released("cancel inside proxy.start", &mut pm, &watched, &acquired).await;
+        }
+
+        // The cancel lands right after the proxy came up.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let token = CancellationToken::new();
+            let hook_token = token.clone();
+            let proxy = MockProxy::new().with_start_hook(move || hook_token.cancel());
+            let (mut pm, watched) =
+                watched_manager(proxy, MockRouting::new(dir.path().to_path_buf()), MockDns::new(), false);
+            let err = pm
+                .start_cancellable(&test_config(), Coverage::Uncovered, token)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::Cancelled), "got {err:?}");
+            let acquired = Acquired {
+                proxy: true,
+                routes: false,
+                events: &[],
+            };
+            assert_failed_start_released("cancel after proxy.start", &mut pm, &watched, &acquired).await;
+        }
+
+        // The forwarder cannot be built: dns.enabled with no resolver to forward to.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut pm, watched) = watched_manager(
+                MockProxy::new(),
+                MockRouting::new(dir.path().to_path_buf()),
+                MockDns::new(),
+                false,
+            );
+            let mut config = test_config();
+            config.dns.enabled = true;
+            config.dns.servers = Vec::new();
+            pm.start(&config).await.unwrap_err();
+            let acquired = Acquired {
+                proxy: true,
+                routes: false,
+                events: &[],
+            };
+            assert_failed_start_released("forwarder build fails", &mut pm, &watched, &acquired).await;
+        }
+
+        // routing.install fails outright.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut pm, watched) = watched_manager(
+                MockProxy::new(),
+                MockRouting::failing_install(dir.path().to_path_buf()),
+                MockDns::new(),
+                false,
+            );
+            pm.start(&test_config()).await.unwrap_err();
+            let acquired = Acquired {
+                proxy: true,
+                routes: false,
+                events: &[],
+            };
+            assert_failed_start_released("routing.install fails", &mut pm, &watched, &acquired).await;
+        }
+
+        // routing.install lands only part of the fatal routes: the mock rolls back and never hands out a guard.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut pm, watched) = watched_manager(
+                MockProxy::new(),
+                MockRouting::failing_routes(dir.path().to_path_buf(), [RouteId::SplitV4Low]),
+                MockDns::new(),
+                false,
+            );
+            pm.start(&test_config()).await.unwrap_err();
+            let acquired = Acquired {
+                proxy: true,
+                routes: false,
+                events: &[],
+            };
+            assert_failed_start_released("partial routes", &mut pm, &watched, &acquired).await;
+        }
+
+        // The standing cover fails to engage after the routes went in.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut pm, watched) = watched_manager(
+                MockProxy::new(),
+                MockRouting::failing_lockdown(dir.path().to_path_buf()),
+                MockDns::new(),
+                true,
+            );
+            pm.start(&test_config()).await.unwrap_err();
+            let acquired = Acquired {
+                proxy: true,
+                routes: true,
+                events: &["routes"],
+            };
+            assert_failed_start_released("standing cover fails", &mut pm, &watched, &acquired).await;
+        }
+
+        // dns.apply is cancelled after the routes went in.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+                .await
+                .unwrap();
+            let (mut pm, watched) = watched_manager(
+                MockProxy::new(),
+                MockRouting::new(dir.path().to_path_buf()),
+                MockDns::new().fail_with(FailKind::Cancelled),
+                false,
+            );
+            let err = pm.start(&forwarder_config(upstream.port())).await.unwrap_err();
+            assert!(matches!(err, ProxyError::Cancelled), "got {err:?}");
+            let acquired = Acquired {
+                proxy: true,
+                routes: true,
+                events: &["routes"],
+            };
+            assert_failed_start_released("dns.apply cancelled", &mut pm, &watched, &acquired).await;
+        }
+
+        // dns.apply fails with an I/O error after the routes went in.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+                .await
+                .unwrap();
+            let (mut pm, watched) = watched_manager(
+                MockProxy::new(),
+                MockRouting::new(dir.path().to_path_buf()),
+                MockDns::new().fail_with(FailKind::Io),
+                false,
+            );
+            let err = pm.start(&forwarder_config(upstream.port())).await.unwrap_err();
+            assert!(matches!(err, ProxyError::Runtime(_)), "got {err:?}");
+            let acquired = Acquired {
+                proxy: true,
+                routes: true,
+                events: &["routes"],
+            };
+            assert_failed_start_released("dns.apply fails", &mut pm, &watched, &acquired).await;
+        }
+    });
+}
+
+#[skuld::test]
+fn a_failed_start_releases_routes_before_the_standing_cover() {
+    // Stop's order: the cover's persistent filters outlive the routes they cover.
+    rt().block_on(async {
+        use crate::test_support::mock_dns::{FailKind, MockDns};
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let (mut pm, watched) = watched_manager(
+            MockProxy::new(),
+            MockRouting::new(dir.path().to_path_buf()),
+            MockDns::new().fail_with(FailKind::Cancelled),
+            true,
+        );
+
+        pm.start(&forwarder_config(upstream.port())).await.unwrap_err();
+
+        assert_eq!(
+            *watched.routing.events.lock().unwrap(),
+            ["engage ends", "routes", "lockdown"],
+            "the cover engaged, then routes were released before the cover"
+        );
+    });
+}
+
+#[skuld::test]
+fn a_failed_start_reaps_recorded_plugins() {
+    // A plugin that cannot be spawned fails phase 1 before any chain handle exists; the records in the state
+    // directory must still be reaped, as a stop reaps them.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = crate::test_support::reap_child::EchoChild::spawn();
+        crate::plugin_state::append_record(dir.path(), child.record(), None).unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
+        let mut config = test_config();
+        config.server.plugin = Some("ex-ray".into());
+
+        pm.start(&config).await.unwrap_err();
+
+        assert!(
+            !child.echoes(),
+            "the recorded plugin must not answer after the failed start"
+        );
+        assert!(
+            !dir.path().join(crate::plugin_state::STATE_FILE_NAME).exists(),
+            "a reap that accounted for every record must clear the state file"
+        );
+    });
+}
+
+#[skuld::test]
+fn a_start_cancelled_at_its_pre_flight_check_reaps_recorded_plugins() {
+    // `start_cancellable` turns a token cancelled on entry away itself; one cancelled after that reaches
+    // `start_inner`'s own pre-flight check, which returns before any phase runs. The plugin the start was
+    // configured with may still have records to reap.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = crate::test_support::reap_child::EchoChild::spawn();
+        crate::plugin_state::append_record(dir.path(), child.record(), None).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut config = test_config();
+        config.server.plugin = Some("ex-ray".into());
+
+        let err = ProxyManager::<MockProxy, MockRouting, crate::test_support::mock_dns::MockDns>::start_inner(
+            &MockProxy::new(),
+            &MockRouting::new(dir.path().to_path_buf()),
+            &crate::test_support::mock_dns::MockDns::new(),
+            &config,
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
+            None,
+            false,
+            false,
+            Some(crate::proxy::BundledPlugin::for_test(
+                "ex-ray",
+                std::env::temp_dir().join("ex-ray"),
+            )),
+            cancel,
+        )
+        .await
+        .err()
+        .expect("a cancelled start fails");
+
+        assert!(matches!(err, ProxyError::Cancelled), "got {err:?}");
+        assert!(
+            !child.echoes(),
+            "the recorded plugin must not answer after the cancelled start"
+        );
+    });
+}
 
 #[skuld::test]
 fn check_health_detects_crashed_task() {
@@ -1779,9 +2186,9 @@ fn mock_install_failclosed_cover_records_the_resolver_argument() {
 //
 // `start_inner` engages the standing lockdown cover AFTER routing.install and
 // BEFORE Dns::apply, ONLY when `bridge-lockdown.json` intent is on. The Cover
-// is committed to RunningState only on the Ok path; `stop()` disengages it. A
+// is held by the session only on the Ok path; `stop()` disengages it. A
 // failed engage under intent-on is fail-FATAL: it aborts the start and the
-// locally-owned routes guard tears down (mirror of the forwarder-self-test gate).
+// session's teardown releases the routes (mirror of the forwarder-self-test gate).
 
 #[skuld::test]
 fn lockdown_off_does_not_engage_cover() {
@@ -1975,9 +2382,9 @@ fn an_unblock_waits_for_a_standing_install_in_flight_and_then_releases_it() {
 #[skuld::test]
 fn lockdown_engage_failure_tears_down_routes_only() {
     // Fail-FATAL engage: routes were installed (engage runs after install) then the
-    // `?` on install_lockdown unwinds the locally-owned `routes` guard. The lockdown
-    // cover is never constructed (the `?` fires before the `lockdown` binding
-    // completes), so the ordered recorder must show exactly one teardown — "routes" —
+    // `?` on install_lockdown fails the start, whose teardown releases the routes the
+    // session holds. The lockdown cover is never constructed (the `?` fires before it
+    // is handed to the session), so the ordered recorder must show exactly one teardown — "routes" —
     // and the cover disengage counter must stay at zero. (On a clean stop the order
     // is the reverse — routes then release — by design; see ProxyManager::stop.)
     rt().block_on(async {
@@ -2171,7 +2578,6 @@ fn lockdown_app_ids_permits_the_chains_binary_and_the_bridge_exe() {
         let chain = crate::proxy::plugin::PluginChain::for_test(
             crate::proxy::plugin_log::PluginLog::new(),
             CancellationToken::new(),
-            None,
             crate::proxy::BundledPlugin::for_test("v2ray-plugin", binary.clone()),
         );
 
@@ -3268,9 +3674,9 @@ fn full_start_fails_closed_when_doh_cannot_resolve() {
 //
 // `start_inner` runs `run_forwarder_self_test` synchronously BEFORE
 // installing TUN routes / applying system DNS. A failed gate returns
-// `Err(ProxyError::ForwarderSelfTestFailed)` and the locally-owned RAII
-// guards unwind without ever hijacking the user's system DNS into a
-// dead tunnel.
+// `Err(ProxyError::ForwarderSelfTestFailed)` and the failed start's teardown
+// releases what it acquired without ever hijacking the user's system DNS into
+// a dead tunnel.
 
 #[cfg(test)]
 mod self_test {
@@ -3369,7 +3775,6 @@ mod self_test {
         let plugin_chain = Some(crate::proxy::plugin::PluginChain::for_test(
             log,
             CancellationToken::new(),
-            None,
             crate::proxy::BundledPlugin::for_test("v2ray-plugin", std::env::temp_dir().join("ex-ray")),
         ));
 
@@ -6211,8 +6616,8 @@ mod self_test {
     // guard below, `no_bridge_source_derives_cover_state_from_a_session`
     // (replacing `cover_tests.rs`'s deleted
     // `the_standing_cover_field_has_exactly_one_reader`), catches a future
-    // second reader of `RunningState.lockdown` outside the one sanctioned
-    // site.
+    // second access of `Session.lockdown` inside session.rs (the compiler
+    // keeps every other file out).
 
     /// The mock's measured `cover_presence()` tracks a session's lifecycle —
     /// engaged after a lockdown-on start, cleared after `stop()` — and stays
@@ -6267,71 +6672,27 @@ mod self_test {
         });
     }
 
-    /// Replaces `cover_tests.rs`'s deleted
-    /// `the_standing_cover_field_has_exactly_one_reader`: `RunningState.lockdown`
-    /// must be read via `.lockdown` in exactly one non-test bridge source
-    /// location. A second reader would mean cover state is being
-    /// re-derived from a session somewhere instead of measured — the exact
-    /// defect this stage removes (bindreams/hole#825).
+    /// `Session.lockdown` is named with `.lockdown` exactly twice in session.rs: `hold_standing_cover` (only writer)
+    /// and `Session::teardown` (only reader); `commit`/`uncommit` move it by pattern. A further reader would
+    /// re-derive cover state from a session instead of measuring it.
     #[skuld::test]
     fn no_bridge_source_derives_cover_state_from_a_session() {
         let pattern = regex::Regex::new(r"\.lockdown\b").unwrap();
-        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session.rs");
+        let text = std::fs::read_to_string(path).expect("failed to read session.rs");
 
-        let mut matches: Vec<(String, usize, String)> = Vec::new();
-        for entry in walkdir::WalkDir::new(&src_root) {
-            let entry = entry.expect("failed to walk crates/bridge/src");
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if file_name.ends_with("_tests.rs") {
-                continue;
-            }
-            if path.components().any(|c| c.as_os_str() == "test_support") {
-                continue;
-            }
-            let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
-            for (line_no, line) in text.lines().enumerate() {
-                if pattern.is_match(line) {
-                    matches.push((path.display().to_string(), line_no + 1, line.trim().to_string()));
-                }
-            }
-        }
+        let accesses: Vec<(usize, &str)> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| pattern.is_match(line))
+            .map(|(i, line)| (i + 1, line.trim()))
+            .collect();
 
-        let diagnostic = || {
-            let mut msg = format!(
-                "no_bridge_source_derives_cover_state_from_a_session: pattern `{}` must match \
-                 exactly once in non-test bridge sources (skipping *_tests.rs and \
-                 src/test_support/).\nMatches found ({}):\n",
-                pattern.as_str(),
-                matches.len()
-            );
-            for (file, line_no, line) in &matches {
-                msg.push_str(&format!("  {file}:{line_no}: {line}\n"));
-            }
-            msg.push_str(
-                "A failure here means one of two things: either a second, independent reader of \
-                 `RunningState.lockdown` was added somewhere (the real defect — the one sanctioned \
-                 reader is `check_health`'s teardown decision), or a comment/doc string in a walked \
-                 file now quotes the pattern, which is a false positive and should be reworded. This \
-                 regex only catches `.field` access — a pattern-destructuring read (`let RunningState \
-                 { lockdown, .. } = ...;`, as `stop_with` does) is invisible to it and would evade \
-                 this guard entirely.",
-            );
-            msg
-        };
-
-        assert_eq!(matches.len(), 1, "{}", diagnostic());
-        let (file, _, _) = &matches[0];
-        assert!(
-            file.ends_with("proxy_manager.rs"),
-            "the one reader must be in proxy_manager.rs:\n{}",
-            diagnostic()
+        assert_eq!(
+            accesses.len(),
+            2,
+            "`.lockdown` is accessed by `hold_standing_cover` (the write) and `Session::teardown` (the one read) \
+             only; a pattern-destructuring read is invisible to this count. Found: {accesses:?}"
         );
     }
 

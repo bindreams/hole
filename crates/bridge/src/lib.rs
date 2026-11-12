@@ -32,6 +32,7 @@ pub mod service_ctrl;
 pub mod service_scm;
 pub mod service_start;
 pub mod service_stop;
+pub(crate) mod session;
 pub mod socket;
 pub mod target;
 
