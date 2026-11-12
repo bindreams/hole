@@ -894,3 +894,102 @@ async fn resolve_via_doh_e2e_through_real_forwarder() {
     .server_ip;
     assert_eq!(ip, IpAddr::V4(expected));
 }
+
+// BootstrapResolver arming --------------------------------------------------------------------------------------------
+
+/// The resolved address is armed by the time `resolve` returns it, so no later
+/// use of it can log it in the clear. A documentation address, never dialed.
+#[skuld::test]
+async fn bootstrap_resolver_arms_the_resolved_address_before_returning_it() {
+    const RESOLVED: &str = "198.51.100.23";
+    const HOST: &str = "resolver-arms.example";
+    let entry = hole_common::config::ServerEntry {
+        id: "5b7d0c1e-0000-0000-0000-000000000000".into(),
+        name: "arming".into(),
+        server: HOST.into(),
+        server_port: 8388,
+        method: "aes-256-gcm".into(),
+        password: "pw".into(),
+        plugin: None,
+        plugin_opts: None,
+        validation: None,
+    };
+    let resolver =
+        super::BootstrapResolver::with_querier(std::sync::Arc::new(crate::test_support::doh_stub::WiringStubQuerier {
+            host: HOST.into(),
+            ip: RESOLVED.parse().unwrap(),
+        }));
+    assert_eq!(
+        util::redact::redact_str(RESOLVED),
+        RESOLVED,
+        "the address must start unarmed"
+    );
+
+    let bootstrapped = resolver
+        .resolve(&entry, &cfg(vec!["1.1.1.1".parse().unwrap()], false))
+        .await
+        .expect("the stub resolves the host");
+
+    assert_eq!(bootstrapped.server_ip, RESOLVED.parse::<IpAddr>().unwrap());
+    assert_eq!(
+        util::redact::redact_str(RESOLVED),
+        hole_common::logging::redact_arm::token_for(&entry.id),
+        "the resolved address must be armed under the entry's token"
+    );
+}
+
+/// A held-cover retry resolves nothing, yet its cached address may have been
+/// armed under another entry's id (the reuse match is by host). `reuse` arms it
+/// under the retry's own entry and revalidates the pin against the retry's
+/// resolver set, so the one function every start passes through is the one
+/// that arms.
+#[skuld::test]
+fn bootstrap_resolver_reuse_arms_under_the_retrys_entry_and_revalidates_the_pin() {
+    const CACHED: &str = "198.51.100.24";
+    let entry = hole_common::config::ServerEntry {
+        id: "9e3a6d52-0000-0000-0000-000000000000".into(),
+        name: "reuse".into(),
+        server: "reuse.example".into(),
+        server_port: 8388,
+        method: "aes-256-gcm".into(),
+        password: "pw".into(),
+        plugin: None,
+        plugin_opts: None,
+        validation: None,
+    };
+    let dropped_resolver: IpAddr = "9.9.9.9".parse().unwrap();
+    let kept_resolver: IpAddr = "1.1.1.1".parse().unwrap();
+    let cached = |via| super::Bootstrapped {
+        server_ip: CACHED.parse().unwrap(),
+        via,
+    };
+    assert_eq!(
+        util::redact::redact_str(CACHED),
+        CACHED,
+        "the address must start unarmed"
+    );
+
+    let reused = super::BootstrapResolver::reuse(
+        &entry,
+        cached(PinSource::Answered(dropped_resolver)),
+        &cfg(vec![kept_resolver], false),
+    );
+
+    assert_eq!(reused.server_ip, CACHED.parse::<IpAddr>().unwrap());
+    assert_eq!(
+        reused.via,
+        PinSource::ResolverDeselected,
+        "a resolver the retry no longer configures must not stay the pin"
+    );
+    assert_eq!(
+        util::redact::redact_str(CACHED),
+        hole_common::logging::redact_arm::token_for(&entry.id),
+        "the reused address must be armed under the retry's entry"
+    );
+    let kept = super::BootstrapResolver::reuse(
+        &entry,
+        cached(PinSource::Answered(kept_resolver)),
+        &cfg(vec![kept_resolver], false),
+    );
+    assert_eq!(kept.via, PinSource::Answered(kept_resolver));
+}

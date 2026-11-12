@@ -2,9 +2,9 @@
 //!
 //! Reserve a cross-process port for the protocols its consumer will bind.
 //! Where the consumer is known at reservation time, name it —
-//! `hole_common::plugin::plugin_alloc_protocols` keys SS_LOCAL by binary
-//! (galoshes TCP+UDP, everything else TCP) and is correct because the bridge
-//! knows the binary. Where the reservation happens before the consumer is
+//! `hole_common::plugin::PluginDescriptor::alloc_protocols` sizes SS_LOCAL per
+//! plugin (galoshes TCP+UDP, everything else TCP) and is correct because the
+//! bridge knows the plugin. Where the reservation happens before the consumer is
 //! known, reserve the union over the possible consumers: over-reserving
 //! costs a retry, under-reserving costs a race.
 //!

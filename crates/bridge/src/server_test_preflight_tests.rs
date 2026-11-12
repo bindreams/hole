@@ -7,59 +7,41 @@
 //! skip run on Windows too.
 
 use super::{preflight, server_endpoint_is_udp};
-use hole_common::config::ServerEntry;
 use hole_common::protocol::ServerTestOutcome;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// A `ServerEntry` with only `plugin` / `plugin_opts` set to the values under
-/// test; every other field is an irrelevant placeholder.
-fn entry(plugin: Option<&str>, plugin_opts: Option<&str>) -> ServerEntry {
-    ServerEntry {
-        plugin: plugin.map(Into::into),
-        plugin_opts: plugin_opts.map(Into::into),
-        ..ServerEntry::default_placeholder()
-    }
+/// [`server_endpoint_is_udp`] for a server with (`has_plugin`) or without a plugin, and its options.
+fn is_udp(has_plugin: bool, plugin_opts: Option<&str>) -> bool {
+    server_endpoint_is_udp(has_plugin, plugin_opts, "placeholder.example")
 }
 
 #[skuld::test]
 fn quic_endpoint_is_udp() {
     // Direct v2ray-plugin/ex-ray QUIC server.
-    assert!(server_endpoint_is_udp(&entry(
-        Some("v2ray-plugin"),
-        Some("host=cloudfront.com;mode=quic;cert=/x;key=/y"),
-    )));
+    assert!(is_udp(true, Some("host=cloudfront.com;mode=quic;cert=/x;key=/y")));
     // galoshes passes `mode=quic` through to its embedded ex-ray.
-    assert!(server_endpoint_is_udp(&entry(
-        Some("galoshes"),
-        Some("server;mode=quic;host=cdn"),
-    )));
+    assert!(is_udp(true, Some("server;mode=quic;host=cdn")));
 }
 
 #[skuld::test]
 fn non_quic_endpoint_is_tcp() {
     // websocket (the default transport) is TCP.
-    assert!(!server_endpoint_is_udp(&entry(
-        Some("v2ray-plugin"),
-        Some("host=cloudfront.com;path=/"),
-    )));
+    assert!(!is_udp(true, Some("host=cloudfront.com;path=/")));
     // Plugin configured but no options at all.
-    assert!(!server_endpoint_is_udp(&entry(Some("v2ray-plugin"), None)));
+    assert!(!is_udp(true, None));
     // No plugin → plain shadowsocks, always TCP-fronted.
-    assert!(!server_endpoint_is_udp(&entry(None, None)));
+    assert!(!is_udp(false, None));
     // Options mention quic but no plugin is configured: the gate requires a
     // plugin (a plain SS server never speaks quic).
-    assert!(!server_endpoint_is_udp(&entry(None, Some("mode=quic"))));
+    assert!(!is_udp(false, Some("mode=quic")));
     // A key that merely contains "mode" must not match (exact-key parse).
-    assert!(!server_endpoint_is_udp(&entry(
-        Some("v2ray-plugin"),
-        Some("servermode=quic"),
-    )));
+    assert!(!is_udp(true, Some("servermode=quic")));
 }
 
 #[skuld::test]
 fn malformed_options_endpoint_is_treated_as_udp() {
-    assert!(server_endpoint_is_udp(&entry(Some("galoshes"), Some(r"path=/a\"))));
+    assert!(is_udp(true, Some(r"path=/a\")));
 }
 
 // preflight ===========================================================================================================

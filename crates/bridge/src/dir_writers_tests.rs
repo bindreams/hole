@@ -1997,6 +1997,24 @@ const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
         "test support: removes the socket of a process the test started",
     ),
     (
+        "crates/bridge/src/test_support/plugin_install.rs",
+        "std::fs::copy",
+        1,
+        "test support: stages the install directory of a test",
+    ),
+    (
+        "crates/bridge/src/test_support/plugin_install.rs",
+        "std::fs::create_dir",
+        1,
+        "test support: stages the install directory of a test",
+    ),
+    (
+        "crates/bridge/src/test_support/plugin_install.rs",
+        "std::fs::write",
+        2,
+        "test support: stages the install directory of a test",
+    ),
+    (
         "crates/common/src/config.rs",
         "std::fs::create_dir_all",
         1,

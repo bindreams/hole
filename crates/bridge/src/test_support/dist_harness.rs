@@ -140,7 +140,7 @@ impl DistHarness {
         // macro's `ctor::declarative::ctor!` block), so it is already
         // active before any fallible work here.
 
-        let hole_exe = dist_bin_dir.join(if cfg!(windows) { "hole.exe" } else { "hole" });
+        let hole_exe = dist_bin_dir.join(format!("hole{}", std::env::consts::EXE_SUFFIX));
         if !hole_exe.is_file() {
             return Err(HarnessError(format!("hole binary missing from dist dir: {hole_exe:?}")));
         }

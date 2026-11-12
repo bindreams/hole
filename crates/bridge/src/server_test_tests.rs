@@ -13,6 +13,9 @@
 #![allow(clippy::disallowed_methods)]
 
 use super::{run_server_test, TestConfig};
+use crate::dns::bootstrap::BootstrapResolver;
+use crate::proxy::PluginResolveError;
+use crate::test_support::plugin_install::{fake_install_with_unspawnable_ex_ray, install_with_built_ex_ray};
 use crate::test_support::port_alloc::wait_for_port;
 use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::PORT_ALLOC;
@@ -54,9 +57,9 @@ fn fast_test_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfi
         ss_connect_timeout: Duration::from_millis(800),
         sentinel_read_timeout: Duration::from_millis(800),
         sentinels: [sentinel_a.to_string(), sentinel_b.to_string()],
-        plugin_path_override: None,
+        plugin_lookup: Default::default(),
         dns: hole_common::config::DnsConfig::default(),
-        bootstrap_querier: None,
+        bootstrap: Default::default(),
     }
 }
 
@@ -101,13 +104,13 @@ fn preflight_only_config() -> TestConfig {
         ss_connect_timeout: Duration::from_millis(500),
         sentinel_read_timeout: Duration::from_millis(500),
         sentinels: [bogus.to_string(), bogus.to_string()],
-        plugin_path_override: None,
+        plugin_lookup: Default::default(),
         dns: hole_common::config::DnsConfig {
             servers: Vec::new(),
             allow_insecure_bootstrap: true,
             ..hole_common::config::DnsConfig::default()
         },
-        bootstrap_querier: None,
+        bootstrap: Default::default(),
     }
 }
 
@@ -311,12 +314,11 @@ fn run_test_returns_server_cannot_reach_internet_when_sentinels_close_empty() {
     });
 }
 
-/// Test 9: plugin start failure for a non-existent plugin binary.
+/// Test 9: a plugin Hole does not ship is refused, not looked up.
 ///
 /// The runner asks for a plugin called `plugin-that-does-not-exist`, which
-/// is not on PATH and not next to any plugin directory. `Plugin::start`
-/// returns Err immediately, surfaced as
-/// [`ServerTestOutcome::PluginStartFailed`].
+/// Hole does not bundle. Resolution refuses it before any spawn, surfaced as
+/// [`ServerTestOutcome::PluginStartFailed`] naming the bundled plugins.
 #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn run_test_returns_plugin_start_failed_for_bad_plugin_path() {
     rt().block_on(async {
@@ -336,7 +338,10 @@ fn run_test_returns_plugin_start_failed_for_bad_plugin_path() {
         let outcome = run_server_test(&entry, &cfg).await;
         match outcome {
             ServerTestOutcome::PluginStartFailed { detail } => {
-                assert!(!detail.is_empty(), "detail should describe the failure");
+                assert!(
+                    detail.contains("plugin-that-does-not-exist") && detail.contains("Bundled plugins:"),
+                    "detail should name the plugin and list the bundled ones: {detail}"
+                );
             }
             other => panic!("expected PluginStartFailed, got {other:?}"),
         }
@@ -424,8 +429,12 @@ fn run_test_with_v2ray_plugin_happy_path() {
 
         // Generous plugin window for cold start. fast_test_config's 800 ms
         // SS/sentinel timeouts are too short for the WS handshake.
+        let dir = tempfile::tempdir().unwrap();
         let cfg = TestConfig {
-            plugin_path_override: Some(plugin_path.to_str().unwrap().to_string()),
+            plugin_lookup: crate::proxy::config::PluginLookup::beside(install_with_built_ex_ray(
+                dir.path(),
+                &plugin_path,
+            )),
             // Generous SS connect/sentinel timeouts because the WS handshake
             // adds latency on top of the raw TCP connect.
             ss_connect_timeout: Duration::from_secs(5),
@@ -481,13 +490,22 @@ fn maybe_start_plugin_preserves_eih_identity_keys() {
 
         let (sentinel_a, _sa) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
         let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+        let dir = tempfile::tempdir().unwrap();
         let cfg = TestConfig {
-            plugin_path_override: Some(plugin_path.to_str().unwrap().to_string()),
+            plugin_lookup: crate::proxy::config::PluginLookup::beside(install_with_built_ex_ray(
+                dir.path(),
+                &plugin_path,
+            )),
             ..fast_test_config(sentinel_a, sentinel_b)
         };
+        let plugin = cfg
+            .plugin_lookup
+            .resolve("v2ray-plugin")
+            .expect("the built ex-ray resolves");
 
         let _chain = super::maybe_start_plugin(
-            &entry,
+            Some(&plugin),
+            entry.plugin_opts.as_deref(),
             &mut svr_cfg,
             "127.0.0.1",
             &cfg,
@@ -532,7 +550,6 @@ fn preflight_path_uses_doh_resolved_ip() {
     use crate::dns::bootstrap::DohQuerier;
     use hole_common::config::{DnsConfig, DnsProtocol};
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Arc;
 
     // Resolves any A query to loopback so preflight connects to the live
     // listener; the stub keys on hostname (the production resolver prefers A).
@@ -570,14 +587,14 @@ fn preflight_path_uses_doh_resolved_ip() {
             ss_connect_timeout: Duration::from_millis(500),
             sentinel_read_timeout: Duration::from_millis(500),
             sentinels: [bogus.to_string(), bogus.to_string()],
-            plugin_path_override: None,
+            plugin_lookup: Default::default(),
             dns: DnsConfig {
                 enabled: true,
                 servers: vec!["1.1.1.1".parse().unwrap()],
                 protocol: DnsProtocol::Https,
                 allow_insecure_bootstrap: false,
             },
-            bootstrap_querier: Some(Arc::new(LoopbackQuerier)),
+            bootstrap: BootstrapResolver::with_querier(std::sync::Arc::new(LoopbackQuerier)),
         };
 
         let outcome = run_server_test(&entry, &cfg).await;
@@ -649,7 +666,7 @@ fn run_test_reclassify_handshake_failed_reset_is_network_blocked() {
             &addr.ip().to_string(),
             addr.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some("tls;host=h"),
             &CancellationToken::new(),
         )
@@ -673,7 +690,6 @@ fn bare_ss_tunnel_uses_doh_resolved_ip() {
     use crate::dns::bootstrap::DohQuerier;
     use hole_common::config::{DnsConfig, DnsProtocol};
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Arc;
 
     // Resolves the A query to the fixture's loopback IP (the production resolver
     // prefers A, so answering only A is sufficient).
@@ -714,7 +730,7 @@ fn bare_ss_tunnel_uses_doh_resolved_ip() {
                 protocol: DnsProtocol::Https,
                 allow_insecure_bootstrap: false,
             },
-            bootstrap_querier: Some(Arc::new(FixtureQuerier)),
+            bootstrap: BootstrapResolver::with_querier(std::sync::Arc::new(FixtureQuerier)),
             ..fast_test_config(sentinel_a, sentinel_b)
         };
 
@@ -758,7 +774,7 @@ fn run_test_fails_closed_when_doh_cannot_resolve() {
                 protocol: DnsProtocol::Https,
                 allow_insecure_bootstrap: false,
             },
-            bootstrap_querier: Some(std::sync::Arc::new(UnreachableQuerier)),
+            bootstrap: BootstrapResolver::with_querier(std::sync::Arc::new(UnreachableQuerier)),
             ..fast_test_config(bogus, bogus)
         };
 
@@ -781,7 +797,7 @@ fn run_test_reclassify_handshake_failed_answered_stays_handshake_failed() {
             &addr.ip().to_string(),
             addr.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some("tls;host=h"),
             &CancellationToken::new(),
         )
@@ -830,7 +846,7 @@ fn ipv6_doh_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfig
             protocol: DnsProtocol::Https,
             allow_insecure_bootstrap: false,
         },
-        bootstrap_querier: Some(std::sync::Arc::new(Ipv6LoopbackQuerier)),
+        bootstrap: BootstrapResolver::with_querier(std::sync::Arc::new(Ipv6LoopbackQuerier)),
         ..fast_test_config(sentinel_a, sentinel_b)
     }
 }
@@ -874,7 +890,7 @@ fn run_test_reclassify_cannot_reach_reset_is_network_blocked() {
             &addr.ip().to_string(),
             addr.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some("tls;host=h"),
             &CancellationToken::new(),
         )
@@ -887,9 +903,10 @@ fn run_test_reclassify_cannot_reach_reset_is_network_blocked() {
 }
 
 /// The plugin path runs the same IPv6 preflight before spawning the plugin. A
-/// live `[::1]:port` listener makes preflight pass; a bogus plugin name then
-/// fails at spawn → `PluginStartFailed`. Reaching plugin-start proves preflight
-/// connected to the raw IPv6 IP rather than failing `DnsFailed` on the bracket.
+/// live `[::1]:port` listener makes preflight pass; the plugin (a bundled one
+/// whose staged binary cannot run) then fails to start → `PluginStartFailed`. Reaching
+/// plugin-start proves preflight connected to the raw IPv6 IP rather than failing
+/// `DnsFailed` on the bracket.
 #[skuld::test]
 fn plugin_preflight_uses_raw_ipv6_not_bracketed_host() {
     use tokio::net::TcpListener;
@@ -897,19 +914,124 @@ fn plugin_preflight_uses_raw_ipv6_not_bracketed_host() {
         let listener = TcpListener::bind("[::1]:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let dir = tempfile::tempdir().unwrap();
 
         let mut entry = entry("v6.example", port, TEST_METHOD_STR, TEST_PASSWORD);
-        entry.plugin = Some("plugin-that-does-not-exist".into());
-        let cfg = ipv6_doh_config(bogus, bogus);
+        entry.plugin = Some("v2ray-plugin".into());
+        let cfg = TestConfig {
+            plugin_lookup: crate::proxy::config::PluginLookup::beside(fake_install_with_unspawnable_ex_ray(dir.path())),
+            ..ipv6_doh_config(bogus, bogus)
+        };
 
         let outcome = run_server_test(&entry, &cfg).await;
+        assert!(
+            matches!(outcome, ServerTestOutcome::PluginStartFailed { .. }),
+            "plugin preflight must pass on raw IPv6 then fail at plugin start, got {outcome:?}"
+        );
+    });
+}
+
+/// A plugin Hole does not ship is refused before anything is dialed: against a
+/// closed port, the preflight would have answered `TcpRefused`.
+#[skuld::test]
+fn an_unbundled_plugin_is_refused_before_the_preflight_dials() {
+    rt().block_on(async {
+        let mut entry = entry("127.0.0.1", 1, TEST_METHOD_STR, TEST_PASSWORD);
+        entry.plugin = Some("kcptun".into());
+
+        let outcome = run_server_test(&entry, &preflight_only_config()).await;
+
         match outcome {
-            ServerTestOutcome::PluginStartFailed { detail } => {
-                assert!(!detail.is_empty(), "detail should describe the failure");
-            }
-            other => panic!("plugin preflight must pass on raw IPv6 then fail at spawn, got {other:?}"),
+            ServerTestOutcome::PluginStartFailed { detail } => assert_eq!(
+                detail,
+                PluginResolveError::NotBundled { name: "kcptun".into() }.to_string()
+            ),
+            other => panic!("expected PluginStartFailed before any dial, got {other:?}"),
         }
     });
+}
+
+// A refused plugin start leaves a record in the bridge log ------------------------------------------------------------
+//
+// The privileged bridge's refusal (a damaged install, an unbundled name, bad
+// options) otherwise reaches only the GUI, so a bug report would carry no
+// bridge-side signal.
+
+/// Run `fut` under a WARN-capturing subscriber. Returns its output and
+/// everything logged.
+fn with_warn_log<T>(fut: impl std::future::Future<Output = T>) -> (T, String) {
+    use crate::test_support::log_capture::VecWriter;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    // Current-thread runtime: `set_default_in_current_thread` is thread-local.
+    let out = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+            fut.await
+        });
+    (out, writer.snapshot_string())
+}
+
+#[skuld::test]
+fn a_refused_plugin_resolution_is_logged() {
+    let mut entry = entry("127.0.0.1", 8388, TEST_METHOD_STR, TEST_PASSWORD);
+    entry.plugin = Some("kcptun".into());
+    let cfg = preflight_only_config();
+
+    let (outcome, log) = with_warn_log(run_server_test(&entry, &cfg));
+
+    let ServerTestOutcome::PluginStartFailed { detail } = outcome else {
+        panic!("expected PluginStartFailed, got {outcome:?}");
+    };
+    assert!(
+        log.contains(&detail),
+        "the refusal must reach the bridge log; got:\n{log}"
+    );
+}
+
+#[skuld::test]
+fn a_failed_plugin_chain_start_is_logged() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut entry = entry("127.0.0.1", 8388, TEST_METHOD_STR, TEST_PASSWORD);
+    entry.plugin = Some("v2ray-plugin".into());
+    // Options the SIP003 parser rejects: the chain refuses before spawning.
+    entry.plugin_opts = Some(r"path=/a\".into());
+    let cfg = TestConfig {
+        plugin_lookup: crate::proxy::config::PluginLookup::beside(fake_install_with_unspawnable_ex_ray(dir.path())),
+        ..preflight_only_config()
+    };
+    let plugin = cfg
+        .plugin_lookup
+        .resolve("v2ray-plugin")
+        .expect("the fake install resolves");
+    let mut svr_cfg = super::build_server_config(&entry, "127.0.0.1".parse().unwrap()).expect("a plain entry builds");
+
+    let (outcome, log) = with_warn_log(super::maybe_start_plugin(
+        Some(&plugin),
+        entry.plugin_opts.as_deref(),
+        &mut svr_cfg,
+        "127.0.0.1",
+        &cfg,
+        crate::dns::ech::PinSource::NoQueryNeeded,
+    ));
+
+    let Err(ServerTestOutcome::PluginStartFailed { detail }) = outcome else {
+        panic!("expected PluginStartFailed, got {outcome:?}");
+    };
+    assert!(
+        log.contains(&detail),
+        "the refusal must reach the bridge log; got:\n{log}"
+    );
 }
 
 /// A `Reachable` outcome is not one a block can masquerade as: the probe must
@@ -924,7 +1046,7 @@ fn run_test_reclassify_reachable_passes_through() {
             &addr.ip().to_string(),
             addr.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some("tls;host=h"),
             &CancellationToken::new(),
         )
@@ -946,7 +1068,7 @@ fn run_test_reclassify_plugin_start_failed_passes_through() {
             &addr.ip().to_string(),
             addr.port(),
             "<server:00000000>",
-            Some("galoshes"),
+            true,
             Some("tls;host=h"),
             &CancellationToken::new(),
         )

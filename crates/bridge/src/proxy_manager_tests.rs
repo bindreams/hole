@@ -6,6 +6,7 @@
 use super::*;
 use crate::proxy::{Proxy, ProxyError, RunningProxy, TrafficTotals};
 use crate::target::Target;
+use crate::test_support::plugin_install::{empty_install, fake_install_with_unspawnable_ex_ray};
 use crate::test_support::target_records;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
@@ -213,6 +214,8 @@ pub(crate) struct MockRoutingState {
     /// `tun.alias()` from the last `install_lockdown` call — see
     /// `last_install_tun_alias`.
     last_lockdown_tun_alias: std::sync::Mutex<Option<String>>,
+    /// The `app_ids` the last `install_lockdown` call was handed.
+    pub(crate) last_lockdown_app_ids: std::sync::Mutex<Option<Vec<PathBuf>>>,
     /// Last `server_ip` passed to `install_failclosed_cover`, so a test can assert
     /// the cover permits exactly the resolved server IP.
     last_cover_server_ip: std::sync::Mutex<Option<IpAddr>>,
@@ -271,6 +274,7 @@ impl Default for MockRoutingState {
             last_install_server_ip: std::sync::Mutex::new(None),
             last_install_tun_alias: std::sync::Mutex::new(None),
             last_lockdown_tun_alias: std::sync::Mutex::new(None),
+            last_lockdown_app_ids: std::sync::Mutex::new(None),
             last_cover_server_ip: std::sync::Mutex::new(None),
             last_cover_resolver_ip: std::sync::Mutex::new(None),
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -529,12 +533,13 @@ impl Routing for MockRouting {
         lock: &CoverLock,
         _server_ip: IpAddr,
         tun: &TunIdentity,
-        _app_ids: &[std::path::PathBuf],
+        app_ids: &[std::path::PathBuf],
     ) -> Result<MockCover, RoutingError> {
         self.state.run_on_install();
         if self.state.fail_lockdown.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock lockdown failure".into()));
         }
+        *self.state.last_lockdown_app_ids.lock().unwrap() = Some(app_ids.to_vec());
         *self.state.last_lockdown_tun_alias.lock().unwrap() = Some(tun.alias().to_owned());
         self.state.lockdown_engage_calls.fetch_add(1, Ordering::SeqCst);
         self.state.events.lock().unwrap().push("engage ends");
@@ -876,14 +881,21 @@ fn new_manager_with_routing(
 
 /// Build a manager over `routing` with the lockdown intent seeded to `enabled` in
 /// the routing's state directory, which is where `start_inner` reads
-/// `bridge-lockdown.json`. The caller keeps the `TempDir` alive.
+/// `bridge-lockdown.json`. The manager resolves bundled plugins in a fake
+/// install whose `ex-ray` resolves but cannot run (see
+/// [`fake_install_with_unspawnable_ex_ray`], whose exe feeds `set_bridge_exe_for_test`), so a start naming `ex-ray` engages
+/// any cover and then fails at the spawn, whatever this host has installed. The
+/// caller keeps the `TempDir` alive.
 fn new_manager_with_lockdown(
     proxy: MockProxy,
     routing: MockRouting,
     enabled: bool,
 ) -> ProxyManager<MockProxy, MockRouting> {
     lockdown_state::set_enabled(&routing.lock_covers(), enabled, None).unwrap();
-    ProxyManager::new(proxy, routing)
+    let install_exe = fake_install_with_unspawnable_ex_ray(routing.state_dir());
+    let mut pm = ProxyManager::new(proxy, routing);
+    pm.set_bridge_exe_for_test(install_exe);
+    pm
 }
 
 /// `new_manager_with_routing` variant that also substitutes `MockDns` for
@@ -1467,7 +1479,11 @@ fn controllable_chain() -> (
         let _ = done_tx.send(());
         Ok(())
     });
-    let chain = crate::proxy::plugin::PluginChain::over_task_for_test(handle, CancellationToken::new());
+    let chain = crate::proxy::plugin::PluginChain::over_task_for_test(
+        handle,
+        CancellationToken::new(),
+        crate::proxy::BundledPlugin::for_test("v2ray-plugin", std::env::temp_dir().join("ex-ray")),
+    );
     (chain, release_tx, done_rx)
 }
 
@@ -2144,52 +2160,59 @@ fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
 
 // lockdown_app_ids ====================================================================================================
 //
-// `resolve_plugin_path` deliberately falls back to the bare binary name when
-// it can't find the plugin next to the bridge exe, so shadowsocks can still
-// do a PATH lookup at spawn (see its own doc). `FwpmGetAppIdFromFileName0`
-// does no PATH search, so that bare name is not a resolvable path for it.
-
-/// A bare (no directory component) plugin name must be omitted from the
-/// App-ID list with a `warn!`, mirroring the `current_exe()`-failure
-/// handling — a narrowed permit set, never a fatal error, and never a bare
-/// name fed to the Win32 App-ID API.
-#[cfg(target_os = "windows")]
+/// The permit list holds the binary the chain was spawned from, then the bridge
+/// exe.
 #[skuld::test]
-fn lockdown_app_ids_skips_an_unresolvable_plugin_path() {
-    use crate::test_support::log_capture::VecWriter;
-    use tracing_subscriber::fmt;
-    use tracing_subscriber::layer::{Layer, SubscriberExt};
+fn lockdown_app_ids_permits_the_chains_binary_and_the_bridge_exe() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("ex-ray.exe");
 
-    let writer = VecWriter::new();
-    let subscriber = tracing_subscriber::registry().with(
-        fmt::layer()
-            .with_writer(writer.clone())
-            .with_ansi(false)
-            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
-    );
-    let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+    rt().block_on(async {
+        let chain = crate::proxy::plugin::PluginChain::for_test(
+            crate::proxy::plugin_log::PluginLog::new(),
+            CancellationToken::new(),
+            None,
+            crate::proxy::BundledPlugin::for_test("v2ray-plugin", binary.clone()),
+        );
 
-    let mut config = test_config();
-    // Not a known friendly plugin name and not a file that exists next to
-    // the test binary — `resolve_plugin_path` falls back to this bare
-    // string verbatim.
-    config.server.plugin = Some("definitely-not-a-real-plugin-binary".into());
+        let ids = lockdown_app_ids(Some(&chain));
 
-    let ids = lockdown_app_ids(&config);
+        assert_eq!(ids.first(), Some(&binary));
+        assert_eq!(ids.last(), std::env::current_exe().ok().as_ref());
+    });
+}
 
-    assert!(
-        ids.iter()
-            .all(|p| p.parent().is_some_and(|d| !d.as_os_str().is_empty())),
-        "no bare (unresolvable) path may reach the App-ID list: {ids:?}"
-    );
-    let output = writer.snapshot_string();
-    assert!(
-        output.contains("WARN") && output.contains("App-ID"),
-        "expected a WARN log naming the omitted App-ID permit; got:\n{output}"
-    );
+#[skuld::test]
+fn lockdown_app_ids_without_a_plugin_holds_only_the_bridge_exe() {
+    assert_eq!(lockdown_app_ids(None), vec![std::env::current_exe().unwrap()]);
 }
 
 // last_error coverage for early-failure paths =========================================================================
+
+/// A plugin Hole does not ship is refused with the typed error before the
+/// proxy is ever started; the user-visible `last_error` names the plugin and
+/// lists the bundled ones.
+#[skuld::test]
+fn unbundled_plugin_is_refused_before_anything_starts() {
+    rt().block_on(async {
+        let backend = MockProxy::new();
+        let state = backend.state_handle();
+        let (mut pm, _dir) = new_manager(backend);
+        let mut config = test_config();
+        config.server.plugin = Some("kcptun".into());
+
+        let err = pm.start(&config).await.unwrap_err();
+
+        assert!(
+            matches!(&err, ProxyError::PluginResolve(crate::proxy::config::PluginResolveError::NotBundled { name }) if name == "kcptun"),
+            "got: {err:?}"
+        );
+        assert_eq!(state.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        let last = pm.last_error().expect("refusal must set last_error");
+        assert!(last.contains("kcptun") && last.contains("Bundled plugins:"), "{last}");
+    });
+}
 
 #[skuld::test]
 fn build_config_failure_sets_last_error() {
@@ -2521,6 +2544,27 @@ fn start_cancellable_cancel_before_start_returns_immediately() {
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(pm.last_error().is_none());
         assert!(!state_path.exists());
+    });
+}
+
+/// A start cancelled before it begins reports the cancel, not the refusal of a
+/// plugin the pre-flight would otherwise have rejected.
+#[skuld::test]
+fn start_cancellable_cancel_before_start_beats_the_plugin_refusal() {
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockProxy::new());
+        let mut config = test_config();
+        config.server.plugin = Some("not-a-bundled-plugin".into());
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let err = pm
+            .start_cancellable(&config, Coverage::Uncovered, token)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ProxyError::Cancelled), "got {err:?}");
+        assert!(pm.last_error().is_none());
     });
 }
 
@@ -3055,36 +3099,7 @@ fn udp_unavailable_when_chain_reports_empty_transports() {
 use crate::dns::bootstrap::DohQuerier;
 use hole_common::protocol::TunnelMode;
 
-/// Stub querier resolving exactly one hostname to one IPv4, used to prove
-/// `start_inner` resolves via DoH (not the OS) and hands the result downstream.
-use crate::dns::forwarder::UpstreamCause;
-struct WiringStubQuerier {
-    host: String,
-    ip: IpAddr,
-}
-
-#[async_trait::async_trait]
-impl DohQuerier for WiringStubQuerier {
-    async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-        crate::dns::forwarder::answered_or_servfail(wire, || {
-            use hickory_proto::op::{Message, MessageType, OpCode, Query};
-            use hickory_proto::rr::rdata::A;
-            use hickory_proto::rr::{Name, RData, Record, RecordType};
-            // Only answer the A query (port-free: the stub keys on hostname).
-            let q = Message::from_vec(wire).ok()?;
-            let question = q.queries.first()?;
-            if question.query_type() != RecordType::A {
-                return None; // force the resolver onto the A path (IPv4-preferred).
-            }
-            let IpAddr::V4(v4) = self.ip else { return None };
-            let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
-            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
-            reply.add_query(Query::query(n.clone(), RecordType::A));
-            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
-            reply.to_vec().ok()
-        })
-    }
-}
+use crate::test_support::doh_stub::WiringStubQuerier;
 
 fn doh_config_with_server_host(host: &str, mode: TunnelMode) -> ProxyConfig {
     ProxyConfig {
@@ -3174,30 +3189,56 @@ fn bare_ss_dials_doh_resolved_ip_not_hostname() {
     });
 }
 
+/// A plugin that cannot run is refused before the DoH bootstrap: with a
+/// querier that fails every query, a start that resolved first would report
+/// `DohBootstrap`.
 #[skuld::test]
-fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
-    // SocksOnly returns early (no routing), but the plugin-chain handoff still
-    // needs the DoH-resolved IP. The plugin binary is nonexistent so the chain
-    // fails; we assert the FAILURE is the plugin spawn (resolve already ran and
-    // succeeded) — i.e. NOT a DohBootstrap error.
-    let expected: IpAddr = "203.0.113.7".parse().unwrap();
+fn a_plugin_that_cannot_run_is_refused_before_the_doh_bootstrap() {
     rt().block_on(async {
-        let (mut pm, _dir) = new_manager(MockProxy::new());
+        let (mut pm, dir) = new_manager(MockProxy::new());
+        pm.set_bootstrap_querier_for_test(Arc::new(UnreachableQuerier));
+        // An empty install: `ex-ray` is missing beside the bridge exe.
+        pm.set_bridge_exe_for_test(empty_install(dir.path()));
+        let mut config = doh_config_with_server_host("proxy.example", TunnelMode::SocksOnly);
+        config.server.plugin = Some("v2ray-plugin".into());
+
+        let err = pm.start(&config).await.unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                ProxyError::PluginResolve(crate::proxy::PluginResolveError::BinaryMissing { .. })
+            ),
+            "expected the plugin refusal before any DoH query, got {err:?}"
+        );
+        assert_eq!(pm.last_error(), Some(err.to_string().as_str()));
+    });
+}
+
+/// A covered start refused for its plugin engages no cover: nothing was resolved
+/// and nothing blocked, so the host is left as it was.
+#[skuld::test]
+fn a_covered_start_refused_for_its_plugin_engages_no_cover() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
         pm.set_bootstrap_querier_for_test(Arc::new(WiringStubQuerier {
             host: "proxy.example".into(),
-            ip: expected,
+            ip: "203.0.113.7".parse().unwrap(),
         }));
-        let mut config = doh_config_with_server_host("proxy.example", TunnelMode::SocksOnly);
-        config.server.plugin = Some("definitely-not-a-real-plugin-binary".into());
-        let err = pm.start(&config).await.unwrap_err();
-        assert!(
-            matches!(err, ProxyError::Plugin(_)),
-            "expected plugin-spawn failure AFTER a successful DoH resolve, got {err:?}"
-        );
-        assert!(
-            !matches!(err, ProxyError::DohBootstrap(_)),
-            "resolve must have succeeded via the stub querier, not failed: {err:?}"
-        );
+        let mut config = doh_config_with_server_host("proxy.example", TunnelMode::Full);
+        config.server.plugin = Some("kcptun".into());
+
+        let err = pm
+            .start_cancellable(&config, covered_now(&pm), CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ProxyError::PluginResolve(_)), "got {err:?}");
+        assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 0);
+        assert!(!pm.blocked_until_connected());
     });
 }
 
@@ -3329,6 +3370,7 @@ mod self_test {
             log,
             CancellationToken::new(),
             None,
+            crate::proxy::BundledPlugin::for_test("v2ray-plugin", std::env::temp_dir().join("ex-ray")),
         ));
 
         let writer = VecWriter::new();
@@ -4381,11 +4423,6 @@ mod self_test {
             cfg.server.server = "proxy.example".into();
             cfg.server.plugin = Some("ex-ray".into());
             cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-            // Forces the forwarder self-test gate, which MockProxy cannot satisfy —
-            // deterministic regardless of whether a real `ex-ray` happens to be on
-            // PATH on this host (resolve_plugin_path_inner falls back to a bare-name
-            // PATH lookup when no sibling binary exists).
-            cfg.dns.enabled = true;
             cfg.dns.servers = vec![failing_resolver, answering_resolver];
             let _ = pm
                 .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
@@ -4503,9 +4540,6 @@ mod self_test {
             cfg.server.server = "203.0.113.9".into();
             cfg.server.plugin = Some("ex-ray".into());
             cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-            // Forces the forwarder self-test gate — deterministic regardless of
-            // whether `ex-ray` happens to be resolvable via PATH on this host.
-            cfg.dns.enabled = true;
             cfg.dns.servers = vec![permitted_resolver];
             let _ = pm
                 .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
@@ -4535,9 +4569,6 @@ mod self_test {
             cfg.server.server = "localhost".into();
             cfg.server.plugin = Some("ex-ray".into());
             cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-            // Forces the forwarder self-test gate — deterministic regardless of
-            // whether `ex-ray` happens to be resolvable via PATH on this host.
-            cfg.dns.enabled = true;
             cfg.dns.allow_insecure_bootstrap = true;
             cfg.dns.servers = vec![permitted_resolver];
             let _ = pm
@@ -4593,6 +4624,54 @@ mod self_test {
                 *st.last_cover_resolver_ip.lock().unwrap(),
                 Some(answering_resolver),
                 "the recorded resolver permit is still the first attempt's — never re-derived on retry"
+            );
+        });
+    }
+
+    /// A covered retry that reuses the held cover's address resolves nothing, so
+    /// the address must still be armed under the retry's own entry token: the
+    /// entry may carry another id than the one the cover was engaged for.
+    #[skuld::test]
+    fn covered_retry_arms_the_reused_address_under_its_own_entry() {
+        rt().block_on(async {
+            let resolved: IpAddr = "198.51.100.131".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "reuse-arm.example".into(),
+                ip: resolved,
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
+            pm.set_bootstrap_querier_for_test(querier.clone());
+            let mut cfg = test_config();
+            cfg.server.server = "reuse-arm.example".into();
+            cfg.server.id = "11111111-0000-0000-0000-00000000aaaa".into();
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["1.0.0.1".parse().unwrap()];
+
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            let queries = querier.queries.load(Ordering::SeqCst);
+
+            // The same server under another entry: the held cover is reused, nothing is resolved.
+            cfg.server.id = "22222222-0000-0000-0000-00000000bbbb".into();
+            pm.start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                querier.queries.load(Ordering::SeqCst),
+                queries,
+                "the retry must not resolve"
+            );
+            assert_eq!(
+                util::redact::redact_str(&resolved.to_string()),
+                hole_common::logging::redact_arm::token_for(&cfg.server.id),
+                "the reused address must be armed under the retry's own entry"
             );
         });
     }
@@ -5605,6 +5684,8 @@ mod self_test {
                 let dir = tempfile::tempdir().unwrap();
                 let routing = MockRouting::new(dir.path().to_path_buf());
                 let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
+                // The manager's fake install resolves `ex-ray`; the spawn fails after
+                // `inject_plugin_directives`.
                 let mut cfg = test_config();
                 cfg.server.server = "203.0.113.9".into();
                 cfg.server.plugin = Some("ex-ray".into());
@@ -5663,9 +5744,6 @@ mod self_test {
                 cfg.server.server = "proxy.example".into();
                 cfg.server.plugin = Some("ex-ray".into());
                 cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-                // Forces the forwarder self-test gate — deterministic regardless of
-                // whether `ex-ray` happens to be resolvable via PATH on this host.
-                cfg.dns.enabled = true;
                 cfg.dns.servers = vec![answering_resolver];
                 let _ = pm
                     .start_cancellable(&cfg, covered_now(&pm), CancellationToken::new())
@@ -5804,12 +5882,8 @@ mod self_test {
         pm.set_bootstrap_querier_for_test(querier);
         let mut cfg = test_config();
         cfg.server.server = "proxy.example".into();
-        // Forces the forwarder self-test gate, which MockProxy cannot satisfy —
-        // deterministic regardless of whether `ex-ray` happens to be resolvable
-        // via PATH on this host, so the cover reliably stays held.
-        cfg.dns.enabled = true;
-        // A real ECH-family name: `ech_doh_will_reach_ex_ray`'s gate needs one
-        // for `ech_resolver_permit` to ever be `Some`.
+        // Only a plugin chain carries an ECH lookup, so `ech_resolver_permit` is
+        // `Some` only with a plugin configured.
         cfg.server.plugin = Some("ex-ray".into());
         cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
         // v6 first so the PIN and the IPv4-preferring fallback disagree — with a
@@ -5874,7 +5948,7 @@ mod self_test {
             let mut pm = new_manager_with_lockdown(MockProxy::new(), routing, false);
             let mut cfg = test_config();
             cfg.server.server = "203.0.113.9".into();
-            cfg.server.plugin = Some("hole-694-absent-plugin".into());
+            cfg.server.plugin = Some("ex-ray".into());
             cfg.dns.servers = vec!["2606:4700:4700::1111".parse().unwrap(), "1.0.0.1".parse().unwrap()];
             let _ = pm
                 .start_cancellable(&cfg, Coverage::Uncovered, CancellationToken::new())
@@ -5896,7 +5970,7 @@ mod self_test {
             let mut cfg = test_config();
             // Resolvable on every CI host without network.
             cfg.server.server = "localhost".into();
-            cfg.server.plugin = Some("hole-694-absent-plugin".into());
+            cfg.server.plugin = Some("ex-ray".into());
             cfg.dns.allow_insecure_bootstrap = true;
             cfg.dns.servers = vec!["2606:4700:4700::1111".parse().unwrap(), "1.0.0.1".parse().unwrap()];
             let _ = pm

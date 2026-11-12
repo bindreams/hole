@@ -69,11 +69,11 @@ fn normalize_ws_path(path: String) -> String {
 }
 
 pub(crate) fn classify_transport(
-    plugin: Option<&str>,
+    has_plugin: bool,
     plugin_opts: Option<&str>,
     server_host: &str,
 ) -> Result<ProbeTransport, garter::MalformedOptions> {
-    if plugin.is_none() {
+    if !has_plugin {
         return Ok(ProbeTransport::Raw);
     }
     // `split_plugin_options`, not `parse_plugin_options`: the latter maps a
@@ -119,7 +119,7 @@ pub async fn probe_server_reachability(
     host: &str,
     port: u16,
     token: &str,
-    plugin: Option<&str>,
+    has_plugin: bool,
     plugin_opts: Option<&str>,
     cancel: &CancellationToken,
 ) -> ReachabilityVerdict {
@@ -129,7 +129,7 @@ pub async fn probe_server_reachability(
     // preflight-skip decision, there is no safe default transport to probe
     // with here, so this best-effort diagnostic stays a graceful Result
     // (Inconclusive) rather than an assertion.
-    let transport = match classify_transport(plugin, plugin_opts, host) {
+    let transport = match classify_transport(has_plugin, plugin_opts, host) {
         Ok(t) => t,
         Err(e) => {
             debug!(

@@ -8,14 +8,20 @@ use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
 
 use super::{proxy_err_to_io_err, start_plugin_chain, ChainTask};
+use crate::proxy::config::BundledPlugin;
 use crate::proxy::ProxyError;
+
+/// An absolute path that exists nowhere: a fresh temp dir, never created files.
+fn absent_plugin() -> BundledPlugin {
+    let dir = tempfile::tempdir().unwrap();
+    BundledPlugin::for_test("v2ray-plugin", dir.path().join("absent-binary"))
+}
 
 #[skuld::test]
 async fn start_with_nonexistent_binary_returns_plugin_error() {
     let cancel = CancellationToken::new();
     let result = start_plugin_chain(
-        "v2ray-plugin",
-        "/nonexistent/binary",
+        &absent_plugin(),
         None,
         "127.0.0.1",
         12345,
@@ -31,6 +37,32 @@ async fn start_with_nonexistent_binary_returns_plugin_error() {
     assert!(
         matches!(err, ProxyError::Plugin(_)),
         "expected ProxyError::Plugin, got: {err:?}"
+    );
+}
+
+/// `bind_ephemeral` refuses an empty protocol set outright, so that refusal
+/// shows the chain sized the handoff port by the descriptor's `alloc_protocols`
+/// rather than by a constant of its own.
+#[skuld::test]
+async fn start_sizes_the_handoff_port_by_the_descriptors_protocols() {
+    static NO_PROTOCOLS: hole_common::plugin::PluginDescriptor = hole_common::plugin::PluginDescriptor {
+        name: "no-protocols",
+        binary_name: "no-protocols",
+        user_visible: false,
+        alloc_protocols: util::port_alloc::Protocols::empty(),
+        takes_hole_directives: false,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = BundledPlugin::for_test_descriptor(&NO_PROTOCOLS, dir.path().join("absent-binary"));
+    let cancel = CancellationToken::new();
+
+    let err = start_plugin_chain(&plugin, None, "127.0.0.1", 12345, None, None, false, &cancel, None)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&err, ProxyError::Plugin(m) if m.contains("non-empty Protocols set")),
+        "got: {err:?}"
     );
 }
 
@@ -154,6 +186,7 @@ mod identity {
             crate::proxy::plugin_log::PluginLog::new(),
             CancellationToken::new(),
             Some(dir.to_path_buf()),
+            crate::proxy::config::BundledPlugin::for_test("v2ray-plugin", std::env::temp_dir().join("ex-ray")),
         )
     }
 

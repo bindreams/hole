@@ -285,11 +285,10 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// the snapshot in [`Coverage::Covered`]: an Unblock since then means the user released the cover the start is
     /// about to engage.
     unblock_generation: Arc<std::sync::atomic::AtomicU64>,
-    /// Test-only DoH querier override. Set by `set_bootstrap_querier_for_test`;
-    /// when present, `start_cancellable` resolves via `resolve_via_doh_with`
-    /// instead of the production `resolve_via_doh`.
-    #[cfg(test)]
-    bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
+    /// How the server hostname resolves; a test can inject a DoH querier.
+    bootstrap: crate::dns::bootstrap::BootstrapResolver,
+    /// Where bundled plugins resolve; a test can stage an install directory.
+    plugin_lookup: crate::proxy::config::PluginLookup,
     /// The `ech-doh` URL the most recent start derived. Test-only: the
     /// derivation is otherwise observable only through the plugin it spawns.
     #[cfg(test)]
@@ -447,8 +446,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             ipv6_bypass_available: true,
             adopted_standing_cover: false,
             unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(test)]
-            bootstrap_querier: None,
+            bootstrap: Default::default(),
+            plugin_lookup: Default::default(),
             #[cfg(test)]
             last_ech_doh: None,
         }
@@ -459,7 +458,22 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// network).
     #[cfg(test)]
     pub fn set_bootstrap_querier_for_test(&mut self, q: std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>) {
-        self.bootstrap_querier = Some(q);
+        self.bootstrap = crate::dns::bootstrap::BootstrapResolver::with_querier(q);
+    }
+
+    /// Test seam: resolve bundled plugins next to `exe` instead of next to the
+    /// test binary.
+    #[cfg(test)]
+    pub fn set_bridge_exe_for_test(&mut self, exe: std::path::PathBuf) {
+        self.plugin_lookup = crate::proxy::config::PluginLookup::beside(exe);
+    }
+
+    /// The bundled plugin `name` names, or why it cannot run. Side-effect free.
+    fn resolve_configured_plugin(
+        &self,
+        name: &str,
+    ) -> Result<crate::proxy::BundledPlugin, crate::proxy::PluginResolveError> {
+        self.plugin_lookup.resolve(name)
     }
 
     /// Clone of the shared routing handle. `IpcState::new` derives
@@ -821,9 +835,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///
     /// Three race scenarios are handled correctly:
     ///
-    /// 1. **Cancel before `start_inner` starts.** The first phase's
-    ///    `cancel.is_cancelled()` check fires immediately and returns
-    ///    `Cancelled` without doing any work.
+    /// 1. **Cancel before the start begins.** The check ahead of the plugin
+    ///    pre-flight fires immediately and returns `Cancelled` without doing
+    ///    any work, whatever the pre-flight would have refused.
     /// 2. **Cancel mid-flight.** Each phase's cancel-aware wrapper
     ///    returns `Cancelled` cooperatively; locally-owned RAII guards
     ///    drop in reverse-declaration order as the function unwinds.
@@ -860,10 +874,34 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // reason regardless of this attempt's outcome.
         self.death_reason = None;
 
-        #[cfg(test)]
-        let bootstrap_querier = self.bootstrap_querier.clone();
-        #[cfg(not(test))]
-        let bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>> = None;
+        // A cancelled start reports the cancel, not whatever else it would have refused.
+        if cancel.is_cancelled() {
+            return Err(self.cancelled_start());
+        }
+
+        // A plugin Hole cannot run is refused before anything else happens: no
+        // DoH bootstrap, no cover engaged or released, no state touched beyond
+        // `last_error`.
+        let plugin = match config
+            .server
+            .plugin
+            .as_deref()
+            .map(|name| self.resolve_configured_plugin(name))
+            .transpose()
+        {
+            Ok(plugin) => plugin,
+            Err(e) => {
+                let e = ProxyError::from(e);
+                self.last_error = Some(e.to_string());
+                warn!(
+                    error = &e as &dyn std::error::Error,
+                    "start refused: the configured plugin cannot run"
+                );
+                return Err(e);
+            }
+        };
+
+        let bootstrap = self.bootstrap.clone();
 
         // A DIFFERENT server's hostname needs a FRESH DoH resolution — not
         // guaranteed to land on the resolver already baked into the held cover
@@ -878,14 +916,22 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
 
         // Resolve the server IP over private DoH. A same-server retry under the
-        // held cover reuses the cached IP and pin.
+        // held cover reuses the cached IP and pin, through the resolver so that
+        // address is armed the same way.
         let (server_ip, pin) = match self
             .posture
             .pending()
             .filter(|b| b.host == config.server.server.expose())
         {
-            Some(b) => (b.server_ip, crate::dns::ech::revalidate(b.pin, &config.dns.servers)),
-            None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
+            Some(b) => {
+                let cached = crate::dns::bootstrap::Bootstrapped {
+                    server_ip: b.server_ip,
+                    via: b.pin,
+                };
+                let b = crate::dns::bootstrap::BootstrapResolver::reuse(&config.server, cached, &config.dns);
+                (b.server_ip, b.via)
+            }
+            None => match Self::resolve_server_ip(config, &bootstrap, &cancel).await {
                 Ok(b) => (b.server_ip, b.via),
                 Err(ProxyError::Cancelled) => return Err(self.cancelled_start()),
                 Err(e) => {
@@ -903,61 +949,43 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             },
         };
 
-        // At the JOIN, not on `resolve_server_ip`'s success path: the
-        // held-cover reuse branch above takes `b.server_ip` and resolves
-        // nothing. Arming only the resolve path would be correct today
-        // solely because `BlockedStart` is in-memory and the registry is
-        // grow-only — an undocumented invariant one refactor from false.
-        hole_common::logging::redact_arm::arm_resolved_ip(&config.server.id, server_ip);
-
         // `ech_doh` (what ex-ray is TOLD to fetch) and `ech_resolver_permit`
-        // (what THIS ATTEMPT would permit it to reach) both read the same
-        // plugin-presence + pin inputs — computed ONCE here so the two cannot
-        // drift apart under a future edit to either gate. Only a plugin chain
-        // carries an ECH lookup, so a plugin-less start derives nothing.
-        let plugin_pin: Option<crate::dns::ech::PinSource> = config.server.plugin.is_some().then_some(pin);
-
-        // Every pin outcome reaches ex-ray as one URL, so the reason is named
-        // here or it is unrecoverable from the log. An "unpinned ECH lookup"
-        // line for a plugin-less start would name an exposure that does not
-        // exist, hence `plugin_pin` gating this too.
-        let ech_doh = plugin_pin.and_then(|p| {
-            let derived = crate::dns::ech::ech_doh_url(&config.dns, p);
-            debug!(ech_doh = ?derived, ?p, "ech-doh source");
-            if matches!(p, crate::dns::ech::PinSource::ResolverDeselected) {
-                warn!("covered retry: the cached DoH resolver is no longer configured; the ECH lookup is unpinned");
-            }
-            derived
-        });
+        // (what THIS ATTEMPT would permit it to reach) both read the one resolved
+        // plugin's descriptor, so the two cannot drift apart under a future edit
+        // to either gate. Every outcome of the pin reaches ex-ray as one URL, so
+        // `derive_ech_doh` names the reason in the log.
+        let ech_doh = crate::proxy::plugin::derive_ech_doh(plugin.as_ref().map(|p| p.descriptor()), &config.dns, pin);
         #[cfg(test)]
         {
             self.last_ech_doh = ech_doh.as_ref().map(|e| e.url.clone());
         }
 
         // `ech_doh` is Hole's CANDIDATE — what it would tell ex-ray, before
-        // `inject_plugin_directives` runs. That injection only rewrites
-        // `ech-doh` for the v2ray-family plugin names, and even then an
-        // operator's own `ech-doh` already in `plugin_opts` can win
+        // `inject_plugin_directives` runs. That injection rewrites `ech-doh`
+        // only for a plugin whose descriptor `takes_hole_directives`, and even
+        // then an operator's own `ech-doh` already in `plugin_opts` can win
         // first-wins over Hole's (see `effective_ech_doh`'s doc). The cover
         // must be gated on whether Hole's candidate is the EFFECTIVE value
         // ex-ray actually dials — not on `ech_doh.is_some()` alone — or a
-        // non-ECH-capable plugin, or an operator's own override, would widen
-        // the cover for a fetch that provably does not use it. The residual
-        // warning below also reads `effective_ech_doh` directly, to name an
-        // operator-won address the cover cannot permit either.
-        let effective_ech_doh = crate::proxy::plugin::effective_ech_doh(
-            config.server.plugin.as_deref().unwrap_or_default(),
-            config.server.plugin_opts.as_deref(),
-            ech_doh.as_ref(),
-        );
+        // plugin that takes no Hole directives, or an operator's own override,
+        // would widen the cover for a fetch that provably does not use it. The
+        // residual warning below also reads `effective_ech_doh` directly, to
+        // name an operator-won address the cover cannot permit either.
+        let effective_ech_doh = plugin
+            .as_ref()
+            .map_or(crate::proxy::plugin::EffectiveEchDoh::None, |p| {
+                crate::proxy::plugin::effective_ech_doh(
+                    p.descriptor(),
+                    config.server.plugin_opts.as_deref(),
+                    ech_doh.as_ref(),
+                )
+            });
         let ech_effective = matches!(effective_ech_doh, crate::proxy::plugin::EffectiveEchDoh::Holes);
 
         // `ech_doh.resolver`, read directly — not re-derived from `pin` — is
         // the exact address the ECH-config fetch will dial (see `EchDoh`'s
         // doc for why permitting it costs no new trust regardless of
-        // `PinSource`). Gated on `ech_effective`, not `ech_doh.is_some()`: a
-        // non-ECH-capable plugin or an operator's own override never widens
-        // the cover for a fetch that provably won't use Hole's address.
+        // `PinSource`). Gated on `ech_effective`, not `ech_doh.is_some()`.
         let ech_resolver_permit = ech_effective.then_some(ech_doh.as_ref()).flatten().map(|e| e.resolver);
         debug!(
             ?ech_resolver_permit,
@@ -1068,6 +1096,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             ech_doh,
             transient_pending,
             lockdown_on,
+            plugin,
             cancel,
         )
         .await;
@@ -1278,18 +1307,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// Host logged here, not in the error, so the PII-free toast omits it.
     async fn resolve_server_ip(
         config: &ProxyConfig,
-        bootstrap_querier: &Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
+        bootstrap: &crate::dns::bootstrap::BootstrapResolver,
         cancel: &CancellationToken,
     ) -> Result<crate::dns::bootstrap::Bootstrapped, ProxyError> {
         if cancel.is_cancelled() {
             return Err(ProxyError::Cancelled);
         }
-        let res = match bootstrap_querier {
-            Some(q) => {
-                crate::dns::bootstrap::resolve_via_doh_with(config.server.server.expose(), &config.dns, q.clone()).await
-            }
-            None => crate::dns::bootstrap::resolve_via_doh(config.server.server.expose(), &config.dns).await,
-        };
+        let res = bootstrap.resolve(&config.server, &config.dns).await;
         Ok(res.inspect_err(|e| {
             warn!(
                 server = %token_for(&config.server.id),
@@ -1382,6 +1406,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // (which also used it to decide whether to engage the transient cover),
         // so this start cannot answer the question two ways.
         standing_cover_expected: bool,
+        // The bundled plugin the caller resolved before any start work, if the
+        // config names one.
+        plugin: Option<crate::proxy::BundledPlugin>,
         cancel: CancellationToken,
     ) -> Result<RunningState<P, R, D>, ProxyError> {
         debug!("start_inner entered");
@@ -1399,11 +1426,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Phase 1: start plugin chain via Garter if a plugin is configured.
         // `start_plugin_chain` threads `cancel` through to its readiness
         // wait + bind_ephemeral retries.
-        let plugin_chain = if let Some(ref plugin_name) = config.server.plugin {
-            let plugin_path = crate::proxy::config::resolve_plugin_path(plugin_name);
+        let plugin_chain = if let Some(ref plugin) = plugin {
             let chain = crate::proxy::plugin::start_plugin_chain(
-                plugin_name,
-                &plugin_path,
+                plugin,
                 config.server.plugin_opts.as_deref(),
                 &server_host,
                 config.server.server_port,
@@ -1629,7 +1654,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 let host = server_ip.to_string();
                 let token = token_for(&config.server.id);
                 let port = config.server.server_port;
-                let plugin = config.server.plugin.clone();
+                let has_plugin = plugin.is_some();
                 let opts = config.server.plugin_opts.clone();
                 let pc = cancel.child_token();
                 // Hold a clone to wind the probe down cooperatively on the paths
@@ -1640,7 +1665,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                         &host,
                         port,
                         &token,
-                        plugin.as_deref(),
+                        has_plugin,
                         opts.as_deref(),
                         &pc,
                     )
@@ -1727,7 +1752,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             socks5_port,
             gw_info.interface_index,
             gw_info.ipv6_available,
-            config.server.plugin.clone(),
+            plugin.as_ref().map(|p| p.descriptor().name.to_string()),
             udp_proxy_available,
             ruleset,
             local_dns_endpoint,
@@ -1802,8 +1827,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // Process image paths for the standing lockdown cover's own
         // App-ID permit (`routing.install_lockdown` below) — see
-        // `lockdown_app_ids`'s doc.
-        let app_ids = lockdown_app_ids(config);
+        // `lockdown_app_ids`'s doc. The plugin's comes off the running chain, so
+        // the permit names the file that ran.
+        let app_ids = lockdown_app_ids(plugin_chain.as_ref());
 
         // Standing lockdown cover (#527). Engaged only when intent is on; when
         // off this whole block is a no-op and the start is byte-identical to
@@ -2312,50 +2338,28 @@ fn promote_adopted_claim(lock: &CoverLock, owner: Option<(u32, u32)>) {
     }
 }
 
-/// The process image paths the Windows lockdown cover permits by App-ID: the
-/// resolved plugin binary (if a plugin is configured) and the bridge's own exe.
-/// Empty on macOS (pf has no per-process matching). Path-keyed so the permit
-/// survives a cutover rename.
-fn lockdown_app_ids(config: &ProxyConfig) -> Vec<std::path::PathBuf> {
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = config;
-        Vec::new()
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let mut ids: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(ref plugin) = config.server.plugin {
-            let resolved = crate::proxy::config::resolve_plugin_path(plugin);
-            let path = std::path::PathBuf::from(&resolved);
-            // `resolve_plugin_path` deliberately falls back to the bare
-            // binary name when it can't find the plugin next to the bridge
-            // exe, so shadowsocks can still do a PATH lookup at spawn — but
-            // `FwpmGetAppIdFromFileName0` does no PATH search of its own and
-            // needs a real file path. A bare name (no directory component)
-            // narrows the permit set rather than breaking the cover; warn so
-            // a bug report carries the signal, same disposition as the
-            // `current_exe()` failure below.
-            if path.parent().is_some_and(|d| !d.as_os_str().is_empty()) {
-                ids.push(path);
+/// The process image paths the lockdown cover is asked to permit by App-ID: the
+/// binary the plugin chain was spawned from (if a plugin is configured), then
+/// the bridge's own exe. Built the same on every platform; only Windows acts on
+/// them (macOS pf has no per-process matching and `engage_lockdown` ignores
+/// them). Path-keyed so the permit survives a cutover rename.
+fn lockdown_app_ids(plugin: Option<&crate::proxy::plugin::PluginChain>) -> Vec<std::path::PathBuf> {
+    let mut ids: Vec<std::path::PathBuf> = plugin.map(|c| c.binary().to_path_buf()).into_iter().collect();
+    match std::env::current_exe() {
+        Ok(exe) => ids.push(exe),
+        // The bridge's own egress still rides the server-IP permit, so a
+        // missing exe path narrows but does not break the cover. Only Windows
+        // acts on App-IDs, so only there is the permit set actually smaller.
+        Err(e) => {
+            let error = &e as &dyn std::error::Error;
+            if cfg!(windows) {
+                warn!(error, "lockdown: current_exe() failed; bridge App-ID permit omitted");
             } else {
-                warn!(plugin = %resolved, "lockdown: plugin path did not resolve to a real file; App-ID permit omitted");
+                debug!(error, "lockdown: current_exe() failed; no bridge App-ID to name");
             }
         }
-        match std::env::current_exe() {
-            Ok(exe) => ids.push(exe),
-            // The bridge's own egress still rides the server-IP permit, so a
-            // missing exe path narrows but does not break the cover. Warn so a
-            // bug report carries the shrunken-permit-set signal.
-            Err(e) => {
-                warn!(
-                    error = &e as &dyn std::error::Error,
-                    "lockdown: current_exe() failed; bridge App-ID permit omitted"
-                )
-            }
-        }
-        ids
     }
+    ids
 }
 
 #[cfg(test)]
@@ -2365,6 +2369,10 @@ pub(crate) mod proxy_manager_tests;
 #[cfg(test)]
 #[path = "proxy_manager_release_tests.rs"]
 mod proxy_manager_release_tests;
+
+#[cfg(test)]
+#[path = "proxy_manager_lockdown_permit_tests.rs"]
+mod proxy_manager_lockdown_permit_tests;
 
 // E2E test platform policy:
 //

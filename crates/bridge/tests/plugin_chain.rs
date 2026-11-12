@@ -20,19 +20,50 @@ fn main() {
     skuld::run_all();
 }
 
+// `test_support` is private to the lib, so the integration target compiles the shared helpers itself.
+#[path = "../src/test_support/log_capture.rs"]
+mod log_capture;
+#[allow(dead_code)] // this target uses a subset of the staging helpers
+#[path = "../src/test_support/plugin_install.rs"]
+mod plugin_install;
+
 use std::path::PathBuf;
 
+use hole_bridge::proxy::config::{resolve_plugin_beside, BundledPlugin};
 use hole_bridge::proxy::plugin::start_plugin_chain;
 use tokio_util::sync::CancellationToken;
+
+/// An install dir holding a bridge exe and an `ex-ray` beside it, resolved the
+/// way production resolves a bundled plugin.
+struct Install {
+    _dir: tempfile::TempDir,
+    plugin: BundledPlugin,
+}
 
 /// Path to the `test_plugin` fixture bin. The runtime env var wins (nextest
 /// remaps it under `--archive-file`); the compile-time value covers plain
 /// `cargo test`. Never invoke cargo here — a concurrent build's uplift
 /// deletes+recreates `target/debug/<bin>`, racing this spawn.
-fn test_plugin_path() -> PathBuf {
+fn test_plugin_bin() -> PathBuf {
     std::env::var("CARGO_BIN_EXE_test_plugin")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_test_plugin").to_string())
         .into()
+}
+
+/// `ex_ray` writes the install's `ex-ray`: the stub's bytes, or something that
+/// cannot run.
+fn install_with(ex_ray: impl FnOnce(&std::path::Path)) -> Install {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let exe = plugin_install::install_with_ex_ray(dir.path(), ex_ray);
+    let plugin = resolve_plugin_beside("v2ray-plugin", Ok(exe)).expect("the install holds ex-ray");
+    Install { _dir: dir, plugin }
+}
+
+/// A working install: `ex-ray` is the stub plugin.
+fn installed_stub() -> Install {
+    install_with(|ex_ray| {
+        std::fs::copy(test_plugin_bin(), ex_ray).expect("copy the stub plugin");
+    })
 }
 
 /// Two properties in one spawn: the options Hole merges must arrive in the
@@ -41,10 +72,10 @@ fn test_plugin_path() -> PathBuf {
 /// ring.
 #[skuld::test]
 async fn the_merged_options_reach_the_child_and_its_output_reaches_the_ring() {
+    let install = installed_stub();
     let cancel = CancellationToken::new();
     let chain = start_plugin_chain(
-        "v2ray-plugin",
-        test_plugin_path().to_str().expect("utf-8 path"),
+        &install.plugin,
         Some("host=example.com;path=/foo"),
         "127.0.0.1",
         9,
@@ -71,6 +102,59 @@ async fn the_merged_options_reach_the_child_and_its_output_reaches_the_ring() {
     drop(chain);
 }
 
+/// The Windows lockdown permit is read off the chain, so the chain must report
+/// the file it ran, not the file it was configured with by name.
+#[skuld::test]
+async fn the_chain_reports_the_file_it_was_spawned_from() {
+    let install = installed_stub();
+    let cancel = CancellationToken::new();
+    let chain = start_plugin_chain(
+        &install.plugin,
+        Some("host=example.com"),
+        "127.0.0.1",
+        9,
+        None,
+        None,
+        false,
+        &cancel,
+        None,
+    )
+    .await
+    .expect("the stub plugin becomes ready");
+
+    assert_eq!(chain.binary(), install.plugin.path());
+
+    cancel.cancel();
+    drop(chain);
+}
+
+/// A shipped plugin's transports come from its sitrep `ready`, not from a TCP
+/// self-probe, which could only ever say TCP: the UDP-drop policy needs galoshes'
+/// `tcp,udp`.
+#[skuld::test]
+async fn the_transports_are_the_ones_the_plugin_reports() {
+    let install = installed_stub();
+    let cancel = CancellationToken::new();
+    let chain = start_plugin_chain(
+        &install.plugin,
+        Some("host=example.com;report-udp"),
+        "127.0.0.1",
+        9,
+        None,
+        None,
+        false,
+        &cancel,
+        None,
+    )
+    .await
+    .expect("the stub plugin becomes ready");
+
+    assert_eq!(chain.transports(), garter::Transports::TCP | garter::Transports::UDP);
+
+    cancel.cancel();
+    drop(chain);
+}
+
 /// A plugin that loses its local-port race must report `bind_conflict`, the one
 /// class `bind_ephemeral` retries on a fresh port. The stub injects the loss
 /// through its options string (there is no environment seam), so the first
@@ -81,10 +165,10 @@ async fn a_bind_conflict_is_retried_on_a_fresh_port() {
     let sentinel = dir.path().join("bind-once");
     let opts = format!("host=example.com;fail-bind-once={}", sentinel.display());
 
+    let install = installed_stub();
     let cancel = CancellationToken::new();
     let chain = start_plugin_chain(
-        "v2ray-plugin",
-        test_plugin_path().to_str().expect("utf-8 path"),
+        &install.plugin,
         Some(&opts),
         "127.0.0.1",
         9,
@@ -170,10 +254,10 @@ async fn a_cancel_of_the_start_after_the_chain_is_ready_leaves_the_chain_running
         listener.local_addr().expect("addr")
     );
 
+    let install = installed_stub();
     let start = CancellationToken::new();
     let chain = start_plugin_chain(
-        "v2ray-plugin",
-        test_plugin_path().to_str().expect("utf-8 path"),
+        &install.plugin,
         Some(&opts),
         "127.0.0.1",
         9,
@@ -217,13 +301,13 @@ async fn a_cancel_during_the_start_stops_the_plugin_it_spawned() {
         listener.local_addr().expect("addr")
     );
 
+    let install = installed_stub();
     let start = CancellationToken::new();
     let starting = tokio::spawn({
         let start = start.clone();
         async move {
             start_plugin_chain(
-                "v2ray-plugin",
-                test_plugin_path().to_str().expect("utf-8 path"),
+                &install.plugin,
                 Some(&opts),
                 "127.0.0.1",
                 9,
@@ -263,10 +347,9 @@ async fn dropping_the_start_future_stops_the_plugin_it_spawned() {
     );
 
     let start = CancellationToken::new();
-    let plugin_path = test_plugin_path();
+    let install = installed_stub();
     let mut starting = Box::pin(start_plugin_chain(
-        "v2ray-plugin",
-        plugin_path.to_str().expect("utf-8 path"),
+        &install.plugin,
         Some(&opts),
         "127.0.0.1",
         9,
@@ -302,10 +385,10 @@ async fn a_plugin_that_exits_after_ready_ends_the_chain_task() {
         listener.local_addr().expect("addr")
     );
 
+    let install = installed_stub();
     let start = CancellationToken::new();
     let chain = start_plugin_chain(
-        "v2ray-plugin",
-        test_plugin_path().to_str().expect("utf-8 path"),
+        &install.plugin,
         Some(&opts),
         "127.0.0.1",
         9,
@@ -327,34 +410,6 @@ async fn a_plugin_that_exits_after_ready_ends_the_chain_task() {
     }
 }
 
-/// Capturing `MakeWriter` — the bridge's own `test_support::log_capture` is a
-/// private module, unreachable from an integration target.
-#[derive(Clone, Default)]
-struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl CaptureWriter {
-    fn snapshot(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().expect("poisoned")).into_owned()
-    }
-}
-
-impl std::io::Write for CaptureWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("poisoned").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-    type Writer = Self;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 /// A chain that never becomes ready is where the plugin's own words matter
 /// most: `spawn_plugin_runner_at`'s "exited before becoming ready" and
 /// readiness-timeout arms carry no detail of their own, and the failed attempt's
@@ -364,7 +419,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
 async fn a_failed_chain_start_reports_the_plugin_ring() {
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
-    let writer = CaptureWriter::default();
+    let writer = log_capture::VecWriter::new();
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
             .with_writer(writer.clone())
@@ -372,12 +427,13 @@ async fn a_failed_chain_start_reports_the_plugin_ring() {
             .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
     );
 
+    // An `ex-ray` that cannot run: the spawn fails and the plugin says nothing.
+    let install = install_with(|ex_ray| std::fs::write(ex_ray, b"not a program").expect("write"));
     let cancel = CancellationToken::new();
     {
         let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
         let err = start_plugin_chain(
-            "v2ray-plugin",
-            "/nonexistent/plugin-binary",
+            &install.plugin,
             Some("host=example.com"),
             "127.0.0.1",
             9,
@@ -395,7 +451,7 @@ async fn a_failed_chain_start_reports_the_plugin_ring() {
     // The binary never ran, so the honest report is that it said nothing — the
     // branch proves the failure path consults the ring at all. What a plugin
     // that DID speak looks like is pinned by `plugin_log`'s own tests.
-    let output = writer.snapshot();
+    let output = writer.snapshot_string();
     assert!(
         output.contains(hole_bridge::proxy::plugin_log::NO_PLUGIN_OUTPUT),
         "a failed chain start must report the plugin ring; got:\n{output}"
@@ -412,7 +468,7 @@ async fn a_failed_chain_start_reports_the_plugin_ring() {
 async fn a_crash_on_stderr_reaches_the_ring_before_the_chain_reports_failure() {
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
-    let writer = CaptureWriter::default();
+    let writer = log_capture::VecWriter::new();
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
             .with_writer(writer.clone())
@@ -420,12 +476,12 @@ async fn a_crash_on_stderr_reaches_the_ring_before_the_chain_reports_failure() {
             .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
     );
 
+    let install = installed_stub();
     let cancel = CancellationToken::new();
     {
         let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
         let err = start_plugin_chain(
-            "v2ray-plugin",
-            test_plugin_path().to_str().expect("utf-8 path"),
+            &install.plugin,
             Some("host=example.com;fail-stderr-then-exit=fatal: injected crash on stderr"),
             "127.0.0.1",
             9,
@@ -440,7 +496,7 @@ async fn a_crash_on_stderr_reaches_the_ring_before_the_chain_reports_failure() {
         assert!(format!("{err}").contains("plugin"), "got: {err}");
     }
 
-    let output = writer.snapshot();
+    let output = writer.snapshot_string();
     // Assert on output ONLY `warn_recent` can produce: garter's ordinary
     // stderr relay (`tracing::warn!(plugin = ..., "{line}")`) ALSO logs the
     // raw line independent of the ring, so a bare substring match on the

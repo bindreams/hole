@@ -1689,7 +1689,7 @@ pub trait Routing: Send + Sync {
     /// exact attempt personally dialed the address (see `EchDoh`'s doc: that
     /// additionally holds for some `PinSource` variants but not all). `None`
     /// covers every case where nothing should be permitted: no plugin
-    /// configured, a non-ECH-capable plugin, malformed plugin options, or an
+    /// configured, a plugin that takes no Hole directives, malformed plugin options, or an
     /// OPERATOR's own `ech-doh` winning instead of Hole's (an address Hole
     /// did not author, so the config-authorship trust does not extend to it
     /// — a disclosed residual, see CONTRIBUTING.md). `None` is never

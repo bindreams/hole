@@ -16,8 +16,8 @@
 //! Consumers across the workspace route through `bind_ephemeral`:
 //!
 //! * `hole-bridge`'s `proxy::plugin::start_plugin_chain` — SIP003 plugin port
-//!   (TCP or TCP+UDP per the plugin binary's
-//!   `hole_common::plugin::plugin_alloc_protocols`).
+//!   (TCP or TCP+UDP per the plugin's
+//!   `hole_common::plugin::PluginDescriptor::alloc_protocols`).
 //! * `plugin-e2e`'s `ssserver::start_real_ss_server*` — in-process shadowsocks
 //!   server fixtures.
 //!
