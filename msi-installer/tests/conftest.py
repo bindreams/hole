@@ -78,11 +78,15 @@ def root(wxs_tree: ET.ElementTree) -> ET.Element:
     return wxs_tree.getroot()
 
 
-@pytest.fixture(scope="session")
-def package(root: ET.Element) -> ET.Element:
+def find_package(root: ET.Element) -> ET.Element:
     pkg = root.find("wix:Package", NS)
     assert pkg is not None, "<Package> element not found"
     return pkg
+
+
+@pytest.fixture(scope="session")
+def package(root: ET.Element) -> ET.Element:
+    return find_package(root)
 
 
 # WiX toolchain fixture ================================================================================================

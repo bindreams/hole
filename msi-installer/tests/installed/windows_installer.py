@@ -3,13 +3,15 @@
 `msi.dll` is loaded inside each call so that importing this module on a non-Windows host (pytest collection) works.
 """
 
+from __future__ import annotations
+
 import ctypes
 import xml.etree.ElementTree as ET
 from contextlib import ExitStack
 from ctypes import wintypes
 from pathlib import Path
 
-from conftest import NS, WXS_PATH
+from conftest import WXS_PATH, find_package
 
 _ERROR_NO_MORE_ITEMS = 259
 _GUID_BUFFER_CHARS = 39  # "{" + 36 + "}" + NUL
@@ -63,8 +65,7 @@ def related_product_codes(upgrade_code: str) -> list[str]:
 
 
 def hole_upgrade_code() -> str:
-    package = ET.parse(WXS_PATH).getroot().find("wix:Package", NS)
-    assert package is not None, "<Package> element not found"
+    package = find_package(ET.parse(WXS_PATH).getroot())
     return "{" + package.attrib["UpgradeCode"].upper() + "}"
 
 

@@ -24,6 +24,7 @@ from windows_installer import installed_hole_product_codes, msi_product_code
 SCRIPTS = REPO_ROOT / ".github" / "scripts"
 INVOKE_MSIEXEC = SCRIPTS / "invoke-msiexec-bounded.ps1"
 KILL_HOLE = SCRIPTS / "kill-hole-processes.ps1"
+IMAGE_PATH = SCRIPTS / "get-process-image-path.ps1"
 RUN_AT_MEDIUM = SCRIPTS / "run-at-medium.ps1"
 E2E_MEDIUM = SCRIPTS / "e2e-medium.ps1"
 VERIFY_GSUDO = SCRIPTS / "verify-gsudo-deelevation.ps1"
@@ -171,8 +172,20 @@ def machine_path_has_bin_dir() -> bool:
     return str(BIN_DIR).casefold() in machine_path().casefold()
 
 
+def leftover_traces() -> list[str]:
+    """What an MSI uninstall removes besides the product's registration: the service, the install dir, the PATH entry."""
+    traces = []
+    if service_registered():
+        traces.append(f"the {SERVICE} service is registered")
+    if INSTALL_DIR.exists():
+        traces.append(f"{INSTALL_DIR} exists")
+    if machine_path_has_bin_dir():
+        traces.append(f"{BIN_DIR} is in the Machine PATH")
+    return traces
+
+
 def installed_traces() -> list[str]:
-    """What shows Hole on this machine: an installed MSI product, the service, the bin dir, the Machine PATH entry.
+    """What shows Hole on this machine: a registered MSI product, or any of `leftover_traces`.
 
     The one definition of "Hole is installed", shared by the preflight refusal, the verification after an uninstall
     and the cleanup.
@@ -180,13 +193,7 @@ def installed_traces() -> list[str]:
     traces = []
     if products := installed_hole_product_codes():
         traces.append(f"MSI product {', '.join(products)} is registered")
-    if service_registered():
-        traces.append(f"the {SERVICE} service is registered")
-    if BIN_DIR.exists():
-        traces.append(f"{BIN_DIR} exists")
-    if machine_path_has_bin_dir():
-        traces.append(f"{BIN_DIR} is in the Machine PATH")
-    return traces
+    return traces + leftover_traces()
 
 
 def assert_nothing_installed() -> None:
@@ -254,14 +261,14 @@ def require_windows_elevated() -> None:
 
 
 def running_hole_exe_paths() -> list[str]:
-    """The image path of every running `hole.exe`, as `Get-Process` reports it."""
+    """The image path of every running `hole.exe`, read the way `kill-hole-processes.ps1` reads it."""
+    listing = (
+        f". {_ps_quote(str(IMAGE_PATH))}; "
+        "Get-Process hole -ErrorAction SilentlyContinue | ForEach-Object { "
+        "$path = Get-ProcessImagePath $_; if ($path) { $path } else { '(path unreadable)' } }; exit 0"
+    )
     out = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-Command",
-            "Get-Process hole -ErrorAction SilentlyContinue | ForEach-Object { if ($_.Path) { $_.Path } else { '(path unreadable)' } }; exit 0",
-        ],
+        ["pwsh", "-NoProfile", "-Command", listing],
         capture_output=True,
         text=True,
         check=True,
@@ -344,6 +351,7 @@ def installed_hole(msi_path: Path, request: pytest.FixtureRequest) -> Iterator[P
     install_completed = False
     product_code = msi_product_code(msi_path)
     mark_install_started(product_code)
+    failure = None
     try:
         code = run_ps(
             INVOKE_MSIEXEC,
@@ -359,10 +367,20 @@ def installed_hole(msi_path: Path, request: pytest.FixtureRequest) -> Iterator[P
         kill_installed_hole_processes()
         install_completed = True
         yield INSTALL_DIR
+    except BaseException as e:
+        failure = e
+        raise
     finally:
-        ensure_uninstalled(product_code, log_dir() / "msi-uninstall.log")
-        # A test's failure never reaches this generator; the session's count is the only trace of it.
-        if not install_completed or request.session.testsfailed > failed_before:
-            dump_failure_diagnostics()
-        # Last, so the dumps above read the marker's start time. An `ensure_uninstalled` that raised leaves it for the cleanup.
-        marker_path().unlink(missing_ok=True)
+        try:
+            ensure_uninstalled(product_code, log_dir() / "msi-uninstall.log")
+        except Exception as e:
+            # The marker stays for the cleanup. The first failure is the one reported.
+            if failure is None:
+                raise
+            print(f"the uninstall after it also failed: {e!r}", file=sys.stderr)
+        else:
+            # A test's failure never reaches this generator; the session's count is the only trace of it.
+            if not install_completed or request.session.testsfailed > failed_before:
+                dump_failure_diagnostics()
+            # Last, so the dump above reads the marker's start time.
+            marker_path().unlink(missing_ok=True)

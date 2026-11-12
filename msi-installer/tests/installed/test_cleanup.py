@@ -10,6 +10,7 @@ from support import (
     ensure_uninstalled,
     installed_traces,
     is_elevated,
+    leftover_traces,
     log_dir,
     marker_path,
     read_marker,
@@ -26,9 +27,13 @@ def test_cleanup_leaves_nothing_installed():
     found = f"Hole is installed ({'; '.join(traces)})"
     marker = read_marker()
     assert marker is not None, f"{found} but the suite did not install it: not uninstalling it"
-    assert marker.product_code in installed_hole_product_codes(), (
-        f"{found}, but not as the product the suite installed ({marker.product_code}): not uninstalling it"
-    )
+    if marker.product_code not in installed_hole_product_codes():
+        leftovers = leftover_traces()
+        assert not leftovers, (
+            f"the suite's uninstall of {marker.product_code} left: {'; '.join(leftovers)}. They cannot be removed "
+            "without the product: remove them by hand"
+        )
+        pytest.fail(f"{found}, but not as the product the suite installed ({marker.product_code}): not uninstalling it")
     assert is_elevated(), "uninstalling needs an elevated shell"
     ensure_uninstalled(marker.product_code, log_dir() / "msi-cleanup-uninstall.log")
     marker_path().unlink(missing_ok=True)
