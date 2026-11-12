@@ -140,7 +140,7 @@ def test_wedge_throws_within_bound_and_emits_all_diagnostics(tmp_path: Path) -> 
     result = _run_script(
         params={
             "Verb": "/i",
-            "MsiPath": "unused.msi",
+            "Package": "unused.msi",
             "LogPath": str(log_path),
             "BoundMinutes": str(bound_minutes),
             "ExePath": sys.executable,
@@ -205,7 +205,7 @@ def test_wedge_still_emits_diagnostics_and_throws_when_log_read_fails(tmp_path: 
         result = _run_script(
             params={
                 "Verb": "/i",
-                "MsiPath": "unused.msi",
+                "Package": "unused.msi",
                 "LogPath": str(log_path),
                 "BoundMinutes": "0.02",
                 "ExePath": sys.executable,
@@ -263,7 +263,7 @@ def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path:
     result = _run_script(
         params={
             "Verb": "/x",
-            "MsiPath": "unused.msi",
+            "Package": "unused.msi",
             "LogPath": str(log_path),
             "BoundMinutes": "0.02",
             "ExePath": sys.executable,
@@ -319,7 +319,7 @@ def test_a_hung_debugger_is_killed_partial_output_survives_and_the_wedge_still_t
         result = _run_script(
             params={
                 "Verb": "/x",
-                "MsiPath": "unused.msi",
+                "Package": "unused.msi",
                 "LogPath": str(log_path),
                 "BoundMinutes": "0.02",
                 "ExePath": sys.executable,
@@ -372,7 +372,7 @@ def test_a_target_the_capture_left_suspended_is_detected_and_terminated(tmp_path
     result = _run_script(
         params={
             "Verb": "/x",
-            "MsiPath": "unused.msi",
+            "Package": "unused.msi",
             "LogPath": str(log_path),
             "BoundMinutes": "0.02",
             "ExePath": sys.executable,
@@ -402,7 +402,7 @@ def test_a_debugger_that_cannot_start_is_reported_and_terminates_nothing(tmp_pat
     result = _run_script(
         params={
             "Verb": "/x",
-            "MsiPath": "unused.msi",
+            "Package": "unused.msi",
             "LogPath": str(log_path),
             "BoundMinutes": "0.02",
             "ExePath": sys.executable,
@@ -429,7 +429,7 @@ def test_stack_capture_budget_exhaustion_is_reported_and_does_not_swallow_the_we
     result = _run_script(
         params={
             "Verb": "/x",
-            "MsiPath": "unused.msi",
+            "Package": "unused.msi",
             "LogPath": str(log_path),
             "BoundMinutes": "0.02",
             "ExePath": sys.executable,
@@ -453,7 +453,7 @@ def test_success_exits_zero_and_does_not_throw(tmp_path: Path) -> None:
     result = _run_script(
         params={
             "Verb": "/i",
-            "MsiPath": "unused.msi",
+            "Package": "unused.msi",
             "LogPath": str(tmp_path / "install.log"),
             "BoundMinutes": "1",
             "ExePath": sys.executable,
@@ -467,7 +467,7 @@ def test_nonzero_exit_without_failonnonzeroexit_warns_but_does_not_throw(tmp_pat
     result = _run_script(
         params={
             "Verb": "/x",
-            "MsiPath": "unused.msi",
+            "Package": "unused.msi",
             "LogPath": str(tmp_path / "uninstall.log"),
             "BoundMinutes": "1",
             "ExePath": sys.executable,
@@ -483,7 +483,7 @@ def test_nonzero_exit_with_failonnonzeroexit_throws(tmp_path: Path) -> None:
     result = _run_script(
         params={
             "Verb": "/i",
-            "MsiPath": "unused.msi",
+            "Package": "unused.msi",
             "LogPath": str(tmp_path / "install.log"),
             "BoundMinutes": "1",
             "ExePath": sys.executable,
@@ -544,7 +544,7 @@ def test_wedge_falls_back_to_thread_states_when_no_debugger_is_installed(tmp_pat
     result = _run_script(
         params={
             "Verb": "/x",
-            "MsiPath": "unused.msi",
+            "Package": "unused.msi",
             "LogPath": str(log_path),
             "BoundMinutes": "0.02",
             "ExePath": sys.executable,

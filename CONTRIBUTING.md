@@ -3710,6 +3710,31 @@ msiexec /i target\release\hole.msi [/quiet]  # install (interactive / unattended
 cd msi-installer && uv run --group dev pytest -v   # WiX source + MSI build validation
 ```
 
+The install, uninstall and dashboard-E2E lifecycle CI runs (`msi-installer/tests/installed/`) runs locally too, against
+any MSI:
+
+```sh
+cargo xtask build hole-msi                  # release MSI (long); needs node_modules (`cargo xtask build frontend-build`)
+# from an ELEVATED terminal:
+cargo xtask run hole-msi-install-tests      # MSI_UNDER_TEST=<path\to\hole.msi> tests other bytes
+cargo xtask run hole-msi-cleanup            # after an interrupted run
+```
+
+It installs Hole system-wide (`C:\Program Files\hole`, the `HoleBridge` service as SYSTEM, the Machine `PATH`
+entry, shortcuts), opens a visible dashboard window for the E2E, then uninstalls and verifies. Tools download into the
+repo's `.cache/installer-e2e/`; nothing is added to `PATH` outside the test's child processes. It refuses an
+unelevated shell, a missing MSI, and a machine that already has Hole: a registered Hole MSI product, the `HoleBridge`
+service, `C:\Program Files\hole` (even empty), its `bin` in the Machine `PATH`, or any running `hole.exe` (a
+development build shares the single-instance id and the bridge socket, and is named, not killed).
+Before installing it records the MSI's ProductCode in `target\.hole-installed-by-the-msi-test-harness`; the cleanup
+uninstalls, by that ProductCode, only a Hole registered under it, and reports any other Hole it finds.
+The gsudo self-test and the dashboard E2E are bounded at five minutes each: a wedged phase fails by name and the
+teardown still uninstalls. `MSI_TEST_LOG_DIR` (default `target\msi-test-logs\`) holds
+the install and uninstall logs. Nothing asserts what remains under `C:\ProgramData\hole` after the uninstall.
+
+CI's `installer-tests` step is this target and `installer-cleanup` (`if: always()`) is the cleanup one; the TUN lane runs
+only when the cleanup passed or the MSI was never built.
+
 ### macOS DMG
 
 ```sh
