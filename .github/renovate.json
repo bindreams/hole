@@ -8,7 +8,8 @@
     {
       "customType": "regex",
       "managerFilePatterns": [
-        "/msi-installer/src/msi_installer/wix-toolchain\\.toml$/"
+        "/msi-installer/src/msi_installer/wix-toolchain\\.toml$/",
+        "/msi-installer/src/msi_installer/e2e-tools\\.toml$/"
       ],
       "matchStrings": [
         "version\\s*=\\s*\"(?<currentValue>[^\"]+)\"\\n.*github\\.com/(?<depName>[^/]+/[^/]+)/"
@@ -107,7 +108,7 @@
       "automerge": true
     },
     {
-      "description": "gsudo (installer-E2E de-elevation): auto-merge; the installer lane of the required Build, lint, test (windows/amd64) check gates it.",
+      "description": "gsudo (installer-E2E de-elevation): auto-merge; the installer lifecycle step of the required Build, lint, test (windows/amd64) check gates it.",
       "matchDepNames": ["gerardog/gsudo"],
       "automerge": true
     },
