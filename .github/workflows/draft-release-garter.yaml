@@ -17,7 +17,7 @@ on:
 jobs:
   # Garter-specific pre-check: surface crates.io publish blockers
   # (missing metadata, syntax, path-deps that won't resolve) BEFORE the
-  # reusable kicks off the 6-platform build matrix.
+  # reusable kicks off CI.
   validate-cargo-publish:
     name: cargo publish --dry-run for garter library
     runs-on: ubuntu-latest
@@ -40,20 +40,4 @@ jobs:
     uses: ./.github/workflows/reusable-draft-release.yaml
     with:
       track: garter
-      crate: garter
       version: ${{ inputs.version }}
-      version-regex: '^[0-9]+\.[0-9]+\.[0-9]+$'
-      cargo-version-group: garter
-      matrix: |
-        [
-          { "os": "windows", "arch": "amd64", "runner": "windows-latest" },
-          { "os": "windows", "arch": "arm64", "runner": "windows-11-arm" },
-          { "os": "darwin",  "arch": "amd64", "runner": "macos-15-intel" },
-          { "os": "darwin",  "arch": "arm64", "runner": "macos-latest" },
-          { "os": "linux",   "arch": "amd64", "runner": "ubuntu-latest" },
-          { "os": "linux",   "arch": "arm64", "runner": "ubuntu-24.04-arm" }
-        ]
-      build-target: garter-bin
-      expected-sha256sums-count: 6
-      release-title: garter v${{ inputs.version }}
-      latest: false

@@ -61,8 +61,11 @@ def log_dir() -> Path:
 
 @pytest.fixture(scope="session")
 def msi_path() -> Path:
-    """The MSI under test: `MSI_UNDER_TEST`, else the release build. Never built here, never skipped when absent."""
-    path = Path(os.environ[MSI_ENV]) if os.environ.get(MSI_ENV) else default_msi()
+    """The MSI under test: `MSI_UNDER_TEST` (a relative path is from the repo root), else the release build.
+
+    Never built here, never skipped when absent.
+    """
+    path = REPO_ROOT / os.environ[MSI_ENV] if os.environ.get(MSI_ENV) else default_msi()
     if not path.is_file():
         pytest.fail(f"no MSI at {path}: run `cargo xtask build hole-msi`, or set {MSI_ENV} to the MSI to test")
     stat = path.stat()

@@ -76,7 +76,7 @@ class Commit:
 class Platform:
     os: str
     arch: str
-    ext: str | None = None
+    asset: str  # the release asset the Downloads table links for this platform
 
 
 # Loading ==============================================================================================================
@@ -269,28 +269,15 @@ def platform_label(os_: str, arch: str) -> str:
 
 
 def parse_platforms(json_str: str) -> list[Platform]:
-    """Parse `--platforms` JSON (the build matrix, verbatim) into `Platform`s.
+    """Parse `--platforms` JSON (`cargo xtask release-assets`, verbatim) into `Platform`s.
 
-    Extra matrix keys (e.g. `runner`) are ignored.
+    Extra keys (e.g. `assets`) are ignored.
     """
     raw = json.loads(json_str)
-    return [Platform(os=p["os"], arch=p["arch"], ext=p.get("ext")) for p in raw]
-
-
-def asset_filename(track: str, version: str, platform: Platform) -> str:
-    """Release asset filename for a platform, matching each workflow's
-    rename step: `ext` present (hole's installers) uses it verbatim;
-    `ext` absent (raw binaries) appends `.exe` on windows, nothing
-    otherwise."""
-    if platform.ext is not None:
-        return f"{track}-{version}-{platform.os}-{platform.arch}.{platform.ext}"
-    suffix = ".exe" if platform.os == "windows" else ""
-    return f"{track}-{version}-{platform.os}-{platform.arch}{suffix}"
+    return [Platform(os=p["os"], arch=p["arch"], asset=p["asset"]) for p in raw]
 
 
 def render_downloads_table(
-    track: str,
-    version: str,
     new_tag: str,
     platforms: list[Platform],
     repo_url: str,
@@ -300,7 +287,7 @@ def render_downloads_table(
     lines = ["## Downloads", "", "| Platform | Download |", "| --- | --- |"]
     for platform in platforms:
         label = platform_label(platform.os, platform.arch)
-        asset = asset_filename(track, version, platform)
+        asset = platform.asset
         url = f"{repo_url}/releases/download/{new_tag}/{asset}"
         lines.append(f"| {label} | [{asset}]({url}) |")
     lines.append("")
@@ -368,10 +355,7 @@ def main() -> int:
     parser.add_argument(
         "--platforms",
         required=True,
-        help="JSON array of {os, arch, ext?} objects describing shipped platforms (the build matrix, verbatim)",
-    )
-    parser.add_argument(
-        "--version", required=True, help="Bare release version (e.g. 0.4.0), used to build asset filenames"
+        help="JSON array of {os, arch, asset} objects describing shipped platforms (`cargo xtask release-assets`, verbatim)",
     )
     parser.add_argument("--head", default="HEAD", help="Git ref representing the new release commit (default: HEAD)")
     parser.add_argument(
@@ -399,7 +383,7 @@ def main() -> int:
         )
 
     platforms = parse_platforms(args.platforms)
-    downloads_table = render_downloads_table(args.track, args.version, args.new_tag, platforms, args.repo_url)
+    downloads_table = render_downloads_table(args.new_tag, platforms, args.repo_url)
 
     config = load_config(repo_root, args.track)
     previous_tag = find_previous_tag(repo_root, args.track, args.head)
@@ -489,54 +473,25 @@ def test_platform_label_unknown_pair_raises():
         platform_label("freebsd", "amd64")
 
 
-def test_parse_platforms_reads_matrix_json():
+def test_parse_platforms_reads_release_assets_json():
     platforms = parse_platforms(
-        '[{"os": "windows", "arch": "amd64", "runner": "windows-latest", "ext": "msi"}, '
-        '{"os": "darwin", "arch": "arm64", "runner": "macos-latest"}]'
+        '[{"os": "windows", "arch": "amd64", "asset": "hole-0.4.0-windows-amd64.msi", '
+        '"assets": ["hole-0.4.0-windows-amd64.msi", "hole-0.4.0-windows-amd64.zip"]}, '
+        '{"os": "darwin", "arch": "arm64", "asset": "hole-0.4.0-darwin-arm64.dmg", "assets": []}]'
     )
     assert platforms == [
-        Platform(os="windows", arch="amd64", ext="msi"),
-        Platform(os="darwin", arch="arm64", ext=None),
+        Platform(os="windows", arch="amd64", asset="hole-0.4.0-windows-amd64.msi"),
+        Platform(os="darwin", arch="arm64", asset="hole-0.4.0-darwin-arm64.dmg"),
     ]
-
-
-def test_asset_filename_with_explicit_ext():
-    assert (
-        asset_filename("hole", "0.4.0", Platform(os="windows", arch="amd64", ext="msi"))
-        == "hole-0.4.0-windows-amd64.msi"
-    )
-    assert (
-        asset_filename("hole", "0.4.0", Platform(os="darwin", arch="arm64", ext="dmg")) == "hole-0.4.0-darwin-arm64.dmg"
-    )
-
-
-def test_asset_filename_raw_binary_windows_gets_exe():
-    assert (
-        asset_filename("galoshes", "0.1.0", Platform(os="windows", arch="amd64", ext=None))
-        == "galoshes-0.1.0-windows-amd64.exe"
-    )
-
-
-def test_asset_filename_raw_binary_unix_no_ext():
-    assert (
-        asset_filename("galoshes", "0.1.0", Platform(os="darwin", arch="arm64", ext=None))
-        == "galoshes-0.1.0-darwin-arm64"
-    )
-    assert (
-        asset_filename("galoshes", "0.1.0", Platform(os="linux", arch="amd64", ext=None))
-        == "galoshes-0.1.0-linux-amd64"
-    )
 
 
 def test_render_downloads_table_hole_shape():
     platforms = [
-        Platform(os="windows", arch="amd64", ext="msi"),
-        Platform(os="darwin", arch="arm64", ext="dmg"),
-        Platform(os="darwin", arch="amd64", ext="dmg"),
+        Platform(os="windows", arch="amd64", asset="hole-0.4.0-windows-amd64.msi"),
+        Platform(os="darwin", arch="arm64", asset="hole-0.4.0-darwin-arm64.dmg"),
+        Platform(os="darwin", arch="amd64", asset="hole-0.4.0-darwin-amd64.dmg"),
     ]
-    table = render_downloads_table(
-        "hole", "0.4.0", "releases/hole/v0.4.0", platforms, "https://github.com/bindreams/hole"
-    )
+    table = render_downloads_table("releases/hole/v0.4.0", platforms, "https://github.com/bindreams/hole")
     assert table == (
         "## Downloads\n"
         "\n"
@@ -551,11 +506,9 @@ def test_render_downloads_table_hole_shape():
     )
 
 
-def test_render_downloads_table_raw_binary_no_ext():
-    platforms = [Platform(os="linux", arch="arm64", ext=None)]
-    table = render_downloads_table(
-        "galoshes", "0.1.0", "releases/galoshes/v0.1.0", platforms, "https://github.com/bindreams/hole"
-    )
+def test_render_downloads_table_raw_binary():
+    platforms = [Platform(os="linux", arch="arm64", asset="galoshes-0.1.0-linux-arm64")]
+    table = render_downloads_table("releases/galoshes/v0.1.0", platforms, "https://github.com/bindreams/hole")
     assert (
         "| Linux (ARM64) | [galoshes-0.1.0-linux-arm64]"
         "(https://github.com/bindreams/hole/releases/download/releases/galoshes/v0.1.0/galoshes-0.1.0-linux-arm64) |\n"
@@ -704,9 +657,7 @@ def test_integration_filtering_against_real_history():
             "--head",
             "HEAD",
             "--platforms",
-            '[{"os": "linux", "arch": "amd64"}]',
-            "--version",
-            "999.0.0",
+            '[{"os": "linux", "arch": "amd64", "asset": "ex-ray-999.0.0-linux-amd64"}]',
         ],
         cwd=repo_root,
         capture_output=True,
@@ -962,9 +913,7 @@ def test_main_initial_release_includes_downloads_table(tmp_path, capsys, monkeyp
             "--repo-root",
             str(repo),
             "--platforms",
-            '[{"os": "windows", "arch": "amd64", "ext": "msi"}]',
-            "--version",
-            "0.1.0",
+            '[{"os": "windows", "arch": "amd64", "asset": "hole-0.1.0-windows-amd64.msi"}]',
         ],
     )
     assert main() == 0
@@ -991,9 +940,7 @@ def test_main_normal_release_includes_downloads_table(tmp_path, capsys, monkeypa
             "--repo-root",
             str(repo),
             "--platforms",
-            '[{"os": "windows", "arch": "amd64", "ext": "msi"}]',
-            "--version",
-            "0.2.0",
+            '[{"os": "windows", "arch": "amd64", "asset": "hole-0.2.0-windows-amd64.msi"}]',
         ],
     )
     assert main() == 0

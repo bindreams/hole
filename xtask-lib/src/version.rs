@@ -301,6 +301,16 @@ fn is_ancestor_of_head(repo_root: &Path, tag: &str) -> Result<bool> {
     }
 }
 
+/// Split a full release tag (`releases/<group>/vX.Y.Z`) into its group and version.
+pub fn parse_release_tag(tag: &str) -> Result<(Group, Version)> {
+    let group = Group::all()
+        .iter()
+        .copied()
+        .find(|g| tag.starts_with(&g.tag_prefix()))
+        .ok_or_else(|| anyhow!("tag '{tag}' is not releases/<group>/vX.Y.Z for any release group"))?;
+    Ok((group, parse_tag_to_version(tag, group)?))
+}
+
 fn parse_tag_to_version(tag: &str, group: Group) -> Result<Version> {
     let prefix = group.tag_prefix();
     let semver_str = tag

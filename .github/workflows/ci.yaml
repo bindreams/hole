@@ -5,9 +5,21 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # A draft-release workflow runs the whole workflow on the release commit. With `release-tag` set,
+  # each leg stages what it ships (RELEASE ASSETS below).
+  workflow_call:
+    inputs:
+      release-tag:
+        description: "Release tag (releases/<group>/vX.Y.Z), created locally before any build so the binaries carry the release version"
+        required: false
+        type: string
+        default: ""
 
+# A release call is its own group: `github.workflow` and `github.ref` are the caller's, so two dispatches of one draft
+# workflow would otherwise share a group and a third would silently cancel the pending second. The tag also keeps
+# two drafts called from one run apart, since `github.run_id` is then the same.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.release-tag != '' && format('-{0}-{1}', github.run_id, inputs.release-tag) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -53,6 +65,12 @@ jobs:
   # log and runs the `always()` steps; the lanes after the hung step do not run.
   # The GitHub cap is 360m. Raised only, never tightened
   # (`no_leg_wall_is_below_the_walls_of_the_jobs_it_absorbed`).
+  #
+  # RELEASE PATH: a release call also runs the `release-*` steps, which the audit's
+  # ordinary-run model skips. Each wall is the ordinary wall plus the budgets of the
+  # release steps that run on the leg: the tag 5, the plugin stage 20 (it builds
+  # the garter CLI on a garter release), the upload 10, and on installer legs the installer stage 10 (35 on
+  # a leg without an installer, 45 with one). These budgets are estimates, not measured.
   ci:
     name: Build, lint, test (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -71,12 +89,12 @@ jobs:
           # `ech` = the ECH-gate Go tests; `portable-lint` = the portable prek
           # hooks and the renovate config check; `frontend` = the Vite bundle and
           # type check.
-          - { os: windows, arch: amd64, runner: windows-latest,   timeout: 175, cache-saver: true, hole: true, installer: true, ex-ray-unit: true }
-          - { os: windows, arch: arm64, runner: windows-11-arm,   timeout: 90 }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel,   timeout: 310, hole: true, dmg: true }
-          - { os: darwin,  arch: arm64, runner: macos-latest,     timeout: 160, cache-saver: true, hole: true, dmg: true, ex-ray-unit: true }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest,    timeout: 60,  cache-saver: true, portable-lint: true, ech: true, frontend: true }
-          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm, timeout: 60 }
+          - { os: windows, arch: amd64, runner: windows-latest,   timeout: 220, cache-saver: true, hole: true, installer: true, ex-ray-unit: true }
+          - { os: windows, arch: arm64, runner: windows-11-arm,   timeout: 125 }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel,   timeout: 355, hole: true, dmg: true }
+          - { os: darwin,  arch: arm64, runner: macos-latest,     timeout: 205, cache-saver: true, hole: true, dmg: true, ex-ray-unit: true }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest,    timeout: 95,  cache-saver: true, portable-lint: true, ech: true, frontend: true }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm, timeout: 95 }
     steps:
       # Provisioning ===================================================================================================
       # Step budgets: 1.25 x the worst measured step, rounded up to 5m; a step
@@ -89,6 +107,21 @@ jobs:
         timeout-minutes: 10
         with:
           fetch-depth: 0
+
+      # Before anything builds: the version stamp reads the nearest release tag.
+      - id: release-tag
+        name: Create the release tag locally (release calls only)
+        if: ${{ inputs.release-tag != '' }}
+        timeout-minutes: 5
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          git tag "$RELEASE_TAG"
+          # `releases/<group>/vX.Y.Z`: the group names the uploads (release and diagnostics, so two drafts in one run
+          # cannot collide), which cannot hold the tag's slashes.
+          GROUP="${RELEASE_TAG#releases/}"
+          echo "group=${GROUP%%/*}" >> "$GITHUB_OUTPUT"
 
       - id: setup-python
         uses: actions/setup-python@v7
@@ -104,7 +137,7 @@ jobs:
         uses: ./.github/actions/setup-build
         timeout-minutes: 30
         with:
-          save-cache: ${{ matrix.cache-saver == true }}
+          save-cache: ${{ matrix.cache-saver == true && inputs.release-tag == '' }}
 
       - id: cargo-binstall
         uses: cargo-bins/cargo-binstall@v1.26.2
@@ -333,6 +366,16 @@ jobs:
         shell: bash
         run: cargo xtask run plugin-e2e-tests
 
+      # Release calls: stage the binaries plugin-e2e ran on; see RELEASE ASSETS.
+      - id: release-stage-plugins
+        name: Stage the plugin binaries a release ships
+        if: ${{ inputs.release-tag != '' && steps.test-plugin-e2e.outcome == 'success' }}
+        timeout-minutes: 20
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: cargo xtask stage-release --tag "$RELEASE_TAG" --lane plugins --out release-assets
+
       # ex-ray Go tests (the `ex-ray-tests` build.yaml target): the ECH
       # fail-closed gate plus the patched vendored tls/quic/hysteria2 (incl. utls)
       # gate/refuse/round-trip tests. The gate logic is platform-independent
@@ -475,10 +518,22 @@ jobs:
         timeout-minutes: 5
         uses: ./.github/actions/upload-diagnostics
         with:
-          name: dmg-flake-diag-${{ matrix.os }}-${{ matrix.arch }}
+          name: dmg-flake-diag-${{ matrix.os }}-${{ matrix.arch }}${{ steps.release-tag.outputs.group && format('-{0}', steps.release-tag.outputs.group) || '' }}
           path: ${{ runner.temp }}/dmg-flake-diag/**
           if-no-files-found: ignore
           retention-days: 14
+
+      # Release calls: stage the DMG the signing tests and the install-and-connect test just ran on, and the update
+      # archive of its app. Both read the one `.dmg` under `target/release/bundle/dmg`, so a DMG that failed the
+      # install test is never staged.
+      - id: release-stage-dmg
+        name: Stage the DMG a release ships
+        if: ${{ inputs.release-tag != '' && steps.dmg-install-e2e.outcome == 'success' && steps.dmg-install-cleanup.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: cargo xtask stage-release --tag "$RELEASE_TAG" --lane dmg --out release-assets
 
       # Hole test lanes =================================================================================================
       # Compile test binaries via the orchestrator (resolves the full DAG:
@@ -640,8 +695,7 @@ jobs:
       # msi-installer harness (`msi-installer/tests/installed/`). It drives the INSTALLED binary
       # through WebDriver over loopback, so it runs before the TUN lane.
       #
-      # The harness uninstalls after a failed check, but a step timeout kills it with Hole still
-      # installed, so `installer-cleanup` runs `always()` after it: an idempotent uninstall that
+      # `installer-cleanup` runs `always()` after `installer-tests`: an idempotent uninstall that
       # verifies nothing is left. That step is the TUN lane's gate: the lane runs only once nothing
       # is installed (cleanup passed, or the MSI was never built), else the MSI's SYSTEM `HoleBridge`
       # service would share WFP, routes and the adapter with the TUN tests and confound their
@@ -665,6 +719,17 @@ jobs:
         shell: bash
         run: cargo xtask run hole-msi-cleanup
 
+      # Release calls: stage the MSI the lifecycle just installed, and an update zip packed from the directory
+      # the MSI was built from (`target/release/installer-stage`). Before the TUN lane.
+      - id: release-stage-msi
+        name: Stage the MSI a release ships
+        if: ${{ inputs.release-tag != '' && steps.installer-tests.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: cargo xtask stage-release --tag "$RELEASE_TAG" --lane msi --out release-assets
+
       # Evidence outlives the runner. The bounded wait in
       # invoke-msiexec-bounded.ps1 is what lets a wedged msiexec fail its step
       # instead of the whole job, so this step is reached to upload it.
@@ -680,7 +745,7 @@ jobs:
         timeout-minutes: 5
         uses: ./.github/actions/upload-diagnostics
         with:
-          name: msi-logs-windows-amd64
+          name: msi-logs-windows-amd64${{ steps.release-tag.outputs.group && format('-{0}', steps.release-tag.outputs.group) || '' }}
           path: |
             target/msi-test-logs/*.log
             target/msi-test-logs/*-stack-*.txt
@@ -700,7 +765,7 @@ jobs:
         timeout-minutes: 5
         uses: ./.github/actions/upload-diagnostics
         with:
-          name: bridge-logs-installer-windows-amd64
+          name: bridge-logs-installer-windows-amd64${{ steps.release-tag.outputs.group && format('-{0}', steps.release-tag.outputs.group) || '' }}
           path: |
             C:\ProgramData\hole\logs\**
             C:\Windows\System32\config\systemprofile\AppData\Local\hole\logs\**
@@ -861,6 +926,21 @@ jobs:
           .github/scripts/retry.sh npx --yes --package "renovate@${RENOVATE_VERSION}" -- node --version
           npx --offline --package "renovate@${RENOVATE_VERSION}" renovate-config-validator --strict --no-global .github/renovate.json
 
+      # Release assets ==================================================================================================
+      # A release call stages what its tag's group ships in `release-assets/`, at the lane that just tested
+      # each file (`cargo xtask stage-release`, steps `release-stage-*`; a group a lane ships nothing for
+      # stages nothing). The draft workflow requires this whole workflow to pass, then uploads these
+      # artifacts, so what it publishes is what passed here. Only a passing leg uploads.
+      - id: release-upload
+        name: Upload the staged release assets
+        if: ${{ success() && inputs.release-tag != '' }}
+        timeout-minutes: 10
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ steps.release-tag.outputs.group }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: release-assets/*
+          if-no-files-found: ignore
+
       # Logs ============================================================================================================
       # Upload bridge.log produced by `DistHarness` subprocesses. Matches files
       # the test harness redirected to `$RUNNER_TEMP` (see
@@ -875,7 +955,7 @@ jobs:
         timeout-minutes: 5
         uses: ./.github/actions/upload-diagnostics
         with:
-          name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}
+          name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}${{ steps.release-tag.outputs.group && format('-{0}', steps.release-tag.outputs.group) || '' }}
           path: ${{ runner.temp }}/**/bridge.log
           if-no-files-found: ignore
           retention-days: 14

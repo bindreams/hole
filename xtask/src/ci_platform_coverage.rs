@@ -17,8 +17,10 @@
 //! `success()` does, and the failed step's outcome is `failure`. It does not
 //! model cancellation, `continue-on-error`, or a second failure. The expression
 //! subset is deliberately small (`&&`, `||`, `!`, `==`, `!=`, parentheses, the
-//! four status functions, `matrix.*` and `steps.<id>.outcome`); anything else
-//! is an error, so the grammar cannot silently widen.
+//! four status functions, `matrix.*`, `steps.<id>.outcome` and `inputs.release-tag`);
+//! anything else is an error, so the grammar cannot silently widen. Every modelled
+//! run is an ordinary (push or pull-request) run: `inputs.release-tag` is empty, so
+//! the steps only a release call runs are skipped.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -608,7 +610,7 @@ impl Parser<'_> {
                 if self.eat(&Tok::LParen) {
                     ensure!(
                         self.eat(&Tok::RParen),
-                        "function {name:?} takes arguments, which are not supported"
+                        "a call to {name:?} with arguments is not supported by this evaluator"
                     );
                     self.used_status_function = true;
                     return call(&name, self.ctx.failed.is_some());
@@ -641,6 +643,9 @@ impl Ctx<'_> {
         }
         if let Some(key) = name.strip_prefix("matrix.") {
             return self.leg.value(key);
+        }
+        if name == "inputs.release-tag" {
+            return Ok(Val::Str(String::new()));
         }
         if let Some(rest) = name.strip_prefix("steps.") {
             let id = rest

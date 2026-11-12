@@ -44,6 +44,7 @@ pub mod run_injected_env;
 pub mod schemars_pin;
 pub mod skuld_label_coverage;
 pub mod stage;
+pub mod stage_release;
 pub mod target;
 pub mod tauri_pairs;
 pub mod test_binaries;
@@ -375,6 +376,38 @@ pub enum Command {
         #[arg(long)]
         archive: PathBuf,
     },
+    /// Copy the files a release ships out of this CI leg's build into `--out`,
+    /// named as the release names them, for the draft workflow to upload.
+    ///
+    /// `--lane` is the point in `ci.yaml` the files have just passed their
+    /// tests; a group the lane ships nothing for stages nothing. The installer is
+    /// `MSI_UNDER_TEST` / `DMG_UNDER_TEST` when set (a relative path is from the
+    /// repo root), else the release build.
+    ///
+    /// The Windows update zip is packed from `target/release/installer-stage`.
+    /// `hole.exe version` and `garter --version` must print the tag's version (a
+    /// `.dirty` build fails) and `garter --help` must exit 0; the galoshes and
+    /// ex-ray versions are not checked.
+    StageRelease {
+        /// Release tag, `releases/<group>/vX.Y.Z`.
+        #[arg(long)]
+        tag: String,
+        /// Which tested files to stage.
+        #[arg(long, value_enum)]
+        lane: stage_release::Lane,
+        /// Directory to stage into.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Print the files a release `--tag` ships, per platform, as a JSON array.
+    ///
+    /// The draft-release workflows check the downloaded assets against it and
+    /// build the notes' Downloads table from it.
+    ReleaseAssets {
+        /// Release tag, `releases/<group>/vX.Y.Z`.
+        #[arg(long)]
+        tag: String,
+    },
     /// Print this host's update-archive asset suffix (e.g. `windows-amd64.zip`).
     ///
     /// The release workflow captures it to name the published archive; the
@@ -524,6 +557,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             println!("xtask: update archive verified {}", archive.display());
             Ok(())
         }
+        Command::ReleaseAssets { tag } => stage_release::list(&tag),
+        Command::StageRelease { tag, lane, out } => stage_release::stage(&repo_root()?, &tag, lane, &out),
         Command::AssetSuffix => {
             println!("{}", xtask_lib::asset::host_update_asset_suffix());
             Ok(())
@@ -738,31 +773,31 @@ pub fn run_build(target: Option<String>, all: bool) -> Result<()> {
              cannot orchestrate"
         )
     })?;
-    let plan = Plan::new(&manifest)?;
 
-    let roots: Vec<&str> = match (target, all) {
-        (Some(name), false) => {
-            let target = manifest.get(&name).ok_or_else(|| anyhow!("unknown target: {name:?}"))?;
-            vec![target.name.as_str()]
+    match (target, all) {
+        (Some(name), false) => build_target_from(&manifest, &repo_root, host, &name),
+        (None, true) => {
+            let plan = Plan::new(&manifest)?;
+            let roots: Vec<&str> = plan
+                .target_names()
+                .into_iter()
+                .filter(|name| {
+                    manifest
+                        .get(name)
+                        .expect("plan target names come from the manifest")
+                        .applies_to(host)
+                })
+                .collect();
+            if roots.is_empty() {
+                println!("xtask: no targets apply to host platform {host}");
+                return Ok(());
+            }
+            let order = plan.order_for(&roots, host)?;
+            execute(&plan, &order, &repo_root)
         }
-        (None, true) => plan
-            .target_names()
-            .into_iter()
-            .filter(|name| manifest.get(name).map(|t| t.applies_to(host)).unwrap_or(false))
-            .collect(),
         (Some(_), true) => unreachable!("clap rejects --all with a positional target"),
-        (None, false) => {
-            return Err(anyhow!("specify a target name or pass --all"));
-        }
-    };
-
-    if roots.is_empty() {
-        println!("xtask: no targets apply to host platform {host}");
-        return Ok(());
+        (None, false) => Err(anyhow!("specify a target name or pass --all")),
     }
-
-    let order = plan.order_for(&roots, host)?;
-    execute(&plan, &order, &repo_root)
 }
 
 pub fn run_run(target: String) -> Result<()> {
@@ -789,12 +824,33 @@ pub fn run_list() -> Result<()> {
     Ok(())
 }
 
+/// Build `target` and its dependencies for `host` in the checkout at `repo_root`, as `cargo xtask build <target>` does;
+/// for callers that already run inside xtask and must not spawn a second one.
+///
+/// Does not relocate the running `xtask.exe` (see [`relocate_self_if_windows`]); relocate first if the target's closure
+/// depends on xtask.
+pub fn build_target_in(repo_root: &Path, host: Platform, target: &str) -> Result<()> {
+    build_target_from(&load_manifest_at(repo_root)?, repo_root, host, target)
+}
+
+/// The one single-target build path: `order_for` rejects a name the manifest does not declare.
+fn build_target_from(manifest: &Manifest, repo_root: &Path, host: Platform, target: &str) -> Result<()> {
+    let plan = Plan::new(manifest)?;
+    let order = plan.order_for(&[target], host)?;
+    execute(&plan, &order, repo_root)
+}
+
 fn load_manifest() -> Result<(Manifest, PathBuf)> {
     let repo_root = repo_root()?;
+    let manifest = load_manifest_at(&repo_root)?;
+    Ok((manifest, repo_root))
+}
+
+fn load_manifest_at(repo_root: &Path) -> Result<Manifest> {
     let path = repo_root.join("build.yaml");
     let text = std::fs::read_to_string(&path).with_context(|| format!("reading manifest at {}", path.display()))?;
     let manifest = Manifest::parse(&text).with_context(|| format!("parsing manifest at {}", path.display()))?;
-    Ok((manifest, repo_root))
+    Ok(manifest)
 }
 
 fn parse_group_arg(s: &str) -> Result<xtask_lib::version::Group, String> {

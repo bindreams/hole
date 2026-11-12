@@ -11,6 +11,7 @@ initial_release: |
 include_paths:
   - crates/ex-ray/**
   - .github/workflows/draft-release-ex-ray.yaml
+  - .github/workflows/reusable-draft-release.yaml
   - .github/workflows/publish-release-ex-ray.yaml
   - .github/release-ex-ray.yaml
   # Workspace-engineering files affect every release track. See #312.

@@ -9,7 +9,10 @@ installs — see issue #364).
 Usage: `uv run --directory dmg-installer pytest -v`
 """
 
+import os
 from pathlib import Path
+
+DMG_ENV = "DMG_UNDER_TEST"
 
 _PKG_DIR = Path(__file__).resolve().parent
 
@@ -28,6 +31,14 @@ def _find_repo_root() -> Path:
 
 
 def find_built_dmg(repo_root: Path) -> Path:
+    """The DMG under test: `DMG_UNDER_TEST` when set (a relative path is from the repo root), else the single `.dmg`
+    of the release build."""
+    override = os.environ.get(DMG_ENV)
+    if override:
+        path = repo_root / override
+        if not path.is_file():
+            raise DmgTestError(f"{DMG_ENV} names {path}, which is not a file")
+        return path
     bundle_dir = repo_root / "target" / "release" / "bundle" / "dmg"
     matches = sorted(bundle_dir.glob("*.dmg"))
     if not matches:

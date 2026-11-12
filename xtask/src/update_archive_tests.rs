@@ -1,3 +1,5 @@
+#[cfg(target_os = "windows")]
+use crate::update_archive::build_update_archive_from_stage;
 use crate::update_archive::{build_update_archive, verify_update_archive};
 use crate::Profile;
 #[cfg(target_os = "windows")]
@@ -79,6 +81,36 @@ fn verify_rejects_an_empty_bindir_entry() {
 
     let err = verify_update_archive(&out).unwrap_err();
     assert!(err.to_string().contains("galoshes.exe"), "got: {err}");
+}
+
+/// The zip carries the staged files' bytes, so it holds what the MSI built from that directory installs.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn the_staged_zip_holds_the_bytes_staged_in_the_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let names = xtask_lib::bindir::bindir_dest_names(xtask_lib::bindir::Os::Windows);
+    for name in &names {
+        fs::write(dir.path().join(name), format!("staged {name}")).unwrap();
+    }
+    let out = dir.path().join("hole.zip");
+    build_update_archive_from_stage(dir.path(), &out).unwrap();
+
+    verify_update_archive(&out).unwrap();
+    let mut zip = zip::ZipArchive::new(fs::File::open(&out).unwrap()).unwrap();
+    for name in &names {
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name(name).unwrap(), &mut content).unwrap();
+        assert_eq!(content, format!("staged {name}"));
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn the_staged_zip_names_the_file_a_stage_directory_lacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("hole.zip");
+    let err = build_update_archive_from_stage(dir.path(), &out).unwrap_err();
+    assert!(err.to_string().contains("hole.exe"), "got: {err}");
 }
 
 /// Repack `zip` keeping every entry except `drop_name`.

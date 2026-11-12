@@ -33,3 +33,8 @@ hole-test-observability = { path = "../test-observability" }
 
 [build-dependencies]
 xtask-lib = { path = "../../xtask-lib", features = ["version"] }
+
+[[test]]
+name = "cli_binary"
+path = "tests/cli_binary.rs"
+harness = false
