@@ -4,7 +4,7 @@
 //! caller is Windows' boot-time twin read-back, and a rule proved only on the
 //! platform that has the hazard is proved nowhere else.
 
-use super::{verdict, Readback};
+use super::{merge, verdict, Readback};
 
 /// A stand-in for the FWPM `FilterRecord` the production caller searches for:
 /// a key to match on, plus a payload, so `Found` carrying the object the
@@ -84,4 +84,20 @@ fn nothing_read_at_all_is_unreadable_and_never_absent() {
         Readback::Unreadable,
         "every view unreadable is the case the shipped predicate got right"
     );
+}
+
+#[skuld::test]
+fn a_merge_unions_every_readable_view_and_names_the_first_read_error() {
+    // The fold `verdict` and a caller that needs every record rather than one share: an error does not hide what
+    // another view returned, and it is still reported.
+    let views: [Result<Vec<Record>, u32>; 4] =
+        [Ok(vec![held()]), Err(0x8032_0005), Ok(vec![other()]), Err(0x8032_0006)];
+    let (records, unread) = merge(&views);
+    assert_eq!(records, vec![held(), other()]);
+    assert_eq!(unread, Some(&0x8032_0005));
+
+    let views: [Result<Vec<Record>, u32>; 2] = [Ok(vec![]), Ok(vec![held()])];
+    let (records, unread) = merge(&views);
+    assert_eq!(records, vec![held()]);
+    assert_eq!(unread, None, "every view readable");
 }

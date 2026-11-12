@@ -8,6 +8,7 @@
 //! taken outside the lock races a locked writer as the old or the new state, and a read that decides a write is taken
 //! again under the lock.
 
+use std::borrow::Cow;
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -579,13 +580,12 @@ pub enum KeyOutcome {
     /// refused or failed (not elevated, engine error, RPC failure). Proof of
     /// NOTHING, for any lifetime.
     ///
-    /// Such a code also fails the release outright — but it reaches the
-    /// clearance fold all the same, because a Windows sweep issues every
-    /// delete before reading any code and hands back both halves
-    /// ([`SweepOutcome`]). So a refused delete shows up in
-    /// [`Clearance::unproven_keys`] beside the failure, and an operator is
-    /// told which key the sweep could not settle rather than only that one
-    /// could not be.
+    /// Such a code also fails the release outright, unless the key is a [`KeyRole::Unlisted`] one
+    /// (`KeyRole::refusal_fails_the_sweep`): the refusal of a filter enumeration found fails nothing, and is
+    /// reported through [`Clearance::refused_strangers`] instead. Either way it reaches the clearance fold, because a
+    /// Windows sweep issues every delete before reading any code and hands back both halves ([`SweepOutcome`]). So a
+    /// refused delete shows up in [`Clearance::unproven_keys`] beside any failure, and an operator is told which key
+    /// the sweep could not settle rather than only that one could not be.
     Failed,
 }
 
@@ -621,22 +621,107 @@ pub enum KeyRole {
     /// removed a live object — see [`KeyLifetime::BootTime`]. On the boots
     /// where it cannot, this key is what is left.
     BootTimeSibling,
+    /// A boot-time filter under Hole's provider that no key list names, found by enumeration
+    /// (`windows::provider_sweep`) and then deleted by key.
+    ///
+    /// Unlike a listed key, it is KNOWN to exist: enumeration returned it. So a delete the OS refused is positive
+    /// evidence a boot-time record is possible on this host, where a refused delete of a listed key proves nothing
+    /// ([`KeyObservation::shows_a_boot_time_object`]).
+    Unlisted,
+    /// Not a key at all: the sweep's own enumeration of the boot-time filters under Hole's provider, which could not
+    /// be read. It observed nothing about any filter, so it is evidence of nothing
+    /// ([`KeyObservation::shows_a_boot_time_object`]) — but it is the one finding that says a stranger went
+    /// unlooked-for, so it is reported whatever else is or is not (`ReportSection::UnenumeratedView`).
+    Enumeration,
+}
+
+impl KeyRole {
+    /// Whether a delete the OS refused fails the sweep that issued it. The whole rule, in one exhaustive match on the
+    /// role.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn refusal_fails_the_sweep(self) -> bool {
+        match self {
+            // A key this build installs and expects to remove: a refusal leaves a cover standing that the caller
+            // would otherwise report gone.
+            KeyRole::Plain => true,
+            KeyRole::BootTimeSibling => true,
+            // A filter this build never learned. A live boot-time filter is measured not to be enforced once BFE has
+            // started, so one the OS will not let go of blocks nothing now; failing the sweep over it would keep the
+            // escape hatches (`bridge unlock`, the tray's Unblock) from writing the lockdown intent off, and the next
+            // start would re-engage the kill switch. It is reported instead, by its GUID.
+            KeyRole::Unlisted => false,
+            // Not a delete at all.
+            KeyRole::Enumeration => false,
+        }
+    }
+}
+
+/// How a report words an unproven key: the three findings an operator is told apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportSection {
+    /// The label names a filter an operator can look up by key, and its absence is in question.
+    Filter,
+    /// The label names a filter enumeration found under Hole's provider that no key list names, and the OS refused to
+    /// delete. Worded apart from [`Self::Filter`]: it is known to exist, and repeating the sweep is no remedy.
+    RefusedStranger,
+    /// The label names a look the sweep could not take. It is no key whose absence is in question, so no evidence
+    /// about a record can excuse it: it is reported whatever else is or is not.
+    UnenumeratedView,
+}
+
+impl ReportSection {
+    /// Which section an unproven key belongs in. The whole rule, in one exhaustive match on the pair:
+    /// `Clearance::leftover_filters`, `Clearance::refused_strangers`, `Clearance::unenumerated_views` and the
+    /// always-reported gate of `Clearance::leftover_keys` all select on it.
+    fn of(role: KeyRole, outcome: KeyOutcome) -> Self {
+        match (role, outcome) {
+            (KeyRole::Plain, _) => ReportSection::Filter,
+            (KeyRole::BootTimeSibling, _) => ReportSection::Filter,
+            (KeyRole::Unlisted, KeyOutcome::Failed) => ReportSection::RefusedStranger,
+            (KeyRole::Unlisted, KeyOutcome::Removed | KeyOutcome::NotFound) => ReportSection::Filter,
+            // The label names a look the sweep could not take, not a filter.
+            (KeyRole::Enumeration, _) => ReportSection::UnenumeratedView,
+        }
+    }
 }
 
 /// One key's contribution to a release verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyObservation {
     /// Operator-facing label. Named, never counted: with the binary gone an
-    /// operator has only the label to look the key up by.
-    pub key: &'static str,
+    /// operator has only the label to look the key up by. A key found by enumeration has no fixed label, so its
+    /// label carries its filter GUID (braced, as `netsh wfp` prints it). A refused stranger's delete does not fail
+    /// the sweep, so its GUID reaches the operator through the clearance report.
+    pub key: Cow<'static, str>,
     pub lifetime: KeyLifetime,
     pub outcome: KeyOutcome,
     /// What this key's outcome says about the OTHER keys in the sweep — see
     /// [`KeyRole`].
     pub role: KeyRole,
+    /// The code the OS answered the delete this observation rests on, as data for a report to print. `None` when no
+    /// delete was issued (an enumeration that could not be read). It decides nothing: the outcome does.
+    pub code: Option<u32>,
 }
 
 impl KeyObservation {
+    /// Whether this observation is itself live evidence that a boot-time object exists on this host, so a
+    /// boot-time record is possible. The whole rule, in one exhaustive match on the pair.
+    fn shows_a_boot_time_object(&self) -> bool {
+        match (self.role, self.outcome) {
+            // BFE re-adds the persistent half every boot, so a removal says a standing cover is installed here.
+            (KeyRole::BootTimeSibling, KeyOutcome::Removed) => true,
+            (KeyRole::BootTimeSibling, KeyOutcome::NotFound | KeyOutcome::Failed) => false,
+            // Found by enumeration, so the refusal is not "nothing there": the object is live.
+            (KeyRole::Unlisted, KeyOutcome::Failed) => true,
+            // A watched removal is proof about the key itself (`proves_empty`); a not-found after enumeration
+            // found it is a race, and says nothing.
+            (KeyRole::Unlisted, KeyOutcome::Removed | KeyOutcome::NotFound) => false,
+            (KeyRole::Plain, _) => false,
+            // An enumeration that could not be read looked at nothing, so it shows nothing.
+            (KeyRole::Enumeration, _) => false,
+        }
+    }
+
     /// Whether this observation PROVES its key now carries nothing.
     ///
     /// The whole rule, in one exhaustive match on the pair, so no call site
@@ -719,10 +804,41 @@ impl KeyObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "the uninstall gate reads this; dropping it restores the silent `Ok` of #1003"]
 pub struct Clearance {
-    unproven: Vec<&'static str>,
+    unproven: Vec<UnprovenKey>,
     sibling: SiblingEvidence,
     witness: ArmingWitness,
     boot_time: BootTimeSightings,
+}
+
+/// A key whose absence a sweep did not prove, with what decides how it is reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnprovenKey {
+    label: Cow<'static, str>,
+    role: KeyRole,
+    /// Where a report puts it, decided once here from the observation's role and outcome ([`ReportSection::of`]).
+    section: ReportSection,
+    /// The code the OS answered the delete ([`KeyObservation::code`]).
+    code: Option<u32>,
+}
+
+impl UnprovenKey {
+    /// The operator-facing label ([`KeyObservation::key`]).
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn role(&self) -> KeyRole {
+        self.role
+    }
+
+    fn new(observation: &KeyObservation) -> Self {
+        Self {
+            label: observation.key.clone(),
+            role: observation.role,
+            section: ReportSection::of(observation.role, observation.outcome),
+            code: observation.code,
+        }
+    }
 }
 
 /// What the persisted record ([`boottime_witness`]) says about whether a
@@ -803,7 +919,9 @@ enum BootTimeSightings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SiblingEvidence {
     /// A sibling's delete removed a live object: a standing cover is
-    /// installed on this host, so a twin was added alongside it.
+    /// installed on this host, so a twin was added alongside it. Also an
+    /// enumerated [`KeyRole::Unlisted`] filter whose delete was refused: a boot-time
+    /// object is live here.
     Installed,
     /// Every sibling answered [`KeyOutcome::NotFound`]: no standing cover is
     /// installed here. The only [`SiblingEvidence`] that suppresses a report.
@@ -840,6 +958,9 @@ impl SiblingEvidence {
 /// suppress every report the moment a boot-time key outlived its sibling in
 /// some future sweep list.
 fn sibling_evidence(observations: &[KeyObservation]) -> SiblingEvidence {
+    if observations.iter().any(KeyObservation::shows_a_boot_time_object) {
+        return SiblingEvidence::Installed;
+    }
     let outcomes: Vec<KeyOutcome> = observations
         .iter()
         .filter(|o| o.role == KeyRole::BootTimeSibling)
@@ -847,9 +968,6 @@ fn sibling_evidence(observations: &[KeyObservation]) -> SiblingEvidence {
         .collect();
     if outcomes.is_empty() {
         return SiblingEvidence::Unknown;
-    }
-    if outcomes.contains(&KeyOutcome::Removed) {
-        return SiblingEvidence::Installed;
     }
     if outcomes.iter().all(|&o| o == KeyOutcome::NotFound) {
         return SiblingEvidence::Absent;
@@ -900,7 +1018,7 @@ impl Clearance {
             unproven: observations
                 .iter()
                 .filter(|o| !o.proves_empty())
-                .map(|o| o.key)
+                .map(UnprovenKey::new)
                 .collect(),
             sibling: sibling_evidence(observations),
             witness,
@@ -931,7 +1049,7 @@ impl Clearance {
     /// The keys whose absence went unproven, in sweep order. Not deduplicated:
     /// distinct keys share a label, and collapsing them would under-report how
     /// much of the sweep was unproven.
-    pub fn unproven_keys(&self) -> &[&'static str] {
+    pub fn unproven_keys(&self) -> &[UnprovenKey] {
         &self.unproven
     }
 
@@ -963,12 +1081,42 @@ impl Clearance {
     /// this one, the twins answering empty because no twin is ever live once
     /// BFE has started. `Unknown` reports for the opposite reason, that
     /// nothing was ruled out. [`ArmingWitness`] splits the same way.
-    pub fn leftover_keys(&self) -> &[&'static str] {
-        if self.sibling.record_possible() || self.witness.record_possible() {
-            &self.unproven
-        } else {
-            &[]
-        }
+    ///
+    /// The exception is an unproven key whose role is always reported (`ReportSection::UnenumeratedView`) — an
+    /// enumeration that could not be read. No evidence about a record can excuse it: it is not a key whose absence
+    /// is in question but a look that did not happen.
+    pub fn leftover_keys(&self) -> impl Iterator<Item = &UnprovenKey> + '_ {
+        let record_possible = self.sibling.record_possible() || self.witness.record_possible();
+        self.unproven
+            .iter()
+            .filter(move |k| record_possible || k.section == ReportSection::UnenumeratedView)
+    }
+
+    /// The leftover keys that are filters whose absence is in question: [`Self::leftover_keys`] in
+    /// `ReportSection::Filter`. What a report names as filters an operator can look up by key and could not be
+    /// proven empty. The refused strangers ([`Self::refused_strangers`]) are worded apart.
+    pub fn leftover_filters(&self) -> impl Iterator<Item = &UnprovenKey> + '_ {
+        self.leftover_keys().filter(|k| k.section == ReportSection::Filter)
+    }
+
+    /// The views a sweep could not enumerate, so a filter in them went unlooked-for: [`Self::leftover_keys`] in
+    /// `ReportSection::UnenumeratedView`. Always reported, and distinct from a key whose absence is in question: it
+    /// names no filter, so a report words it apart from [`Self::leftover_filters`].
+    pub fn unenumerated_views(&self) -> impl Iterator<Item = &UnprovenKey> + '_ {
+        self.leftover_keys()
+            .filter(|k| k.section == ReportSection::UnenumeratedView)
+    }
+
+    /// The filters under Hole's provider that no key list names, which enumeration found and the OS then refused to
+    /// delete, each with the label that names it and the code the OS answered, when it did.
+    ///
+    /// Read off the unproven set directly, not through [`Self::leftover_keys`]: whether a report names it must not
+    /// rest on what the sibling or the record say, because the filter is known to exist.
+    pub fn refused_strangers(&self) -> impl Iterator<Item = (&str, Option<u32>)> + '_ {
+        self.unproven
+            .iter()
+            .filter(|k| k.section == ReportSection::RefusedStranger)
+            .map(|k| (k.label(), k.code))
     }
 
     /// What this sweep's own observations say the persisted record should now
@@ -1258,3 +1406,10 @@ mod live_tun_permit_privileged_tests;
 #[cfg(all(test, target_os = "windows"))]
 #[path = "failclosed/boottime_privileged_tests.rs"]
 mod boottime_privileged_tests;
+
+// Privileged-lane proof of the version-independent boot-time sweep (#1008) against the real firewall: a provider-
+// filtered enumeration returns boot-time filters at every layer, and a full sweep removes an unrecognised one and
+// nothing else. Gated identically to `boottime_privileged_tests` above.
+#[cfg(all(test, target_os = "windows"))]
+#[path = "failclosed/provider_sweep_privileged_tests.rs"]
+mod provider_sweep_privileged_tests;

@@ -881,7 +881,8 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             log_dir: _, // consumed by `resolve_cli_log_dir` already
         } => match hole_bridge::cutover::release_covers() {
             Ok(clearance) => {
-                if let Some(report) = hole_bridge::cutover::release_clearance_report(&clearance) {
+                if let Some(report) = hole_bridge::cutover::release_clearance_report(&clearance, hole::version::VERSION)
+                {
                     cli_log!(warn, "{report}");
                 }
                 0
@@ -896,7 +897,8 @@ fn handle_bridge(action: BridgeAction) -> i32 {
         // it writes the kill-switch intent off.
         BridgeAction::Unlock => match hole_bridge::cutover::unlock() {
             Ok(clearance) => {
-                if let Some(report) = hole_bridge::cutover::release_clearance_report(&clearance) {
+                if let Some(report) = hole_bridge::cutover::release_clearance_report(&clearance, hole::version::VERSION)
+                {
                     cli_log!(warn, "{report}");
                 }
                 0
