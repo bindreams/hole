@@ -4715,7 +4715,8 @@ Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
   `ci.yaml` on it with `release-tag` set (the call has its own concurrency group, so
   two drafts never cancel each other). Each leg creates the tag locally before
   building, so the binaries carry the release version, and stages what the tag's
-  product ships right after the tests of those files
+  product ships right after the tests of those files (the DMG after the
+  install-and-connect test as well)
   (`cargo xtask stage-release --lane msi|dmg|plugins`, steps `release-stage-*`; see
   `xtask/src/stage_release.rs`). Only a passing leg uploads
   `release-<track>-<os>-<arch>`; the draft job needs the whole of CI to have passed, checks

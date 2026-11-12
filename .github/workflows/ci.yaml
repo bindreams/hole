@@ -523,10 +523,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      # Release calls: stage the DMG the signing tests just ran on, and the update archive of its app.
+      # Release calls: stage the DMG the signing tests and the install-and-connect test just ran on, and the update
+      # archive of its app. Both read the one `.dmg` under `target/release/bundle/dmg`, so a DMG that failed the
+      # install test is never staged.
       - id: release-stage-dmg
         name: Stage the DMG a release ships
-        if: ${{ inputs.release-tag != '' && steps.dmg.outcome == 'success' }}
+        if: ${{ inputs.release-tag != '' && steps.dmg-install-e2e.outcome == 'success' && steps.dmg-install-cleanup.outcome == 'success' }}
         timeout-minutes: 10
         shell: bash
         env:
