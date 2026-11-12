@@ -4,10 +4,14 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use super::{proxy_err_to_io_err, runtime_dir_env, start_plugin_chain, ChainTask};
+use super::{proxy_err_to_io_err, ready_or_end, runtime_dir_env, start_plugin_chain, ChainTask};
 use crate::proxy::config::BundledPlugin;
 use crate::proxy::ProxyError;
 
@@ -161,34 +165,192 @@ async fn dropping_a_chain_task_cancels_its_token_and_aborts_its_task() {
     assert!(abort.is_finished(), "Drop must abort the chain's task");
 }
 
-// Plugin identity: spawn-time record, stop-time reap ==================================================================
+/// Sets its flag when dropped, so a task that owns it reports the moment its future is gone.
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// garter's default drain for a plugin that is told to stop.
+const PLUGINS_GRACE: Duration = Duration::from_secs(12);
+
+/// A chain task that, once `cancel` fires, takes [`PLUGINS_GRACE`] to stop, as garter's runner does while it drains
+/// its plugins. `gone` is set when the task's future is dropped: by an abort, or by running to its end.
+fn draining_task(cancel: &CancellationToken, gone: &Arc<AtomicBool>) -> tokio::task::JoinHandle<garter::Result<()>> {
+    let cancel = cancel.clone();
+    let flag = DropFlag(Arc::clone(gone));
+    tokio::spawn(async move {
+        let _flag = flag;
+        cancel.cancelled().await;
+        tokio::time::sleep(PLUGINS_GRACE).await;
+        Ok(())
+    })
+}
+
+#[skuld::test]
+async fn ending_a_plugin_chain_returns_only_once_its_task_is_gone() {
+    // Paused: the plugins' grace elapses only if `end` awaits it.
+    tokio::time::pause();
+    let before = tokio::time::Instant::now();
+    let cancel = CancellationToken::new();
+    let gone = Arc::new(AtomicBool::new(false));
+    let chain = super::PluginChain::over_task_for_test(draining_task(&cancel, &gone), cancel.clone(), absent_plugin());
+
+    chain.end().await;
+
+    assert!(
+        gone.load(Ordering::SeqCst),
+        "the task's future is gone when `end` returns"
+    );
+    assert!(cancel.is_cancelled(), "`end` signals the chain's shutdown token");
+    assert_eq!(
+        before.elapsed(),
+        Duration::ZERO,
+        "`end` does not wait for the plugins' grace"
+    );
+}
+
+// Readiness: every failure ends the chain first =======================================================================
+
+type ReadySender = oneshot::Sender<Result<garter::ChainReady, garter::StartError>>;
+
+/// Drive [`ready_or_end`] over a [`draining_task`]: `settle` decides how readiness comes out, and returns the sender
+/// when the channel must stay open. Returns the result and whether the chain's task was gone by the time
+/// `ready_or_end` returned.
+async fn readiness_outcome(
+    settle: impl FnOnce(ReadySender, &CancellationToken) -> Option<ReadySender>,
+) -> (Result<(), ProxyError>, bool) {
+    let chain_cancel = CancellationToken::new();
+    let start_cancel = CancellationToken::new();
+    let gone = Arc::new(AtomicBool::new(false));
+    let task = ChainTask {
+        handle: draining_task(&chain_cancel, &gone),
+        cancel: chain_cancel,
+    };
+    let (tx, rx) = oneshot::channel();
+    let _held_open = settle(tx, &start_cancel);
+
+    let result = ready_or_end(task, rx, &start_cancel).await;
+    let gone_at_return = gone.load(Ordering::SeqCst);
+    match result {
+        Ok((task, _)) => {
+            task.end().await;
+            (Ok(()), gone_at_return)
+        }
+        Err(e) => (Err(e), gone_at_return),
+    }
+}
+
+fn ready() -> garter::ChainReady {
+    garter::ChainReady {
+        listen: dummy_addr(),
+        transports: garter::Transports::TCP,
+    }
+}
+
+#[skuld::test]
+async fn a_cancelled_readiness_wait_returns_without_the_plugins_grace() {
+    // Paused: the grace elapses only if something awaits it.
+    tokio::time::pause();
+    let before = tokio::time::Instant::now();
+
+    // Held open: the cancel is the only thing that can resolve the wait.
+    let (result, gone) = readiness_outcome(|tx, start_cancel| {
+        start_cancel.cancel();
+        Some(tx)
+    })
+    .await;
+
+    assert!(matches!(result, Err(ProxyError::Cancelled)));
+    assert_eq!(
+        before.elapsed(),
+        Duration::ZERO,
+        "a cancelled start must not wait for the plugin's own graceful stop"
+    );
+    assert!(gone, "the chain's task is gone when the cancel returns");
+}
+
+#[skuld::test]
+async fn a_chain_that_reports_ready_is_left_running() {
+    let (result, gone) = readiness_outcome(|tx, _| {
+        let _ = tx.send(Ok(ready()));
+        None
+    })
+    .await;
+
+    assert!(result.is_ok());
+    assert!(!gone, "a ready chain is handed back running");
+}
+
+#[skuld::test]
+async fn every_failed_readiness_has_ended_the_chain_before_it_is_reported() {
+    // Paused so the readiness timeout row elapses by the runtime's own auto-advance.
+    tokio::time::pause();
+    type Settle = Box<dyn FnOnce(ReadySender, &CancellationToken) -> Option<ReadySender>>;
+    type Row = (&'static str, Settle, fn(&ProxyError) -> bool);
+    let rows: Vec<Row> = vec![
+        (
+            "fatal start error",
+            Box::new(|tx, _| {
+                let _ = tx.send(Err(garter::StartError::Fatal {
+                    detail: "boom".into(),
+                    errno: None,
+                }));
+                None
+            }),
+            |e| matches!(e, ProxyError::Plugin(m) if m.contains("boom")),
+        ),
+        (
+            "bind conflict",
+            Box::new(|tx, _| {
+                let _ = tx.send(Err(garter::StartError::BindConflict {
+                    errno: 98,
+                    addr: dummy_addr(),
+                }));
+                None
+            }),
+            |e| matches!(e, ProxyError::BindRace { .. }),
+        ),
+        (
+            "plugin exited before ready",
+            Box::new(|_, _| None),
+            |e| matches!(e, ProxyError::Plugin(m) if m.contains("exited before becoming ready")),
+        ),
+        (
+            "start cancelled",
+            // Held open: the cancel is the only thing that can resolve the wait.
+            Box::new(|tx, start_cancel| {
+                start_cancel.cancel();
+                Some(tx)
+            }),
+            |e| matches!(e, ProxyError::Cancelled),
+        ),
+        (
+            "readiness timeout",
+            // Held open and never cancelled: only the timeout can resolve the wait.
+            Box::new(|tx, _| Some(tx)),
+            |e| matches!(e, ProxyError::Plugin(m) if m.contains("did not become ready")),
+        ),
+    ];
+
+    for (name, settle, expected) in rows {
+        let (result, gone) = readiness_outcome(settle).await;
+        let err = result.expect_err(name);
+        assert!(expected(&err), "{name}: unexpected error {err:?}");
+        assert!(gone, "{name}: the chain must have ended before the failure is reported");
+    }
+}
+
+// Plugin identity: spawn-time record ==================================================================================
 
 mod identity {
-    use super::super::{record_plugin_pid, PluginChain};
+    use super::super::record_plugin_pid;
     use crate::plugin_state::{self, STATE_FILE_NAME};
     use crate::test_support::reap_child::EchoChild;
-    use tokio_util::sync::CancellationToken;
     use util::versioned_file::Loaded;
-
-    fn synthetic_record() -> cosca::identity::ProcessIdRecord {
-        cosca::identity::ProcessIdRecord {
-            version: cosca::identity::RECORD_VERSION,
-            platform: cosca::identity::Platform::Windows,
-            pid: 4242,
-            token: 133_700_000_000_000_000,
-            boot_id: None,
-            pid_ns: None,
-        }
-    }
-
-    fn chain_over(dir: &std::path::Path) -> PluginChain {
-        PluginChain::for_test(
-            crate::proxy::plugin_log::PluginLog::new(),
-            CancellationToken::new(),
-            Some(dir.to_path_buf()),
-            crate::proxy::config::BundledPlugin::for_test("v2ray-plugin", std::env::temp_dir().join("ex-ray")),
-        )
-    }
 
     #[skuld::test]
     fn pid_sink_appends_a_resolved_childs_record() {
@@ -230,53 +392,6 @@ mod identity {
         assert!(
             !dir.path().join(STATE_FILE_NAME).exists(),
             "a pid that names nothing must not be recorded"
-        );
-    }
-
-    #[skuld::test]
-    async fn kill_tracked_kills_by_exact_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut child = EchoChild::spawn();
-        plugin_state::append_record(dir.path(), child.record(), None).unwrap();
-
-        chain_over(dir.path()).kill_tracked();
-
-        assert!(
-            !child.echoes(),
-            "the tracked process must not answer after kill_tracked"
-        );
-        assert!(
-            !dir.path().join(STATE_FILE_NAME).exists(),
-            "a reap that accounted for every record must clear the state file"
-        );
-    }
-
-    #[skuld::test]
-    async fn kill_tracked_spares_a_token_mismatch() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut child = EchoChild::spawn();
-        let mut record = child.record();
-        record.token ^= 1;
-        plugin_state::append_record(dir.path(), record, None).unwrap();
-
-        chain_over(dir.path()).kill_tracked();
-
-        assert!(
-            child.echoes(),
-            "a recycled pid must survive kill_tracked: the child stopped answering"
-        );
-    }
-
-    #[skuld::test]
-    async fn dropping_a_chain_does_not_delete_the_state_file() {
-        let dir = tempfile::tempdir().unwrap();
-        plugin_state::append_record(dir.path(), synthetic_record(), None).unwrap();
-
-        drop(chain_over(dir.path()));
-
-        assert!(
-            dir.path().join(STATE_FILE_NAME).exists(),
-            "Drop never accounted for these records, so it must not delete them"
         );
     }
 }

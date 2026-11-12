@@ -15,6 +15,14 @@ use crate::hole_router::HoleRouter;
 /// Builds a `Dispatcher` without a TUN device, backed by a stand-in
 /// "driver" task whose body the caller controls.
 fn build_dispatcher(driver_body: impl Future<Output = ()> + Send + 'static) -> Dispatcher {
+    build_dispatcher_over_cancel(|_| driver_body)
+}
+
+/// [`build_dispatcher`] whose driver body receives the dispatcher's own cancel token, so a body can end exactly when
+/// the dispatcher is told to stop.
+pub(crate) fn build_dispatcher_over_cancel<F: Future<Output = ()> + Send + 'static>(
+    driver_body: impl FnOnce(CancellationToken) -> F,
+) -> Dispatcher {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1080);
     let router = Arc::new(HoleRouter::new(
         Socks5Endpoint::new(addr, None, false),
@@ -23,7 +31,7 @@ fn build_dispatcher(driver_body: impl Future<Output = ()> + Send + 'static) -> D
         RuleSet::default(),
     ));
     let cancel = CancellationToken::new();
-    let driver_handle = tokio::spawn(driver_body);
+    let driver_handle = tokio::spawn(driver_body(cancel.clone()));
     let driver_abort = driver_handle.abort_handle();
 
     Dispatcher {

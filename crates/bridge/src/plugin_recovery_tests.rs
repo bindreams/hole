@@ -400,3 +400,56 @@ fn a_reap_that_cannot_account_for_a_record_keeps_that_record_and_removes_the_res
         "the next start retries only the record this reap could not settle"
     );
 }
+
+// The blocking reap's join ============================================================================================
+
+/// The `JoinError`s a blocking task's join can report, produced by real tasks: one aborted before it ran, one that
+/// panicked.
+async fn join_errors() -> (tokio::task::JoinError, tokio::task::JoinError) {
+    let aborted = tokio::spawn(std::future::pending::<()>());
+    aborted.abort();
+    let panicked = tokio::spawn(async {
+        if true {
+            panic!("injected panic in the reap task");
+        }
+    });
+    (
+        aborted.await.expect_err("an aborted task"),
+        panicked.await.expect_err("a panicked task"),
+    )
+}
+
+#[skuld::test]
+async fn a_cancelled_blocking_reap_is_run_inline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = EchoChild::spawn();
+    plugin_state::append_record(dir.path(), child.record(), None).unwrap();
+    let (cancelled, _) = join_errors().await;
+
+    let log = captured(|| settle_blocking_reap(Err(cancelled), dir.path()));
+
+    assert!(!child.echoes(), "the recorded process must be reaped, not left running");
+    assert!(!log.contains("panicked"), "a cancel is not a panic; got:\n{log}");
+    child.release_and_wait();
+}
+
+#[skuld::test]
+async fn a_panicked_blocking_reap_is_logged_as_a_panic_and_not_rerun() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = EchoChild::spawn();
+    plugin_state::append_record(dir.path(), child.record(), None).unwrap();
+    let (_, panicked) = join_errors().await;
+
+    let log = captured(|| settle_blocking_reap(Err(panicked), dir.path()));
+
+    assert!(log.contains("panicked"), "got:\n{log}");
+    assert!(child.echoes(), "a reap that panicked is not retried inline");
+    child.release_and_wait();
+}
+
+#[skuld::test]
+async fn a_blocking_reap_that_joined_cleanly_logs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = captured(|| settle_blocking_reap(Ok(()), dir.path()));
+    assert!(log.is_empty(), "got:\n{log}");
+}

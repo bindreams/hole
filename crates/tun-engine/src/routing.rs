@@ -1555,7 +1555,7 @@ where
 /// A cover RAII guard that can be DISARMED — consumed without disengaging — so
 /// the persistent WFP/pf filters survive a cutover restart; the new bridge
 /// re-adopts them via `decide_cover_recovery == Adopt`. A trait (not an inherent
-/// method) because `RunningState.lockdown` holds the cover behind the
+/// method) because `Session.lockdown` holds the cover behind the
 /// `Routing::Cover` associated type, and an inherent method is not callable
 /// through that type parameter.
 pub trait CoverGuard {
