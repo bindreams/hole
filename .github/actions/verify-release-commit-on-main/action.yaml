@@ -1,0 +1,36 @@
+name: Verify the release commit is on main
+description: Fail unless the commit this workflow runs on is an ancestor of origin/main
+
+# `workflow_dispatch` accepts --ref, so without this a draft can be pinned to unmerged code and every
+# later check still passes.
+
+runs:
+  using: composite
+  steps:
+    - name: Check ancestry
+      shell: bash
+      env:
+        SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+        if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+          git fetch --quiet --unshallow origin
+        fi
+        git fetch --quiet origin main
+
+        set +e
+        git merge-base --is-ancestor "$SHA" origin/main
+        STATUS=$?
+        set -e
+
+        case "$STATUS" in
+          0) echo "$SHA is an ancestor of origin/main" ;;
+          1)
+            echo "::error::$SHA is not an ancestor of origin/main. Release only from merged commits."
+            exit 1
+            ;;
+          *)
+            echo "::error::git merge-base failed (exit $STATUS); cannot confirm $SHA is on main"
+            exit 1
+            ;;
+        esac

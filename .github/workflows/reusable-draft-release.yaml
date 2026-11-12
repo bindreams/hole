@@ -1,24 +1,17 @@
 name: Reusable Draft Release
 
-# Common scaffolding for the draft-release workflows of "simple"
-# tracks: a single Rust binary per platform, named `<crate>${EXT}`,
-# at `target/release/<crate>${EXT}`. Galoshes and garter fit.
+# Common scaffolding for the draft-release workflows of every track (hole,
+# ex-ray, galoshes, garter); each is a thin caller.
 #
-# Hole (MSI + DMG, per-platform build targets, requires Node + uv) and
-# ex-ray (Go-built, requires setup-go instead of setup-build) do NOT
-# fit this shape and are NOT supported by this reusable.
+# The binaries come from ci.yaml (`cargo xtask stage-release`).
 #
-# See #321 (introduction) and CLAUDE.md "Releases" for context.
+# See CLAUDE.md "Releases" for context.
 
 on:
   workflow_call:
     inputs:
       track:
-        description: "Release track (galoshes | garter); used in tag, asset, artifact names"
-        required: true
-        type: string
-      crate:
-        description: "Cargo crate / binary name. Equals `track` for galoshes; `garter` (from garter-bin) for garter track"
+        description: "Release track (hole | ex-ray | galoshes | garter); names the tag, assets, artifacts, release title and `xtask version` group"
         required: true
         type: string
       version:
@@ -26,33 +19,15 @@ on:
         required: true
         type: string
       version-regex:
-        description: "Bash extended regex for validating the normalized version"
-        required: true
+        description: "Bash extended regex for validating the normalized version (default: plain X.Y.Z)"
+        required: false
         type: string
-      cargo-version-group:
-        description: "Group name for `cargo xtask version --check --exact --group <name>`"
-        required: true
-        type: string
-      matrix:
-        description: "JSON-encoded matrix `include:` list (per-track shape)"
-        required: true
-        type: string
-      build-target:
-        description: "`cargo xtask build <target>` argument"
-        required: true
-        type: string
-      expected-sha256sums-count:
-        description: "Expected number of lines in SHA256SUMS (matrix size)"
-        required: true
-        type: number
-      release-title:
-        description: "GitHub release title (e.g. `galoshes v${VERSION}`)"
-        required: true
-        type: string
+        default: '^[0-9]+\.[0-9]+\.[0-9]+$'
       latest:
         description: "Pass to `gh release create --latest`. Use true for hole only"
-        required: true
+        required: false
         type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -64,12 +39,16 @@ jobs:
     timeout-minutes: 15
     outputs:
       version: ${{ steps.version.outputs.version }}
+      platforms: ${{ steps.assets.outputs.platforms }}
     steps:
       - uses: actions/checkout@v7
         with:
+          # Full history and tags: `version --check` walks ancestor release tags.
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-rust
+
+      - uses: ./.github/actions/verify-release-commit-on-main
 
       - name: Normalize and validate version
         id: version
@@ -89,63 +68,46 @@ jobs:
       - name: Fetch crate sources
         run: .github/scripts/cargo-fetch.sh
 
-      - name: Validate Cargo.toml matches version
-        run: cargo xtask version --check --exact --group ${{ inputs.cargo-version-group }}
+      - name: Validate the crate version group matches version
+        run: cargo xtask version --check --exact --group ${{ inputs.track }}
 
-  build:
-    name: Build (${{ matrix.os }}/${{ matrix.arch }})
+      # What this release ships, per platform, from the plan `stage-release` stages by.
+      - name: List the release assets
+        id: assets
+        uses: ./.github/actions/list-release-assets
+        with:
+          tag: releases/${{ inputs.track }}/v${{ steps.version.outputs.version }}
+
+  # CI's test track on the release commit; each leg uploads what it staged (ci.yaml, "Release assets").
+  ci:
+    name: CI
     needs: validate
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
-    strategy:
-      fail-fast: true
-      matrix:
-        include: ${{ fromJSON(inputs.matrix) }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yaml
+    with:
+      release-tag: releases/${{ inputs.track }}/v${{ needs.validate.outputs.version }}
+
+  release:
+    name: Create draft release
+    needs: [validate, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          path: source
 
-      - name: Create local tag for build
-        run: git tag "releases/${{ inputs.track }}/v${{ needs.validate.outputs.version }}"
-
-      - uses: ./.github/actions/setup-build
-
-      - name: Build (${{ inputs.build-target }})
-        shell: bash
-        run: cargo xtask build ${{ inputs.build-target }}
-
-      - name: Rename artifact
-        shell: bash
-        env:
-          OS: ${{ matrix.os }}
-          ARCH: ${{ matrix.arch }}
-          TRACK: ${{ inputs.track }}
-          CRATE: ${{ inputs.crate }}
-          VERSION: ${{ needs.validate.outputs.version }}
-        run: |
-          set -euo pipefail
-          EXT=""
-          if [ "$OS" = "windows" ]; then EXT=".exe"; fi
-          ASSET="${TRACK}-${VERSION}-${OS}-${ARCH}${EXT}"
-          mv "target/release/${CRATE}${EXT}" "$ASSET"
-          echo "Artifact: $ASSET"
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ${{ inputs.track }}-${{ matrix.os }}-${{ matrix.arch }}
-          path: ${{ inputs.track }}-*
-
-  release:
-    name: Create draft release
-    needs: [validate, build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
       - uses: actions/download-artifact@v8
         with:
-          pattern: ${{ inputs.track }}-*
+          pattern: release-${{ inputs.track }}-*
           merge-multiple: true
+
+      # Checks the working directory, which holds only the downloaded files.
+      - uses: ./source/.github/actions/check-release-assets
+        with:
+          platforms: ${{ needs.validate.outputs.platforms }}
 
       # Hash on ubuntu (single platform) so SHA256SUMS is uniformly
       # text-mode regardless of which per-matrix runner built each
@@ -156,19 +118,8 @@ jobs:
         run: |
           sha256sum ${{ inputs.track }}-* > SHA256SUMS
 
-          lines=$(wc -l < SHA256SUMS)
-          if [ "$lines" -ne ${{ inputs.expected-sha256sums-count }} ]; then
-            echo "::error::Expected ${{ inputs.expected-sha256sums-count }} entries in SHA256SUMS, got $lines"
-            exit 1
-          fi
-
           echo "SHA256SUMS:"
           cat SHA256SUMS
-
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          path: source
 
       - uses: astral-sh/setup-uv@v10.3.3
 
@@ -182,8 +133,7 @@ jobs:
             --new-tag "$TAG" \
             --head "${{ github.sha }}" \
             --repo-root source \
-            --platforms '${{ inputs.matrix }}' \
-            --version "$VERSION" \
+            --platforms '${{ needs.validate.outputs.platforms }}' \
             > release-notes.md
           echo "--- release-notes.md ---"
           cat release-notes.md
@@ -202,7 +152,7 @@ jobs:
             --draft \
             --latest=${{ inputs.latest }} \
             --notes-file release-notes.md \
-            --title "${{ inputs.release-title }}" \
+            --title "${{ inputs.track }} v${VERSION}" \
             --target "${{ github.sha }}" \
             ${{ inputs.track }}-* SHA256SUMS
           echo "Draft release created: https://github.com/${{ github.repository }}/releases/tag/$TAG"

@@ -91,6 +91,30 @@ fn group_tag_prefix() {
 }
 
 #[skuld::test]
+fn release_tag_splits_into_group_and_version() {
+    assert_eq!(
+        parse_release_tag("releases/hole/v0.7.0").unwrap(),
+        (Group::Hole, v(0, 7, 0))
+    );
+    assert_eq!(
+        parse_release_tag("releases/ex-ray/v1.20.3").unwrap(),
+        (Group::ExRay, v(1, 20, 3))
+    );
+}
+
+#[skuld::test]
+fn release_tag_rejects_other_shapes() {
+    for bad in [
+        "v0.1.0",
+        "releases/hole/v1.0.0-rc1",
+        "releases/nope/v1.0.0",
+        "releases/hole/1.0.0",
+    ] {
+        assert!(parse_release_tag(bad).is_err(), "{bad}");
+    }
+}
+
+#[skuld::test]
 fn group_all_lists_four() {
     assert_eq!(Group::all().len(), 4);
 }

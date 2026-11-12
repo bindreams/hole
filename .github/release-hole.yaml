@@ -36,6 +36,7 @@ include_paths:
   - ui/**
   - scripts/**
   - .github/workflows/draft-release-hole.yaml
+  - .github/workflows/reusable-draft-release.yaml
   - .github/workflows/publish-release-hole.yaml
   - .github/release-hole.yaml
   - CLAUDE.md

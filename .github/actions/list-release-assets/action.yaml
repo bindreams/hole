@@ -1,0 +1,26 @@
+name: List the release assets
+description: What release TAG ships per platform, from the plan `stage-release` stages by (`cargo xtask release-assets`)
+
+inputs:
+  tag:
+    description: The release tag, `releases/<track>/v<version>`
+    required: true
+
+outputs:
+  platforms:
+    description: JSON array of {os, arch, asset, assets[]}
+    value: ${{ steps.list.outputs.platforms }}
+
+runs:
+  using: composite
+  steps:
+    - name: List
+      id: list
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        # Assigned first: inside `echo "$(...)"` a failing command would not fail the step.
+        PLATFORMS="$(cargo xtask release-assets --tag "$TAG")"
+        echo "platforms=$PLATFORMS" >> "$GITHUB_OUTPUT"

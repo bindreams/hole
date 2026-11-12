@@ -4710,6 +4710,32 @@ Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
 - **Versions** live in each crate's `[package.metadata.hole-release].group`
   (ex-ray in `crates/ex-ray/version.toml`); validate with `cargo xtask version [--check --group <name> [--exact]]` (release CI uses `--exact`). The legacy
   `v0.1.0` tag predates the scheme and is ignored.
+- **A draft ships what CI tested.** Every draft workflow checks that its commit is
+  an ancestor of `main` (`.github/actions/verify-release-commit-on-main`), then calls
+  `ci.yaml` on it with `release-tag` set (the call has its own concurrency group, so
+  two drafts never cancel each other). Each leg creates the tag locally before
+  building, so the binaries carry the release version, and stages what the tag's
+  product ships right after the tests of those files (the DMG after the
+  install-and-connect test as well)
+  (`cargo xtask stage-release --lane msi|dmg|plugins`, steps `release-stage-*`; see
+  `xtask/src/stage_release.rs`). Only a passing leg uploads
+  `release-<track>-<os>-<arch>`; the draft job needs the whole of CI to have passed, checks
+  (`.github/actions/check-release-assets`) that the downloaded files are exactly what
+  `cargo xtask release-assets --tag <tag>` lists, builds the release notes'
+  Downloads table from the same list, then hashes and uploads the files; it builds
+  nothing.
+- **What staging requires.** The Windows update zip is packed from
+  `target/release/installer-stage` (the MSI's payload directory), not from
+  `target/release`. `hole.exe version` and `garter --version` must print the tag's
+  version, so a build of a dirty tree (`X.Y.Z.dirty`) fails; `garter --help` must
+  exit 0. The galoshes and ex-ray versions are not checked.
+- **Installer under test.** The DMG tests take the DMG from `DMG_UNDER_TEST`
+  (default: the release build's single `.dmg`), the MSI lifecycle tests the MSI from
+  `MSI_UNDER_TEST` (default: `target/release/hole.msi`). A relative path in either
+  variable is from the repo root, in the Python harnesses and in xtask alike.
+  `stage-release` stages only this checkout's own build (the update archive and the
+  `hole.exe` probe come from it), so it refuses a variable that names any other
+  file.
 
 Rollback, minisign key rotation, and the crates.io dry-run TOCTOU note are in
 [RELEASE-OPS.md](RELEASE-OPS.md).

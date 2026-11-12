@@ -263,12 +263,12 @@ fn each_malformed_expression_is_an_error_naming_the_problem() {
         ("matrix.flag matrix.flag", "trailing input"),
         ("matrix.name == 'Win", "unterminated string"),
         ("(matrix.flag", "missing `)`"),
-        ("always(1)", "takes arguments"),
+        ("always(1)", "with arguments is not supported"),
         ("steps.first.conclusion == 'success'", "only `steps.<id>.outcome`"),
         ("matrix.flag &&", "unexpected end"),
         ("matrix.flag & matrix.flag", "unsupported character"),
         ("github.ref == 'x'", "unsupported context reference"),
-        ("hashFiles('x')", "takes arguments"),
+        ("hashFiles('x')", "with arguments is not supported"),
         ("contains()", "contains"),
     ] {
         let err = probe_error(condition);
@@ -738,6 +738,16 @@ const FAILURE_ONLY: [&str; 3] = [
     "dmg-upload-diagnostics",
 ];
 
+/// Steps only a release call runs (`inputs.release-tag` set). The mapping above models an ordinary run, where
+/// none of them runs on any leg.
+const RELEASE_ONLY: [&str; 5] = [
+    "release-tag",
+    "release-stage-plugins",
+    "release-stage-dmg",
+    "release-stage-msi",
+    "release-upload",
+];
+
 /// Every platform runs exactly the steps the mapping says, and no leg gained or
 /// lost a lane. The matrix flags are the only thing selecting lanes, so one
 /// deleted flag would otherwise be invisible: the job stays green.
@@ -778,7 +788,7 @@ fn the_six_legs_run_exactly_the_documented_step_ids() {
 /// ci.yaml without a mapping row (or a typo in the table) cannot pass by being
 /// absent from every leg.
 #[skuld::test]
-fn every_ci_step_is_either_in_the_mapping_or_failure_only() {
+fn every_ci_step_is_in_the_mapping_failure_only_or_release_only() {
     let ci_yaml = read_repo(".github/workflows/ci.yaml");
     let all_ids: BTreeSet<String> = steps_after(&ci_yaml, "ci", "checkout")
         .expect("order")
@@ -789,6 +799,7 @@ fn every_ci_step_is_either_in_the_mapping_or_failure_only() {
         .keys()
         .map(|s| s.to_string())
         .chain(FAILURE_ONLY.iter().map(|s| s.to_string()))
+        .chain(RELEASE_ONLY.iter().map(|s| s.to_string()))
         .collect();
     assert_eq!(
         all_ids.symmetric_difference(&known).collect::<Vec<_>>(),

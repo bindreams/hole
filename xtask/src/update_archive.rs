@@ -2,6 +2,8 @@
 //! the shared `payload-archive` crate (the same code the bridge unpacks with).
 //! Windows: a flat `.zip`; macOS: a `.tar.gz` of the built `Hole.app`.
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use std::path::Path;
 
 use anyhow::Result;
@@ -41,6 +43,34 @@ pub fn build_update_archive(profile: Profile, repo_root: &Path, out: &Path) -> R
     {
         let _ = (profile, repo_root, out);
         anyhow::bail!("update-archive is only built on windows/macos")
+    }
+}
+
+/// Build the Windows update zip from the BINDIR files staged in `dir` (`cargo xtask stage`'s output, the directory the
+/// MSI is built from), so the zip holds the files the MSI installs. Every other host bails.
+pub fn build_update_archive_from_stage(dir: &Path, out: &Path) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use anyhow::{ensure, Context};
+        use xtask_lib::bindir::{bindir_dest_names, Os};
+
+        let mut entries = Vec::new();
+        for name in bindir_dest_names(Os::Windows) {
+            let path = dir.join(&name);
+            ensure!(
+                path.is_file(),
+                "{} is not a file; was `{}` staged?",
+                path.display(),
+                name
+            );
+            entries.push((path, name));
+        }
+        payload_archive::pack_zip(&entries, out).context("pack windows update zip from the staged BINDIR")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (dir, out);
+        anyhow::bail!("a staged-BINDIR update zip is only built on windows")
     }
 }
 
@@ -101,6 +131,26 @@ pub fn verify_update_archive(archive: &Path) -> Result<()> {
         let _ = archive;
         anyhow::bail!("update-archive is only built on windows/macos")
     }
+}
+
+/// Assert the `.app` inside a macOS update archive passes `codesign --verify`, as Gatekeeper will judge it after the
+/// updater unpacks it: the archive is extracted with `payload_archive::unpack_targz`, the code the updater extracts with.
+#[cfg(target_os = "macos")]
+pub fn verify_app_signature(archive: &Path) -> Result<()> {
+    use anyhow::Context;
+
+    let workdir = tempfile::tempdir().context("create a scratch dir to unpack the archive")?;
+    payload_archive::unpack_targz(archive, workdir.path()).with_context(|| format!("unpack {}", archive.display()))?;
+    let app = payload_archive::find_single_app(workdir.path())
+        .map_err(|e| anyhow::anyhow!("select the .app unpacked from {}: {e}", archive.display()))?;
+    let output = crate::command::run_captured(
+        std::process::Command::new("codesign")
+            .args(["--verify", "--deep", "--strict", "--verbose=2"])
+            .arg(&app),
+    )?;
+    // codesign reports on stderr, even on success.
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    Ok(())
 }
 
 /// The single built `.app` under `target/<profile>/bundle/macos`, via the shared

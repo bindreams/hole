@@ -19,7 +19,14 @@ pub const RETRY_LOOP_INTERRUPTED_EXIT: i32 = 43;
 /// clean-release code.
 pub const CHILD_ERROR_EXIT: i32 = 99;
 
+/// First argument that turns the test binary into a stand-in for a shipped executable (see [`probe_target`]).
+pub const PROBE_TARGET_ARG: &str = "--xtask-probe-target";
+
 pub fn maybe_run() {
+    // `args_os`: `args` panics on a non-UTF-8 argument, which every test binary's own arguments may be.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(PROBE_TARGET_ARG)) {
+        probe_target(std::env::args().skip(2));
+    }
     let Ok(mode) = std::env::var(MODE_ENV) else { return };
     match mode.as_str() {
         "interrupt-parent" => run_interrupt_parent(),
@@ -37,6 +44,18 @@ pub fn maybe_run() {
             eprintln!("unknown {MODE_ENV} mode: {other}");
             std::process::exit(2);
         }
+    }
+}
+
+/// A stand-in executable for `run_probes`: `print <text>` prints `text` and exits 0; `exit <code>` exits with `code`.
+fn probe_target(mut args: impl Iterator<Item = String>) -> ! {
+    match (args.next().as_deref(), args.next()) {
+        (Some("print"), Some(text)) => {
+            println!("{text}");
+            std::process::exit(0);
+        }
+        (Some("exit"), Some(code)) => std::process::exit(code.parse().expect("exit code")),
+        other => panic!("unknown {PROBE_TARGET_ARG} arguments: {other:?}"),
     }
 }
 

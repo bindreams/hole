@@ -1,0 +1,22 @@
+name: Check the assets are what the release ships
+description: Fail unless the files in the working directory are exactly the assets the release plan lists
+
+# Run from the directory the release artifacts were downloaded into.
+
+inputs:
+  platforms:
+    description: The JSON `list-release-assets` printed
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Diff the files against the plan
+      shell: bash
+      env:
+        PLATFORMS: ${{ inputs.platforms }}
+      run: |
+        set -euo pipefail
+        jq -r '.[].assets[]' <<<"$PLATFORMS" | sort > "$RUNNER_TEMP/expected-assets.txt"
+        find . -maxdepth 1 -type f -printf '%f\n' | sort > "$RUNNER_TEMP/actual-assets.txt"
+        diff -u "$RUNNER_TEMP/expected-assets.txt" "$RUNNER_TEMP/actual-assets.txt"
