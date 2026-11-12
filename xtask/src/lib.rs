@@ -771,31 +771,26 @@ pub fn run_build(target: Option<String>, all: bool) -> Result<()> {
              cannot orchestrate"
         )
     })?;
-    let plan = Plan::new(&manifest)?;
 
-    let roots: Vec<&str> = match (target, all) {
-        (Some(name), false) => {
-            let target = manifest.get(&name).ok_or_else(|| anyhow!("unknown target: {name:?}"))?;
-            vec![target.name.as_str()]
+    match (target, all) {
+        (Some(name), false) => build_target_from(&manifest, &repo_root, host, &name),
+        (None, true) => {
+            let plan = Plan::new(&manifest)?;
+            let roots: Vec<&str> = plan
+                .target_names()
+                .into_iter()
+                .filter(|name| manifest.get(name).map(|t| t.applies_to(host)).unwrap_or(false))
+                .collect();
+            if roots.is_empty() {
+                println!("xtask: no targets apply to host platform {host}");
+                return Ok(());
+            }
+            let order = plan.order_for(&roots, host)?;
+            execute(&plan, &order, &repo_root)
         }
-        (None, true) => plan
-            .target_names()
-            .into_iter()
-            .filter(|name| manifest.get(name).map(|t| t.applies_to(host)).unwrap_or(false))
-            .collect(),
         (Some(_), true) => unreachable!("clap rejects --all with a positional target"),
-        (None, false) => {
-            return Err(anyhow!("specify a target name or pass --all"));
-        }
-    };
-
-    if roots.is_empty() {
-        println!("xtask: no targets apply to host platform {host}");
-        return Ok(());
+        (None, false) => Err(anyhow!("specify a target name or pass --all")),
     }
-
-    let order = plan.order_for(&roots, host)?;
-    execute(&plan, &order, &repo_root)
 }
 
 pub fn run_run(target: String) -> Result<()> {
@@ -822,17 +817,20 @@ pub fn run_list() -> Result<()> {
     Ok(())
 }
 
-/// Build `target` and its dependencies for the host, as `cargo xtask build <target>` does, with `repo_root` as the
-/// checkout; for callers that already run inside xtask and must not spawn a second one.
-pub fn build_target_in(repo_root: &Path, target: &str) -> Result<()> {
-    relocate_self_if_windows()?;
-    let manifest = load_manifest_at(repo_root)?;
-    let host = Platform::host().ok_or_else(|| anyhow!("host platform not in the known set"))?;
-    let plan = Plan::new(&manifest)?;
-    let target = manifest
-        .get(target)
-        .ok_or_else(|| anyhow!("unknown target: {target:?}"))?;
-    let order = plan.order_for(&[target.name.as_str()], host)?;
+/// Build `target` and its dependencies for `host` in the checkout at `repo_root`, as `cargo xtask build <target>` does;
+/// for callers that already run inside xtask and must not spawn a second one.
+///
+/// Does not relocate the running `xtask.exe` (see [`relocate_self_if_windows`]): that guards a build step that runs
+/// `cargo xtask`, which can make cargo relink it. The caller relocates first if the target's closure has one; the only
+/// caller today builds `garter-bin`, whose steps are plain `cargo build`s of crates that do not depend on xtask.
+pub fn build_target_in(repo_root: &Path, host: Platform, target: &str) -> Result<()> {
+    build_target_from(&load_manifest_at(repo_root)?, repo_root, host, target)
+}
+
+/// The one single-target build path: `order_for` rejects a name the manifest does not declare.
+fn build_target_from(manifest: &Manifest, repo_root: &Path, host: Platform, target: &str) -> Result<()> {
+    let plan = Plan::new(manifest)?;
+    let order = plan.order_for(&[target], host)?;
     execute(&plan, &order, repo_root)
 }
 

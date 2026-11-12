@@ -252,11 +252,20 @@ fn every_build_first_names_a_build_target_for_the_platform_it_ships_on() {
             for os in [Os::Windows, Os::Linux, Os::Darwin] {
                 for arch in [Arch::Amd64, Arch::Arm64] {
                     let platform = Platform { os, arch };
-                    let Ok(shipment) = plan(*group, lane, "1.2.3", platform, Path::new("repo"), || {
+                    let planned = plan(*group, lane, "1.2.3", platform, Path::new("repo"), || {
                         Ok(PathBuf::from("the-installer"))
-                    }) else {
+                    });
+                    // The hole installer lanes refuse the other OSes; no other pairing errors.
+                    if *group == Group::Hole
+                        && matches!(
+                            (lane, os),
+                            (Lane::Msi, Os::Linux | Os::Darwin) | (Lane::Dmg, Os::Linux | Os::Windows)
+                        )
+                    {
+                        assert!(planned.is_err(), "{group} {lane:?} on {platform} should refuse");
                         continue;
-                    };
+                    }
+                    let shipment = planned.unwrap();
                     let Some(target) = shipment.build_first else { continue };
                     named += 1;
                     let found = manifest
@@ -296,12 +305,9 @@ fn the_build_runs_before_the_files_are_required_to_exist() {
     let err = ensure_built(&garter, |_| Ok(())).unwrap_err();
     assert!(err.to_string().contains("is not a file"), "{err}");
 
-    // A failed build is reported with its target and is not followed by the file check.
+    // A failed build's error is returned as is, and the file check does not run after it.
     let err = ensure_built(&garter, |_| anyhow::bail!("cargo failed")).unwrap_err();
-    assert!(
-        format!("{err:#}").contains("build target garter-bin: cargo failed"),
-        "{err:#}"
-    );
+    assert_eq!(format!("{err:#}"), "cargo failed");
 }
 
 #[skuld::test]

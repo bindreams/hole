@@ -366,11 +366,12 @@ fn run_probes(exe: &Path, probes: &[Probe]) -> Result<()> {
     Ok(())
 }
 
-/// Run the shipment's `build_first` target through `build`, then require every file it ships to exist.
-/// The existence check is only here, after the build, so no path can check before building.
+/// Run the shipment's `build_first` target through `build`, then require every file in `files` to exist.
+/// The existence check is only here, after the build, so no path can check before building. A failed build's error is
+/// returned as is: the build already names its target.
 fn ensure_built(shipment: &Shipment, build: impl FnOnce(&str) -> Result<()>) -> Result<()> {
     if let Some(target) = shipment.build_first {
-        build(target).with_context(|| format!("build target {target}"))?;
+        build(target)?;
     }
     for asset in &shipment.files {
         ensure!(asset.src.is_file(), "{} is not a file", asset.src.display());
@@ -391,7 +392,7 @@ pub fn stage(repo_root: &Path, tag: &str, lane: Lane, out: &Path) -> Result<()> 
         return Ok(());
     }
 
-    ensure_built(&shipment, |target| crate::build_target_in(repo_root, target))?;
+    ensure_built(&shipment, |target| crate::build_target_in(repo_root, platform, target))?;
 
     std::fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;
     for asset in &shipment.files {
