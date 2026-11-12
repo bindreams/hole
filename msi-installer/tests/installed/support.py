@@ -367,7 +367,7 @@ def installed_hole(msi_path: Path, request: pytest.FixtureRequest) -> Iterator[P
         kill_installed_hole_processes()
         install_completed = True
         yield INSTALL_DIR
-    except BaseException as e:
+    except Exception as e:
         failure = e
         raise
     finally:

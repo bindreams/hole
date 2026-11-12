@@ -27,12 +27,14 @@ def test_cleanup_leaves_nothing_installed():
     found = f"Hole is installed ({'; '.join(traces)})"
     marker = read_marker()
     assert marker is not None, f"{found} but the suite did not install it: not uninstalling it"
-    if marker.product_code not in installed_hole_product_codes():
+    installed = installed_hole_product_codes()
+    if not installed:
         leftovers = leftover_traces()
         assert not leftovers, (
             f"the suite's uninstall of {marker.product_code} left: {'; '.join(leftovers)}. They cannot be removed "
             "without the product: remove them by hand"
         )
+    if marker.product_code not in installed:
         pytest.fail(f"{found}, but not as the product the suite installed ({marker.product_code}): not uninstalling it")
     assert is_elevated(), "uninstalling needs an elevated shell"
     ensure_uninstalled(marker.product_code, log_dir() / "msi-cleanup-uninstall.log")

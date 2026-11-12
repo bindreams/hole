@@ -621,7 +621,8 @@ jobs:
       #
       # Last-resort kill: the harness bounds each phase itself (msiexec 3 min; gsudo self-test,
       # dashboard E2E and each diagnostics dump 5 min), so a wedged phase fails by name and the
-      # fixture still uninstalls first. Those bounds sum to about 35 min; 75 leaves margin for the tool downloads.
+      # fixture still uninstalls first. Those bounds sum to about 25 min; 75 leaves margin for the
+      # unbounded phases (tool provisioning, the build, process listing).
       - id: installer-tests
         name: Install, E2E and uninstall the MSI
         if: ${{ !cancelled() && steps.installer-build-msi.outcome == 'success' }}
