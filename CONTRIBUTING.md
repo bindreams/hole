@@ -2025,11 +2025,28 @@ sweep already removed — is still silent.
 template names *no provider* — deliberately, since filtering by ours would make
 "the record dropped its provider" and "there is no record" the same empty
 answer. So what is proven is that the stored record *carries* our `providerKey`,
-**not** that a `BOOTTIME_ONLY` template filtered *by* `providerKey` returns it.
-Those are one step apart and
+**not** that the provider sweep's read returns it. Those are one step apart and
 [#1008](https://github.com/bindreams/hole/issues/1008) needs the second. The
-result rules out the outcome that would have made #1008 impossible; it does not
-demonstrate #1008's mechanism.
+second is measured by `provider_sweep_privileged_tests`
+(`boottime_global_net_state_a_provider_enumeration_returns_boot_time_filters_at_every_layer`,
+`..._every_layer_the_engine_lists_has_a_readable_boot_time_view`), which reads the
+boot-time view of every layer the engine lists and expects a boot-time probe at
+each of the four layers a cover installs at. What those reads rest on:
+
+- **A layer is required.** A `BOOTTIME_ONLY` template whose `layerKey` is the
+  zero GUID is refused with `FWP_E_LAYER_NOT_FOUND` (`0x80320004`, measured on
+  the elevated lane); it is not read as "any layer". So the sweep lists the
+  layers with `FwpmLayerEnum0` and reads each one's view, rather than naming a
+  provider, and selects `PROVIDER_GUID` in code (`unrecognised_keys`). The layers
+  are not a list this build carries, so a layer a later build installs at is
+  read too.
+- **A live boot-time filter is not enforced after BFE has started.** Measured on
+  the elevated lane: a boot-time block on a loopback port that only the test
+  listened on let the connect through, where a persistent block on the same port
+  (the control) refused it. So a stranded boot-time filter harms the next boot's
+  early window and not the running host, which is why an unreadable view does not
+  fail a sweep, while a refused delete does (its record is what blocks the next
+  boot, and no runtime check sees that).
 
 **Not settled by any test, and not claimed.** Everything above holds *within a
 single boot* — that is the whole reach of the elevated lane, which does not
@@ -2079,7 +2096,47 @@ re-provisioned every boot, the twins work every boot *and* a stranded one blocks
 every boot; if it is spent after one, the hazard mostly evaporates and so does
 most of the protection. Hole assumes the worse branch for safety and claims the
 weaker one for coverage. Bounding the hazard is
-[#1008](https://github.com/bindreams/hole/issues/1008).
+[#1008](https://github.com/bindreams/hole/issues/1008): every release and every
+disengage (`release_all` and `disengage_lockdown`) also reads the boot-time view of every
+layer, selects the filters under `PROVIDER_GUID`, and deletes every BOOT-TIME one
+no key list in the running build names (`failclosed/windows/provider_sweep.rs`).
+Every cover this build runs has its keys in the fixed lists, so an unlisted
+boot-time filter is never a running cover's. Another provider's filter is never
+touched, and neither is a persistent one under Hole's provider, on purpose: a
+live persistent filter may be another bridge's cover, which a sweep of this build
+must not delete ([#878](https://github.com/bindreams/hole/issues/878)). What that
+leaves is
+[#1242](https://github.com/bindreams/hole/issues/1242): a persistent filter a
+later build installed under a key this build never learned survives unlock,
+`release-covers` and uninstall.
+A stranger whose delete removed a live object is a watched removal like a twin.
+One whose delete was refused does not fail the sweep (a refused delete of a listed key
+does; `KeyRole::refusal_fails_the_sweep`): a live boot-time filter is not enforced
+once BFE has started, so failing `bridge unlock` or the tray's Unblock over it would
+keep them from writing the lockdown intent off, and the next start would re-engage
+the kill switch, a lockout loop. The clearance carries it as a refused stranger
+(`Clearance::refused_strangers`: the filter's GUID and the code the OS answered),
+which is a fact about the filter. No sweep fails over it, the uninstall gate included:
+a boot-time filter is live only between kernel start and BFE start, a bounded harm,
+and failing the uninstall over a refusal that may never clear would leave the product
+unremovable. `bridge unlock` and `release-covers` print it on a line of its own, with
+the GUID, the code and a remedy (the refusal may be transient; failing that, remove it
+by key with an elevated tool, since `netsh wfp` has no delete verb). The tray's Unblock and `turn_lockdown_off` discard the
+clearance, so there the GUID reaches only the bridge log (the warning `sweep_provider`
+writes); surfacing it in the GUI is not built. A refused stranger is also live
+evidence that a record is possible here (`KeyRole::Unlisted`), so the witness is armed. A view
+that could not be read, a layer list that could not, or a layer list that is empty
+(no layer, so no look was taken, and no code to name) does not fail the sweep
+but is always reported (`KeyRole::Enumeration`, an unproven boot-time observation
+that no sibling or record can silence, worded as a look that did not happen, and
+the warning names the layer and the code); it keeps the witness armed for good
+while it stays unreadable. Whether the enumeration returns a twin on a boot later
+than the one that armed it is unmeasured, with #1043's purge assumption. The
+sweep does not reach the transient sweep (`recover_cover`, which stays by-key and
+runs no enumeration) or the presence probe, so a stranger alone on a host is
+removed by the escape hatches (`bridge unlock`, the tray's Unblock, the uninstall
+gate), not by a start-time recovery; and a build older than the sweep cannot
+enumerate at all.
 
 **Size that worst case correctly.** Both Microsoft readings agree the filter
 stops applying once BFE starts, so a stranded twin blocks egress from tcpip.sys
@@ -2918,7 +2975,7 @@ bounded, not on any figure. Refusing the uninstall over a bounded early-boot
 block would trade it for a permanently unremovable product: the same trade the
 bookkeeping clause above already refuses. The gate stops claiming proof it does
 not have; it does not withhold the uninstall. What replaces the silence is
-`cutover::release_clearance_report`, which `bridge release-covers` and `bridge uninstall` both print: it names each unproven key, points at `netsh wfp show boottimepolicy` to *see* whether a record survived, says outright that `netsh wfp` cannot remove one, and names reinstalling Hole as the only thing that can.
+`cutover::release_clearance_report`, which `bridge release-covers` and `bridge uninstall` both print: it names each unproven key, points at `netsh wfp show boottimepolicy` to *see* whether a record survived, says outright that `netsh wfp` cannot remove one, and names reinstalling the running build's own release (`running_version`, passed in by the caller), or later, as the only thing that can: a key that answered not-found is not live, so no enumeration sees it and only a build whose list names it can address it. The running build's list names every key it installs, so a boot-time key added later is covered by this remedy with no edit.
 This is the last moment a Hole binary exists to say anything at all, so what it
 says has to be runnable.
 It deliberately does not assert a leftover is *present* — an unproven key is

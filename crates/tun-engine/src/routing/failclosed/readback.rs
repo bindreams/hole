@@ -50,18 +50,30 @@ pub(crate) enum Readback<T> {
 /// vacuously true of nothing read, and the vacuous reading is the one with a
 /// consequence.
 pub(crate) fn verdict<T: Copy, E>(views: &[Result<Vec<T>, E>], wanted: impl Fn(&T) -> bool) -> Readback<T> {
-    if let Some(found) = views
-        .iter()
-        .filter_map(|v| v.as_ref().ok())
-        .flatten()
-        .find(|t| wanted(t))
-    {
-        return Readback::Found(*found);
+    let (records, unread) = merge(views);
+    if let Some(found) = records.into_iter().find(|t| wanted(t)) {
+        return Readback::Found(found);
     }
-    if views.is_empty() || views.iter().any(Result::is_err) {
+    if views.is_empty() || unread.is_some() {
         return Readback::Unreadable;
     }
     Readback::Absent
+}
+
+/// The records of every readable view, in view order, and the first read error among the rest.
+///
+/// The fold [`verdict`] is built on, for a caller that needs every matching record rather than one: an error in
+/// one view never hides what another returned, and it is still reported. `None` means every view was read, so an
+/// empty `views` is `None` too; whether that vacuous answer may be read as "complete" is the caller's to decide, as
+/// [`verdict`] decides it.
+pub(crate) fn merge<T: Copy, E>(views: &[Result<Vec<T>, E>]) -> (Vec<T>, Option<&E>) {
+    let records = views
+        .iter()
+        .filter_map(|v| v.as_ref().ok())
+        .flatten()
+        .copied()
+        .collect();
+    (records, views.iter().find_map(|v| v.as_ref().err()))
 }
 
 #[cfg(test)]

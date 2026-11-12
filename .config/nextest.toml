@@ -201,6 +201,12 @@ success-output = 'immediate-final'
 filter = 'test(/cutover_global_net_state_service_controls_after_stop_/)'
 success-output = 'immediate-final'
 
+# The provider sweep's tests print what it costs under the cover lock: the read of every layer's view, and the whole
+# sweep with its deletes. Nextest discards captured output on success, and the figure is what judges that cost.
+[[profile.default.overrides]]
+filter = 'test(/boottime_global_net_state_(every_layer_the_engine_lists|release_all_removes|disengage_removes)_/)'
+success-output = 'immediate-final'
+
 # `cutover_global_net_state_stop_probe_*` print what the SCM answers a Stop (and
 # an arm for every state) in each state a restart passes through,
 # `cutover_global_net_state_service_sid_probe_*` print whether a service

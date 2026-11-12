@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use super::super::clearance_tests::pairs;
 use super::super::{
     ArmingWitness, Clearance, CoverKind, CoverLock, KeyLifetime, KeyObservation, KeyOutcome, KeyRole, RoutingError,
     SweepOutcome,
@@ -21,10 +22,11 @@ use super::{next_record, WitnessUpdate};
 /// An ordinary key, whose outcome speaks only for itself.
 fn obs(key: &'static str, lifetime: KeyLifetime, outcome: KeyOutcome) -> KeyObservation {
     KeyObservation {
-        key,
+        key: key.into(),
         lifetime,
         outcome,
         role: KeyRole::Plain,
+        code: None,
     }
 }
 
@@ -32,10 +34,11 @@ fn obs(key: &'static str, lifetime: KeyLifetime, outcome: KeyOutcome) -> KeyObse
 /// whose outcome says whether a standing cover is installed right now.
 fn sibling(outcome: KeyOutcome) -> KeyObservation {
     KeyObservation {
-        key: "lockdown filter",
+        key: "lockdown filter".into(),
         lifetime: KeyLifetime::Persistent,
         outcome,
         role: KeyRole::BootTimeSibling,
+        code: None,
     }
 }
 
@@ -120,12 +123,16 @@ fn a_sweep_that_consumed_the_sibling_leaves_a_later_one_able_to_report() {
     let state = dir();
 
     let first = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_not_found()]);
-    assert_eq!(first.leftover_keys(), [TWIN], "the sweep that holds the evidence");
+    assert_eq!(
+        pairs(first.leftover_keys()),
+        [(TWIN, KeyRole::Plain)],
+        "the sweep that holds the evidence"
+    );
 
     let second = sweep(state.path(), &[sibling(KeyOutcome::NotFound), twin_not_found()]);
     assert_eq!(
-        second.leftover_keys(),
-        [TWIN],
+        pairs(second.leftover_keys()),
+        [(TWIN, KeyRole::Plain)],
         "the sibling is gone because the FIRST sweep removed it; its absence is not evidence the \
          twin was never armed, and going silent here deletes hole.exe over a live boot-time record"
     );
@@ -142,7 +149,11 @@ fn a_host_that_never_armed_a_twin_stays_silent_across_every_sweep() {
     for round in 0..3 {
         let c = sweep(state.path(), &[sibling(KeyOutcome::NotFound), twin_not_found()]);
         assert!(!c.is_proven(), "round {round}: the twin is still unproven");
-        assert!(c.leftover_keys().is_empty(), "round {round}: {:?}", c.leftover_keys());
+        assert!(
+            c.leftover_keys().next().is_none(),
+            "round {round}: {:?}",
+            pairs(c.leftover_keys())
+        );
     }
     assert_eq!(
         super::load(state.path()),
@@ -170,9 +181,9 @@ fn arming_then_unblocking_in_one_boot_clears_the_record_and_stays_clear() {
 
     let off = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
     assert!(
-        off.leftover_keys().is_empty(),
+        off.leftover_keys().next().is_none(),
         "the unblock watched the twin go: {:?}",
-        off.leftover_keys()
+        pairs(off.leftover_keys())
     );
     assert_eq!(
         super::load(state.path()),
@@ -182,10 +193,10 @@ fn arming_then_unblocking_in_one_boot_clears_the_record_and_stays_clear() {
 
     let uninstall = sweep(state.path(), &[sibling(KeyOutcome::NotFound), twin_not_found()]);
     assert!(
-        uninstall.leftover_keys().is_empty(),
+        uninstall.leftover_keys().next().is_none(),
         "and the uninstall after it has nothing to say either — no cover installed, no record \
          outstanding: {:?}",
-        uninstall.leftover_keys()
+        pairs(uninstall.leftover_keys())
     );
 }
 
@@ -205,7 +216,11 @@ fn an_uninstall_on_the_boot_that_armed_the_twin_watched_it_go() {
 
     let uninstall = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
     assert!(uninstall.is_proven(), "every key this sweep touched was watched going");
-    assert!(uninstall.leftover_keys().is_empty(), "{:?}", uninstall.leftover_keys());
+    assert!(
+        uninstall.leftover_keys().next().is_none(),
+        "{:?}",
+        pairs(uninstall.leftover_keys())
+    );
     assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
 }
 
@@ -221,7 +236,7 @@ fn an_empty_sibling_set_never_clears_a_recorded_twin() {
 
     for round in 0..3 {
         let c = sweep(state.path(), &[sibling(KeyOutcome::NotFound), twin_not_found()]);
-        assert_eq!(c.leftover_keys(), [TWIN], "round {round}");
+        assert_eq!(pairs(c.leftover_keys()), [(TWIN, KeyRole::Plain)], "round {round}");
         assert_eq!(super::load(state.path()), ArmingWitness::Armed, "round {round}");
     }
 }
@@ -237,8 +252,8 @@ fn the_engage_records_the_twin_before_any_sweep_could_have_seen_it() {
 
     let c = sweep(state.path(), &[sibling(KeyOutcome::NotFound), twin_not_found()]);
     assert_eq!(
-        c.leftover_keys(),
-        [TWIN],
+        pairs(c.leftover_keys()),
+        [(TWIN, KeyRole::Plain)],
         "the record is the only surviving evidence and it must be enough"
     );
 }
@@ -275,8 +290,8 @@ fn a_failed_sweep_that_already_removed_the_sibling_still_records_what_it_saw() {
 
     let uninstall = sweep(state.path(), &[sibling(KeyOutcome::NotFound), twin_not_found()]);
     assert_eq!(
-        uninstall.leftover_keys(),
-        [TWIN],
+        pairs(uninstall.leftover_keys()),
+        [(TWIN, KeyRole::Plain)],
         "the sibling is gone because the FAILED sweep removed it, so the record is the only \
          evidence left and it must be there"
     );
@@ -324,7 +339,7 @@ fn a_record_that_cannot_be_read_reports_rather_than_suppressing() {
     assert_eq!(super::load(state.path()), ArmingWitness::Unreadable);
 
     let c = sweep(state.path(), &[sibling(KeyOutcome::NotFound), twin_not_found()]);
-    assert_eq!(c.leftover_keys(), [TWIN]);
+    assert_eq!(pairs(c.leftover_keys()), [(TWIN, KeyRole::Plain)]);
 }
 
 #[skuld::test]
@@ -390,7 +405,7 @@ fn an_engage_after_a_disarming_sweep_arms_the_record() {
 
     let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
     assert!(
-        c.leftover_keys().is_empty(),
+        c.leftover_keys().next().is_none(),
         "the sweep itself proved its own twins gone"
     );
     assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
@@ -451,7 +466,7 @@ fn a_host_that_never_armed_a_twin_is_not_littered_by_a_sweep_that_watched_one_go
     // record, in a directory the uninstall is about to remove.
     let state = dir();
     let c = sweep(state.path(), &[sibling(KeyOutcome::NotFound), twin_removed()]);
-    assert!(c.leftover_keys().is_empty(), "{:?}", c.leftover_keys());
+    assert!(c.leftover_keys().next().is_none(), "{:?}", pairs(c.leftover_keys()));
     assert_eq!(super::load(state.path()), ArmingWitness::Unset);
     assert!(
         !state.path().join(super::STATE_FILE_NAME).exists(),
@@ -471,7 +486,7 @@ fn a_record_that_cannot_be_read_is_replaced_by_a_sweep_that_watched_the_twin_go(
     assert_eq!(super::load(state.path()), ArmingWitness::Unreadable);
 
     let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
-    assert!(c.leftover_keys().is_empty(), "{:?}", c.leftover_keys());
+    assert!(c.leftover_keys().next().is_none(), "{:?}", pairs(c.leftover_keys()));
     assert_eq!(
         super::load(state.path()),
         ArmingWitness::Disarmed,
@@ -490,7 +505,7 @@ fn disarm_over_a_corrupt_witness_backs_it_up_and_clears_the_report() {
 
     let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
 
-    assert!(c.leftover_keys().is_empty(), "{:?}", c.leftover_keys());
+    assert!(c.leftover_keys().next().is_none(), "{:?}", pairs(c.leftover_keys()));
     assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
     assert_eq!(std::fs::read(backup_of(&state)).expect("backup"), b"{ not json");
 }
@@ -504,7 +519,7 @@ fn arm_over_a_newer_witness_keeps_a_backup() {
     // An unproven twin beside a live cover: the sweep arms the record.
     let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_not_found()]);
 
-    assert_eq!(c.leftover_keys(), [TWIN]);
+    assert_eq!(pairs(c.leftover_keys()), [(TWIN, KeyRole::Plain)]);
     assert_eq!(super::load(state.path()), ArmingWitness::Armed);
     assert_eq!(std::fs::read(backup_of(&state)).expect("backup"), newer);
 }
@@ -536,7 +551,7 @@ fn a_record_that_says_not_armed_is_re_armed_rather_than_left_alone() {
     assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
 
     let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_not_found()]);
-    assert_eq!(c.leftover_keys(), [TWIN]);
+    assert_eq!(pairs(c.leftover_keys()), [(TWIN, KeyRole::Plain)]);
     assert_eq!(super::load(state.path()), ArmingWitness::Armed);
 }
 

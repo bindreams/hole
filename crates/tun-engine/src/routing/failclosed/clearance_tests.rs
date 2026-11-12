@@ -6,6 +6,12 @@
 
 use super::*;
 
+/// What a report is made of: each key's label and role. The pair a test compares, so a key cannot match on its
+/// label alone.
+pub(crate) fn pairs<'a>(keys: impl IntoIterator<Item = &'a UnprovenKey>) -> Vec<(&'a str, KeyRole)> {
+    keys.into_iter().map(|k| (k.label(), k.role())).collect()
+}
+
 /// Fold a sweep against a host with NO persisted record — the state every
 /// test below that is only about the sibling axis wants, and the one an
 /// ordinary host is in. `ArmingWitness::Unset` contributes no evidence, so
@@ -17,10 +23,11 @@ fn fold(observations: &[KeyObservation]) -> Clearance {
 /// An ordinary key, whose outcome speaks only for itself.
 fn obs(key: &'static str, lifetime: KeyLifetime, outcome: KeyOutcome) -> KeyObservation {
     KeyObservation {
-        key,
+        key: key.into(),
         lifetime,
         outcome,
         role: KeyRole::Plain,
+        code: None,
     }
 }
 
@@ -28,10 +35,11 @@ fn obs(key: &'static str, lifetime: KeyLifetime, outcome: KeyOutcome) -> KeyObse
 /// whose outcome says whether a standing cover is installed on this host.
 fn sibling(outcome: KeyOutcome) -> KeyObservation {
     KeyObservation {
-        key: "lockdown filter",
+        key: "lockdown filter".into(),
         lifetime: KeyLifetime::Persistent,
         outcome,
         role: KeyRole::BootTimeSibling,
+        code: None,
     }
 }
 
@@ -77,7 +85,10 @@ fn a_boot_time_key_that_answered_not_found_is_not_proven_empty() {
         KeyOutcome::NotFound,
     )]);
     assert!(!c.is_proven(), "not-found on a boot-time key proves nothing");
-    assert_eq!(c.unproven_keys(), ["lockdown boot-time block-all V4"]);
+    assert_eq!(
+        pairs(c.unproven_keys()),
+        [("lockdown boot-time block-all V4", KeyRole::Plain)]
+    );
 }
 
 #[skuld::test]
@@ -123,7 +134,10 @@ fn a_failing_sweep_outcome_carries_its_observations_beside_the_error() {
         "the sibling this sweep already removed is still evidence, and the record is written \
          from it"
     );
-    assert_eq!(outcome.clearance().leftover_keys(), ["lockdown boot-time block-all V4"]);
+    assert_eq!(
+        pairs(outcome.clearance().leftover_keys()),
+        [("lockdown boot-time block-all V4", KeyRole::Plain)]
+    );
     assert!(outcome.into_result().is_err(), "and the failure still travels");
 
     let clean = SweepOutcome::per_kind(Clearance::proven(), []);
@@ -149,8 +163,11 @@ fn a_mixed_sweep_names_every_unproven_key_and_only_those() {
     ]);
     assert!(!c.is_proven());
     assert_eq!(
-        c.unproven_keys(),
-        ["boot-time block-all V4", "boot-time block-all V6 twin"],
+        pairs(c.unproven_keys()),
+        [
+            ("boot-time block-all V4", KeyRole::Plain),
+            ("boot-time block-all V6 twin", KeyRole::Plain)
+        ],
         "the two boot-time keys that answered EMPTY are unproven; the one whose removal was \
          watched is proven, and no persistent key joins either group"
     );
@@ -172,7 +189,7 @@ fn a_delete_that_failed_proves_nothing_for_either_lifetime() {
         );
         let c = fold(&[o]);
         assert!(!c.is_proven(), "{lifetime:?}");
-        assert_eq!(c.unproven_keys(), ["lockdown filter"]);
+        assert_eq!(pairs(c.unproven_keys()), [("lockdown filter", KeyRole::Plain)]);
     }
 }
 
@@ -233,11 +250,14 @@ fn a_twin_on_a_host_with_no_standing_cover_is_unproven_but_not_reported() {
     // trains them to ignore the host where it is real.
     let c = fold(&[sibling(KeyOutcome::NotFound), unproven_twin()]);
     assert!(!c.is_proven(), "the sweep still proved nothing about the twin");
-    assert_eq!(c.unproven_keys(), ["lockdown boot-time block-all V4"]);
+    assert_eq!(
+        pairs(c.unproven_keys()),
+        [("lockdown boot-time block-all V4", KeyRole::Plain)]
+    );
     assert!(
-        c.leftover_keys().is_empty(),
+        c.leftover_keys().next().is_none(),
         "no standing cover is installed, so no twin could have been added beside one: {:?}",
-        c.leftover_keys()
+        pairs(c.leftover_keys())
     );
 }
 
@@ -250,7 +270,10 @@ fn a_twin_beside_a_cover_this_sweep_removed_is_reported() {
     // answers empty. That is a host where a boot-time record is genuinely
     // possible.
     let c = fold(&[sibling(KeyOutcome::Removed), unproven_twin()]);
-    assert_eq!(c.leftover_keys(), ["lockdown boot-time block-all V4"]);
+    assert_eq!(
+        pairs(c.leftover_keys()),
+        [("lockdown boot-time block-all V4", KeyRole::Plain)]
+    );
 }
 
 #[skuld::test]
@@ -261,8 +284,8 @@ fn a_sweep_carrying_no_sibling_at_all_reports_its_unproven_twins() {
     // future sweep list — silently, and in the direction that hurts.
     let c = fold(&[unproven_twin()]);
     assert_eq!(
-        c.leftover_keys(),
-        ["lockdown boot-time block-all V4"],
+        pairs(c.leftover_keys()),
+        [("lockdown boot-time block-all V4", KeyRole::Plain)],
         "with no sibling to ask, nothing was ruled out"
     );
 }
@@ -274,9 +297,10 @@ fn a_sibling_whose_delete_failed_cannot_rule_out_a_leftover() {
     // `proves_empty` refuses, applied to the second axis.
     let c = fold(&[sibling(KeyOutcome::Failed), unproven_twin()]);
     assert!(
-        c.leftover_keys().contains(&"lockdown boot-time block-all V4"),
-        "a sibling that could not be read rules nothing out: {:?}",
         c.leftover_keys()
+            .any(|k| k.label() == "lockdown boot-time block-all V4"),
+        "a sibling that could not be read rules nothing out: {:?}",
+        pairs(c.leftover_keys())
     );
 }
 
@@ -291,7 +315,10 @@ fn one_removed_sibling_outweighs_an_empty_one() {
         sibling(KeyOutcome::Removed),
         unproven_twin(),
     ]);
-    assert_eq!(c.leftover_keys(), ["lockdown boot-time block-all V4"]);
+    assert_eq!(
+        pairs(c.leftover_keys()),
+        [("lockdown boot-time block-all V4", KeyRole::Plain)]
+    );
 }
 
 #[skuld::test]
@@ -321,9 +348,9 @@ fn an_uninstall_on_the_boot_that_engaged_is_quiet_because_it_watched_the_twin_go
         ),
     ]);
     assert!(c.is_proven());
-    assert!(c.leftover_keys().is_empty(), "{:?}", c.leftover_keys());
+    assert!(c.leftover_keys().next().is_none(), "{:?}", pairs(c.leftover_keys()));
     // A platform with no boot-time key class still has nothing to say.
-    assert!(Clearance::proven().leftover_keys().is_empty());
+    assert!(Clearance::proven().leftover_keys().next().is_none());
 }
 
 #[skuld::test]
@@ -341,7 +368,8 @@ fn every_sibling_evidence_has_one_answer_and_only_an_empty_one_suppresses() {
         assert_eq!(sibling_evidence(&[sibling(outcome)]), evidence, "{outcome:?}");
         let c = fold(&[sibling(outcome), unproven_twin()]);
         assert_eq!(
-            c.leftover_keys().contains(&"lockdown boot-time block-all V4"),
+            c.leftover_keys()
+                .any(|k| k.label() == "lockdown boot-time block-all V4"),
             reports,
             "{outcome:?}"
         );
@@ -356,6 +384,137 @@ fn every_sibling_evidence_has_one_answer_and_only_an_empty_one_suppresses() {
         SiblingEvidence::Unknown,
         "a PLAIN key speaks only for itself, however it answered"
     );
+}
+
+/// A boot-time filter under Hole's provider that no key list names, found by enumeration and then deleted.
+fn unlisted(outcome: KeyOutcome) -> KeyObservation {
+    KeyObservation {
+        key: "unrecognised boot-time filter".into(),
+        lifetime: KeyLifetime::BootTime,
+        outcome,
+        role: KeyRole::Unlisted,
+        code: Some(5),
+    }
+}
+
+#[skuld::test]
+fn a_refused_delete_of_a_found_filter_is_a_refused_stranger_carrying_the_code_the_os_answered() {
+    let c = fold(&[
+        sibling(KeyOutcome::NotFound),
+        unproven_twin(),
+        unlisted(KeyOutcome::Failed),
+    ]);
+    let refused: Vec<_> = c.refused_strangers().collect();
+    assert_eq!(refused, [("unrecognised boot-time filter", Some(5))]);
+    // Reported on its own line, so it is no "filter key that could not be proven empty" beside the twin.
+    let filters: Vec<_> = c.leftover_filters().map(UnprovenKey::label).collect();
+    assert_eq!(filters, ["lockdown boot-time block-all V4"]);
+}
+
+#[skuld::test]
+fn only_a_found_filter_whose_delete_was_refused_is_a_refused_stranger() {
+    for outcome in [KeyOutcome::Removed, KeyOutcome::NotFound] {
+        let c = fold(&[unlisted(outcome)]);
+        assert_eq!(c.refused_strangers().count(), 0, "{outcome:?}");
+    }
+    // A listed key's refusal fails its sweep; it is not a stranger.
+    let listed = fold(&[
+        obs("lockdown filter", KeyLifetime::Persistent, KeyOutcome::Failed),
+        sibling(KeyOutcome::Failed),
+    ]);
+    assert_eq!(listed.refused_strangers().count(), 0);
+    let unread = fold(&[KeyObservation {
+        key: "boot-time filters under Hole's provider".into(),
+        lifetime: KeyLifetime::BootTime,
+        outcome: KeyOutcome::Failed,
+        role: KeyRole::Enumeration,
+        code: None,
+    }]);
+    assert_eq!(unread.refused_strangers().count(), 0);
+}
+
+#[skuld::test]
+fn a_refused_stranger_is_found_whatever_the_evidence_gating_the_leftover_report_says() {
+    // The report reads this list, not `leftover_keys`, so no gating can hide it.
+    let c = fold(&[unlisted(KeyOutcome::Failed)]).corroborate(ArmingWitness::Disarmed);
+    assert_eq!(c.refused_strangers().count(), 1);
+}
+
+#[skuld::test]
+fn a_refusal_is_a_refused_stranger_whether_or_not_the_os_gave_a_code() {
+    // The outcome decides; the code is data for the report.
+    let mut no_code = unlisted(KeyOutcome::Failed);
+    no_code.code = None;
+    let c = fold(&[no_code]);
+    assert_eq!(
+        c.refused_strangers().collect::<Vec<_>>(),
+        [("unrecognised boot-time filter", None)]
+    );
+}
+
+#[skuld::test]
+fn each_role_and_outcome_is_reported_in_exactly_one_section() {
+    use KeyOutcome::{Failed, NotFound, Removed};
+    for outcome in [Removed, NotFound, Failed] {
+        assert_eq!(ReportSection::of(KeyRole::Plain, outcome), ReportSection::Filter);
+        assert_eq!(
+            ReportSection::of(KeyRole::BootTimeSibling, outcome),
+            ReportSection::Filter
+        );
+        assert_eq!(
+            ReportSection::of(KeyRole::Enumeration, outcome),
+            ReportSection::UnenumeratedView
+        );
+    }
+    assert_eq!(
+        ReportSection::of(KeyRole::Unlisted, Failed),
+        ReportSection::RefusedStranger
+    );
+    assert_eq!(ReportSection::of(KeyRole::Unlisted, Removed), ReportSection::Filter);
+    assert_eq!(ReportSection::of(KeyRole::Unlisted, NotFound), ReportSection::Filter);
+}
+
+#[skuld::test]
+fn a_found_filter_whose_delete_was_refused_is_live_evidence_that_a_record_is_possible() {
+    // Enumeration returned it, so it exists on this boot: the opposite of a not-found. On a host whose siblings all
+    // answered empty and with no persisted record, the sweep must still report it and arm the record.
+    let c = fold(&[
+        sibling(KeyOutcome::NotFound),
+        unproven_twin(),
+        unlisted(KeyOutcome::Failed),
+    ]);
+    assert_eq!(
+        sibling_evidence(&[unlisted(KeyOutcome::Failed)]),
+        SiblingEvidence::Installed
+    );
+    assert!(
+        c.leftover_keys().any(|k| k.label() == "unrecognised boot-time filter"),
+        "{:?}",
+        pairs(c.leftover_keys())
+    );
+    assert_eq!(
+        c.witness_update(),
+        crate::routing::failclosed::boottime_witness::WitnessUpdate::Arm
+    );
+}
+
+#[skuld::test]
+fn a_found_filter_that_was_removed_or_raced_away_says_nothing_about_the_host() {
+    // A watched removal is proof about itself (`proves_empty`) and a raced not-found is nothing; neither makes a
+    // record possible for the known twins beside it.
+    for outcome in [KeyOutcome::Removed, KeyOutcome::NotFound] {
+        let c = fold(&[sibling(KeyOutcome::NotFound), unproven_twin(), unlisted(outcome)]);
+        assert_eq!(
+            sibling_evidence(&[sibling(KeyOutcome::NotFound), unlisted(outcome)]),
+            SiblingEvidence::Absent,
+            "{outcome:?}"
+        );
+        assert!(
+            c.leftover_keys().next().is_none(),
+            "{outcome:?}: {:?}",
+            pairs(c.leftover_keys())
+        );
+    }
 }
 
 // The second evidence source, and why one is not enough ===============================================================
@@ -373,7 +532,10 @@ fn a_recorded_twin_reports_even_where_the_sibling_is_gone() {
     // existed, that answer alone suppressed the report — forever, after one
     // ordinary "turn the kill switch off".
     let c = Clearance::from_observations(&[sibling(KeyOutcome::NotFound), unproven_twin()], ArmingWitness::Armed);
-    assert_eq!(c.leftover_keys(), ["lockdown boot-time block-all V4"]);
+    assert_eq!(
+        pairs(c.leftover_keys()),
+        [("lockdown boot-time block-all V4", KeyRole::Plain)]
+    );
 }
 
 #[skuld::test]
@@ -383,7 +545,10 @@ fn a_live_sibling_reports_even_where_the_record_is_gone() {
     // which is indistinguishable from a host that never armed a twin. The
     // standing cover itself is still installed and says so.
     let c = Clearance::from_observations(&[sibling(KeyOutcome::Removed), unproven_twin()], ArmingWitness::Unset);
-    assert_eq!(c.leftover_keys(), ["lockdown boot-time block-all V4"]);
+    assert_eq!(
+        pairs(c.leftover_keys()),
+        [("lockdown boot-time block-all V4", KeyRole::Plain)]
+    );
 }
 
 #[skuld::test]
@@ -407,7 +572,7 @@ fn every_evidence_pair_has_one_answer_and_only_both_ruling_out_suppresses() {
         for (witness, witness_reports) in witness_axis {
             let c = Clearance::from_observations(&[sibling(outcome), unproven_twin()], witness);
             assert_eq!(
-                !c.leftover_keys().is_empty(),
+                c.leftover_keys().next().is_some(),
                 sibling_reports || witness_reports,
                 "{evidence:?} + {witness:?}"
             );
@@ -434,7 +599,7 @@ fn a_sweep_with_no_boot_time_key_reports_nothing_however_loudly_both_sources_spe
         ArmingWitness::Armed,
     );
     assert!(c.is_proven());
-    assert!(c.leftover_keys().is_empty());
+    assert!(c.leftover_keys().next().is_none());
 }
 
 #[skuld::test]
@@ -451,8 +616,8 @@ fn corroboration_moves_only_toward_reporting() {
         ArmingWitness::Unreadable,
     ] {
         assert_eq!(
-            armed.clone().corroborate(peer).leftover_keys(),
-            ["lockdown boot-time block-all V4"],
+            pairs(armed.clone().corroborate(peer).leftover_keys()),
+            [("lockdown boot-time block-all V4", KeyRole::Plain)],
             "{peer:?} must not retract an armed record"
         );
     }
@@ -462,10 +627,11 @@ fn corroboration_moves_only_toward_reporting() {
         .clone()
         .corroborate(ArmingWitness::Unset)
         .leftover_keys()
-        .is_empty());
+        .next()
+        .is_none());
     assert_eq!(
-        quiet.corroborate(ArmingWitness::Armed).leftover_keys(),
-        ["lockdown boot-time block-all V4"],
+        pairs(quiet.corroborate(ArmingWitness::Armed).leftover_keys()),
+        [("lockdown boot-time block-all V4", KeyRole::Plain)],
         "a peer's record is what an elevated non-service bridge's twin is recorded in"
     );
 }
@@ -501,9 +667,18 @@ fn every_sighting_and_sibling_pair_has_one_write_answer() {
             vec![sibling(KeyOutcome::NotFound), unproven_twin()],
             WitnessUpdate::Leave,
         ),
-        (vec![sibling(KeyOutcome::Removed), removed_twin], WitnessUpdate::Disarm),
-        (vec![sibling(KeyOutcome::NotFound), removed_twin], WitnessUpdate::Disarm),
-        (vec![sibling(KeyOutcome::Failed), removed_twin], WitnessUpdate::Disarm),
+        (
+            vec![sibling(KeyOutcome::Removed), removed_twin.clone()],
+            WitnessUpdate::Disarm,
+        ),
+        (
+            vec![sibling(KeyOutcome::NotFound), removed_twin.clone()],
+            WitnessUpdate::Disarm,
+        ),
+        (
+            vec![sibling(KeyOutcome::Failed), removed_twin.clone()],
+            WitnessUpdate::Disarm,
+        ),
         (vec![removed_twin], WitnessUpdate::Disarm),
         (
             vec![
@@ -549,7 +724,10 @@ fn every_sighting_and_sibling_pair_has_one_write_answer() {
             fold(&observations).witness_update(),
             want,
             "{:?}",
-            observations.iter().map(|o| (o.key, o.outcome)).collect::<Vec<_>>()
+            observations
+                .iter()
+                .map(|o| (o.key.clone(), o.outcome))
+                .collect::<Vec<_>>()
         );
     }
 }

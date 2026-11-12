@@ -22,8 +22,8 @@
 //!    `boottime_probe::enum_boottime` for why), so this measures that the
 //!    stored record CARRIES our `providerKey` — not that a `BOOTTIME_ONLY`
 //!    template filtered BY `providerKey` returns it. #1008 needs the second.
-//!    Passing rules out the one answer that would make #1008 impossible; it
-//!    does not show #1008's mechanism works.
+//!    Passing rules out the one answer that would make #1008 impossible; the
+//!    second is `provider_sweep_privileged_tests`'.
 //! 3. **Does `FwpmFilterDeleteByKey0` actually remove it?** The default
 //!    enumeration/get view EXCLUDES boot-time filters
 //!    (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` / `..._INCLUDE_BOOTTIME` exist to
@@ -132,29 +132,29 @@ fn probe_spec() -> FilterSpec {
     }
 }
 
-/// Removes the probe on every exit path, including an unwind from a failed
-/// assertion. It issues the same by-key delete the test measures — there is no
-/// other removal API in WFP — so it is a best-effort tidy-up, NOT the thing
-/// that makes stranding safe; the probe being a permit on an unroutable
-/// address is (module doc). It fails loud rather than silently: a code that is
-/// neither success nor not-found means the filter is still installed.
-struct DeleteProbeOnDrop;
-impl Drop for DeleteProbeOnDrop {
+/// Removes its probes by key on every exit path, including an unwind from a failed assertion, then the containers
+/// the first add created. It issues the same by-key delete the tests measure — there is no other removal API in WFP —
+/// so it is a best-effort tidy-up, NOT the thing that makes stranding safe; a probe being a permit on an unroutable
+/// address is (module doc). It fails loud rather than silently: a code that is neither success nor not-found means a
+/// filter is still installed.
+pub(crate) struct DeleteProbesOnDrop(pub(crate) &'static [windows::core::GUID]);
+impl Drop for DeleteProbesOnDrop {
     fn drop(&mut self) {
-        let code = boottime_probe::delete_by_key(PROBE_GUID);
-        let cleared = matches!(code, Ok(c) if c == ERROR_SUCCESS.0 || c == FWP_E_FILTER_NOT_FOUND_DWORD);
-        if !cleared {
-            eprintln!(
-                "BOOT-TIME PROBE STRANDED: {PROBE_GUID:?} could not be removed ({code:?}). It is a \
-                 permit on {PROBE_ADDR} (RFC 5737, unroutable) so it blocks nothing. No Hole sweep \
-                 can reach it — PROBE_GUID is deliberately disjoint from every cover GUID — and \
-                 `netsh wfp` has no verb that deletes a filter, so removing it needs a WFP-aware \
-                 tool. Harmless on an ephemeral CI runner, residue anywhere else."
-            );
+        for guid in self.0 {
+            let code = boottime_probe::delete_by_key(*guid);
+            let cleared = matches!(code, Ok(c) if c == ERROR_SUCCESS.0 || c == FWP_E_FILTER_NOT_FOUND_DWORD);
+            if !cleared {
+                eprintln!(
+                    "BOOT-TIME PROBE STRANDED: {guid:?} could not be removed ({code:?}). It is a permit on a \
+                     documentation address (RFC 5737 / RFC 3849, unroutable) so it blocks nothing. A boot-time \
+                     probe under Hole's provider is removed by `hole bridge release-covers` run elevated; a \
+                     persistent one is left by every sweep on purpose, and `netsh wfp` has no verb that deletes a \
+                     filter, so it needs a WFP-aware tool. Harmless on an ephemeral CI runner, residue anywhere else."
+                );
+            }
         }
-        // `add` must create the persistent provider + sublayer to hang the
-        // probe off; without this the test leaves two container objects behind
-        // on a developer's own machine. Best-effort by construction: this fails
+        // `add` must create the persistent provider + sublayer to hang a probe off; without this the test leaves two
+        // container objects behind on a developer's own machine. Best-effort by construction: this fails
         // (correctly) while any live cover filter still references them.
         boottime_probe::delete_containers();
     }
@@ -303,7 +303,7 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
     // Pre-state: nothing of ours may already be there, or every observation
     // below is about someone else's filter.
     let before = both(Layer::ConnectV4);
-    let _cleanup = DeleteProbeOnDrop;
+    let _cleanup = DeleteProbesOnDrop(&[PROBE_GUID]);
 
     let added = boottime_probe::add(&spec);
     let after_add = both(Layer::ConnectV4);
