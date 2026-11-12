@@ -184,6 +184,18 @@ targets:
     platforms: [windows/amd64]
     run: uv run --directory msi-installer --group dev pytest -v -s -m cleanup tests/installed/test_cleanup.py
 
+  hole-dmg-install-e2e:
+    # Installs the built Hole.app's bridge as root and connects through each
+    # bundled plugin, on the layout a user's machine has. It mutates the
+    # host (root daemon, launchd job) and needs passwordless sudo, so it is its
+    # own target: `hole-dmg-tests` stays safe to run locally.
+    #
+    # Run-only, no `depends:`: it consumes the app, `galoshes` and `ex-ray` that
+    # `hole-dmg` built in the same job, so a second cascade here would roll the
+    # flaky bundle_dmg.sh/hdiutil pipeline twice.
+    platforms: [darwin/amd64, darwin/arm64]
+    run: uv run --directory dmg-installer pytest -v -m install_e2e
+
   frontend-build:
     # Vite bundle of ui/ → ui/dist/. Pure JS/TS toolchain, platform-
     # independent output. The type-check (`cargo xtask run frontend-check`)
