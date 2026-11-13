@@ -62,8 +62,9 @@ The adapter holds its IPv6 address with the operating system as well as inside H
 no global IPv6 address would otherwise have no source address for the IPv6 routes, and every IPv6 connection would fail
 instead of going through the tunnel.
 
-If the tunnel adapter has no IPv6 at all, Hole still issues the two IPv6 routes but tolerates their failing, rather than
-failing the connect.
+If the tunnel adapter has no IPv6 at all, Hole still issues the two IPv6 routes and does not stop at their failing. The
+install then counts fewer routes than it planned, so it is rolled back and the connect fails; see [route commands and what
+failing means](../contributing/architecture/route-failure-policy.md#fatality-is-per-command).
 
 ## From packets to connections
 

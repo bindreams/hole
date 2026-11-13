@@ -315,7 +315,7 @@ const _: () = assert!(<BestEffortPhase as Phase>::BEST_EFFORT);
 //
 // route(8) exits 0 unconditionally even on a routing-socket failure; the
 // only reliable signal is the stderr text `rtmsg()` prints. See docs/contributing/architecture/route-ownership.md for
-// the verified mechanism. Windows' `route.exe`/
+// what that rests on. Windows' `route.exe`/
 // `netsh` exit non-zero on failure, so no parsing is needed there.
 
 /// True if macOS `route(8)`'s own text confirms the mutation went through —
@@ -2032,8 +2032,8 @@ impl SystemRouting {
     /// 3. clears the persisted route-state file ONLY once nothing remains
     ///    unconfirmed — a command whose fate is genuinely unknown (a spawn
     ///    failure, or teardown itself not confirming a delete) stays recorded
-    ///    for the next start's crash recovery to retry, exactly as
-    ///    docs/contributing/architecture/route-ownership.md describes;
+    ///    for the next start's crash recovery to retry, as
+    ///    docs/contributing/architecture/route-failure-policy.md describes;
     /// 4. returns `Err(RoutingError::RouteSetup)`. No [`SystemRoutes`] guard is
     ///    constructed, so no caller can report the tunnel up.
     fn install_with<Rs, Rt>(

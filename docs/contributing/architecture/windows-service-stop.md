@@ -32,8 +32,9 @@ identifies the step that is stuck.
 | `ShutdownRuntime` | Shut down the tokio runtime, which joins outstanding blocking tasks                                                                      |
 
 The proxy-side phases are entered by `ProxyManager::stop_with_progress`, each just before the work it names, and only when
-that work exists in the session: a SOCKS-only start has no TUN engine, and a start with no plugin has no plugin chain. A path
-that fails before teardown, such as a failed bind, skips the proxy and ETW phases.
+that work exists in the session: a SOCKS-only start has no TUN engine, a start with no plugin has no plugin chain, and a
+bridge whose ETW consumer did not start has no `CloseEtw`. A path that fails before teardown, such as a failed bind, skips
+every phase between the stop report and `ShutdownRuntime`, `AcquireProxy` and `DropResources` included.
 
 Each phase has a wait hint (`StopPhase::wait_hint`). It is advisory: the SCM or a service control program *may* treat a
 checkpoint stuck past it as a failed stop, so the hints err long.

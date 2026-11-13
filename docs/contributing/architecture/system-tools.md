@@ -53,7 +53,7 @@ CI is attended and keeps bare names.
 
 ## Plugins
 
-The privileged bridge runs only the plugins Hole ships (`hole_common::plugin::KNOWN_PLUGINS`), found in the one folder its
+The privileged bridge runs only the plugins Hole ships (the table behind `hole_common::plugin::lookup` and `is_known`), found in the one folder its
 `PluginSource` names, with the same aim by a different mechanism. `PluginSource::resolve`
 ({src}`crates/bridge/src/proxy/plugin_source.rs`) is the only production producer of a `BundledPlugin`, a shipped plugin's
 descriptor bound to the absolute path of its binary, and `start_plugin_chain` accepts only that. A bare name for

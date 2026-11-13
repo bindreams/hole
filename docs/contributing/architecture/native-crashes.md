@@ -9,9 +9,10 @@ crash leaves no crash report.
 
 ## The marker
 
-`tombstone::attach(kind, log_dir)` installs the crash handler. It is called from `init_multi` in
-{src}`crates/common/src/logging.rs`, right after `install_panic_hook()`, which covers the app, the command line and the
-bridge, and from galoshes' own `main`. A second call is a no-op. `kind` labels the process ("gui", "bridge", "gui-cli",
+`tombstone::attach(kind, log_dir)` installs the crash handler. It is called from `init_dual` in
+{src}`crates/common/src/logging.rs` (which `init` and `init_multi` delegate to), right after `install_panic_hook()`. That
+covers the app, the command line and the bridge. galoshes calls it from its own `main`, with its own directory (see
+[the sweep](#the-sweep)). A second call is a no-op. `kind` labels the process ("gui", "bridge", "gui-cli",
 "galoshes", "test").
 
 On a fault, `on_crash` runs in a compromised context: the heap and every lock may be held by a thread that will never run
@@ -54,9 +55,12 @@ holds keys and traffic.
 ## The sweep
 
 `tombstone::sweep(log_dir)` runs at start. It reports each `crash-*.marker` it finds with a `tracing::error!` under the
-target `crash`, then deletes the marker and leaves a sibling `.dmp`. Whichever process sweeps the directory first reports a
-marker, so a marker is reported exactly once. The marker lands in the log directory and not the state directory because the
-elevated bridge's marker must be readable by the unprivileged app.
+target `crash`, then deletes the marker and leaves a sibling `.dmp`. Reporting and deleting are two steps, and a marker is
+reported by whichever process sweeps the directory first: two sweeps that overlap can both report it. The bridge, the app and
+the command line share the log directory, which the code treats as readable by the unprivileged app even when the bridge is
+elevated; a marker the bridge writes is created world-readable and left root-owned on purpose, since the signal-safe handler
+cannot chown it. galoshes is the exception: it attaches and sweeps its own per-user runtime directory, so its markers are
+reported on its next start and not by the bridge.
 
 The sweep opens `log_dir` through `Dir` and reads each marker through a `ReadDir` by its name inside that handle. A symlink at a
 marker name is reported unreadable and unlinked as itself, a FIFO is never waited for, and a marker the directory's owner cannot
@@ -64,7 +68,8 @@ vouch for (`ReadDir::read_vouched`) is reported unreadable too. The listing of n
 
 ## Plugins and the known gap
 
-ex-ray is spawned with `GOTRACEBACK=crash` ({src}`crates/garter/src/binary.rs`), and `record_exit` in
+Every binary plugin (ex-ray among them) is spawned with `GOTRACEBACK=crash` ({src}`crates/garter/src/binary.rs`), so a Go
+plugin dumps its goroutines to stderr on a native fault and the bridge relays that stderr. `record_exit` in
 {src}`crates/garter/src/chain.rs` logs a plugin that dies mid-run with its exit code or a killed flag.
 
 Windows `__fastfail` (`int 29h`, including `/GS` stack-cookie failures and `std::process::abort()` on Windows) cannot be

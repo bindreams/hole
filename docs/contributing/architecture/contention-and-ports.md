@@ -39,8 +39,7 @@ each iteration and logs at growing milestones, so the log stays small however lo
 saturated runner needs many retries and a healthy machine needs one, and a fixed cap would either hide real saturation or fail
 on a transient one.
 
-The retry exists because Windows keeps *independent* TCP and UDP excluded-port-range tables (Hyper-V, WSL and Docker
-reserve ranges), so a port the OS hands out for one transport can be reserved for the other. The kernel has no "free for both"
+The retry exists because Windows keeps *independent* TCP and UDP excluded-port-range tables, so a port the OS hands out for one transport can be reserved for the other. The kernel has no "free for both"
 call. `free_port` binds one transport with port 0 and then verifies the rest with `ensure_port_free`, and any race starts a new
 iteration with a fresh candidate.
 

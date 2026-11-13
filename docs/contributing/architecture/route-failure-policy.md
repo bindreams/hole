@@ -14,7 +14,7 @@ Every route command runs in a *phase*, and a phase belongs to one of two familie
 |                                 | Fatal                                                                                                                             | Best-effort                                                                                                        |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | Phases                          | `FatalPhase::Setup` (and the macOS firewall engage)                                                                               | `BestEffortPhase`: `Teardown`, `RecoverSplit`, `RecoverBypass` (and the macOS firewall recovery)                   |
-| Runner                          | `run_setup_commands`, reached through `setup_routes`                                                                              | `run_teardown_commands`, reached through `teardown_routes` and `recover_routes`                                    |
+| Runner                          | `run_setup_commands`, reached through `setup_routes`. The macOS firewall engage uses no route runner (`run_capturing`)            | `run_teardown_commands`, reached through `teardown_routes`; `recover_groups` for recovery and for install's sweep  |
 | A command that does not confirm | Stops the phase and returns a `RouteCommandError`                                                                                 | Is logged and kept in the record; the next command still runs                                                      |
 | Why                             | A route that was never installed but is reported as installed sends traffic outside the tunnel while the app says it is protected | A cleanup that stops at the first failure strands routes, and leaves the user worse off than if Hole had never run |
 
@@ -25,13 +25,15 @@ and the platform tools exit non-zero for that.
 ## The pairing is a type
 
 A phase is a value of `FatalPhase` or `BestEffortPhase`. Both implement the sealed trait `Phase`, whose constant
-`BEST_EFFORT` also picks the log level (a failure in a best-effort phase is expected, so it is logged at debug) and which
+`BEST_EFFORT` also picks the log level of the runner (an unconfirmed best-effort command is logged at debug, since a
+failure is expected; the teardown and recovery callers then log it again at warn, keeping the route recorded) and which
 question the runner asks of a command's result ([what confirmed means](#what-confirmed-means)). Each runner accepts only
 its own family, and the two command types differ as well (`SetupCommand` and `RouteCommand`). Wiring a teardown phase into
 the fatal runner does not compile.
 
-A best-effort runner narrows a `Vec<RouteId>` accumulator and returns nothing, so there is no `Result` for a later edit to
-`?` out of. That is the second half of the guarantee: the cleanup path has no way to stop early.
+The best-effort runners return no `Result`. `run_teardown_commands` narrows a `Vec<RouteId>` accumulator and returns
+nothing, and `recover_groups` returns the groups it could not confirm. There is nothing for a later edit to `?` out of.
+That is the second half of the guarantee: the cleanup path has no way to stop early.
 
 ## What confirmed means
 
@@ -47,11 +49,15 @@ The two IPv6 splits (`::/1` and `8000::/1`) are fatal only when the TUN device h
 `gateway::tun_ipv6_available` probes by the TUN's own name once the OS has created it.
 
 Where a host has no IPv6 on the TUN (a `DisabledComponents` setting, or an EDR policy that unbinds IPv6 from new
-adapters), adding an IPv6 route to it can fail outright, and a host with no IPv6 stack has no IPv6 traffic to leak.
-Aborting there would lose the whole tunnel and protect nothing. The two commands are still *issued*, and only their
-failure is tolerated: a bound TUN accepts the route whatever the upstream connectivity, so only a genuinely unbound TUN
-makes the add itself fail. The probe is of the TUN, not of the upstream interface that `GatewayInfo::ipv6_available`
-measures, because the TUN's name is what those commands carry.
+adapters), adding an IPv6 route to it can fail outright, and a host with no IPv6 stack has no IPv6 traffic to leak. The
+two commands are still *issued*, and only their failure is tolerated: a bound TUN accepts the route whatever the upstream
+connectivity, so only a genuinely unbound TUN makes the add itself fail. The probe is of the TUN, not of the upstream
+interface that `GatewayInfo::ipv6_available` measures, because the TUN's name is what those commands carry.
+
+The tolerance ends at `run_setup_commands`. A tolerated command is dropped from the confirmed set, and `install_with`
+then compares that set with `planned_routes`, which always lists both IPv6 splits. So on an unbound TUN the install still
+fails ([a failed install](#a-failed-install)): the per-command flag decides whether the runner stops, not whether the
+start succeeds. The unit tests cover the flag in `run_setup_commands` only, and none runs `install_with` over it.
 
 ## A failed install
 
@@ -66,9 +72,9 @@ things and nothing else; its doc comment is the source of truth.
 
 A command that ran but did not confirm is the same failure. If `setup_routes` finishes without error but fewer routes are
 confirmed than `planned_routes(server_ip)` lists, `install_with` rolls back and returns `Err` too. A partial tunnel is
-worse than no tunnel: the user believes traffic is captured when some of it is not. The case that matters in practice is
-another VPN that already holds `0.0.0.0/1`: Hole's add fails, the route is never recorded, and Hole's stop leaves it
-alone.
+worse than no tunnel: the user believes traffic is captured when some of it is not. The error text names the suspected
+cause, another process holding a conflicting route. A route that never confirmed is never recorded, and Hole's stop leaves
+it alone.
 
 ## The accepted trade
 
@@ -79,6 +85,8 @@ tolerance for an "already exists" exit code to make a start succeed: a stranded 
 
 ## Error text
 
-`RouteCommandError`'s `Display` carries the program name, the command's position in the phase and the exit code, and
-nothing else. It reaches a toast verbatim through `StartError::Failed`, so it must not hold the server address or an
-interface name. The full argv and the child's output go to `bridge.log` from the runner (`run_command`).
+`RouteCommandError`'s `Display` carries the program name and the command's position in the phase, then either the exit
+code or, when the program could not start, the OS error text. It never holds the argv, so it does not hold the server
+address or an interface name. It reaches a toast through `StartError::Failed`, and `redact_outgoing` in the bridge's IPC
+layer runs the message through the server-address redactor on the way out. The full argv and the child's output go to
+`bridge.log` from the runner (`run_command`).

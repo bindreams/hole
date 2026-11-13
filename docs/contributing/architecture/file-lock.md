@@ -52,9 +52,10 @@ caller that chooses a sink that may hold a path (`gui.log`) and never the bridge
 Every file the bridge reads back across a restart is a `util::versioned_file::VersionedFile`
 ({src}`crates/util/src/versioned_file.rs`). Each is one flat JSON object, `{"version": N, ...}`, where every version of the
 payload is its own frozen type linked to the one before. The files are `bridge-routes.json`, `bridge-target.json`,
-`bridge-startup.json`, `bridge-plugins.json`, `bridge-dns.json`, the plugin folder's `layout.json`, the update marker
-`update-in-progress.json`, and the cover's `bridge-failclosed.json`, `bridge-lockdown.json`, `bridge-lockdown-pf.json` and
-`bridge-boottime.json`. The module doc is the reference for adding a version.
+`bridge-startup.json`, `bridge-plugins.json`, `bridge-dns.json`, the plugin folder's `layout.json`, and the cover's
+`bridge-failclosed.json`, `bridge-lockdown.json`, `bridge-lockdown-pf.json` and `bridge-boottime.json`. The update marker
+`update-in-progress.json` is a `VersionedFile` too, but it lives in the log directory
+([update cutover](update-cutover.md#the-update-marker)). The module doc is the reference for adding a version.
 
 The type's three calls, `observe`, `update` and `create_new`, open the directory as a `Dir` and do every step inside that
 handle:
@@ -80,6 +81,7 @@ Three more properties follow from the contract:
 
 Exclusion is in two parts. `observe` and `update` take an in-process lock keyed by the file's path, so two threads never
 interleave a read with the write that depends on it. It does not exclude another process; for the bridge's state files that
-is the liveness lock above, held by the running bridge and by every command that writes state. `create_new` takes no lock,
+is the liveness lock above, held by the running bridge and by every command that writes state. The update marker is outside
+it: the Windows cutover child writes it, and its claim is a create-new. `create_new` takes no lock,
 since the rename that publishes the file refuses to replace and is atomic across processes. The cover has a separate lock
 for its own changes ([the cover lock](kill-switch-recovery.md#the-cover-lock)).

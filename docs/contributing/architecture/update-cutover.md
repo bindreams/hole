@@ -7,14 +7,14 @@ the restart is on [the kill switch page](kill-switch.md#transitions) (T10, then 
 
 ## The apply handler
 
-The app has already verified the installer's signature when it downloaded it. The handler
-(`handle_update_apply` in {src}`crates/bridge/src/ipc.rs`, with its helpers in {src}`crates/bridge/src/cutover/apply.rs`) does
-not rely on that. It runs these steps in order:
+The handler (`handle_update_apply` in {src}`crates/bridge/src/ipc.rs`, with its helpers in
+{src}`crates/bridge/src/cutover/apply.rs`) treats the app as untrusted and relies on no check the app made. It runs these
+steps in order:
 
 1. **Refuse a second cutover.** A present marker is a cutover already in flight: HTTP 409.
 1. **Check consent.** An update with the kill switch off requires `consent: true` in the request (`consent_gate`): the gap
-   between the old bridge stopping and the new one starting can leak, and the app asks the user first. With the standing
-   cover in force, the cover holds the gap and consent is moot.
+   between the old bridge stopping and the new one starting can leak, and the app asks the user first. What a standing cover
+   changes about that gap is on [the kill switch page](kill-switch.md#transitions).
 1. **On macOS, validate the swap target** before anything is claimed: the `.app` path the app supplies must be a genuine
    `com.hole.app` bundle on a volume that can swap atomically. A bad target is a clean 400.
 1. **Claim the marker.** The claim is a create-new, so two concurrent requests cannot both win, and only the winner ever
@@ -31,15 +31,18 @@ cover-mutating method, so a cutover structurally cannot engage a transient cover
 
 ## The swap
 
-The swap is *rename-away, then move-in*, and it is all-or-nothing. The live binary is renamed aside to `<file>.old-<version>`
-(Windows: a running image opened with `FILE_SHARE_DELETE` can be renamed; macOS `.app` bundles use `renamex_np` with
-`RENAME_SWAP`), and the staged new file moves onto the freed canonical path. The running process keeps the old inode, and the
-canonical path now names a different file, which is what the app's self-heal compares to decide to relaunch.
+The Windows swap is *rename-away, then move-in*, and it is all-or-nothing. The live binary is renamed aside to
+`<file>.old-<version>` (a running image opened with `FILE_SHARE_DELETE` can be renamed), and the staged new file moves onto
+the freed canonical path. The running process keeps the old image, and the canonical path now names a different file, which
+is what the app's self-heal compares to decide to relaunch.
 
 The swap covers the full set of bundled binaries (the `bindir` names from `xtask_lib::bindir`), not only `hole.exe`. If one
 image fails midway, the swaps already committed are rolled back to the prior consistent set before the error returns, so the
 service never boots a mix of old and new. Deleting the swapped-out images is deferred until the whole set has committed,
 which is what makes the rollback possible; the next bridge start sweeps `*.old-*` once no process maps them.
+
+On macOS the `.app` bundle is swapped with `renamex_np` and `RENAME_SWAP`, and the privileged helper is moved by a plain
+rename. There is no `.old-<version>` and no `bindir` set.
 
 ## The restart differs by OS
 
@@ -68,9 +71,10 @@ record](kill-switch-uninstall.md#the-disabled-service-and-its-record)).
 ```{tab-item} macOS
 :sync: macos
 
-The actor runs inline, on a detached task, after the handler has returned its response. It swaps first, and then runs
-`launchctl kill SIGTERM` against its own service. SIGTERM takes the graceful shutdown (`pm.stop()`), where the update
-marker makes the cover disarm and not drop; the routes and DNS tear down. It does not wait and does not start anything: it
+The actor runs inline in the bridge, on a task spawned before the handler sends its response. Nothing depends on it
+running after the response: the marker is already written. It swaps first, and then runs `launchctl kill SIGTERM` against
+its own service. SIGTERM takes the graceful shutdown (`pm.stop()`); the routes and DNS tear down, and what the shutdown does
+to a cover while the marker is set is on [the kill switch page](kill-switch.md#transitions). It does not wait and does not start anything: it
 cannot return past its own SIGTERM. launchd's `KeepAlive=true` respawns the now-swapped binary.
 ```
 ````

@@ -31,7 +31,8 @@ sync-group: os
 
 `route delete <server> mask 255.255.255.255 <gateway>` accepts a gateway, and it scopes which entry is deleted. The
 install knows the gateway, so the record carries it as `original_gateway` and the bypass teardown uses it. A takeover
-VPN's route to the same destination has a different gateway, so Hole's delete fails to match it and is a no-op.
+VPN's route to the same destination has a different gateway, so Hole's delete fails to match it and is a no-op. That
+scoping is from `route.exe`'s documented syntax; nothing in the tree measures a takeover.
 
 The split-route deletes cannot be scoped and rely on provenance alone.
 
@@ -68,18 +69,19 @@ replaced, removed or acted on, and a connect is refused over it.
 | `original_gateway`                        | The gateway the bypass went through; `None` only for a record migrated from schema 1 or 2                     |
 | `route_form`                              | `Via` or `OnLink`: which shape of bypass command was used                                                     |
 | `installed`                               | The `RouteId`s this run got into the table: the only routes a delete may touch                                |
-| `stale`                                   | Groups left over from an earlier `install` in the same process, each with its own copy of the identity fields |
+| `stale`                                   | Groups an earlier `install` or recovery could not confirm gone, each with its own copy of the identity fields |
 
 `route_form` is a field of its own, apart from `original_gateway`, because "no gateway was ever recorded" (a migrated
 record) and "the route was on-link" are different facts. A migrated record is read as `Via`.
 
 ## Checkpointing
 
-The record is rewritten before and after every single route command, not once per phase. At any instant, including in a
-crash, `installed` names at most one route more than the table confirms: the command in flight. A pre-command write that
-fails stops the install before the command runs, since a mutation Hole could not record is not run. Teardown and recovery
-checkpoint the same way on the way out. A command is dropped from the record only once its outcome is confirmed (deleted,
-or already absent); one that fails to spawn stays recorded so the next start retries it, and nothing after it is skipped.
+Install rewrites the record before and after every single route command, not once per phase. At any instant, including
+in a crash, `installed` names at most one route more than the table confirms: the command in flight. A pre-command write
+that fails stops the install before the command runs, since a mutation Hole could not record is not run. Teardown and
+recovery have no pre-write: they rewrite the record after each command, narrowing it. A route is dropped from the record
+only once its delete is confirmed gone ([what counts as gone](#what-counts-as-gone)); one that is not confirmed, or whose
+command fails to spawn, stays recorded so the next start retries it, and nothing after it is skipped.
 
 "Next start" means the next `install`, not only the next process. `recover_routes` runs once per bridge process, but one
 process can install several times (a reconnect, a server switch), so `install` itself sweeps a record a previous install
@@ -98,7 +100,9 @@ union; each survivor is cut to `planned_routes(server_ip)`, because an id with n
 drain and would keep `stale` non-empty for ever; an empty survivor is dropped.
 
 Without that, a reconnect to the same server, which shares `tun_name` and often `server_ip` with a carried-forward group,
-would issue a byte-identical delete twice. On Windows the second is never confirmed, and the group is stranded. On macOS
+would issue a byte-identical delete twice. On Windows the first delete removes the route, the second finds it absent and
+exits non-zero, which Windows never counts as confirmed ([what counts as gone](#what-counts-as-gone)), so the group stays
+recorded. On macOS
 the split deletes are unscoped, so the second one removes whatever a third party claimed after the first freed the prefix,
 which is the harm this page exists to prevent. `recover_groups` also runs every group's split deletes before any bypass
 delete, and issues each distinct argv once across all groups: a split delete's argv depends on `tun_name` alone, so two
@@ -109,11 +113,12 @@ groups with different servers can still produce the same command.
 `exec_one` decides from the process result whether the route's state is confirmed. The fatal phase asks whether the add
 worked; every best-effort phase asks whether the route is gone.
 
-- **macOS** `route(8)` is read as exiting 0 whenever it gets as far as the routing socket, so the exit code is no evidence.
-  The signal is text on stderr: `macos_route_command_succeeded` treats `writing to routing socket` as a failed add, and
+- **macOS** `route(8)` is read as exiting 0 whenever it gets as far as the routing socket, so a zero exit is no evidence
+  of success. A non-zero exit is: the command never reached the kernel, so neither oracle confirms anything. Past that,
+  the signal is text on stderr: `macos_route_command_succeeded` treats `writing to routing socket` as a failed add, and
   `macos_route_confirmed_absent` accepts a delete only if that text is absent or says `not in table` (already gone). Any
-  other failure text keeps the route recorded. Parsing a tool's diagnostics is fragile, and the code names a routing socket
-  that reads the kernel's reply as the better mechanism.
+  other failure text keeps the route recorded. Parsing a tool's diagnostics is fragile. Like the reading of `route(8)`
+  above, the oracle rests on source reading, not on a measurement in the tree.
 - **Windows** `route.exe` and `netsh` exit non-zero on a failed add, so the exit code is enough there. For a delete it is
   not: the code records that an absent route and one that needed elevation both exited 1 with no distinguishing text. So
   `route_confirmed_absent` trusts only exit 0, and a delete that fails for any reason stays recorded rather than risk
@@ -130,12 +135,12 @@ refuses an on-link default route there before `install` is reached.
 ## What is not covered
 
 A VPN that takes a prefix over *mid-session*, necessarily by deleting Hole's entry first, is still torn down by Hole's
-stop on macOS, because macOS has no compare-and-delete. Closing that needs a different mechanism (a routing socket that
-acts and then repairs from the delete's reply), not a different flag. Windows has no equivalent: the takeover's route has a
-different gateway and Hole's scoped delete does not match it.
+stop on macOS, because macOS has no compare-and-delete. Closing that needs a different mechanism, not a different flag.
+Windows has no equivalent: the takeover's route has a different gateway and Hole's scoped delete does not match it.
 
 ## The escape
 
-`scripts/network-reset.py` deliberately does not honour the record. It deletes the four split routes unconditionally, reads
-only `server_ip` for the bypass, and stops the bridge and `ex-ray` processes. It is the escape for when the in-bridge
+`scripts/network-reset.py` deliberately does not honour the record's `installed` list. It reads only `server_ip` from it,
+for the bypass, and stops the bridge and `ex-ray` processes. On macOS it deletes the four split routes unconditionally. On
+Windows it removes them only on an interface whose alias starts with `hole-tun`, and the bypass by destination prefix. It is the escape for when the in-bridge
 recovery cannot run; see [crash recovery](crash-recovery.md#the-escape).

@@ -20,8 +20,9 @@ other loader.
 - A file that does not parse, or cannot be read, is *quarantined*: moved to a sibling named
   `config.json.<timestamp>.bak`, where the timestamp is UTC with dashes in place of colons, which Windows file names do not
   allow. A backup that would collide gets `-2`, `-3` and so on before `.bak`. The app then runs on defaults and shows a
-  native dialog that names the backup ({src}`crates/hole/src/config_recovery.rs`). The parse error's text stays in
-  `gui.log` and is never put in the recovery record, because it can echo the file's content.
+  native dialog that names the backup ({src}`crates/hole/src/config_recovery.rs`). A parse error is reduced to its kind,
+  line and column, because serde's text can echo the file's content. That reduced error is what `gui.log` and the recovery
+  record carry. An I/O error's text is kept as it is.
 
 The quarantine prefers a rename, which keeps the original's permissions (the file holds plaintext passwords). If the rename
 fails and the contents were readable, it writes the backup as a new file and removes the original on a best-effort basis; on
