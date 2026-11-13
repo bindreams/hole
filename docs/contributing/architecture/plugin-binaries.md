@@ -18,13 +18,13 @@ lists the plugins Hole ships. The server test resolves through the same source a
 Per-variant behaviour is a method of `PluginSource`, one exhaustive match each, and no file outside the per-platform
 constructors names a variant; `plugin_source_policy_lives_on_the_type_not_at_call_sites` enforces it.
 
-| Platform and mode                      | `PluginSource`    | Where the plugins are                                  | Who writes them                       | How they are vouched for                                               |
-| -------------------------------------- | ----------------- | ------------------------------------------------------ | ------------------------------------- | ---------------------------------------------------------------------- |
-| macOS service                          | `Managed`         | `/Library/Application Support/Hole`, root-owned        | the service, from bytes inside `hole` | the repair of this start, [below](#macos-the-folder-the-service-keeps) |
-| Windows service                        | `InstallDir`      | beside the installed bridge executable                 | the installer                         | Program Files is not user-writable                                     |
-| foreground, either platform            | `BuildDir`        | beside the bridge executable, a staged build directory | `cargo xtask stage`                   | nothing                                                                |
-| foreground `--plugin-dir DIR`, Windows | `Explicit`        | `DIR`, read and never written                          | the administrator                     | nothing                                                                |
-| foreground `--plugin-dir DIR`, macOS   | `ExplicitStamped` | `DIR`, read and never written                          | the administrator                     | a current layout stamp                                                 |
+| Platform and mode                      | `PluginSource`    | Where the plugins are                                  | Who writes them                       | How they are vouched for                                                 |
+| -------------------------------------- | ----------------- | ------------------------------------------------------ | ------------------------------------- | ------------------------------------------------------------------------ |
+| macOS service                          | `Managed`         | `/Library/Application Support/Hole`, root-owned        | the service, from bytes inside `hole` | the repair of this start, [below](#macos-the-folder-the-service-keeps)   |
+| Windows service                        | `InstallDir`      | beside the installed bridge executable                 | the installer                         | Program Files is not user-writable by default; the bridge does not check |
+| foreground, either platform            | `BuildDir`        | beside the bridge executable, a staged build directory | `cargo xtask stage`                   | nothing                                                                  |
+| foreground `--plugin-dir DIR`, Windows | `Explicit`        | `DIR`, read and never written                          | the administrator                     | nothing                                                                  |
+| foreground `--plugin-dir DIR`, macOS   | `ExplicitStamped` | `DIR`, read and never written                          | the administrator                     | a current layout stamp                                                   |
 
 `BuildDir` and `InstallDir` look in the directory of the real executable: `beside` canonicalizes a symlinked
 registration, and requires an absolute executable path so the lookup never depends on the working directory. A missing
@@ -81,16 +81,16 @@ The `Managed` source holds it in a `RepairVerdict`, and `Prepared::standing` is 
 | `Vouched`           | repair `Converged` or `Repaired`, runtime folder made                             | the path                               |
 | `NotPrepared`       | no preparation has run yet                                                        | `FolderNotPrepared`                    |
 | `FolderNotRepaired` | repair `Degraded` (a failed write, an unreadable folder, a build with no payload) | `FolderNotRepaired`                    |
-| `RuntimeDirNotMade` | the runtime folder could not be made                                              | `RuntimeDirNotMade`, naming the folder |
+| `RuntimeDirNotMade` | repair `Converged` or `Repaired`, but the runtime folder could not be made        | `RuntimeDirNotMade`, naming the folder |
 | `StampUnreadable`   | repair `Refused`                                                                  | `LayoutUnreadable`, naming the stamp   |
 
-Both failures are logged even when the folder's outcome is the one the error names.
+When the repair `Degraded` or `Refused` and the runtime folder also failed, the error names the folder and the runtime
+failure is only logged.
 
 A start asks `resolve` for the configured plugin before anything else: before the DoH bootstrap, before any cover is
 engaged or released, before any dial. A refusal therefore touches nothing and reaches the user as the usual start
 error. Import already rejects plugins Hole does not ship, so only a hand-edited or old config, or a direct IPC call,
-gets here. The stamp of a folder no repair vouched
-for is never read.
+gets here. The stamp of an unsound folder (`UnsoundDir`) is never read.
 
 ### The layout stamp
 

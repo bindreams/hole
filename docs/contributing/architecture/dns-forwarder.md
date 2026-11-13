@@ -28,8 +28,9 @@ so no filter sees it. TCP transports use `tokio-socks`; plain UDP uses a hand-wr
 the Shadowsocks listener can only relay when the plugin carries UDP.
 
 **The endpoint.** UDP/53 reaches `LocalDnsEndpoint` before the filter decision does
-([the cascade](datapath.md#the-cascade)). TCP port 53 does not: it takes the ordinary cascade to the real resolver, over
-the tunnel. The endpoint refuses TCP by contract (`debug_assert!`), since port 53 over TCP is not necessarily DNS.
+([the cascade](datapath.md#the-cascade)). TCP port 53 does not: it takes the ordinary cascade to the real resolver, so the user's
+rule for that address decides (`Proxy` goes over the tunnel, `Bypass` leaves from the real interface, `Block` drops). The
+endpoint refuses TCP by contract (`debug_assert!`), since port 53 over TCP is not necessarily DNS.
 
 `DnsConfig::default()` is enabled and uses DoH with its default resolvers. `AppConfig` is `#[serde(default)]`, so a
 config file written before the forwarder existed enables it silently on upgrade. With `enabled` and an empty `servers`,
@@ -38,11 +39,11 @@ live TUN with nothing to forward to would strand every DNS flow.
 
 ## How the operating system reaches it
 
-`Dns::apply` points the operating system's resolvers at the configured resolver addresses, but on the TUN interface only.
-Those addresses fall in the halves the split routes send into the device, so a lookup arrives at the bridge, and
-`LocalDnsEndpoint` intercepts it. Hole writes DNS to no adapter or service except the one of the tunnel it created, and
-it reads nothing of the user's own DNS configuration, so there is nothing to capture or restore on a fresh apply. How
-the pointing is done differs.
+`Dns::apply` points the operating system's resolvers at the configured resolver addresses. Those addresses fall in the halves the split routes send into the device, so a lookup arrives at the bridge, and
+`LocalDnsEndpoint` intercepts it. Hole reads nothing of the user's own DNS configuration, so there is nothing to capture
+or restore on a fresh apply. On Windows it writes DNS to no adapter except the tunnel's own. On macOS it writes to no
+adapter at all and publishes one machine-wide resolver instead, as the tab below describes. How the pointing is done
+differs.
 
 `````{tab-set}
 ````{tab-item} Windows
@@ -52,9 +53,8 @@ the pointing is done differs.
    permits UDP and TCP port 53 only on `hole-tun` (by LUID), on loopback and to the Shadowsocks server, and blocks it
    elsewhere. The server permit has no port condition, so the tunnel's own handshake survives a server on port 53. The set
    lives in a **dynamic, process-scoped** FWPM session, so it dies with the bridge and needs no crash recovery. That is
-   the opposite lifetime from [the kill-switch cover](kill-switch-windows.md), on purpose: a cover that outlives the
-   bridge is the user's intent, and a DNS block that outlives it is harm with nobody left to release it. The two are not to
-   be unified.
+   the opposite lifetime from [the kill-switch cover](kill-switch-windows.md#the-filter-set), on purpose; the reason is
+   there.
 1. **Set servers.** The resolver addresses are set on the adapter, IPv4 and IPv6 separately, each family from its own
    configured resolvers. A family with none is left untouched, never cleared.
 
@@ -68,7 +68,8 @@ interface cannot be named to it. `apply_macos` instead publishes a supplemental 
 empty match-domain makes `configd` merge it as a resolver for every query, ranked above its own default.
 
 The store session is opened with `session_keys(true)`, so the key belongs to the bridge's own dynamic-store session and
-`configd` discards it when the session closes, including on `SIGKILL`. This is the analogue of the Windows session's
+`configd` discards it when the session closes, which the bridge's comments take to include an abrupt exit such as
+`SIGKILL`; no test kills the bridge to check. This is the analogue of the Windows session's
 process-scoped lifetime. Two live bridges publish two keys, and `configd` merges both.
 
 The resolver list is filtered to the address families the tunnel carries (`RoutedFamilies`), read once from the routes
@@ -82,11 +83,11 @@ used: the key covers the whole machine.
 no session. The type system enforces it: `phase::run` ({src}`crates/bridge/src/dns/system/phase.rs`) is the only place an
 apply step's result is consumed, and each call picks a sealed `DnsPhase`, `LeakBearing` (the error propagates) or
 `Cosmetic` (a warning). Warning on a leak-bearing call means choosing `Cosmetic` at the call site, a reviewable act, and
-mirrors `FatalPhase` and `BestEffortPhase` in route installation. Only the resolver-cache flush, and the best-effort
-withdraw after a cancel, are `Cosmetic`.
+mirrors `FatalPhase` and `BestEffortPhase` in route installation. Only the resolver-cache flush and the macOS steering
+withdraw (after a cancel, and on shutdown) are `Cosmetic`.
 
-Residuals the design accepts: DoH to an on-link resolver is indistinguishable from ordinary HTTPS to that host on both
-platforms, and on Windows DoT on port 853 is not confined. macOS has no per-port egress filter to evade, since the key only
+Residuals the design accepts: DoH to an on-link resolver is not caught by the port-53 confinement, which names no port
+but 53, so on both platforms it leaves as ordinary HTTPS to that host. On Windows DoT on port 853 is not confined. macOS has no per-port egress filter to evade, since the key only
 adds a resolver. An older build's own rewrite of another adapter's DNS after a crash is still undone by
 {src}`crates/bridge/src/dns/recovery.rs`; this build never writes `bridge-dns.json`.
 

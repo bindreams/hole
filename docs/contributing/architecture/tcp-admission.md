@@ -49,9 +49,9 @@ socket whose peer is still live stays in the set.
 
 `TimeWait` can be removed at once because every socket the stack creates has its delayed ACK disabled
 (`set_ack_delay(None)`, in `ensure_listener`). smoltcp therefore sends any ACK it owes on the poll that ingests the
-segment, and a socket removed at `TimeWait` owes nothing. With a delayed ACK, the peer's last data and FIN would go
-unacknowledged and its retransmission would be answered with a reset. `SocketStack::remove` asserts the property in debug
-builds. The `Listen` case matters because a reverted socket keeps its listen endpoint and would take every later SYN on
+segment, and a socket removed at `TimeWait` owes nothing. With a delayed ACK, the ACK for the peer's last data and FIN would still be owed when the socket went, and the peer's
+retransmission would be answered with a reset; that consequence is smoltcp's behaviour as read, not measured here.
+`SocketStack::remove` asserts the property in debug builds. The `Listen` case matters because a reverted socket keeps its listen endpoint and would take every later SYN on
 its port (`a_reverted_socket_would_hijack_a_later_syn`).
 
 ### One call per packet
@@ -60,7 +60,8 @@ Retiring only marks a socket; the reap happens in the next `poll`. In between, t
 its port, so a SYN arriving before that poll can be handed to it, with no accept path watching it. `Driver::settle_packet`
 closes the gap by construction: enqueue, both polls, admission, relay and retirement all happen inside one call per
 packet, so two packets' verdicts can never straddle a poll however the loop's read cadence changes. It is the only
-production entry point for a TUN packet.
+production entry point for a packet bound for the TCP/IP stack: `handle_udp_packet` takes the UDP packets (and the
+optional DNS hook) first, and only what it does not consume reaches `settle_packet`.
 
 ## One owner per 4-tuple
 

@@ -18,10 +18,10 @@ flowchart TB
     router --> drops["DropSink: records a drop, nothing is served"]
 ```
 
-`tun-engine` ({src}`crates/tun-engine/`) knows nothing about filters, proxies or DNS. Its `Driver`
-({src}`crates/tun-engine/src/engine/driver.rs`) runs the packet loop and the TCP/IP stack
-([smoltcp](https://github.com/smoltcp-rs/smoltcp)), and hands each accepted TCP connection and each new UDP flow to a
-`Router` trait object ({src}`crates/tun-engine/src/engine/router.rs`). The {term}`bridge` supplies the one implementation,
+The `Driver` ({src}`crates/tun-engine/src/engine/driver.rs`, in `tun-engine`) runs the packet loop and the TCP/IP stack
+([smoltcp](https://github.com/smoltcp-rs/smoltcp)). It knows nothing about filters or proxies: it hands each accepted TCP
+connection and each new UDP flow to a `Router` trait object ({src}`crates/tun-engine/src/engine/router.rs`) and takes
+no routing decision itself. The {term}`bridge` supplies the one implementation,
 `HoleRouter` ({src}`crates/bridge/src/hole_router.rs`), built by `Dispatcher::new`
 ({src}`crates/bridge/src/dispatcher.rs`) together with the TUN device and the engine.
 
@@ -56,7 +56,7 @@ It is the only place that does, and it reads top to bottom:
 | `Block`                                                                  | drop: `RuleBlock`                          |
 
 A drop is not a dispatch: `resolve_endpoint` returns a drop reason in place of an endpoint, and the router closes the
-flow itself. The three reasons each have their own method on `DropSink`, so a test can tell an explicit rule block from
+flow itself. `DropSink` has one method per reason (the rule block has a TCP and a UDP form), so a test can tell an explicit rule block from
 the privacy drop from an unreachable destination. Production wires `LoggingDropSink`
 ({src}`crates/bridge/src/drop_sink/logging.rs`), which logs them; tests wire a recording sink, which is what makes the
 invariant below assertable.
@@ -82,7 +82,8 @@ Where `supports_udp` comes from for the proxy endpoint:
 away from a TCP-only endpoint, and the assertion states that contract.
 
 **UDP port 53 is the exception, and it comes first.** With DNS enabled the router sends every UDP/53 flow to
-`LocalDnsEndpoint` before reading the filter decision, to any destination, so DNS keeps working on a TCP-only plugin and
+`LocalDnsEndpoint` ahead of the action cascade (the filter decision is made but its answer is ignored for these flows), to
+any destination, so DNS keeps working on a TCP-only plugin and
 a hard-coded resolver is answered too. TCP port 53 is not intercepted; it takes the normal cascade. `Driver` also has a
 generic `DnsInterceptor` hook ({src}`crates/tun-engine/src/engine/dns.rs`), but the bridge does not register one:
 `Dispatcher::new` leaves it unset, and the interception lives in the cascade.
@@ -96,7 +97,8 @@ listener is either the one the user enabled (**Local proxy server** on) or an in
 
 - `build_ss_config` pushes at most two local instances: SOCKS5 (`Mode::TcpAndUdp`, always) and HTTP CONNECT
   (`Mode::TcpOnly`, because CONNECT is TCP-only).
-- `validate_proxy_config` rejects four combinations before anything starts, each a `ProxyError`:
+- `validate_proxy_config` runs `validate_listeners` before anything starts, which rejects four combinations, each a
+  `ProxyError` (it also rejects a cipher name it cannot parse, `InvalidMethod`):
 
 | Error                   | When                                                                     |
 | ----------------------- | ------------------------------------------------------------------------ |
@@ -105,16 +107,16 @@ listener is either the one the user enabled (**Local proxy server** on) or an in
 | `DuplicateListenerPort` | both listeners enabled on the same port                                  |
 | `InvalidListenerPort`   | an enabled listener has port 0 (`local_port` or `local_port_http` named) |
 
-- Full tunnel with neither listener enabled is the pure-VPN start, not an error. `start_inner` allocates a loopback
-  port with `port_alloc::bind_ephemeral` (TCP and UDP), `build_ss_config` receives it as `internal_socks5_port`, and
+- Full tunnel with neither listener enabled is the pure-VPN start, not an error. `ProxyManager::acquire` allocates a
+  loopback port with `port_alloc::bind_ephemeral` (TCP and UDP), `build_ss_config` receives it as `internal_socks5_port`, and
   nothing is bound on the configured ports. The GUI sends this configuration when the master toggle is off:
   `build_proxy_config` ({src}`crates/hole/src/commands.rs`) ANDs both listener flags with `proxy_server_enabled`.
 - `TunnelRequiresSocks5` exists because the mixed case (a fixed HTTP port next to an internal SOCKS5 one) would put the
   fixed port inside `bind_ephemeral`'s retry loop, which has no bound by design. A real conflict on a fixed port must
   surface instead.
 
-The dispatcher, the DNS forwarder and its self-test all dial the port `start_inner` ends up with
-(`socks5_port`), never the configured one blindly.
+The dispatcher, the DNS forwarder and its self-test all dial the port `ProxyManager::acquire` ends up
+with (`socks5_port`), never the configured one blindly.
 
 ## Read next
 

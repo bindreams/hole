@@ -30,9 +30,9 @@ them before editing; the sections linked below are the authoritative source.
 - **TUN naming.** The running TUN device's name has exactly one source of
   truth at runtime, `tun_engine::device::TunIdentity`: Windows names it the
   fixed constant `WINDOWS_TUN_ALIAS` (`"hole-tun"`), macOS's kernel assigns
-  it (`TunName::KernelAssigned`, a `utunN`) and every macOS consumer —
-  DNS apply, the lockdown TUN permit — reads it back rather than assuming
-  a literal. →
+  it (`TunName::KernelAssigned`, a `utunN`) and every macOS consumer that
+  needs the name — route install, the lockdown TUN permit — reads it back
+  rather than assuming a literal (the macOS DNS apply takes none). →
   [docs/contributing/architecture/tun-device.md#the-device-name-has-one-source](docs/contributing/architecture/tun-device.md#the-device-name-has-one-source)
 - **IPv6 in the tunnel.** IPv6 is meant to traverse the tunnel: the `::/1` +
   `8000::/1` split pair captures it, and the TUN interface holds
@@ -41,8 +41,8 @@ them before editing; the sections linked below are the authoritative source.
   global ID is generated per RFC 4193, not `fd00::`. Windows waits for the
   interface's IPv6 half itself (`tun` waits only for the IPv4 one) and
   creates the address `IpDadStatePreferred`; assignment is fatal on Windows,
-  warn-only on macOS, and `Dispatcher::ipv6_assigned()` is what route-install
-  fatality must read. →
+  warn-only on macOS, and route-install fatality reads
+  `gateway::tun_ipv6_available`, not the assignment's outcome. →
   [docs/contributing/architecture/tun-device.md#ipv6-in-the-tunnel](docs/contributing/architecture/tun-device.md#ipv6-in-the-tunnel)
 - **TCP accept refusal.** The accept verdict lands while the listener is still
   in `SynReceived` with its SYN-ACK paused, so a declined connection is refused
@@ -63,10 +63,9 @@ them before editing; the sections linked below are the authoritative source.
   `SynReceived`/`FinWait2`/`CloseWait` holds its slot forever. →
   [docs/contributing/architecture/tcp-admission.md](docs/contributing/architecture/tcp-admission.md)
 - **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; OS
-  resolution is diverted to the configured resolver IPs on the TUN interface
-  only, which route into it and are intercepted by the in-TUN
-  `LocalDnsEndpoint`; a start-time forwarder self-test gates the whole
-  connection. The apply mechanism itself is platform-specific — Windows sets
+  resolution is diverted to the configured resolver IPs, which route into
+  the TUN and are intercepted by the in-TUN `LocalDnsEndpoint`; a start-time
+  forwarder self-test gates the whole connection. The apply mechanism itself is platform-specific — Windows sets
   the adapter's resolvers directly; macOS's `networksetup` has no interface
   identifier, so it instead publishes a synthetic, session-scoped
   `SCDynamicStore` supplemental-resolver key (`tun_engine::dns_steer`) — both

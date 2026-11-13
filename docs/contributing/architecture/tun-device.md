@@ -28,9 +28,8 @@ requested name that does not already look like `utunN`, which is why `Dispatcher
 Who reads the identity afterwards:
 
 - `Routing::install` takes `tun.alias()` as the interface for the split routes, on both platforms.
-- `Routing::install_lockdown` takes `tun.alias()` for the cover's permit on the TUN interface (a pf rule naming the
-  interface on macOS; on Windows the cover resolves the LUID from the alias at engage time). See [the kill
-  switch](kill-switch.md).
+- `Routing::install_lockdown` takes `tun.alias()` for the cover's permit on the TUN interface. How each platform turns
+  the alias into a permit is in [what the cover permits](kill-switch.md#what-the-cover-permits).
 - On Windows, the LUID goes to the DNS-egress confinement and to the interface-metric call in `Dispatcher::new`.
 - The macOS DNS apply takes the identity as a parameter and does not read it: the steering key it publishes covers the
   machine, not one interface ([the DNS forwarder](dns-forwarder.md#how-the-operating-system-reaches-it)).
@@ -62,7 +61,7 @@ any IPv6 destination (`supports_ipv6_dst` is always true), and the cascade drops
 interface, and in the address list of the smoltcp interface (`SocketStack::new`). The second is what the packet loop's own stack answers
 for. The first is what lets the kernel pick a source address for a packet that matches the `::/1` route.
 Without it a host with no global IPv6 address has nothing to put in the source field, and every IPv6 flow fails instead
-of travelling. A dual-stack host would hide the gap, since it sources from its upstream adapter.
+of travelling.
 
 The `tun` crate's `Configuration` holds a single address, so the IPv4 address goes to the crate and the IPv6 address is
 assigned by `ipv6_addr::assign` ({src}`crates/tun-engine/src/device/ipv6_addr.rs`), called from `Device::build` with the
@@ -88,29 +87,34 @@ and does not poll.
 
 The address is then created with `CreateUnicastIpAddressEntry` and `DadState = IpDadStatePreferred`, which skips duplicate
 address detection for this address alone, as the `tun` crate does for the IPv4 address. IP Helper is used and not
-`netsh`, because `netsh interface ipv6 add address` stores the address persistently, keyed by an adapter GUID that wintun
-derives from the adapter name. A crash would leave the address waiting for the next `hole-tun`. An address created through
-IP Helper has no persistence parameter and dies with the adapter, so route recovery has nothing to sweep.
+`netsh`, because `netsh interface ipv6 add address` stores the address persistently, keyed by the adapter GUID, and Hole
+requests the same GUID on every create. A crash would leave the address waiting for the next `hole-tun`.
+`CreateUnicastIpAddressEntry` has no persistence parameter, so by its contract nothing outlives the adapter and route
+recovery has nothing to sweep. That is reasoned from the API, not measured.
 
 ### macOS: `ifconfig`, and a failure only warns
 
 The macOS assignment runs `ifconfig <interface> inet6 <address> prefixlen <n> alias` through `SystemTool::Ifconfig`, since
 `libc` has no `in6_aliasreq`. A spawn failure, a failed `if_indextoname` or a non-zero exit logs a warning and returns
 `Assigned::Ipv6StackAbsent`; on success it also reads back, with a routing lookup for a different address inside the prefix,
-whether the alias created a prefix route, and logs the answer. Two behaviours are reasoned and not measured: how long
-duplicate address detection keeps the address tentative, and whether the alias creates a prefix route in every case. The
-module doc names the condition for making the macOS path fatal like Windows.
+whether the alias created a prefix route, and logs the answer.
+
+The whole path is unproven on a real macOS run: no test asserts that the assignment succeeds, which is why a failure only
+warns while Windows fails the start. The module doc names the condition for making macOS fatal too: the path has run
+green on the darwin TUN lane. Two behaviours stay unmeasured even then: how long duplicate address detection keeps the
+address tentative, and whether the alias creates a prefix route in every case.
 
 ### What is fatal
 
 On Windows, IPv6 never appearing on the interface (the stack is unbound) and a missing IPv6 stack reported by
 `CreateUnicastIpAddressEntry` (`ERROR_NOT_SUPPORTED`) both give `Assigned::Ipv6StackAbsent`, which only warns. Any other
 IP Helper failure, in the registration, the existence query, the LUID lookup or the create, is
-`DeviceError::Ipv6Assign` and fails the start. On macOS nothing fails the start: every `ifconfig` failure is
-`Ipv6StackAbsent`.
+`DeviceError::Ipv6Assign` and fails the start. On macOS every `ifconfig` failure is `Ipv6StackAbsent`. On both
+platforms, before any assignment, a device whose interface index is unavailable or not positive also fails the start with
+`DeviceError::Ipv6Assign`.
 
 `Device::build` logs a warning for `Ipv6StackAbsent` and records it; `Dispatcher::ipv6_assigned()` exposes it, and
-`start_inner` logs it with the routes it installed.
+`ProxyManager::bring_up_tunnel` logs it with the routes it installed.
 
 **Route installation reads a different measurement.** Whether the two IPv6 split routes are fatal is decided by
 `gateway::tun_ipv6_available(tun_name)` ({src}`crates/tun-engine/src/gateway.rs`), a probe of the TUN interface at install

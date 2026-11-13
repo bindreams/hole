@@ -15,7 +15,9 @@ session is one yamux connection to the server: `SessionTransport::spawn` wraps t
 session, so a reconnect does not rebind a port that the previous session's detached tasks may still hold.
 
 `run_client_session` is a `select!` over: shutdown, the keepalive, the driver's inbound-stream channel, a local TCP
-accept, a local UDP receive, and association clean-up. Whichever of the first three fires ends the session.
+accept, a local UDP receive, and association clean-up. Shutdown ends the session, the keepalive ends it, and the
+inbound-stream channel ends it when it closes. A stream the server opens arrives on that channel too; it is logged and
+dropped, and the session goes on.
 
 ## Telling that the transport is dead
 
@@ -89,11 +91,13 @@ v2ray-core would only add framing and a second connection lifecycle that can fai
   therefore cannot talk to a server whose ex-ray has `mux` on, and both ends must run a galoshes that agrees. Pinning `mux=1`
   in the plugin options on both ends restores the earlier wire format.
 - A mismatched pair fails to tunnel, and slowly. `galoshes_ws_mux_default_cannot_reach_a_mux1_server`
-  ({src}`crates/plugin-e2e/tests/roundtrip.rs`) shows the break against a control with `mux=1` on both ends. The server's
-  Mux.Cool worker stops reading on a frame it cannot parse (`ServerWorker.run` in the vendored v2ray-core,
-  `common/mux/server.go`) without closing anything, so no reset arrives, and the client sees the failure only when the
-  yamux keepalive declares the silent transport dead. The test's read budget outlasts that.
+  ({src}`crates/plugin-e2e/tests/roundtrip.rs`) shows the break against a control with `mux=1` on both ends. On a frame it cannot parse,
+  the server's Mux.Cool worker (`ServerWorker.run` in the vendored v2ray-core, `common/mux/server.go`) interrupts its
+  input and returns. Whether that tears the underlying connection down promptly is not shown; the test's comment and
+  its read budget fit a client that learns of the failure only when the yamux keepalive declares the transport dead,
+  but nothing here proves that mechanism.
 - The append goes through `garter::{split_plugin_options, join_plugin_options}`, so the escaping cannot drift from the
   parser's. A naive strip-and-append turns `path=/a\;` into `path=/a\;mux=0`, which ex-ray reads as one pair with no `mux`
   key. Two shapes have no correct output and are refused at startup: a dangling final escape, and a segment with an empty
-  key, because ex-ray rejects either string whole and silently falls back to every flag default.
+  key, because ex-ray rejects either string whole, and a rewriter that made one parseable would turn that loud startup
+  failure into a silently different configuration.
