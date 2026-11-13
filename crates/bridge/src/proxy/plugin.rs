@@ -801,8 +801,7 @@ const EX_RAY_DEFAULT_HOST: &str = "cloudfront.com";
 /// v2ray-core's server-listener construction path, not attempted here.
 /// Hole never spawns ex-ray as a server regardless, so an operator would
 /// have to hand-author `server` into their own `plugin_opts` to reach any
-/// of this. See CONTRIBUTING.md's "ECH-config-fetch reachability gate"
-/// section for why.
+/// of this.
 fn ex_ray_fatal_config_error(
     segments: &[garter::OptionSegment<'_>],
     ech_doh: Option<&crate::dns::ech::EchDoh>,

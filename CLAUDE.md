@@ -18,7 +18,7 @@ them before editing; the sections linked below are the authoritative source.
 - **Single binary, two modes.** GUI (system tray, settings, config) and bridge
   (TUN, routing, shadowsocks-service) selected by CLI args; they speak HTTP/1.1
   REST (JSON) over an AF_UNIX socket on both platforms (Windows via `socket2`). →
-  [CONTRIBUTING.md#architecture](CONTRIBUTING.md#architecture)
+  [docs/contributing/architecture/overview.md](docs/contributing/architecture/overview.md)
 - **Single-instance GUI.** Single-instance via `tauri-plugin-single-instance`
   (`com.hole.app`); CLI subcommands bypass the lock. →
   [CONTRIBUTING.md#single-instance-enforcement](CONTRIBUTING.md#single-instance-enforcement)
@@ -146,91 +146,11 @@ them before editing; the sections linked below are the authoritative source.
   earlier `mux=` overrides it. `mux` also picks the server's dokodemo
   destination, so a `mux=0` client cannot reach a `mux=1` server. →
   [CONTRIBUTING.md#galoshes-mux-default](CONTRIBUTING.md#galoshes-mux-default)
-- **Fail-closed covers.** The **standing lockdown** cover
-  (`Routing::install_lockdown`, opt-in kill switch) holds the update-cutover gap:
-  the bridge **disarms-not-drops** it across the restart and the new bridge
-  re-adopts it (`decide_cover_recovery == Adopt`). The **transient**
-  `install_failclosed_cover` (permit loopback + server, plus the resolver
-  Hole's own `ech-doh` URL names when it's the value ex-ray will actually dial
-  — `effective_ech_doh == Holes`, not merely a plugin being configured —
-  scoped to TCP/443) is a bounded-window RAII guard engaged by every covered
-  (auto-connect) start whose lockdown intent is OFF; a lockdown-on covered
-  start uses the standing cover instead and releases any held transient one.
-  Both are persistent WFP filters (Win) / self-contained pf ruleset (mac); the
-  standing cover's Windows block-all pair additionally installs `BOOTTIME`
-  twins — two more filters, aimed at the kernel-start→BFE-start window
-  `PERSISTENT` alone cannot reach. They carry the block only, so that window
-  has no permits at all — which is exactly why the block is **soft**
-  (`CLEAR_ACTION_RIGHT`, on the boot-time arm of `FilterLifetime::filter_flags`
-  and nowhere else): a hard one could not be overridden by the egress a host
-  may need to FINISH booting and so to reach the BFE start that lifts it.
-  **Overridable cuts both ways** — the same higher-weight permit in another
-  sublayer that unblocks a boot lets an ordinary flow out of an armed host
-  unencrypted, the #998 leak in the window #998 covers; the owner took an
-  unbootable host as the worse outcome and the leak is the disclosed price,
-  not an oversight. The
-  persistent half stays hard, and its weight-ordering argument is untouched —
-  the two halves are never in force at once, and hardness never decides
-  within-sublayer arbitration. The flag a twin is installed
-  with and the `KeyLifetime` its key is swept under are **one value**
-  (`FilterLifetime`, a newtype over `KeyLifetime`, read by both sites out of
-  `LOCKDOWN_BOOTTIME_TWINS`), so a boot-time filter whose key a sweep calls
-  `Persistent` — the #1003 false proof — is not expressible. Every engage
-  **pre-deletes** the twins' fixed keys, and every other key whose condition
-  carries a runtime value (server IP, TUN LUID, App-ID path), rather than
-  re-adding them: an add would short-circuit on `FWP_E_ALREADY_EXISTS` and
-  leave whatever the previous engage stored — a twin spent by the boot it
-  covered, or the pre-update `hole.exe` path. What is measured (WFP accepts and
-  stores them under our containers; a by-key delete removes a LIVE one; every
-  engage re-arms) versus unverified (anything spanning a reboot, including the
-  later-boot delete that #1009's uninstall gate depends on) is in
-  CONTRIBUTING.md. **Evidence about a boot-time key never comes from a commit
-  code:** an engage proves a twin armed by reading it back out of the
-  `BOOTTIME_ONLY` view (`verify_boottime_twins`) instead of trusting the
-  commit. Going the other way, only a delete that REMOVED a live twin proves
-  one gone, and only under bindreams/hole#1043's assumption that the by-key
-  delete purges the boot-time policy record with the runtime object (unmeasured
-  — every read available is a BFE read, while the record is what applies before
-  BFE starts). A not-found proves nothing and never will: it is the answer on
-  every boot where no object is live. Whether a stranded record is possible
-  at all is read off the twins' `Persistent` sibling
-  (`KeyRole::BootTimeSibling`) — which is why `disengage_lockdown` returns a
-  `Clearance` like `release_all`, and why `release_clearance_report` fires on
-  `leftover_keys` rather than on every unproven key. That sibling is **live
-  evidence a sweep consumes**: it is added with its twin and never removed with
-  it, so the sweep that deletes it destroys the only thing that could report.
-  Every sweep therefore copies the finding into `bridge-boottime.json`
-  (`failclosed::boottime_witness`) before returning — including a sweep that
-  FAILED, which issued every delete before reading any code and so is still
-  holding the sibling it removed (`SweepOutcome`, not a `Result`) — an engage
-  records it the instant the transaction commits (`commit_and_record`, before
-  the read-back that can fail over a cover already in force), and
-  `leftover_keys` reports when **either** source says a twin is possible — the
-  sibling survives a wiped state dir, the record survives the sweep that
-  consumes the sibling, and only a watched removal retracts it. The full
-  sweeps (`release_all`, `disengage_lockdown`) also delete every boot-time filter under
-  `PROVIDER_GUID` that no key list names (`failclosed::windows::provider_sweep`), so a
-  downgrade cannot strand another build's twin; a persistent one is left on purpose. A
-  refused delete of such a stranger, or an unreadable view, never fails a sweep (a
-  live boot-time filter is not enforced once BFE has started, measured): it is
-  reported with its GUID and code and arms the record (`KeyRole::Unlisted`,
-  `KeyRole::Enumeration`). The
-  transient one is swept unconditionally on next start, the standing one only
-  on an explicit recorded off — full reconciliation table (`decide_cover_recovery`)
-  and disclosed residuals in CONTRIBUTING.md. A single persisted `Target`
-  (`Off` / `Connected` / `Unreadable`) is what both the cover and the tunnel
-  session reconcile toward (`reconciler::{cover_step,tunnel_step,step_order}`);
-  `reconcile_once` drives this at boot, and `turn_lockdown_off`, the tray's
-  Unblock action, and session teardown each drive it inline for their own
-  event, since only boot is covered by a reconcile pass today. Who holds a
-  cover is a **measured OS fact**, `CoverPresence`, read via
-  `Routing::lockdown_cover_presence`, not derived from session state; the
-  escape (`Routing::release_all_covers`) is unconditional, has a
-  structurally-guarded set of sanctioned callers, and clears the in-process
-  adopted-cover claim only on a confirmed release, never on a guard's silent
-  `Drop`. Mutators take `&CoverLock` (one lock per state dir), readers take a
-  path ([the cover lock](CONTRIBUTING.md#the-cover-lock)). →
-  [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)
+- **Fail-closed covers.** The standing lockdown cover (the opt-in kill switch) outlives
+  the bridge: the bridge **disarms-not-drops** it and the new bridge adopts it. Release
+  decisions come from the persisted `Target` and the measured `CoverPresence`;
+  `Routing::release_all_covers` is unconditional; mutators take `&CoverLock`. →
+  [docs/contributing/architecture/kill-switch.md](docs/contributing/architecture/kill-switch.md)
 - **Server-address redaction.** The configured address — hostname, resolved IP,
   every textual form — is replaced by a `<server:XXXXXXXX>` token before it
   reaches a log, the dev console, a toast, or the support bundle. A byte-level
@@ -300,7 +220,7 @@ them before editing; the sections linked below are the authoritative source.
   hazard outright over guarding it: `CoverGuard::disarm` had a "call only
   before process exit" precondition that no test could enforce, and closing the
   handle it leaked deleted the rule instead of policing it.
-  [→](CONTRIBUTING.md#fail-closed-cover)
+  [→](docs/contributing/architecture/kill-switch.md#the-decisions)
 - **Privileged code in a folder a user may own walks through handles** —
   `util::dir::Dir` (or `ReadDir`, for code that only reads), never a path call.
   The walk gets the path as given: never `canonicalize` it first, which follows
