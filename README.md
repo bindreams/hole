@@ -22,7 +22,7 @@ second. To use Hole you need a Shadowsocks server, and there are two ways to get
 
 Get the installer for your system from the [latest release](https://github.com/bindreams/hole/releases/latest):
 
-- **Windows:** the `.msi` installer.
+- **Windows:** the `.msi` installer, for 64-bit Intel or AMD Windows (x64). Windows on ARM is not supported.
 - **macOS:** the `.dmg` for your Mac, `arm64` for Apple silicon or `amd64` for Intel. To tell which you have, open the
   Apple menu, choose **About This Mac**, and look at the **Chip** line: "Apple" followed by a name such as M1 means Apple
   silicon.

@@ -8,14 +8,18 @@ Builds `docs/` with warnings promoted to errors, then verifies the landing page'
 versions line carries the real manifest versions and that no substitution was
 left unrendered. Also checks every `{src}` link in `docs/`: its path must be
 tracked in the repository and, for a Markdown target, its `#anchor` must match a
-heading there (GitHub's slug rules).
+heading there (GitHub's slug rules). Every README link into the published site
+must name a page that exists under `docs/`.
 
 Usage:
     uv run scripts/validate-docs.py
     uv run scripts/validate-docs.py --fetch-only
+    uv run scripts/validate-docs.py --links-only
 
 `--fetch-only` resolves and downloads the build's tools and builds nothing, so CI
-can run the fetch under a retry without retrying a docs failure.
+can run the fetch under a retry without retrying a docs failure. `--links-only`
+runs the `{src}` and README link checks without the build: those read files
+anywhere in the repository, so the pre-commit hook for them runs on every commit.
 """
 
 import re
@@ -46,6 +50,9 @@ CODE_REGION_RE = re.compile(r"<(pre|code)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNOR
 # A `{src}` role: {src}`path`, {src}`path#anchor` or {src}`title <path#anchor>`.
 SRC_ROLE_RE = re.compile(r"\{src\}`([^`]+)`")
 SRC_TITLED_RE = re.compile(r"^.*?<([^<>]+)>$", re.DOTALL)
+
+# A README link into the published site: the page path after `/en/latest/`, if any.
+SITE_LINK_RE = re.compile(r"https://hole\.readthedocs\.io/en/latest/([^\s)#>]*)")
 
 HEADING_RE = re.compile(r"^ {0,3}#{1,6}[ \t]+(.*?)[ \t]*$")
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*(.*?)[ \t]*$")
@@ -146,6 +153,29 @@ def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
     return problems
 
 
+def readme_link_problems(repo_root: Path) -> list[str]:
+    """Problems with the README's links into the published site.
+
+    `<page>.html` must have a `docs/<page>.md` source; the bare site root maps to
+    `docs/index.md`.
+    """
+    problems = []
+    readme = (repo_root / "README.md").read_text(encoding="utf-8")
+    for number, line in enumerate(readme.splitlines(), start=1):
+        for link in SITE_LINK_RE.finditer(line):
+            page = link.group(1)
+            if page.endswith(".html"):
+                source = f"docs/{page.removesuffix('.html')}.md"
+            elif page == "":
+                source = "docs/index.md"
+            else:
+                problems.append(f"README.md:{number}: site link is not a page or the site root: {link.group(0)}")
+                continue
+            if not (repo_root / source).is_file():
+                problems.append(f"README.md:{number}: site link has no page source {source}: {link.group(0)}")
+    return problems
+
+
 def tracked_files() -> frozenset[str]:
     """Paths of the files in the git index (staged files included)."""
     listing = subprocess.run(
@@ -178,7 +208,11 @@ def main() -> int:
     if sys.argv[1:] == ["--fetch-only"]:
         return subprocess.run(sphinx_command("--version"), cwd=REPO_ROOT).returncode
 
-    problems = src_link_problems(REPO_ROOT, tracked_files())
+    problems = src_link_problems(REPO_ROOT, tracked_files()) + readme_link_problems(REPO_ROOT)
+    if sys.argv[1:] == ["--links-only"]:
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        return 1 if problems else 0
 
     # A fresh output directory every run. Reusing one lets Sphinx build
     # incrementally -- it skips re-reading unchanged pages, so a broken
@@ -346,3 +380,25 @@ def test_src_links_are_read_inside_directives_but_not_inside_code(tmp_path: Path
 
     assert len(problems) == 1
     assert "a.md:3" in problems[0]
+
+
+def test_readme_links_accept_pages_and_the_site_root(tmp_path: Path) -> None:
+    _write_repo(tmp_path, {"docs/index.md": "", "docs/reference/cli.md": ""})
+    (tmp_path / "README.md").write_text(
+        "[a](https://hole.readthedocs.io/en/latest/) [b](https://hole.readthedocs.io/en/latest/reference/cli.html#x)\n",
+        encoding="utf-8",
+    )
+
+    assert readme_link_problems(tmp_path) == []
+
+
+def test_readme_links_report_a_missing_page(tmp_path: Path) -> None:
+    _write_repo(tmp_path, {"docs/index.md": ""})
+    (tmp_path / "README.md").write_text(
+        "ok\n[a](https://hole.readthedocs.io/en/latest/reference/gone.html)\n", encoding="utf-8"
+    )
+
+    problems = readme_link_problems(tmp_path)
+
+    assert len(problems) == 1
+    assert "README.md:2" in problems[0] and "docs/reference/gone.md" in problems[0]

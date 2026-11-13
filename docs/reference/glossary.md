@@ -33,9 +33,8 @@ galoshes
   connection. See [Distributions](distributions.md).
 
 kill switch
-  An optional setting, off by default. It blocks every connection except local (loopback) traffic, traffic through the
-  tunnel and traffic to the server itself, so a dropped tunnel cannot leak, and it stays switched on across restarts
-  until you turn it off. The tray calls it **Lockdown**. See
+  An optional setting, off by default. It blocks traffic that would otherwise leave outside the tunnel, so a dropped
+  tunnel cannot leak, and it stays switched on across restarts until you turn it off. The tray calls it **Lockdown**. See
   {src}`the contributor reference <CONTRIBUTING.md#lockdown-mode>`.
 
 lockdown
@@ -66,5 +65,5 @@ VPN client
   service: it comes with no server. Get a config from whoever runs one, or run your own with {term}`Postern`.
 
 Unblock Network
-  See {term}`kill switch`: the tray action, offered when Hole is not connected, that turns it off.
+  See {term}`kill switch`: the tray action, shown whenever Hole is blocking traffic, connected or not, that disconnects and turns it off.
 ```
