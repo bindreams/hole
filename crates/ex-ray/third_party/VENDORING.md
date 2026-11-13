@@ -13,6 +13,27 @@ Patched so ex-ray's TLS engine survives real-world ECH:
 - the **uTLS** fingerprint-mimicry engine carries ECH (so SNI concealment composes
   with a mimicked ClientHello), routed through the same fail-closed gate + retry.
 
+### The ECH patch in v2ray-core
+
+- **Fail-closed gate.** Client dials build their TLS config through `(*tls.Config).GetTLSConfigForClient` (ECH-capable
+  transports) or `GetTLSConfigForUnsupportedClient` (engines that cannot do ECH: uTLS, hysteria2).
+  `RequireEchSatisfied` aborts an `ech=always` dial that cannot obtain an ECH config, so the real SNI is never sent in
+  cleartext. Server listeners keep calling bare `GetTLSConfig`.
+- **`retry_configs` recovery (RFC 9849).** On an `*tls.ECHRejectionError`, `DialClientWithECHRetry` retries once with the
+  server-provided configs and refreshes the ECH cache through `RefreshECHCache`. It is wired for tcp, websocket, http,
+  quic and the `transportcommon` transports (httpupgrade and request-assembly). gRPC has no `security.Engine` seam, so it
+  is not wired; hysteria2 cannot do ECH.
+
+### What guards the patches on a bump
+
+The `ex-ray-tests` target (`cargo xtask run ex-ray-tests`) runs the gate, refuse and `retry_configs` Go tests and a
+fake-TLS-server reject-then-accept test, so a bump that drops or breaks the ECH patch fails CI. golangci-lint excludes
+the vendored tree, so this lane, not the linter, is the guard.
+
+`TestDialSystemAppliesKeepAlive` guards the two behaviours the `tcp-keepalive` option relies on: a registered dialer
+controller still reaches the socket's file descriptor, and `SocketConfig`'s keepalive fields still suppress Go's own
+post-connect defaults. A bump that breaks either fails CI instead of silently restoring Go's default keepalive.
+
 ## `utls/` — pinned **v1.8.2** ([refraction-networking/utls](https://github.com/refraction-networking/utls))
 
 Patched so an ECH-rejection retry can succeed. On rejection, uTLS v1.8.2 verifies

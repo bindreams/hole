@@ -1,45 +1,29 @@
 # tun-engine
 
-Cross-platform TUN device, OS routing, gateway discovery, and a
-smoltcp-backed packet-loop engine for building split-tunnel VPN / proxy
-daemons in Rust.
+tun-engine is a Rust library for building a split-tunnel VPN or proxy daemon on Windows and macOS. It opens a TUN
+device, installs the operating system's routes, and runs a [smoltcp](https://github.com/smoltcp-rs/smoltcp) TCP/IP
+stack over the packets it reads. Each TCP connection or UDP flow that arrives is handed to a `Router` you write, which
+decides what to do with it. The crate knows nothing about the protocol you tunnel into.
 
-`tun-engine` is protocol-agnostic. It handles the mechanics common to any
-tun2socks-style forwarder — opening a TUN device, running a smoltcp TCP/IP
-stack over the packets it reads, and dispatching each inbound TCP
-connection or UDP flow to a caller-supplied `Router`. Policy (what to do
-with each connection) stays in the consumer.
+It is part of [Hole](https://github.com/bindreams/hole), a Shadowsocks client, whose bridge is its one consumer.
 
-## Status
+## Who it is for
 
-**Pre-release.** Currently consumed path-locally by the `hole-bridge`
-crate in this repository. Published documentation, crates.io release, and
-API stabilization will happen once the public surface has proven itself
-across a second consumer.
+Developers writing a tun2socks-style forwarder: something that captures a machine's traffic and relays it to a proxy,
+or filters it, or drops it. tun-engine does the operating-system work and the packet loop; the policy is yours.
 
-## Architecture
+It is not published to crates.io and its API is not stable. Depend on it by path or by git from a checkout of this
+repository, and expect it to change until a second consumer has shaped it.
 
-Three independently-usable modules:
+## Use
 
-- **`routing`** — an OS-level `Routing` trait plus a production
-  `SystemRouting` impl that shells out to `netsh` (Windows) or
-  `route(8)` (macOS), with a JSON state file for crash recovery.
-- **`device`** — cross-platform TUN open (`Device::build`). Windows
-  additionally provides `device::wintun` for `wintun.dll` pre-loading so
-  missing-DLL failures report a descriptive path list.
-- **`engine`** — the packet-loop `Engine`. Construction is closure-based
-  (no chained builders); per-connection dispatch goes through the
-  caller-supplied `Router` trait.
+```toml
+[dependencies]
+tun-engine = { git = "https://github.com/bindreams/hole" }
+```
 
-Plus:
-
-- **`helpers`** — ready-made splice primitives (SOCKS5 CONNECT, SOCKS5
-  UDP ASSOCIATE, interface-bound bypass sockets) that a typical `Router`
-  impl uses inline.
-- **`gateway`** — detect the system's default gateway + interface.
-- **`net`** — small OS-level socket-binding utilities.
-
-## Quickstart
+A `Router` has two methods, one per flow. This one drops everything; a real one would splice the flow to an upstream,
+for which `tun_engine::helpers` has SOCKS5 and interface-bound sockets.
 
 ```rust
 use std::sync::Arc;
@@ -51,18 +35,15 @@ struct MyRouter;
 
 #[async_trait]
 impl Router for MyRouter {
-    async fn route_tcp(&self, meta: TcpMeta, mut flow: TcpFlow) -> std::io::Result<()> {
-        // Optionally peek at the first bytes (e.g. for SNI-based routing).
-        let peeked = flow.peek(2048, std::time::Duration::from_millis(100)).await?;
-        // ... decide + splice: tun_engine::helpers::socks5_connect(...), etc.
-        drop(peeked);
-        drop(flow);
+    async fn route_tcp(&self, _meta: TcpMeta, flow: TcpFlow) -> std::io::Result<()> {
+        // `flow.peek` reads the first bytes without consuming them, for routing on SNI or a Host header.
+        drop(flow); // dropping the flow resets the connection
         Ok(())
     }
 
     async fn route_udp(&self, _meta: UdpMeta, mut flow: UdpFlow) -> std::io::Result<()> {
-        while let Some(_pkt) = flow.recv().await {
-            // ... dispatch, optionally reply via flow.send(...)
+        while let Some(_datagram) = flow.recv().await {
+            // `flow.send` replies to the sender.
         }
         Ok(())
     }
@@ -76,46 +57,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         c.ipv4 = Some("10.255.0.1/24".parse().unwrap());
     })?;
 
-    let engine = Engine::build(device, Arc::new(MyRouter), |c| {
-        c.max_connections = 4096;
-    })?;
-
-    let cancel = CancellationToken::new();
-    engine.run(cancel).await;
+    let engine = Engine::build(device, Arc::new(MyRouter), |_| {})?;
+    engine.run(CancellationToken::new()).await;
     Ok(())
 }
 ```
 
-## Test-isolation contract
+Opening the device and changing routes needs an elevated process (administrator on Windows, root on macOS).
 
-Production I/O that mutates the host's routing tables MUST go through the
-`Routing` trait. The free functions `setup_routes` / `teardown_routes` are
-lint-disallowed outside the crate's own internals (see workspace
-`clippy.toml`). Consumers that author their own `Routing` impls can ignore
-the lint; consumers that only use `SystemRouting` get the guard-rail for
-free. Motivation: see [bindreams/hole#165][issue-165].
+## What is in the crate
 
-## Route-command failure policy
+- `device`: opens the TUN device. On Windows it loads `wintun.dll` and names the adapter as you ask; on macOS you can
+  leave the name to the kernel (`TunName::KernelAssigned`).
+- `engine`: the packet loop, `Engine`, and the `Router` trait it dispatches to.
+- `routing`: a `Routing` trait and `SystemRouting`, which installs and removes the split routes with `netsh` on Windows
+  and `route` on macOS. It records what it installed in a state file so a crashed run can be cleaned up, and it can
+  install a fail-closed cover that blocks the machine's egress except to loopback and the proxy server.
+- `gateway`: finds the default gateway and its interface.
+- `helpers`: SOCKS5 CONNECT and UDP ASSOCIATE clients, and sockets bound to a chosen interface to bypass the tunnel.
+- `dns_steer` (macOS) publishes a resolver that sends the operating system's DNS to the tunnel; `dns_confine` (Windows)
+  blocks DNS on every path but the tunnel, loopback and the proxy server.
+- `sim` (behind the `test-utils` feature): in-memory doubles, so a `Router` can be tested without an operating-system
+  device.
 
-`setup_routes` is **fatal**: the first `netsh`/`route` command that does not
-exit zero aborts the phase and returns a `RouteCommandError`, and
-`SystemRouting::install` rolls back and hands back no guard. Reporting routes
-that were never installed sends traffic outside the tunnel.
-
-Fatality is decided per command, not per phase (`SetupCommand::fatal`). The two
-IPv6 split routes are non-fatal when the upstream interface cannot reach IPv6:
-there the `add route` cannot succeed, and a host with no IPv6 stack has no IPv6
-traffic to leak.
-
-`teardown_routes` and `recover_routes` are **best-effort**: every command is
-issued and none can abort the rest. They return a `CleanupReport` (counts) —
-not a `Result` — so there is no error channel to short-circuit through, because
-stopping early would strand routes on the user's machine. See
-[bindreams/hole#901][issue-901].
+The API is documented in the source: run `cargo doc -p tun-engine --open` in a checkout. How Hole uses the crate is in
+[The TUN device and the routes](https://hole.readthedocs.io/en/latest/how-it-works/tun.html).
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE.md](../../LICENSE.md).
-
-[issue-165]: https://github.com/bindreams/hole/issues/165
-[issue-901]: https://github.com/bindreams/hole/issues/901
+[GPL-3.0-or-later](https://github.com/bindreams/hole/blob/main/LICENSE.md).

@@ -1,107 +1,32 @@
 # garter
 
 [![Crates.io](https://img.shields.io/crates/v/garter.svg)](https://crates.io/crates/garter)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/bindreams/hole/blob/main/crates/garter/LICENSE)
 
-Plugin-chain runner for [SIP003](https://shadowsocks.org/doc/sip003.html) /
-SIP003u shadowsocks plugins.
+garter is a Rust library that runs a chain of [SIP003](https://shadowsocks.org/doc/sip003.html) Shadowsocks plugins as
+if they were one. Shadowsocks starts a plugin and hands it an address to listen on and an address to forward to; garter
+starts several plugins, wires each one's output to the next one's input, waits until the whole chain is ready, and shuts
+it down together.
 
-`garter` lets you compose multiple SIP003 plugins into a chain and run them
-as one. It handles the SIP003 environment variables (`SS_REMOTE_HOST`,
-`SS_REMOTE_PORT`, `SS_LOCAL_HOST`, `SS_LOCAL_PORT`, `SS_PLUGIN_OPTIONS`),
-per-link port allocation, lifecycle (graceful shutdown propagation), and
-byte-level diagnostics.
+It is part of [Hole](https://github.com/bindreams/hole), a Shadowsocks client, which uses it to run its plugins.
 
-## What's in the box
+## Who it is for
 
-- **`ChainPlugin`** — the core trait. Anything implementing it can be a
-  link in the chain. The crate ships `BinaryPlugin` (wraps an external
-  SIP003 plugin executable) and `TapPlugin` (instruments byte counts +
-  TTFB on the wire).
-- **`ChainRunner`** — composes a sequence of `ChainPlugin`s into a single
-  end-to-end transport.
-- **`CountingStream` / `StreamCounters`** — wire-level instrumentation
-  for any `tokio::io::AsyncRead + AsyncWrite` stream.
-- **`parse_plugin_options`** — parses the SIP003 `;`-separated options
-  string into an ordered list of key/value pairs, or an error for a string a
-  SIP003 plugin would reject outright.
-- **`Mode`** — selects chain direction (`Client` / `Server`); see below.
+- **Developers building something that runs SIP003 plugins**, such as a Shadowsocks launcher or a plugin that wraps
+  another plugin.
+- **People who want two plugins at once**, for example one that obfuscates traffic inside one that carries it. The
+  `garter` command (below) does this from a config file, with no Rust.
 
-### Modes
+## Install
 
-`ChainRunner` supports two SIP003 chain directions selected via
-`.mode(...)`:
+```sh
+cargo add garter
+```
 
-- `Mode::Client` (default) — data flows from the SS client's listener
-  (`SS_LOCAL_*`) through the chain to the SS server's public endpoint
-  (`SS_REMOTE_*`).
-- `Mode::Server` — data flows from the public-facing endpoint
-  (`SS_REMOTE_*`) through the chain back to a local `ssserver`
-  (`SS_LOCAL_*`). The plugin add-order stays the same in both modes
-  (data-source-side first); in Server mode garter inverts the address
-  wiring — including which plugin position faces the public endpoint.
-  Per-plugin readiness is declared by each link (see the sitrep
-  protocol below); the runner reports the chain ready once every link has.
+`garter` is a library. The `garter` command is a separate binary, on the Hole
+[releases page](https://github.com/bindreams/hole/releases) for Windows, macOS and Linux (each on amd64 and arm64).
 
-Use `Mode::from_plugin_options(env.plugin_options.as_deref())` to derive
-the mode automatically from the SIP003 `server` keyword in
-`SS_PLUGIN_OPTIONS`.
-
-### Start order, restart and failure
-
-The hops start one at a time, each only after the hop it forwards to has
-reported ready. Plugins are added data-source-side first in both modes; the
-mode decides which end starts first.
-
-| Mode     | Starts first (forwards to the destination) | Starts last (listens on the public address) |
-| -------- | ------------------------------------------ | ------------------------------------------- |
-| `Client` | the last plugin added                      | the first plugin added                      |
-| `Server` | the first plugin added                     | the last plugin added                       |
-
-Every hop but the last-started listens on a loopback port the chain picks for
-it just before it starts. The port is free when picked, and another process may
-take it before the hop binds it. A hop that reports that as a `bind_conflict`
-(`StartError::BindConflict`) is stopped and run again on its own, on a fresh
-port, as often as it takes: the hops already running are not touched, and only a
-shutdown ends the retries. A conflict on the public address is the caller's, so
-the chain reports it. This makes `ChainPlugin::run` re-runnable: a plugin is a
-description of a hop, and `run` may be called again after it returned.
-
-`ChainRunner::run` returns `Error::StartFailed { plugin, cause }` whenever a hop
-fails to start, whether it reported a failure or ended before it was ready
-(whatever it returned). The chain cancels every plugin first, with or without an
-`on_ready` callback, and the start failure outranks the plugins' own exit
-errors and the drain timeout. A shutdown before the chain is ready is not
-itself a start failure, unless the hop that was starting had delivered one by
-then.
-
-A public `local_port` of `0` is passed through to the hop, which picks its own
-port. The chain reports it in `ChainReady::listen` when the hop says which port
-it bound (sitrep `ready` carries `listen`).
-
-A hop that does not speak sitrep (`ReadinessMode::Probe`) cannot report a lost
-intermediate port. It exits without a typed conflict, so the chain fails with a
-`Fatal` "exited before becoming ready" start failure and does not restart it,
-and if another process now listens on that port the probe reports ready for that
-process instead. Use `ExpectSitrep` for a hop that is not the public one. A
-`TapPlugin` reports its inner plugin's typed conflict as its own, so a tap whose
-inner speaks sitrep is restarted, and the re-run picks a fresh inner port.
-
-## sitrep protocol
-
-A SIP003 plugin reports its startup to the host that spawned it —
-readiness, the actual bound listen address, the transports it serves,
-and any typed start failure — over **sitrep**, a one-way,
-line-delimited JSON control stream on the plugin's stdout. It replaces
-connect-probing the plugin's port and scraping its logs.
-
-`garter` is the reference implementation of sitrep, but the protocol is
-independently adoptable: any SIP003 / SIP003u plugin or host may
-implement it without depending on `garter`.
-
-See [SITREP.md](SITREP.md) for the full normative specification.
-
-## Example
+## Use
 
 ```rust,no_run
 use garter::{BinaryPlugin, ChainRunner, Mode, PluginEnv};
@@ -109,9 +34,7 @@ use garter::{BinaryPlugin, ChainRunner, Mode, PluginEnv};
 #[tokio::main]
 async fn main() -> garter::Result<()> {
     let env = PluginEnv::from_env()?;
-    // Detect SIP003 chain mode from SS_PLUGIN_OPTIONS (`server` keyword
-    // = Server; default = Client). Same parse used by v2ray-plugin and
-    // other SIP003 plugins.
+    // `server` in SS_PLUGIN_OPTIONS selects Server; otherwise Client.
     let mode = Mode::from_plugin_options(env.plugin_options.as_deref())?;
 
     let chain = ChainRunner::new()
@@ -123,16 +46,57 @@ async fn main() -> garter::Result<()> {
 }
 ```
 
-Without a `.cancel_token(...)`, `run` ends the chain on SIGTERM/SIGINT/Ctrl+C. With one, `run` registers no signal handler:
-the embedder routes signals into its token.
+Plugins are added data-source side first in both modes. In `Mode::Client` (the default) data flows from the Shadowsocks
+client through the chain to the server; in `Mode::Server` it flows the other way, to a local Shadowsocks server.
 
-See [the SIP003 spec][sip003] for the broader context on shadowsocks
-plugins, and the [`hole`](https://github.com/bindreams/hole) repository
-for a worked example (the `galoshes` plugin embeds `garter` to compose a
-YAMUX-multiplexed v2ray-plugin transport).
+A `BinaryPlugin` decides it is ready by connecting to the port it was given, unless `.readiness(ReadinessMode::ExpectSitrep)`
+says the plugin speaks sitrep (below), which also lets the chain restart a hop that loses its port.
+
+Without `.cancel_token(...)`, `run` ends the chain on SIGTERM, SIGINT or Ctrl+C. With one, `run` registers no signal
+handler and the embedder routes signals into its token.
+
+## What is in the crate
+
+- `ChainPlugin`, the trait a link in the chain implements, with `BinaryPlugin` (an external SIP003 plugin executable) and
+  `TapPlugin` (wraps another plugin and logs byte counts and time to first byte per connection).
+- `ChainRunner`, which composes plugins into one transport.
+- `CountingStream` and `StreamCounters`, byte counters for any `AsyncRead + AsyncWrite` stream.
+- `parse_plugin_options`, which parses the semicolon-separated `SS_PLUGIN_OPTIONS` string.
+- `sitrep`, the types of the readiness protocol below.
+
+The [API documentation](https://docs.rs/garter) covers start order, restarts and failures in detail.
+
+## sitrep
+
+A plugin can report its startup to the program that spawned it, meaning readiness, the address it bound, the transports it
+serves and any typed start failure, as **sitrep**: a one-way, line-delimited JSON stream on its standard output. It
+replaces probing the plugin's port and scraping its logs. garter is the reference implementation, and any SIP003 plugin
+or host can adopt the protocol without depending on garter. The specification is
+[SITREP.md](https://github.com/bindreams/hole/blob/main/crates/garter/SITREP.md).
+
+## The `garter` command
+
+The `garter` binary runs a chain from a YAML file, so it can be named as the plugin of a Shadowsocks client or server.
+Shadowsocks launches it with the usual SIP003 environment, and `SS_PLUGIN_OPTIONS` names the file with `config=`:
+
+```yaml
+chain:
+  - plugin: ./v2ray-plugin
+    options: "tls;host=example.com"
+  - plugin: ./obfs-local
+    options: "obfs=tls"
+```
+
+A relative `plugin` path is read relative to the config file. `garter --version` prints the version and `garter --help`
+a short help text.
+
+## Documentation
+
+- [What ships from the Hole repository](https://hole.readthedocs.io/en/latest/reference/distributions.html), including
+  the `garter` command.
+- [Shadowsocks and its plugins](https://hole.readthedocs.io/en/latest/how-it-works/plugins.html), including how Hole
+  runs plugins through garter.
 
 ## License
 
-Licensed under [Apache-2.0](LICENSE).
-
-[sip003]: https://shadowsocks.org/doc/sip003.html
+Licensed under [Apache-2.0](https://github.com/bindreams/hole/blob/main/crates/garter/LICENSE).
