@@ -82,8 +82,8 @@ the next `pfctl -E` of any app, so `pfctl -X` never runs while a record names th
   both restore under pf defaults.
 - A failed restore leaves the block, its record and its token in place and returns the restore's own error. The ways out:
   fix `/etc/pf.conf` and unblock again (the restore is retried); `sudo pfctl -d` turns pf off, and the record stays until a
-  later restore succeeds; a reboot resets pf and keeps the record, and unless the target is `Off` the boot reconcile connects and `Reenable`
-  re-arms the cover. The target is `Off` after `unlock`, `release-covers` or a Disconnect. A failed release in Unblock or
+  later restore succeeds; a reboot resets pf and keeps the record, and a boot connect that reaches the cover's install step re-arms it
+  (`Reenable`, [below](#no-reboot-survival)). The target is `Off` after `unlock`, `release-covers` or a Disconnect. A failed release in Unblock or
   untick writes no record, so it leaves the target as it was.
 - A clear that cannot write is the release's error and drops nothing, so the retry still has its token. A token that will
   not drop is logged only: with the rules restored it blocks nothing.
@@ -96,11 +96,21 @@ sweep answers `Clearance::proven()`, and the witness machinery is Windows-only.
 
 ## No reboot survival
 
-A pf ruleset does not survive a reboot, and neither does pf being enabled. After a reboot the host is open until the
-bridge starts and a connect engages the cover again: the persisted record survives, `engage_pf_action` reads
-"record exists, pf disabled", and `Reenable` loads the ruleset into an *enabled* pf. The boot reconcile narrows the gap by
-connecting sooner, but a boot connect that fails engages nothing. Windows is meant to cover the equivalent window with
-[boot-time filters](kill-switch-windows.md#the-boot-window), which has not been measured across a reboot.
+A pf ruleset does not survive a reboot, and neither does pf being enabled. After a reboot the host is open until a
+connect engages the cover again: the persisted record survives, `engage_pf_action` reads "record exists, pf disabled", and
+`Reenable` loads the ruleset into an *enabled* pf. The bridge starting does not do that. Startup reads the cover as
+`Recorded` and adopts it, and `Phase::Cover(Engage)` in the boot reconcile is a no-op; the engage happens inside the
+connect, after the routes. With the intent `On`, what follows a reboot is one of three things:
+
+- **The boot connect reaches the install step.** `Reenable` re-arms the cover. The reconcile narrows the gap by
+  connecting sooner than the user would.
+- **The boot connect fails before the install step.** Nothing is engaged and the host stays open. The record stays, so
+  the next connect that gets that far re-arms the cover. A connect that fails after the install releases what it
+  installed.
+- **There is no boot connect.** The startup-resolved target is `Off` (the startup preference **Do not connect**), so the
+  reconcile releases the record and the host stays open; the intent stays `On`, so a later connect installs a fresh
+  cover. A target that cannot be read holds the record and connects nothing, which leaves the host open too. Windows is meant to cover the equivalent window with
+  [boot-time filters](kill-switch-windows.md#the-boot-window), which has not been measured across a reboot.
 
 ## What a macOS restart under the cover has to do
 

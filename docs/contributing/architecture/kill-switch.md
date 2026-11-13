@@ -16,19 +16,23 @@ decisions are made where, and the behaviours that are under question today. The 
 - Three facts drive every decision: the **intent** (the Lockdown preference, a persisted file), the **target** (what the
   user last asked to be connected to, a persisted file) and the **presence** of a cover (measured from the operating
   system, never remembered). Each is a closed type, and each decision is one exhaustive `match` with no wildcard arm.
+- A fourth input acts at every bridge start, before anything is decided: the **startup preference** (**On system
+  startup**). It is folded into the target, and **Do not connect** makes the target `Off`, which releases any cover the
+  start finds, whatever the intent ([#1294](https://github.com/bindreams/hole/issues/1294)).
 - Every mutation of a cover runs under one lock. See [Recovery, adoption and the cover lock](kill-switch-recovery.md).
 
 ## Vocabulary
 
-| Term            | Meaning                                                                                                                                  | Code                                                                          |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| Cover           | The installed rule, held in the bridge by an RAII guard. Dropping the guard removes the rule; `disarm` lets go and leaves it in force.   | `Routing::Cover`, `CoverGuard` in {src}`crates/tun-engine/src/routing.rs`     |
-| Standing cover  | The kill switch. Persistent, adopted across a restart, removed by an escape or when the target or the intent says so.                    | `Routing::install_lockdown`                                                   |
-| Transient cover | A bounded block for a connect attempt. No start engages it today ([below](#the-transient-cover)).                                        | `Routing::install_failclosed_cover`                                           |
-| Intent          | The Lockdown preference: `On`, `Off`, `Unset` (no record) or `Unreadable` (a record that cannot be read). Stored in the state directory. | `Intent` in {src}`crates/tun-engine/src/routing/failclosed/lockdown_state.rs` |
-| Target          | What the user last asked for: `Off`, `Connected { config }` or `Unreadable`.                                                             | `Target` in {src}`crates/bridge/src/target.rs`                                |
-| Presence        | What the operating system says about the standing cover: `Live`, `Recorded`, `Absent`, `Indeterminate`, `Unreachable`.                   | `CoverPresence` in {src}`crates/tun-engine/src/routing.rs`                    |
-| Session event   | Why a session ended: `UserStopped`, `GaveUp`, `CutoverRestart`, `Blipped`, `ProcessExiting`.                                             | `SessionEvent` in {src}`crates/bridge/src/target.rs`                          |
+| Term               | Meaning                                                                                                                                                          | Code                                                                                                                    |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Cover              | The installed rule, held in the bridge by an RAII guard. Dropping the guard removes the rule; `disarm` lets go and leaves it in force.                           | `Routing::Cover`, `CoverGuard` in {src}`crates/tun-engine/src/routing.rs`                                               |
+| Standing cover     | The kill switch. Persistent, adopted across a restart, removed by an escape or when the target or the intent says so.                                            | `Routing::install_lockdown`                                                                                             |
+| Transient cover    | A bounded block for a connect attempt. No start engages it today ([below](#the-transient-cover)).                                                                | `Routing::install_failclosed_cover`                                                                                     |
+| Intent             | The Lockdown preference: `On`, `Off`, `Unset` (no record) or `Unreadable` (a record that cannot be read). Stored in the state directory.                         | `Intent` in {src}`crates/tun-engine/src/routing/failclosed/lockdown_state.rs`                                           |
+| Target             | What the user last asked for: `Off`, `Connected { config }` or `Unreadable`.                                                                                     | `Target` in {src}`crates/bridge/src/target.rs`                                                                          |
+| Startup preference | **On system startup**: `DoNotConnect`, `RestoreLastState` or `AlwaysConnect`. The app sends it with every connect; the bridge keeps it in `bridge-startup.json`. | `StartupBehavior` in {src}`crates/common/src/config.rs`, `resolve_startup_target` in {src}`crates/bridge/src/target.rs` |
+| Presence           | What the operating system says about the standing cover: `Live`, `Recorded`, `Absent`, `Indeterminate`, `Unreachable`.                                           | `CoverPresence` in {src}`crates/tun-engine/src/routing.rs`                                                              |
+| Session event      | Why a session ended: `UserStopped`, `GaveUp`, `CutoverRestart`, `Blipped`, `ProcessExiting`.                                                                     | `SessionEvent` in {src}`crates/bridge/src/target.rs`                                                                    |
 
 The intent is `bridge-lockdown.json` and the target is `bridge-target.json`, both in the bridge's state directory. The
 two are separate on purpose. The intent is a preference that survives a disconnect; the target says whether a connection
@@ -154,7 +158,7 @@ stateDiagram-v2
     [*] --> Absent
     Absent --> Live: connect with intent On
     Live --> Live: settings restart, update or clean shutdown, with intent On
-    Live --> Absent: Disconnect or Exit (a reconnect passes through here)
+    Live --> Absent: Disconnect or Exit, with a session running (a reconnect passes through here)
     Live --> Absent: the app polls and finds the proxy or plugin dead
     Live --> Absent: untick Lockdown
     Live --> Absent: Unblock Network
@@ -162,6 +166,7 @@ stateDiagram-v2
     Live --> Absent: a start that installed it fails
     Live --> Live: bridge exits or crashes, filters stay
     Live --> Absent: next bridge starts, intent Off
+    Live --> Absent: next bridge starts, startup preference Do not connect
     Live --> Recorded: macOS reboot, pf is off and the record stays
     Recorded --> Live: macOS, a connect re-engages from the record
 ```
@@ -172,15 +177,26 @@ decision reads the state *after* the event.
 
 | Event            | Raised by                                                        | Target after | The cover                                                                                                                                                                       |
 | ---------------- | ---------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `UserStopped`    | Disconnect, or Exit (the app sends a Stop)                       | `Off`        | Released, whatever the intent and the presence say                                                                                                                              |
+| `UserStopped`    | Disconnect, or Exit (the app sends a Stop)                       | `Off`        | Released, whatever the intent and the presence say, when a session is running; with none, nothing is settled ([#1295](https://github.com/bindreams/hole/issues/1295))           |
 | `GaveUp`         | `check_health` finds the proxy task or plugin chain dead         | `Off`        | `cover_step` against `Off`: released when presence is `Live`, `Recorded` or `Indeterminate`, left when `Absent` or `Unreachable`                                                |
 | `CutoverRestart` | The update cutover stops the bridge                              | unchanged    | `cover_step` against `Connected`: kept with intent `On` or `Unreadable`; with `Off` or `Unset`, released when presence is `Live`, `Recorded` or `Indeterminate`, otherwise left |
 | `Blipped`        | A settings change that cannot be applied live (`reload`)         | unchanged    | As `CutoverRestart`                                                                                                                                                             |
 | `ProcessExiting` | The bridge is stopped with no update pending (SCM Stop, SIGTERM) | unchanged    | As `CutoverRestart`                                                                                                                                                             |
 
+The `cover_step` rows read the target as the event left it. An `Unreadable` target holds the cover whatever the intent
+says, because `cover_step` answers `Hold` for it before it looks at anything else. The intent the teardown uses is
+`effective_lockdown_intent` ({src}`crates/bridge/src/proxy_manager.rs`), not the file alone: while this run holds an
+adopted cover it has not released, the claim turns an `Unset` or `Unreadable` intent into `On`, and a recorded `Off` still
+wins.
+
 *Kept* means `disarm`: the guard is consumed and the process lets go of its handle, but the filters stay. The next bridge
-finds them (presence `Live`) and adopts them. A network drop with the processes still alive is not an event at all: no
-teardown runs.
+finds them (presence `Live`) and adopts them, and then decides again at its own start, which can release them (see the
+boot reconcile below). A network drop with the processes still alive is not an event at all: no teardown runs.
+
+`UserStopped` settles a cover only when a session is running. `stop_with` on an idle manager records the target `Off` and
+returns, so a cover this run adopted, or one left unguarded by the Windows read-back failure (above), stays in force when
+Disconnect or Exit finds no session; Unblock Network or the next bridge start clears it
+([#1295](https://github.com/bindreams/hole/issues/1295)).
 
 Two details about `GaveUp`. `check_health` is called only by the status and metrics handlers in
 {src}`crates/bridge/src/ipc.rs`, so a dead proxy or plugin is noticed when the app next polls, and with no app running
@@ -193,7 +209,10 @@ Releases that are not session events:
 
 - **A start that fails** after it installed the cover, as above.
 - **Unticking Lockdown, Unblock Network and `hole bridge unlock`**, in the next section.
-- **The boot reconcile**, in [Recovery](kill-switch-recovery.md).
+- **The boot reconcile**, in [Recovery](kill-switch-recovery.md). It releases a cover that the startup-resolved target
+  does not authorise. With the startup preference **Do not connect** the target is `Off` at every start, so that is every
+  cover it finds: an update's new bridge or a reboot adopts the cover and then releases it, with the intent still `On`
+  ([#1294](https://github.com/bindreams/hole/issues/1294)).
 
 ## The decisions
 
@@ -223,7 +242,9 @@ call site that re-derives the rule (`session_event_policy_lives_on_the_type_not_
 `coverage_policy_lives_on_the_type_not_at_call_sites`).
 
 When a release and a tunnel step happen together, `step_order` puts the tunnel first: egress is never opened while the
-tunnel is half-standing. When an engage and a tunnel start happen together, the cover goes first.
+tunnel is half-standing. For an engage and a tunnel start it lists the cover first, but the boot driver does nothing for
+that step (`Phase::Cover(Engage)` in `reconcile_once`): the real engage runs inside `start_cancellable`, after the routes
+(above). A boot connect therefore does not have the cover ahead of the tunnel.
 
 ## The escapes
 
@@ -235,7 +256,7 @@ whether the records move before or after it.
 | Untick **Lockdown**  | `handle_lockdown` and `ProxyManager::turn_lockdown_off`  | Yes, under the proxy lock    | Releases every cover, then records the intent `Off`. The target is untouched; a running session stays up, unblocked.                                                                                                   |
 | **Unblock Network**  | `handle_unblock` in {src}`crates/bridge/src/ipc.rs`      | Yes, and takes no proxy lock | Releases every cover, then records the target `Off`, the intent `Off`, and clears the auto-connect candidate. It reads no session state and stops no session ([#1282](https://github.com/bindreams/hole/issues/1282)). |
 | `hole bridge unlock` | `cutover::unlock` in {src}`crates/bridge/src/cutover.rs` | No: refuses                  | Takes the liveness lock, records the target `Off`, disengages the standing cover only, clears the candidate, then records the intent `Off`. Prints what it could not prove.                                            |
-| Startup sweep        | `recover_routes`                                         | At boot                      | Removes a standing cover only when the intent is recorded `Off`. See [Recovery](kill-switch-recovery.md).                                                                                                              |
+| Startup sweep        | `recover_routes`, then `reconcile_once`                  | At boot                      | `recover_routes` removes a standing cover when the intent is recorded `Off`. `reconcile_once` then releases one that the startup-resolved target does not authorise. See [Recovery](kill-switch-recovery.md).          |
 
 - **Presence probe.** Unblock and untick have none: they call `release_all_covers`, which is documented idempotent, and a
   stale `Absent` is the one wrong answer at an explicit disarm. `unlock` has none on Windows, where the deletes are issued
@@ -245,6 +266,11 @@ whether the records move before or after it.
 - **Order.** Unblock and untick release first and write the records after, so a failed release leaves the intent on and
   the cover present, with Unblock still on the menu. `unlock` and `release-covers` record the target `Off` first and
   release after, so a failed `unlock` leaves the target `Off` and the intent `On`.
+- **`unlock` is not Unblock Network without the app.** When it succeeds the same three records end up written (target
+  `Off`, intent `Off`, candidate cleared). The differences: it disengages the standing cover only, where Unblock releases
+  every cover, so a transient cover left by an older bridge stays until the next start sweeps it; it refuses while a
+  bridge runs; it does not bump `unblock_generation`, since no start can be in flight; and its order and presence
+  handling are as above.
 - **What `unlock` detects.** It takes the liveness lock of the service's state directory only. A bridge started by hand
   keeps its own state directory and is not seen: `unlock` then records `Off` in the service directory and, on Windows,
   deletes the machine-wide filters under that bridge. `release-covers` probes the peer directories as well ([Uninstall](kill-switch-uninstall.md)).
@@ -305,10 +331,15 @@ Each of these is the code's present behaviour. Where an issue is open, the behav
   ([#1287](https://github.com/bindreams/hole/issues/1287)).
 - Bypass traffic passes on Windows and is blocked on macOS ([#1283](https://github.com/bindreams/hole/issues/1283)); UDP
   to the server with no plugin is blocked on macOS ([#1284](https://github.com/bindreams/hole/issues/1284)).
-- On macOS the ruleset does not survive a reboot: pf is off after boot, and egress is open until the bridge starts and
-  engages the cover again, which `Reenable` in `engage_lockdown` does for a persisted record. Windows is meant to cover
-  that window with the boot-time twins, but nothing that spans a reboot has been measured. See
-  [macOS](kill-switch-macos.md) and [Windows](kill-switch-windows.md).
+- On macOS the ruleset does not survive a reboot: pf is off after boot, and egress is open until a connect passes the
+  install step and engages the cover again, which `Reenable` in `engage_lockdown` does for a persisted record. The bridge
+  starting does not do it. A boot connect that fails first, or the startup preference **Do not connect**, leaves the host
+  open ([macOS](kill-switch-macos.md#no-reboot-survival) has the three outcomes). Windows is meant to cover that window
+  with the boot-time twins, but nothing that spans a reboot has been measured. See [Windows](kill-switch-windows.md).
+- With the startup preference **Do not connect**, every bridge start releases a standing cover it finds, after an update
+  as after a reboot ([#1294](https://github.com/bindreams/hole/issues/1294)).
+- **Disconnect** and **Exit** release a cover only when a session is running
+  ([#1295](https://github.com/bindreams/hole/issues/1295)).
 - On Windows, if the engage commits and the read-back of the boot-time twins then fails, `engage_lockdown` returns an
   error with the filters in force and no guard over them. The connect fails and the block stays until **Unblock
   Network** or `hole bridge unlock`.

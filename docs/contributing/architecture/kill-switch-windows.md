@@ -1,9 +1,10 @@
 # Windows: filters and the boot window
 
 The Windows cover is a set of filters in the Windows Filtering Platform (WFP), written by
-{src}`crates/tun-engine/src/routing/failclosed/windows.rs`. Its module doc is the long reference; this page is the shape
-of it, and the one part that needs argument: covering the window between the kernel starting and the Base Filtering
-Engine (BFE) starting. It assumes [the kill switch](kill-switch.md).
+{src}`crates/tun-engine/src/routing/failclosed/windows.rs`. This page is the long reference for it: the filter set, the
+weight arbitration, and the part that needs argument, covering the window between the kernel starting and the Base
+Filtering Engine (BFE) starting. The module doc of that file is only a short summary that points here. It assumes [the
+kill switch](kill-switch.md).
 
 ## The filter set
 
@@ -28,7 +29,8 @@ accept side because a loopback connect is authorised in both directions.
 
 **One sublayer, arbitrated by weight.** The permits sit at `PERMIT_WEIGHT` and the block-all at `BLOCK_WEIGHT`, so within
 the sublayer the higher-weight permit wins. No persistent filter sets `CLEAR_ACTION_RIGHT`, which makes every persistent
-action *hard*. This is the layout wireguard-windows uses. An earlier layout put the flag on the permits and not on the
+action *hard*. This is the recipe wireguard-windows uses: its loopback, TUN and DHCP permits and its block-all are weight-ordered with
+the flag off, and it sets the flag only on its own service App-ID permit, and Hole sets it on no persistent filter. An earlier layout put the flag on the permits and not on the
 block-all, and the block-all then vetoed every permit, so the cover blocked everything. The cover's sublayer is created
 with the highest weight WFP allows (`add_sublayer`). What a filter in another sublayer can still do to the cover has not
 been measured here.
@@ -76,7 +78,11 @@ The twins are `Action::Block` *with* `CLEAR_ACTION_RIGHT`, so the block is **sof
 sublayer can win. The flag is set on the boot-time arm of `FilterLifetime::filter_flags` and nowhere else. The reason is
 that this window carries no permit of Hole's at all, so a hard block would be unoverridable by anything, including whatever
 a host needs to finish booting and reach the BFE start that lifts the block (a PXE or iSCSI boot, a volume unlock against
-a network key server).
+a network key server). The flag is permission to be overridden, not a guarantee that anything will override: whether the
+pre-BFE kernel arbitrates boot-time filters across sublayers at all, and whether an early-boot path ships a filter that
+would win, has not been established. A soft block narrows the hazard for a host whose boot needs egress and does not
+close it. The privileged lane asserts that WFP stores `BOOTTIME` and `CLEAR_ACTION_RIGHT` together rather than rejecting
+the pair or dropping the flag.
 
 ```{warning}
 The override runs both ways. The same higher-weight permit that lets a host finish booting also lets an ordinary
@@ -89,6 +95,28 @@ traded apart. The owner took an unbootable host as the worse outcome; a leak in 
 The persistent half is unaffected in both directions. A boot-time filter is enforced only before BFE starts and the
 persistent set exists only after, so the two are never arbitrated against each other, and a boot-time filter is absent
 from the default enumeration view while it is live.
+
+### Shipped precedent
+
+What the twin pair, the block-only choice and the soft block rest on besides Hole's own reasoning. This is a reading of
+other projects' source, made when the twins were designed and not re-checked since.
+
+- **Twins.** Mullvad and TinyWall each install a rule twice, `BOOTTIME` and `PERSISTENT`, under their own persistent
+  containers. TinyWall is cited for that shape only; its boot-time rule set was not read.
+- **Blocks only.** Of the two boot-time rule sets that could be read, Fort Firewall's and Mullvad's, every filter is a
+  block. Neither ships a boot-time permit.
+- **Soft or hard.** Fort's boot-time blocks are soft, for the reason above. Mullvad's are hard. Fort also puts its
+  boot-time filters in the default sublayer and its persistent ones in its own, which is consistent with treating the
+  cross-sublayer question as a hazard; no Fort filter names a provider, so that is no evidence about Hole's provider.
+- **When the block goes in.** Mullvad's boot-time blocks go in as the daemon shuts down under a blocking policy and are
+  swept by provider enumeration on the way back up. Hole's go in at every engage and stay for as long as the kill switch
+  is armed, a much wider window for a version skew to strand one.
+- **Without boot-time filters.** wireguard-windows defines the boot-time flag and never uses it: its blocker runs a fully
+  dynamic session under a per-run random provider GUID. OpenVPN's WFP blocker sets the dynamic-session flag, with the
+  comment that its filters do not survive reboots or crashes. wireguard-windows was read closely because Hole takes its
+  weight recipe from it, which is grounds for trusting that the survey did not miss a boot-time use, not for claiming its
+  authors weighed boot-time filters and rejected them. Neither project ships an always-on kill switch meant to survive
+  an arbitrary reboot, which is the requirement that makes `PERSISTENT` alone insufficient.
 
 ## Evidence about a boot-time key
 
@@ -109,7 +137,9 @@ of absence, in either direction.
   `FwpmFilterDeleteByKey0` purges the boot-time record together with the runtime object. Nothing in the crate can check it,
   because only a reboot separates "purged" from "still provisioned and invisible"
   ([#1043](https://github.com/bindreams/hole/issues/1043)). `FWP_E_FILTER_NOT_FOUND` is never evidence: the key answers
-  empty on a host that armed the switch years ago and on one that never did.
+  empty on a host that armed the switch years ago and on one that never did. No lifetime-specific delete exists: a
+  boot-time filter is removed by the same `FwpmFilterDeleteByKey0` as a persistent one, so every by-key sweep covers the
+  twins once their GUIDs are in its list.
 - **Possible on this host at all.** The twins' `PERSISTENT` sibling (`KeyRole::BootTimeSibling`) is added with every twin
   and BFE re-adds it every boot, so a sibling removed at this boot says a standing cover is installed *here*, and every
   sibling answering empty says none is.
@@ -154,6 +184,11 @@ unreadable view arms it only when the twin's siblings leave one possible, and ot
 being disarmed. A persistent filter that a later build installed under a key this build never
 learned survives unlock, `release-covers` and uninstall ([#1242](https://github.com/bindreams/hole/issues/1242)).
 
+What the sweep does not reach: `recover_cover`, the transient sweep, stays by key, because a boot-time filter under the
+provider may be the standing cover's. The presence probe reads the fixed keys, so a stranger alone on a host reads
+`Absent` and no start-time recovery sweeps for it; the escapes (`hole bridge unlock`, Unblock Network, the uninstall
+gate) are what reach it. A build older than this sweep cannot enumerate at all.
+
 ## What is measured, and what is not
 
 The privileged lane measures, on the real firewall and with no reboot, in
@@ -181,6 +216,7 @@ Nothing measures anything that spans a reboot, and the lane does not reboot:
 - whether a twin covers boots after the one that follows its install. Microsoft's pages disagree on the mechanic
   (boot-time filters are "removed" once BFE initialises, or "disabled") and none addresses re-provisioning at later boots.
   That silence is recorded as silence. Every path is correct under both readings, which is why the twins are pre-deleted;
+- whether the provider-filtered enumeration returns a twin on a boot later than the one that armed it;
 - whether Hole's provider survives a BFE start. `add_provider` passes no service name. The code's comments quote Microsoft's
   `FWPM_FILTER0` reference: a provider's filters are disabled when BFE starts if the provider has no associated service
   name or its service is not set to auto-start. If that applies to Hole's persistent provider, the persistent half would

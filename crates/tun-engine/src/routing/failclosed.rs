@@ -547,8 +547,8 @@ pub enum KeyLifetime {
     /// claim is that it is bounded and ends before the network stack is
     /// generally usable, not any particular duration. It is not permanent
     /// network loss, which is why an unproven key does not fail a release —
-    /// but conditionally: the Windows impl's "Boot-time coverage" module doc
-    /// (`failclosed/windows.rs`) declines to assert that bound for a host
+    /// but conditionally: the Windows cover page (kill-switch-windows.md,
+    /// "The boot window") declines to assert that bound for a host
     /// whose boot itself needs egress (PXE or iSCSI boot, volume unlock
     /// against a network key server), where a block in that window can stop
     /// the boot from ever reaching the BFE start that would lift it. What it

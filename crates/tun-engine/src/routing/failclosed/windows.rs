@@ -1,269 +1,21 @@
 //! Windows fail-closed cover via the Windows Filtering Platform (WFP/FWPM).
 //!
-//! Engage installs a persistent provider + sublayer + filter set in one FWPM
-//! transaction: permit loopback on `ALE_AUTH_CONNECT_V4`/`_V6` and
-//! `ALE_AUTH_RECV_ACCEPT_V4`/`_V6` (a loopback connect authorizes on both ALE
-//! directions) — by the loopback address range (127.0.0.0/8, ::1/128) on ALL
-//! four layers, since the IS_LOOPBACK flag isn't reliably set at either ALE layer
-//! in some elevated environments (CONNECT keeps the flag permit too as harmless
-//! belt-and-suspenders) — + the SS server IP on CONNECT, block everything else on
-//! CONNECT (egress kill switch).
+//! Engage installs a persistent provider, sublayer and filter set in one FWPM transaction: permits for loopback
+//! (by address range on all four ALE layers, plus the `IS_LOOPBACK` flag at CONNECT), the TUN interface, the
+//! caller's App-IDs and the server address, and a block-all on `ALE_AUTH_CONNECT_V4`/`_V6` (the egress kill
+//! switch). Permits sit at `PERMIT_WEIGHT` and the block-all at `BLOCK_WEIGHT` in one sublayer, so within it the
+//! higher-weight permit wins; no persistent filter sets `CLEAR_ACTION_RIGHT`. Optionally one more permit, scoped to
+//! `RESOLVER_PERMIT_PORT`, lets a plugin's ECH-config fetch through (see `Routing::install_failclosed_cover`).
 //!
-//! Optionally also permits ONE more address on its own family's CONNECT layer,
-//! scoped to `RESOLVER_PERMIT_PORT`: the resolver the caller's own `ech-doh`
-//! URL names, so a plugin's later ECH-config fetch (dialing that same
-//! resolver under this same cover) is not blocked. Omitted whenever nothing
-//! should be permitted — see `Routing::install_failclosed_cover`'s doc for
-//! the exact conditions.
+//! The filters are PERSISTENT, not a dynamic session, so a crashed bridge leaves traffic blocked, not leaked;
+//! recovery sweeps them by their fixed GUIDs. The standing cover's block-all pair also has BOOTTIME twins, two more
+//! filters, which are the only soft (`CLEAR_ACTION_RIGHT`) block in the set.
 //!
-//! One sublayer, weight-based arbitration: the permits sit at weight 15 and the
-//! block-all at weight 0, so within the sublayer the higher-weight permit wins.
-//! No PERSISTENT filter sets `CLEAR_ACTION_RIGHT` (the boot-time twins do, and
-//! only they — see "Boot-time coverage" below). That flag makes THIS filter's own
-//! action soft (cross-sublayer overridable); omitting it makes the action HARD.
-//! Hardness only governs cross-sublayer arbitration — within a sublayer it does
-//! nothing. The old bug: it set the flag on the permits (making them soft) but not
-//! on the block-all (a default-HARD block), so block-all vetoed every permit and
-//! the cover blocked everything. With the flag off across the persistent set,
-//! within-sublayer arbitration is pure weight: the weight-15 permits beat the
-//! weight-0 block-all. This is the wireguard-windows recipe — its
-//! loopback/TUN/DHCP permits and block-all are weight-ordered with the flag off;
-//! it sets `CLEAR_ACTION_RIGHT` only on its own service app-ID permit, none of
-//! ours. The trade-off: a higher-weight third-party sublayer could in principle
-//! override us (accepted — wireguard ships the same all-but-one-soft layout); a
-//! two-sublayer hard-permit/soft-block layout is a possible future hardening.
-//!
-//! **The twins do not enter that argument.** A boot-time filter is enforced only
-//! between kernel start and BFE start and the persistent set exists only once BFE
-//! has started, so the two halves are never arbitrated against each other; and
-//! hardness never affects within-sublayer weight ordering, which is what the
-//! paragraph above rests on. Softening the twins therefore leaves the persistent
-//! half's arbitration untouched.
-//!
-//! PERSISTENT filters — NOT a dynamic session — so a coordinator crash
-//! mid-cutover leaves traffic blocked (fail-closed), not leaked; `recover_cover`
-//! sweeps them by their fixed GUIDs on the next bridge start. The standing
-//! lockdown cover's block-all pair additionally gets BOOTTIME twins — two more
-//! filters, not two more bits; see "Boot-time coverage" below.
-//!
-//! ## Boot-time coverage (#998)
-//!
-//! `FWPM_FILTER_FLAG_PERSISTENT` filters are re-added by the Base Filtering
-//! Engine (BFE) once it starts; they are NOT enforced before that — the
-//! kernel (tcpip.sys) enforces only `FWPM_FILTER_FLAG_BOOTTIME` filters from
-//! kernel start until BFE takes over. The two flags are mutually exclusive on
-//! one filter (WFP's own `FWPM_FILTER0` docs: "This flag \[PERSISTENT\]
-//! cannot be set together with FWPM_FILTER_FLAG_BOOTTIME"), so covering both
-//! windows needs two filter objects — and the hand-off between them is
-//! documented as seamless: "The transition from boot-time to persistent
-//! filters could be several seconds... It is atomic, so if a provider has both
-//! a boot-time and a persistent filter, there will never be a window when
-//! neither is in effect" (WFP's "Basic Operation" page). The twin pair is
-//! exactly the shape that sentence describes.
-//!
-//! What is installed, and what is not. `build_lockdown_spec` gives ONLY the
-//! standing cover's block-all pair `Boottime` twins
-//! ([`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`]); every permit, loopback included,
-//! stays `Persistent`-only, so the boot→BFE window carries the block and
-//! nothing else — a total egress block with no exemptions, not a scaled-down
-//! copy of the cover BFE later installs. It is egress-only all the same: the
-//! twins sit on `ALE_AUTH_CONNECT_V4`/`_V6` and nothing is added at
-//! `RECV_ACCEPT`. A permit is not twinned because (a) the TUN-LUID and
-//! server-IP permits carry runtime-discovered values and nothing runs pre-BFE
-//! to refresh them, so a boot-time copy is stale by construction; (b) a
-//! boot-time loopback or App-ID permit has no hand-off to its narrower
-//! persistent counterpart and would need a lifecycle of its own; (c) the leak
-//! #998 closes is network egress, not loopback. The transient cutover cover
-//! never spans a reboot, so it is `Persistent`-only throughout — see
-//! [`build_cover_spec`].
-//!
-//! **The twins are OVERRIDABLE, and that is a deliberate choice about the
-//! hazard, not an oversight.** They are [`Condition::Any`] + [`Action::Block`]
-//! *with* `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT` ([`FilterLifetime`]), so the
-//! block is soft and a higher-weight permit in another sublayer can win. The
-//! reason is that this window carries no permit of ours at all: with a HARD
-//! block, every outbound connect between tcpip.sys start and BFE start fails,
-//! loopback included, and nothing can lift it — including whatever a host needs
-//! to FINISH BOOTING and so to reach the BFE start that would take the block out
-//! of effect (PXE or iSCSI boot, a network-key volume unlock). Fort Firewall's
-//! boot-time blocks are soft for the same reason; Mullvad's are hard.
-//!
-//! What that leaves open, stated rather than argued away: the flag is a
-//! *permission* to be overridden, not a guarantee anything will. Whether the
-//! pre-BFE kernel arbitrates boot-time filters across sublayers at all, and
-//! whether any of those early-boot paths ships a filter that would win, has not
-//! been established here. So a soft block narrows the hazard; it does not close
-//! it, and the residual is the same class it was — an armed host whose boot needs
-//! egress.
-//!
-//! **The override runs BOTH ways, and that is what the choice costs.** The flag
-//! does not know which connect it is relieving. The same higher-weight permit
-//! in another sublayer that lets a host finish booting lets an ordinary
-//! outbound flow leave too — unencrypted, outside the tunnel, on an armed host,
-//! in the exact window #998 exists to cover. The hard block vetoed that flow;
-//! the soft one does not, and these twins carry no permit of ours for it to
-//! outrank. Nor is the candidate hypothetical in kind: Windows provisions a
-//! boot-time policy of its own, and what a boot-time policy holds is permits.
-//! One unknown decides both directions at once — the cross-sublayer question
-//! above — so the two hazards cannot be traded apart: whatever narrows the
-//! brick narrows the block by the same amount. The owner took an unbootable
-//! host as the worse outcome. A leak in that window is the price, and an
-//! operator arming the kill switch is entitled to know it is part of the deal.
-//!
-//! Both twins reference the same [`PROVIDER_GUID`]/[`SUBLAYER_GUID`] the
-//! persistent filters already use, which is a MEASURED choice rather than a
-//! documented one. **docs/contributing/architecture/kill-switch-windows.md is the
-//! long-form home** for the risk sizing, the out-of-band recovery options and
-//! the measurement results; this section
-//! keeps only what a maintainer needs at these call sites and does not restate
-//! it.
-//!
-//! ## What counts as evidence about a boot-time key
-//!
-//! Every path here follows from one rule. A boot-time key has two things
-//! behind it: the runtime FWPM object, which exists only between kernel start
-//! and BFE start (or inside the session that just added it), and the boot-time
-//! POLICY RECORD, which is what actually serves the next boot and which no call
-//! in this crate can read. So no read-back or return code speaks about the
-//! record directly, and the three questions are answered separately:
-//!
-//! - **That a twin is ARMED** — only a read of the boot-time enumeration view
-//!   while its object is live. A commit code is not evidence:
-//!   `FwpmTransactionCommit0` returning zero says the transaction reached the
-//!   object store and nothing about the record behind it.
-//!   [`verify_boottime_twins`] takes that read on the shipped path and fails
-//!   the engage when a view that WAS readable does not hold the twin. The
-//!   record is written one statement EARLIER, bound to the commit itself
-//!   ([`commit_and_record`]): a failed verification leaves the committed cover
-//!   in force, so a record written after it would be skipped for precisely the
-//!   host class it exists to cover (bindreams/hole#1010 F3).
-//! - **That a twin is GONE** — only [`KeyOutcome::Removed`], a delete that
-//!   removed a LIVE object, and only under an assumption this file cannot
-//!   discharge: that the by-key delete purges the boot-time policy record
-//!   along with the runtime object `boottime_privileged_tests` measured it
-//!   removing. Every read reachable from here — the delete's code, a
-//!   `BOOTTIME_ONLY` enumeration, `netsh wfp show boottimepolicy` — is a read
-//!   through BFE, while the record is by definition what applies before BFE
-//!   starts, so only a reboot could tell "purged" from "provisioned and
-//!   invisible". The assumption is the repo owner's, and verifying it on real
-//!   hardware is tracked as **bindreams/hole#1043**.
-//!
-//!   `FWP_E_FILTER_NOT_FOUND` is NOT evidence and no assumption makes it one:
-//!   on any boot where no object is live the key answers empty whether or not
-//!   a record survives behind it — on a host that armed the switch years ago
-//!   and on one that never armed it. That asymmetry is the whole reason
-//!   [`release_all`] AND [`disengage_lockdown`] both carry a [`Clearance`] in
-//!   their [`SweepOutcome`] (the facade's `Ok` holds it) rather than a bare
-//!   `Ok`: the ordinary uninstall sees exactly that answer.
-//! - **That a record could exist on this host AT ALL** — the twins'
-//!   `Persistent` sibling, the other half of the same rule
-//!   ([`KeyRole::BootTimeSibling`]). BFE re-adds it from its own store at every
-//!   boot and a twin is never installed without it, so a sibling removed at
-//!   this boot says a standing cover is installed HERE, and every sibling
-//!   answering empty says none is. It is the only question a sweep can still
-//!   settle, and `Clearance::leftover_keys` is what reads it — without it the
-//!   unproven twins raise an operator warning on essentially every Windows
-//!   uninstall, which is how the one host where a leftover is real gets
-//!   ignored.
-//!
-//! The rule cuts both ways, deliberately: absence of evidence is never
-//! evidence of absence. An enumeration that could not be READ does not fail an
-//! engage, for the same reason a not-found delete does not prove a key empty.
-//!
-//! Deletion needs no new path. A boot-time filter is removed by the same
-//! `FwpmFilterDeleteByKey0` call a persistent one is — no lifetime-specific
-//! delete API exists — so every fixed-GUID sweep here ([`disengage_lockdown`],
-//! [`release_all`], [`swept_lockdown_keys`]) covers the twins once their GUIDs are in the array.
-//! The twins no array names are the version-independent sweep's ([`provider_sweep`], below).
-//!
-//! ## What no test here can reach
-//!
-//! EVERYTHING measured for #998 happens inside a SINGLE boot: the elevated
-//! Windows lane does not reboot, and no reboot-capable elevated lane exists to
-//! add the case to. Do not read this file's green CI as covering any of it.
-//!
-//! Microsoft's pages disagree on what becomes of a boot-time filter when BFE
-//! starts — `FwpmFilterAdd0`'s Remarks and "Object Management" say "removed",
-//! "Basic Operation of WFP" says twice "disabled" — and none of them addresses
-//! whether the underlying record is re-provisioned at LATER boots at all. That
-//! is silence, not contradiction, and it stays recorded as silence rather than
-//! settled by picking the reading that suits the design.
-//!
-//! What the disagreement DOES settle is a constraint, and it is enforced:
-//! every path here must be correct under BOTH readings. That is why
-//! [`lockdown_pre_delete_guids`] deletes the twins' keys before re-adding
-//! them — under "removed" the pre-delete is a benign not-found, under
-//! "disabled" it is the only thing that replaces a spent twin instead of
-//! letting [`ok_or_exists`] report `Ok` over it.
-//!
-//! ASSUMED rather than measured, and tracked as **bindreams/hole#1043**: that
-//! a by-key delete purges the boot-time record. [`KeyObservation::proves_empty`]
-//! is `true` for [`KeyOutcome::Removed`] on the strength of it, which is what
-//! lets an ordinary "arm, unblock, uninstall" go quiet. Nothing in a
-//! single-boot lane can check it.
-//!
-//! Open, and not claimed: whether the kernel ENFORCES a twin during the
-//! boot→BFE window at all (the twins name containers BFE itself provisions,
-//! and what the pre-BFE kernel does with those is undocumented); and whether a
-//! twin covers boots after the one following its install.
-//!
-//! ## The version-independent sweep
-//!
-//! A fixed-GUID sweep reaches only a filter whose GUID the RUNNING binary
-//! knows. A stranded BOOT-TIME leftover of a later build is not re-added by
-//! BFE, so an older binary that never learned its GUID cannot find it. So every
-//! release and every disengage ([`release_all`], [`disengage_lockdown`]) also
-//! read the boot-time view of every layer the engine lists, select the filters
-//! under [`PROVIDER_GUID`], and delete EVERY BOOT-TIME one no list names
-//! ([`provider_sweep`]). Every cover this build runs has its keys in the fixed
-//! lists, so an unlisted boot-time filter is never a running cover's. Another
-//! provider's filter is never touched, and neither is a PERSISTENT filter under
-//! Hole's provider, on purpose: a live one may be another bridge's cover, which a
-//! sweep of this build must not delete.
-//!
-//! A layer is required: a `BOOTTIME_ONLY` template whose layer is the zero GUID
-//! is refused with `FWP_E_LAYER_NOT_FOUND` (measured), so the layers come from
-//! [`enum_layers`] rather than a list this build carries, and the provider is
-//! selected in code, not by the template.
-//!
-//! What such a delete records follows the same rule as a twin's. A stranger
-//! whose delete REMOVED a live object is a watched removal, under the
-//! assumption above; a delete that found nothing proves nothing; an enumeration
-//! that could not be read is an unproven boot-time observation, never proof; an
-//! enumeration that returned nothing observes nothing. The
-//! [`super::boottime_witness`] record stays one machine-wide `armed` bool: a
-//! stranger's removal cannot disarm it while a known twin's absence is unproven.
-//!
-//! A refused delete of such a stranger never fails a sweep, though a refused
-//! by-key delete does ([`KeyRole::refusal_fails_the_sweep`]): a live boot-time
-//! filter is measured NOT to be enforced once BFE has started, and failing
-//! `bridge unlock` over it would keep the intent from being written off, so the
-//! next start would re-engage the kill switch, a lockout loop. It is reported with
-//! its GUID and code, and arms the record ([`KeyRole::Unlisted`]). An unreadable
-//! view is likewise reported and never fatal ([`KeyRole::Enumeration`]); it keeps
-//! an armed record from being disarmed, and arms the record only when the
-//! siblings leave one possible.
-//!
-//! **Unmeasured, and called so.** Whether the provider-filtered enumeration
-//! returns a twin on a boot LATER than the one that armed it, and whether a
-//! by-key delete purges the boot-time policy record behind the runtime object,
-//! are one open question, owed a manual test: every read available is a
-//! read through BFE.
-//!
-//! **What it does not reach.** [`recover_cover`] is the transient sweep and
-//! stays by-key, because a boot-time filter under the provider may be the
-//! standing cover's. [`lockdown_cover_presence`] reads the fixed keys, so a
-//! stranger alone on a host reads `Absent` and no start-time recovery sweeps for
-//! it; the escape hatches (`bridge unlock`, the tray's Unblock, the uninstall
-//! gate) are what reach it. A build older than this sweep cannot enumerate at
-//! all.
-//!
-//! `boottime_privileged_tests` measures, within one boot: the add is accepted
-//! under our containers and stored with them; a by-key delete of a LIVE twin
-//! returns `ERROR_SUCCESS` and it leaves the boot-time view; a by-key GET
-//! returns no code that could make [`classify_presence`] answer
-//! `Indeterminate`; and every engage re-arms the twins rather than
-//! short-circuiting.
+//! The reasoning behind the layout is long and lives in
+//! docs/contributing/architecture/kill-switch-windows.md, which is the reference for: the weight arbitration
+//! and its precedent, the twins and why they carry only the block, the soft block and what it costs, what counts as
+//! evidence about a boot-time key, the version-independent provider sweep, what the privileged lane measures, and
+//! what no test here can reach (everything that spans a reboot). Read it before changing any of those.
 
 use std::borrow::Cow;
 use std::net::IpAddr;
@@ -347,8 +99,8 @@ pub const LOCKDOWN_FILTER_GUIDS: [GUID; 12] = [
     GUID::from_u128(0xd766a20f_050a_4c40_8de3_33bf259b7e34), // loopback-net CONNECT V6 (::1/128)
 ];
 
-// Boot-time twin of the lockdown block-all pair (#998) — see the module doc's
-// "Boot-time coverage" section. Disjoint from every other GUID in this file.
+// Boot-time twin of the lockdown block-all pair (#998) — see
+// kill-switch-windows.md, "The boot window". Disjoint from every other GUID in this file.
 // CROSS-VERSION CONTRACT, same as `FILTER_GUIDS`/`LOCKDOWN_FILTER_GUIDS`
 // above: never remove or reorder an entry. A build that never learned a newer
 // build's boot-time GUID cannot delete it by key; `provider_sweep` finds it
@@ -631,7 +383,7 @@ fn transient_pre_delete_guids() -> Vec<GUID> {
 /// The twins are here for a different reason than the permits, and it is the
 /// reason the twins are re-armed rather than re-added: **a boot-time filter is
 /// spent by the boot it covers.** Microsoft's pages disagree on how (see the
-/// module doc: "Object Management"/`FwpmFilterAdd0` say the filter is REMOVED
+/// kill-switch-windows.md: "Object Management"/`FwpmFilterAdd0` say the filter is REMOVED
 /// once BFE finishes initializing, "Basic Operation" says twice it is
 /// DISABLED), and this file deliberately declines to adjudicate — so it must be
 /// correct under BOTH readings. Under "removed" a plain add suffices. Under
@@ -659,8 +411,8 @@ fn transient_pre_delete_guids() -> Vec<GUID> {
 /// "egress leaks now"; it is "the next boot's pre-BFE window is unprotected
 /// while the GUI still reports the kill switch armed". Under the "removed"
 /// reading there is no record to update and the question is moot; under
-/// "disabled" it is open. Disclosed, not closed — see the module doc's "What
-/// no test here can reach". The `Persistent` block-all beside them is NOT in
+/// "disabled" it is open. Disclosed, not closed — see kill-switch-windows.md,
+/// "What is measured, and what is not". The `Persistent` block-all beside them is NOT in
 /// this set: it is live and enforcing right now, and dropping it — even
 /// transactionally — is the one thing a refresh must never do to the floor.
 fn lockdown_pre_delete_guids() -> Vec<GUID> {
@@ -757,7 +509,7 @@ pub enum Action {
 
 /// A filter's lifetime: the WFP flag [`add_filter`] stamps on the object AND
 /// the [`KeyLifetime`] a sweep of that object's key must record. One value,
-/// not two — see the module doc's "Boot-time coverage" section.
+/// not two — see kill-switch-windows.md "The boot window".
 ///
 /// **This is the compile-time half of the #1003 hazard** (bindreams/hole#1010).
 /// The two used to be separate enums — a `Boottime` variant here, a
@@ -827,7 +579,7 @@ impl FilterLifetime {
     /// higher-weight permit in another sublayer. It belongs to the LIFETIME
     /// rather than to the filter because it follows from what else is in force
     /// in that lifetime's window: the boot→BFE window carries the block and no
-    /// permit of ours at all (see the module doc's "Boot-time coverage"), so a
+    /// permit of ours at all (see kill-switch-windows.md "The boot window"), so a
     /// hard block there is unoverridable by anything, including whatever a host
     /// needs to finish booting and reach the BFE start that would lift it. The
     /// persistent half is the opposite case — it ships with our own permits
@@ -1165,7 +917,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
 /// there, so the range is the only matcher). Block stays CONNECT-only — egress
 /// kill switch, not inbound. Permits at `PERMIT_WEIGHT`, block at `BLOCK_WEIGHT`;
 /// within the single sublayer the higher-weight permit wins. The block-all pair
-/// also gets a `Boottime` twin (see the module doc's "Boot-time coverage"
+/// also gets a `Boottime` twin (see kill-switch-windows.md "The boot window"
 /// section — the twins are the only filters here whose block is SOFT) — every
 /// permit stays `Persistent`-only. The twins' keys go in `pre_delete` so every engage
 /// RE-ARMS them rather than short-circuiting on `FWP_E_ALREADY_EXISTS` — see
@@ -1250,7 +1002,7 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
     ));
     // Boot-time twins of the block-all pair (#998) — enforced by the kernel
     // from boot until BFE starts, when the persistent pair above takes over.
-    // See the module doc's "Boot-time coverage" section for why only
+    // See kill-switch-windows.md "The boot window" for why only
     // block-all gets one, and `lockdown_pre_delete_guids` for why these two
     // keys are deleted before this add rather than left to `ok_or_exists`.
     //
@@ -1272,8 +1024,8 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
     }
 }
 
-/// Always `Persistent` — no permit is ever boot-time twinned (see the module
-/// doc's "Boot-time coverage" section: only the block-all floor gets one).
+/// Always `Persistent` — no permit is ever boot-time twinned (see
+/// kill-switch-windows.md, "The boot window": only the block-all floor gets one).
 fn permit(guid: GUID, layer: Layer, condition: Condition) -> FilterSpec {
     FilterSpec {
         guid,
@@ -1713,8 +1465,8 @@ unsafe fn add_filter(
         Action::Permit => FWP_ACTION_PERMIT,
         Action::Block => FWP_ACTION_BLOCK,
     };
-    // Lifetime flag (PERSISTENT or BOOTTIME, see `FilterLifetime` and the
-    // module doc's "Boot-time coverage" section), plus CLEAR_ACTION_RIGHT on
+    // Lifetime flag (PERSISTENT or BOOTTIME, see `FilterLifetime` and
+    // kill-switch-windows.md, "The boot window"), plus CLEAR_ACTION_RIGHT on
     // the boot-time arm and only there. Setting that flag makes a filter's
     // action SOFT (cross-sublayer overridable); omitting it makes the action
     // HARD, and hardness governs only cross-sublayer arbitration. A BLOCK with
@@ -1723,7 +1475,7 @@ unsafe fn add_filter(
     // every permit (the cover blocked everything). With the flag off across
     // the persistent set, within-sublayer arbitration is pure weight: the
     // weight-15 permits beat the weight-0 block-all (the wireguard-windows
-    // recipe — see the module doc). The twins are outside that argument: they
+    // recipe — see kill-switch-windows.md). The twins are outside that argument: they
     // are never in force while the persistent set is, and hardness does
     // nothing within a sublayer anyway.
     // `FilterLifetime::filter_flags` is the ONLY producer of these bits in
@@ -1997,8 +1749,8 @@ impl Cover {
     /// block-all `Boottime` twins ([`FilterLifetime`]) are NOT re-added by BFE
     /// and are not in force while it runs, so they add nothing to the coverage
     /// being handed off here; they exist for a later boot's pre-BFE window
-    /// (module doc's "Boot-time coverage" — what about that is measured, and
-    /// what is not, is recorded there).
+    /// (kill-switch-windows.md "The boot window" — what about that is measured,
+    /// and what is not, is recorded there).
     ///
     /// That is what lets a LONG-LIVED caller keep the host covered without
     /// leaking a handle per call: `std::mem::forget` alone, which this

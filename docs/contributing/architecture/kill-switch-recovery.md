@@ -12,7 +12,9 @@ this order:
 
 1. `route_recovery::recover_and_record` calls `recover_routes`: crash recovery of routes, then the cover decision below.
 1. The plugin reap kills every plugin process the state directory records.
-1. `reconcile_once` drives the persisted target ([the kill switch](kill-switch.md#the-decisions)).
+1. `reconcile_once` folds the startup preference (**On system startup**) into the persisted target, then drives the
+   result ([the kill switch](kill-switch.md#the-decisions)). The cover step of that pass releases or holds; the cover's
+   engage is not done here but inside the connect it starts, after the routes.
 
 The cover decision reads two things. The **intent** comes from `bridge-lockdown.json`. The **presence** is measured:
 
@@ -47,13 +49,16 @@ axes. Four rules produce it:
 
 A sweep of the *transient* cover (`recover_cover`) runs after this, unconditionally and outside every presence branch,
 and is told whether the standing cover is being adopted so that macOS skips the `/etc/pf.conf` reload that would wipe it.
-It exists for the leftovers of an older bridge. Startup therefore always touches the transient cover's objects. It
-removes the standing cover only on an explicit recorded `Off`; an adopt leaves it in place apart from the one Windows
-reclaim of its TUN permit, below.
+It exists for the leftovers of an older bridge. Startup therefore always touches the transient cover's objects. This
+step removes the standing cover only on an explicit recorded `Off`; an adopt leaves it in place apart from the one Windows
+reclaim of its TUN permit, below. The step after it can still release an adopted cover:
+`reconcile_once` folds the startup preference into the target, and a target of `Off` (**Do not connect**) releases
+whatever it finds, whatever the intent says ([#1294](https://github.com/bindreams/hole/issues/1294)).
 
 ## What Adopt does
 
-Adopt keeps the host blocked across the restart, and it deliberately does almost nothing. It never disengages the cover,
+Adopt keeps the host blocked across the restart, until the reconcile after it decides otherwise, and it deliberately does
+almost nothing itself. It never disengages the cover,
 on either platform. It records the claim *a standing cover is live this run and this process has not released it*
 (`ProxyManager::set_standing_cover_adopted`), and it does that only for a *measured* `Live`, since `Adopt` also covers
 `Recorded` and `Indeterminate`, which the operating system did not confirm.
@@ -62,7 +67,9 @@ on either platform. It records the claim *a standing cover is live this run and 
   previous run's interface and server. Deleting them at recovery time would let a second bridge started with a fresh
   state directory delete a *running* first bridge's server permit while the block-all stayed in force, so the refresh
   lives inside `engage_lockdown`'s own transaction. Until the next connect, the adopted cover keeps a stale server
-  permit; the App-ID permit already lets the bridge and plugin binaries out in that window.
+  permit. On Windows the App-ID permit already lets the bridge and plugin binaries out in that window. macOS has no
+  App-ID permit, so the stale server permit is all there is, and a start that must look a hostname server up meets the
+  block ([#1286](https://github.com/bindreams/hole/issues/1286)).
 - **One reclaim, Windows only.** `reclaim_stale_tun_permit` deletes the TUN permit when the TUN name no longer resolves
   to an interface. A `NET_LUID` is a type and an index, and NDIS can hand a freed index to an unrelated wintun adapter,
   which would then inherit unconditional egress from the stale permit. A name that still resolves proves a bridge may be
