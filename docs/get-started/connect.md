@@ -57,7 +57,9 @@ A server card. The tooltip on the status dot shows the result of the last test.
 - The badge shows which plugin the server uses, if it uses one.
 - The dot is gray for a server that has not been tested, green for one that answered and red for one that did not.
   Hover over it to read the message.
-- **Test** checks the server on demand, without switching Hole on. Hole also tests every server it imports.
+- **Test** checks the server on demand, without switching Hole on. Hole also tests every server it imports. The test
+  runs in Hole's {term}`bridge`, so on a Mac it works only once the first connect has installed the bridge: until then,
+  the dots of imported servers turn red with "Internal error: bridge unreachable". Connect once, then test again.
 - The **✕** removes the server from the list at once.
 
 Click a card to select it. The selected server is the one Hole connects to. After an import, Hole selects the first new
@@ -70,7 +72,7 @@ listed in [Troubleshooting](troubleshooting.md#what-a-test-result-means).
 
 Click the round power button at the top of the right-hand column. The status next to it changes from **You are
 Disconnected** to **Connecting...** and then **Connected**. Clicking the button again while it says **Connecting...**
-cancels the attempt.
+cancels the attempt, and the status reads **Cancelling...** until it has stopped.
 
 You can also choose **Connect** from the tray menu.
 
@@ -98,8 +100,9 @@ A connected Hole. The address and flag are the server's.
 1. Connect. After a moment the address and flag change to the server's. Websites now see the server's address.
 1. If you want a second opinion, open a "what is my IP" website in a browser. It should show the same address.
 
-Hole looks the address up when the connection state changes and once a minute while the dashboard is open. A `--` means the
-lookup failed, not that Hole is disconnected.
+Hole looks the address up with a request to Cloudflare, so Cloudflare sees it; while connected, the request goes through
+the tunnel. It runs when the connection state changes and once a minute while the dashboard is visible, not while it is
+hidden or minimized. A `--` means the lookup failed, not that Hole is disconnected.
 
 If the address does not change, or no website loads, see [Troubleshooting](troubleshooting.md).
 
@@ -125,11 +128,14 @@ The tray menu while connected.
 ```
 
 The menu shows the status, a **Connect** or **Disconnect** item, **Start at Login**, **Lockdown**, **Dashboard...** and
-**Exit**. When a new version is found, an **Install Update** item appears too.
+**Exit**. When a new version is found, an **Install Update (v...)** item with the version appears too, and while a block
+is in force, an **Unblock Network** item.
 
-**Lockdown** is the {term}`kill switch`. With it on, traffic that would leave outside the tunnel is blocked while Hole is
-connecting or connected, so a dropped connection does not quietly send your traffic around the tunnel. It is off by
-default. The [settings page](settings.md#the-tray-menu) explains what it blocks and how to lift it.
+**Lockdown** is the {term}`kill switch`. Click it to turn it on or off. Once it is on and Hole connects, traffic that
+would leave outside the tunnel is blocked while Hole is connecting or connected, so a dropped connection does not quietly
+send your traffic around the tunnel. It is off by default. If you turn it on while already connected, nothing is blocked
+until the next time you connect. The [settings page](settings.md#the-tray-menu) explains what it blocks and how to lift
+it.
 
 ## Next
 

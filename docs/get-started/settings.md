@@ -5,7 +5,7 @@ through it control by control. You do not have to change any of it to use Hole: 
 computer's traffic through the server.
 
 Settings take effect the next time you connect. The exceptions are filters, which apply at once if Hole is connected, and
-the login setting, which applies at once.
+the login setting and the theme, which apply at once.
 
 The dashboard has two columns. The left column holds **Servers**, **Filters** and **Settings**, and each section folds
 away when you click its title. The right column shows the connection. The screenshots show Windows.
@@ -61,7 +61,8 @@ and cannot be edited, moved or deleted. Drag a rule by its handle to reorder it.
 
 To add a rule, click **+ Add rule**, type the address, press Enter, and then pick the matching and the action from the
 rule's drop-downs. A new rule starts as **wildcard** with the action **Proxy**. A rule Hole cannot apply, for instance a
-subnet that is not valid, shows a **⚠** that says why.
+subnet that is not valid, shows a **⚠** that says why ("Rule not applied: ..."). The **⚠** appears only while Hole is
+connected, because it is the running connection that rejects the rule.
 
 To see what the rules do, type a domain or an IP address into **Test filtering**. It reports the action and the rule that
 decided it.
@@ -84,11 +85,11 @@ Windows or macOS shows up here.
 
 What Hole does when the computer starts.
 
-| Choice                 | What happens                                                                         |
-| ---------------------- | ------------------------------------------------------------------------------------ |
-| **Do not connect**     | Hole does not connect.                                                               |
-| **Restore last state** | Hole connects if the last thing you asked it to do was connect. This is the default. |
-| **Always connect**     | Hole connects to the last server it connected to, even if you had disconnected.      |
+| Choice                 | What happens                                                                                                                            |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| **Do not connect**     | Hole does not connect.                                                                                                                  |
+| **Restore last state** | Hole connects if the last thing you asked it to do was connect, and Hole has not since given up on the connection. This is the default. |
+| **Always connect**     | Hole connects to the last server it connected to, even if you had disconnected.                                                         |
 
 The choice is carried out by the {term}`bridge` when it starts, which is when the computer starts, so the connection can
 come up before you sign in and without the dashboard open. If the automatic connection fails, the internet works as it
@@ -106,7 +107,7 @@ for the occasional app that you want to point at Hole yourself. It is a proxy th
 
 | Control                        | What it does                                                                               |
 | ------------------------------ | ------------------------------------------------------------------------------------------ |
-| **Local proxy server**         | The master switch. Off, Hole listens on no port at all.                                    |
+| **Local proxy server**         | The master switch. Off, Hole opens no port you can point an app at.                        |
 | **SOCKS5**                     | A SOCKS5 proxy on the SOCKS5 port. On by default.                                          |
 | **HTTP**                       | An HTTP proxy on the HTTP port. Off by default.                                            |
 | **SOCKS5 port**, **HTTP port** | The ports to listen on. The two must differ. The HTTP port shows only when **HTTP** is on. |
@@ -120,12 +121,17 @@ A DNS lookup turns a website's name into an address. With the forwarder on, whic
 computer's lookups to the resolver you pick, through the tunnel, so the network you are on does not see them. Turned off,
 Hole leaves the computer's DNS settings alone.
 
-| Control                      | What it does                                                                                                        |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| **Protocol**                 | How Hole talks to the resolver: **DNS over HTTPS** (the default), **DNS over TLS**, **Plain TCP** or **Plain UDP**. |
-| **Resolver**                 | **Cloudflare** (the default), **Google**, **Quad9**, **OpenDNS**, **AdGuard**, or **Custom...**.                    |
-| **Resolver IPs**             | Shown for **Custom...**: one or more IP addresses, separated by commas. Hole tries them in order, first one first.  |
-| **Allow insecure bootstrap** | Off by default. See below.                                                                                          |
+| Control                      | What it does                                                                                                                                          |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Protocol**                 | How Hole talks to the resolver: **DNS over HTTPS** (the default), **DNS over TLS**, **Plain TCP** or **Plain UDP**.                                   |
+| **Resolver**                 | **Cloudflare** (the default), **Google**, **Quad9**, **OpenDNS**, **AdGuard**, or **Custom...**.                                                      |
+| **Resolver IPs**             | Shown only while the saved resolver list matches no preset: one or more IP addresses, separated by commas. Hole tries them in order, first one first. |
+| **Allow insecure bootstrap** | Off by default. See below.                                                                                                                            |
+
+Choosing **Custom...** on its own does not reveal **Resolver IPs**: the row appears only when the saved list is already
+custom, for instance after the config file was edited by hand. A custom resolver must speak {term}`DoH`, because Hole
+always looks the server's name up over DoH through these IPs before it connects, whatever **Protocol** you chose. The
+presets all do.
 
 **Plain UDP** works only if the server's plugin can carry UDP traffic ({term}`galoshes` can; {term}`ex-ray` cannot) or the
 resolver is covered by a **Bypass** rule. Otherwise Hole drops the lookups. The other three protocols work with any
@@ -147,15 +153,20 @@ whether or not the forwarder is on.
 ## The right-hand column
 
 - **The power button and status.** Click the button to connect or disconnect. The status reads **Disconnected**,
-  **Connecting...**, **Connected**, **Disconnecting...**, **Connection failed** or **Disconnect failed**.
+  **Connecting...**, **Connected**, **Disconnecting...**, **Cancelling...** (after you click the button while it connects),
+  **Connection failed** or **Disconnect failed**.
 - **The address.** The public IP address websites see, with its country's flag. The copy button beside it copies the
   address.
 - **The graph and the figures.** Throughput over the last minute, then **Downloaded**, **Uploaded**, **Download speed**,
   **Upload speed** and **Uptime**.
-- **Diagnostics.** Five dots, from the app to the internet. Gray is unknown, green is fine and red is a problem; hover over
-  a dot for details. **App**, **Bridge** and **Network** are live checks. **VPN Server** and **Internet** come from the
-  selected server's last test, and **Internet** turns green only after a real **Test**, not merely after connecting.
-- **Capabilities.** Two dots that describe the current connection and change nothing. **UDP proxy** is green when the
+- **Diagnostics.** Five dots, from the app to the internet. Gray is unknown, green is fine and red is a problem. They are
+  coarse checks. **App** is green whenever the dashboard is running. **Bridge** turns red when the bridge's last start,
+  reload or stop failed. **Network** is green when the computer has a default route, and does not probe it. **VPN Server**
+  and **Internet** come from the selected server's last test, and hovering over either shows the result; the other three
+  have no hover text. **VPN Server** is red after a failed test. **Internet** turns green only after a real **Test**, not
+  merely after connecting, and is gray otherwise, never red.
+- **Capabilities.** Two dots that describe the current connection and change nothing. Both are gray while Hole is
+  disconnected. **UDP proxy** is green when the
   connection can carry UDP traffic. It is red with a plugin that carries TCP only, such as ex-ray; Hole then drops the UDP
   traffic that would go through the server, rather than sending it around the tunnel. **IPv6 bypass** is red when the
   computer's network has no working IPv6, so a **Bypass** rule cannot send IPv6 traffic around the tunnel.
@@ -163,18 +174,21 @@ whether or not the forwarder is on.
 ## The tray menu
 
 The tray menu has the status, **Connect** or **Disconnect**, **Start at Login**, **Lockdown**, **Dashboard...** and
-**Exit**, plus **Install Update** when a new version is found. **Connect**, **Disconnect**, **Dashboard...** and **Exit**
+**Exit**, plus **Install Update (v...)** with the version when a new one is found, and **Unblock Network** while a block
+is in force. **Connect**, **Disconnect**, **Dashboard...** and **Exit**
 are covered in [Connect](connect.md), and **Start at Login** is described above.
 
 ### Lockdown
 
-**Lockdown** is the {term}`kill switch`, and it is off by default. With it on, while Hole is connecting or connected,
-traffic that would leave outside the tunnel is blocked, including traffic to devices on your local network such as a
+**Lockdown** is the {term}`kill switch`, and it is off by default. Click the item in the tray menu to turn it on or off.
+With it on, while Hole is connecting or connected, traffic that would leave outside the tunnel is blocked, including traffic to devices on your local network such as a
 printer. The block holds through brief drops, reconnects and restarts, so a dropped connection never quietly sends your
 traffic around the tunnel. It lifts when you disconnect, or when Hole gives up on the connection.
 
 The menu item shows **Lockdown: On** when the switch is on and the block is in force. **Lockdown: On (warning: not
-engaged)** means the switch is on but no block is in force right now, for instance because Hole is not connected.
+engaged)** means the switch is on but no block is in force right now. That is the case when Hole is not connected, and
+also when you turned Lockdown on while connected: the block starts at the next connect, so disconnect and connect again
+to be protected.
 
 While a block is in force, the menu offers **Unblock Network (disconnects, turns Lockdown off)**. It disconnects Hole,
 removes the block and turns Lockdown off. If Hole cannot reach its bridge, [Troubleshooting](troubleshooting.md) has the

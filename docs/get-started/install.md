@@ -25,15 +25,16 @@ sync-group: os
 :sync: windows
 
 Hole supports 64-bit Intel and AMD PCs. To check, open **Settings** → **System** → **About**: the **System type** line
-should say "64-bit operating system, x64-based processor". Windows on ARM is not supported. Hole needs Windows 10 version
-2004 or later; Windows 11 qualifies.
+should say "64-bit operating system, x64-based processor". The installer is built for x64 only, and Windows on ARM is not
+a supported platform. Hole needs Windows 10 version 2004 or later; Windows 11 qualifies.
 ```
 
 ```{tab-item} macOS
 :sync: macos
 
 Open the Apple menu, choose **About This Mac** and look at the **Chip** line. If it starts with "Apple" followed by a
-name such as M1, the Mac has Apple silicon: pick the `arm64` file. If it says Intel, pick the `amd64` file.
+name such as M1, the Mac has Apple silicon: pick the `arm64` file. If it says Intel, pick the `amd64` file. Hole does not
+state a minimum macOS version.
 ```
 ````
 
@@ -136,9 +137,14 @@ If Hole shows a dialog titled **Hole — Permission Required** that says it need
 VPN, your account is not yet allowed to talk to the bridge. This happens when a different account did the install. It is
 expected, and it is safe to answer.
 
-- **Yes** asks for administrator permission once and gives your account standing access, by adding it to a local group
-  named `hole`. Hole does not ask again.
-- **No** asks for administrator permission for this one action, and Hole asks again the next time.
+- **Yes** asks the operating system for administrator permission once and gives your account standing access, by adding
+  it to a local group named `hole`. On Windows, group membership takes effect only after you sign out and in. Until
+  then Hole reaches the bridge through a temporary grant that a bridge restart, such as an update, drops, so the
+  operating system's administrator prompt can return before you sign out and in.
+- **No** asks the operating system for administrator permission for this one action.
+
+Either way, Hole shows this dialog only once. After **No**, the next time Hole needs permission the operating system's
+administrator prompt appears by itself, with no explanation first.
 ```
 
 ## Updating

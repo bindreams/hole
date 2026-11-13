@@ -11,10 +11,20 @@ The app is the main way to use Hole. These commands are for scripting and recove
 | `hole bridge unlock`                 | Turn the {term}`kill switch` off and clear the block it left behind. Run it as administrator (`sudo` on macOS).    |
 
 On Windows the installer runs `hole path add` for you. On macOS `hole` is not on
-`PATH` until you add it, so give the full path to the app's binary:
+`PATH` until you add it, so every command on this page needs the full path to the app's binary there, for example:
 
 ```sh
 sudo /Applications/Hole.app/Contents/MacOS/hole path add
+sudo /Applications/Hole.app/Contents/MacOS/hole bridge unlock
+```
+
+```{admonition} On Windows, from a terminal
+---
+class: note
+---
+`hole.exe` is a graphical program that attaches to the terminal it was started from to print. A terminal may give you
+its prompt back before a command has finished, and these pages describe the exit status and the `hole upgrade` consent
+prompt from the code, not from a measurement on Windows.
 ```
 
 ## hole upgrade
@@ -52,10 +62,10 @@ on failure. Open a new terminal afterwards: one that was already open does not s
 
 - **Windows:** `add` appends the folder that holds `hole.exe` to the system `Path` (`HKEY_LOCAL_MACHINE`) and `remove`
   deletes that entry. An entry that is already there, or already gone, is reported and is not an error.
-- **macOS:** `add` creates the symlink `/usr/local/bin/hole` pointing at the running binary, replacing a stale `hole`
-  link; `remove` deletes it. `remove` refuses a link that does not point at a file named `hole`. `add` refuses to run
-  from a translocated copy of the app: move Hole.app to `/Applications` first. Run it with the full path to the binary,
-  as shown above.
+- **macOS:** `add` creates the symlink `/usr/local/bin/hole` pointing at the running binary. If anything else is at that
+  path, whether a link to another program or an ordinary file, `add` deletes it first. `remove` deletes the link, and
+  refuses one that does not point at a file named `hole`. `add` refuses to run from a translocated copy of the app: move
+  Hole.app to `/Applications` first. Run it with the full path to the binary, as shown above.
 
 Source: {src}`crates/hole/src/path_management.rs`.
 
@@ -66,7 +76,7 @@ hole bridge unlock
 ```
 
 The recovery route for a {term}`kill switch` block that nothing else can lift: it works with no bridge running. Run it as
-administrator (`sudo` on macOS). In order, it records that Hole should not be connected, removes the standing block,
+administrator (`sudo` on macOS, with the full path to the binary, as above). In order, it records that Hole should not be connected, removes the standing block,
 clears the server remembered for the **Always connect** startup choice, and records the kill switch as off. It stops with
 an error before changing anything if a bridge is running: the message names the app's **Unblock Network** action as the
 route to use then. On Windows it may print a warning that it could not prove every boot-time filter gone.
