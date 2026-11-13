@@ -184,10 +184,18 @@ name = "validate docs build"
 entry = "uv run scripts/validate-docs.py"
 language = "system"
 pass_filenames = false
-# Gated rather than `always_run`: this runs a full Sphinx build. The pattern is
-# what the build reads, which includes LICENSE.md -- docs/license.md is nothing
-# but an `{include}` of it.
-files = "^(docs/|scripts/validate-docs\\.py$|LICENSE\\.md$|crates/(hole|galoshes|garter)/Cargo\\.toml$|crates/ex-ray/version\\.toml$)"
+# Gated rather than `always_run`: this runs a full Sphinx build. The
+# pattern is what the build reads. The `{src}` and README link checks read files
+# anywhere in the repository and run in the hook below on every commit.
+files = "^(docs/|scripts/validate-docs\\.py$|crates/(hole|galoshes|garter)/Cargo\\.toml$|crates/ex-ray/version\\.toml$)"
+
+[[repos.hooks]]
+id = "validate-docs-links"
+name = "validate docs links"
+entry = "uv run scripts/validate-docs.py --links-only"
+language = "system"
+pass_filenames = false
+always_run = true
 
 # External hooks =======================================================================================================
 
