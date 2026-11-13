@@ -10,7 +10,7 @@ tell the truth. It assumes [the kill switch](kill-switch.md).
 
 | Door                                                                                  | Releases                | Refuses against a live bridge? | Failure is fatal for                                                         |
 | ------------------------------------------------------------------------------------- | ----------------------- | ------------------------------ | ---------------------------------------------------------------------------- |
-| `hole bridge unlock` (`cutover::unlock`)                                              | The standing cover only | Yes                            | The whole command                                                            |
+| `hole bridge unlock` (`cutover::unlock`)                                              | The standing cover only | Yes, the service's bridge only | The whole command                                                            |
 | `hole bridge release-covers` (`cutover::release_covers`), and `hole bridge uninstall` | Every cover kind        | Yes                            | The target write and the release itself; the trailing bookkeeping only warns |
 | The in-process doors (Unblock, untick)                                                | Every cover kind        | No: they run inside the bridge | Their request                                                                |
 
@@ -21,8 +21,8 @@ structurally, not by ordering: both out-of-process doors take the bridge's **liv
 the lock a running bridge holds for its whole life, and refuse when it is held. A lock held across the whole sequence also
 stops a bridge that starts mid-way from having its live cover restored away.
 
-The lock is per state directory, and the Windows covers are machine-wide, so `release_covers_with` probes the service's
-directory and every directory a foreground or elevated non-`--service` run can use (`peer_state_dirs`). Each one is locked,
+The lock is per state directory, and the Windows covers are machine-wide. `unlock` probes the service's directory only.
+`release_covers_with` probes the service's directory and every directory a foreground or elevated non-`--service` run can use (`peer_state_dirs`). Each one is locked,
 including one that does not exist yet, since a peer left unlocked because it looked absent is a peer nothing excludes. A
 path already probed is skipped, because the lock contends per open handle. The cost is kept and not cleaned up: an empty
 `hole/state` holding a `bridge-liveness.lock` stays behind on an account that never ran a bridge. Removing it could only
@@ -75,8 +75,9 @@ which is survivable because pf does not survive a reboot.
   recovery. The deleted service has no start type left to read, so an administrator's setting is not carried across.
 - **`LEAVE_NETWORK_BLOCKED=1`** skips the release and so leaves every cover in place. It is the escape from the escape: a
   release that can never succeed (BFE stopped, `hole.exe` quarantined) would otherwise make the product unremovable. The
-  way back from the block it leaves is to reinstall Hole and then release the cover, because the new bridge adopts a live
-  cover: turn the kill switch off, or run `hole bridge release-covers` elevated.
+  way back from the block it leaves is to reinstall Hole and then release the cover from the running bridge: **Unblock
+  Network** or unticking Lockdown in the tray. `hole bridge release-covers` refuses while the reinstalled service runs, so
+  it needs the service stopped first.
 
 The release runs against a dead bridge on purpose: the service is stopped first, so no in-process posture is left claiming
 a cover that no longer exists.
@@ -182,8 +183,8 @@ next cutover, `bridge install` or the GUI's Repair resets it.
 
 ## Disclosed residuals
 
-- **The live-bridge refusal probes a known set of directories.** A bridge given an explicit `--state-dir` outside
-  `peer_state_dirs`, or running under a different account than the uninstaller (the MSI's actions run as SYSTEM), holds a
+- **The live-bridge refusal probes a known set of directories.** `unlock` probes the service's alone, so a bridge started
+  by hand is not seen by it. For `release-covers`, a bridge given an explicit `--state-dir` outside `peer_state_dirs`, or running under a different account than the uninstaller (the MSI's actions run as SYSTEM), holds a
   lock nothing here can see. On Windows the consequence is the desync the refusal exists to prevent: `release_all` sweeps by
   GUID, deletes that bridge's filters while its posture still claims them, and its next start would skip re-engagement and
   run uncovered. `release-covers` is hidden and uninstall-only for this reason.

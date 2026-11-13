@@ -64,8 +64,8 @@ a record is first written means there is no pre-lockdown ruleset left to capture
 (`main_snapshot_captured: false`) and a restore reloads `/etc/pf.conf`. A failed load restores the host before it returns,
 and the caller, which is fail-fatal, aborts the start.
 
-`pfctl -E` is refcounted: Hole's token is Hole's hold on pf being enabled. The token is parsed from the stderr line
-`Token : <n>`, which is the only place pf exposes it.
+`pfctl -E` is refcounted: Hole's token is Hole's hold on pf being enabled. The token is parsed from the line
+`Token : <n>` that `pfctl -E` prints, on stderr or on some hosts stdout; that line is the only place pf exposes it.
 
 The standing engage does **not** purge pf's state table (`purges_state`). `pfctl -F states` is host-wide and would kill the
 tunnel the cover exists to protect, and pf matches state before rules, so a flow that already had a state entry when the
@@ -82,7 +82,9 @@ the next `pfctl -E` of any app, so `pfctl -X` never runs while a record names th
   both restore under pf defaults.
 - A failed restore leaves the block, its record and its token in place and returns the restore's own error. The ways out:
   fix `/etc/pf.conf` and unblock again (the restore is retried); `sudo pfctl -d` turns pf off, and the record stays until a
-  later restore succeeds; a reboot resets pf, and with the target already off nothing re-arms it.
+  later restore succeeds; a reboot resets pf and keeps the record, and unless the target is `Off` the boot reconcile connects and `Reenable`
+  re-arms the cover. The target is `Off` after `unlock`, `release-covers` or a Disconnect. A failed release in Unblock or
+  untick writes no record, so it leaves the target as it was.
 - A clear that cannot write is the release's error and drops nothing, so the retry still has its token. A token that will
   not drop is logged only: with the rules restored it blocks nothing.
 - A record that cannot be read is never treated as absent and never removed. After a good restore the release answers an
@@ -97,8 +99,8 @@ sweep answers `Clearance::proven()`, and the witness machinery is Windows-only.
 A pf ruleset does not survive a reboot, and neither does pf being enabled. After a reboot the host is open until the
 bridge starts and a connect engages the cover again: the persisted record survives, `engage_pf_action` reads
 "record exists, pf disabled", and `Reenable` loads the ruleset into an *enabled* pf. The boot reconcile narrows the gap by
-connecting sooner, but a boot connect that fails engages nothing. Windows covers the equivalent window with
-[boot-time filters](kill-switch-windows.md#the-boot-window).
+connecting sooner, but a boot connect that fails engages nothing. Windows is meant to cover the equivalent window with
+[boot-time filters](kill-switch-windows.md#the-boot-window), which has not been measured across a reboot.
 
 ## What a macOS restart under the cover has to do
 

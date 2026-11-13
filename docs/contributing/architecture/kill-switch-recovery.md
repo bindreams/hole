@@ -18,8 +18,9 @@ The cover decision reads two things. The **intent** comes from `bridge-lockdown.
 
 - **Windows** asks `FwpmFilterGetByKey0` about every lockdown filter GUID. `Live` means *at least one* is found, because a
   sweep that was interrupted midway leaves a partial cover, and probing a single filter would call it `Absent` for ever.
-- **macOS** reads the rule label `hole-lockdown` back out of `pfctl -s labels`, and falls back to the record
-  `bridge-lockdown-pf.json` when pf cannot be asked.
+- **macOS** reads the rule label `hole-lockdown` back out of `pfctl -s labels`. When the label is not seen, whether pf
+  said no or could not be asked, a record `bridge-lockdown-pf.json` makes the answer `Recorded`. That is the ordinary
+  state after a reboot, with pf off, the label gone and the record kept.
 
 Windows can produce `Live`, `Absent`, `Indeterminate` and `Unreachable`; macOS produces `Live`, `Recorded`, `Absent` and
 `Unreachable`. The facade is {src}`crates/tun-engine/src/routing/failclosed.rs` (`lockdown_cover_presence`).
@@ -46,8 +47,9 @@ axes. Four rules produce it:
 
 A sweep of the *transient* cover (`recover_cover`) runs after this, unconditionally and outside every presence branch,
 and is told whether the standing cover is being adopted so that macOS skips the `/etc/pf.conf` reload that would wipe it.
-It exists for the leftovers of an older bridge. Startup therefore always touches the transient cover's objects, and
-touches the standing cover only on an explicit recorded `Off`.
+It exists for the leftovers of an older bridge. Startup therefore always touches the transient cover's objects. It
+removes the standing cover only on an explicit recorded `Off`; an adopt leaves it in place apart from the one Windows
+reclaim of its TUN permit, below.
 
 ## What Adopt does
 
@@ -99,8 +101,12 @@ Every mutation of a cover inside the bridge runs under one lock per state direct
   cover record while a bridge runs, and the lock does not try to exclude it.
 
 The cost is disclosed in code and not hidden: an Unblock waits for an engage in flight, and a start that begins during an
-Unblock waits and then reads `Off`. `unblock_generation` (read by the handler before the proxy lock, compared under the
-cover lock) is what makes a start whose Unblock committed in between install nothing.
+Unblock waits and then reads `Off`. Two guards cover the start that was already running when an Unblock committed. The
+standing install re-reads the intent under the cover lock, and a recorded `Off` makes it install nothing
+(`install_standing_cover`). `unblock_generation` is read by the handler before the proxy lock and compared under the cover
+lock when the start writes its records (`persist_after_start`), so such a start does not write a `Connected` target or
+an auto-connect candidate over the Unblock's `Off`. The same counter gates the transient cover's engage, which no
+production start reaches.
 
 ## Who owns a cover
 
@@ -110,8 +116,8 @@ those facts are about the host and not about anything a live process remembers. 
 whether the manager is idle, holds a pending start or holds a session, because teardown ordering needs it, but no site
 derives cover state from it. Two structural tests hold this: `no_bridge_source_derives_cover_state_from_a_session`
 counts reads of the session's cover field, and `cover_release_has_the_known_sanctioned_caller_set` lists every caller of
-the unconditional `release_all_covers` (`handle_unblock`, `turn_lockdown_off`, `apply_cover_disposition` and
-`reconcile_once`).
+the unconditional cover release (`release_all_covers` and the free `release_all` behind it): `handle_unblock`,
+`turn_lockdown_off`, `apply_cover_disposition`, `reconcile_once` and `cutover::release_covers`.
 
 ## Disclosed residuals
 
@@ -119,14 +125,17 @@ the unconditional `release_all_covers` (`handle_unblock`, `turn_lockdown_off`, `
   constants, and the presence probe ignores the state directory, so it answers "is *a* Hole cover present" and never "is
   it mine". An adopted second bridge's own next connect can also replace the first one's permits. Both need a per-install
   cover identity ([#878](https://github.com/bindreams/hole/issues/878)).
-- **`Unset` over `Unreachable` leaves Unblock hidden.** The routes in are the Base Filtering Engine not running or an RPC
-  failure; `unlock` would fail in the same states, so the next start, once BFE answers, adopts the cover and restores the
-  item.
+- **`Unset` over `Unreachable` adopts nothing.** The routes in are the Base Filtering Engine not running or an RPC
+  failure. Unblock is still offered, because `Unreachable` counts as present. What is left unset is the claim: the
+  Lockdown checkbox reads unchecked and `standing_cover_expected` answers no, so a connect before the next start installs
+  no cover, and if one is in force it blocks the new TUN, which names a different interface (connected, with no traffic). The next
+  start, once BFE answers, adopts the cover.
 - **macOS: an unusable state file.** A corrupt record, or one at a version this release cannot read, costs the captured
   pre-cover rules (the release falls back to `/etc/pf.conf`) and, when no token can be read out of it, leaks a pf enable
   refcount until reboot. A record that cannot be read at all is left in place, and every later release answers an error
   until it reads again. A *missing* record reads as "no cover of this kind", and `release_all` answers `Ok` over a
   labelled cover that has no record, because it has no snapshot to restore.
-- **An unreadable `bridge-lockdown.json` has two folds.** `reads_armed` (`On` or `Unreadable`) drives the status reply and
-  the tray, so a corrupt record keeps Unblock on the menu. `installs_standing_cover` (`On` only) drives the connect path,
-  so the same record installs nothing at connect, and the tray can read `Lockdown: On (warning: not engaged)`.
+- **An unreadable `bridge-lockdown.json` has two folds.** `reads_armed` (`On` or `Unreadable`) drives the status reply,
+  which the tray reads for the Lockdown checkbox and label and the CLI's update-consent check reads as "lockdown on". `installs_standing_cover` (`On` only) drives the connect path, so the same record installs nothing at
+  connect, and the tray can read `Lockdown: On (warning: not engaged)`. The tray's Unblock item does not depend on either:
+  it follows the measured presence of a cover.

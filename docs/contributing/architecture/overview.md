@@ -9,9 +9,10 @@ Rust and not necessarily VPNs. The user-level picture is in [How Hole is put tog
 `hole` with no arguments is the **app**: a Tauri program with the tray, the settings window and the config file. It runs
 with the user's rights. `hole bridge run` is the {term}`bridge`: it manages the {term}`TUN` device, the routes, the
 {term}`Shadowsocks` connection and the firewall block, and it needs administrator rights. Run by hand it stays in the
-foreground; with `--service` the operating system's service manager (Windows SCM, macOS launchd) starts it. The mode is
-chosen in `handle_bridge` in {src}`crates/hole/src/cli.rs`, and the subcommands that do not start a bridge (`install`,
-`uninstall`, `unlock` and the rest) share the same entry point.
+foreground; with `--service` the operating system's service manager (Windows SCM, macOS launchd) starts it. `main` in
+{src}`crates/hole/src/main.rs` chooses the mode: no subcommand starts the app, and any subcommand goes to the command
+line. `handle_bridge` in {src}`crates/hole/src/cli.rs` then dispatches the `bridge` subcommands, of which `run` is one;
+`install`, `uninstall`, `unlock` and the rest do not start a bridge.
 
 The two modes talk HTTP/1.1 with JSON bodies over an AF_UNIX socket on both platforms. The listener is
 {src}`crates/bridge/src/socket.rs` (`tokio::net::UnixListener` on macOS, `socket2` on Windows), the server is axum in
@@ -57,9 +58,11 @@ flowchart TB
 - **`tun-engine`** ({src}`crates/tun-engine/`) holds the TUN device, the packet loop, route installation and the
   firewall covers.
 - **`hole-common`** ({src}`crates/common/`) holds the protocol types, the config and the log setup both modes use.
-- The **state directory** holds the bridge's records, such as `bridge-target.json` and `bridge-lockdown.json`. It is
-  owned by the bridge, not by the user. Records are written through `util::dir::Dir` handles, because a directory the
-  user can write cannot be trusted by a privileged process.
+- The **state directory** holds the bridge's records, such as `bridge-target.json` and `bridge-lockdown.json`. The
+  `--service` bridge keeps it in a system location (`%ProgramData%\hole\state` on Windows, `/var/db/hole/state` on
+  macOS), owned by the system. A bridge started by hand defaults to the invoking user's profile and gives its files to
+  that user, so a directory the user can write holds the records of a privileged process. That is why records are
+  written through `util::dir::Dir` handles.
 
 ## What one connect holds
 
@@ -72,8 +75,9 @@ The field order of `Session` is the release order:
 1. `plugins`: the plugin chain, then a reap of the plugin processes by their recorded identity.
 1. `proxy`: the Shadowsocks client, stopped with `stop().await`.
 1. `routes`: removed by RAII.
-1. `lockdown`: the [standing kill-switch cover](kill-switch.md), released last, so its persistent filters outlive the
-   routes. Its fate is decided by the caller, not by the session.
+1. `lockdown`: the [standing kill-switch cover](kill-switch.md). `Session::teardown` does not release it: it hands the
+   cover back armed, after the routes are gone, and the caller releases it or lets go of it, so the cover's persistent
+   filters can outlive the routes.
 
 A teardown never observes a cancel token: a cancelled start still runs it to the end.
 
@@ -85,19 +89,23 @@ them:
 | Trait     | Defined in                              | Owns                                                                        |
 | --------- | --------------------------------------- | --------------------------------------------------------------------------- |
 | `Proxy`   | {src}`crates/bridge/src/proxy.rs`       | Starting the Shadowsocks client; a single-use `RunningProxy` handle         |
-| `Routing` | {src}`crates/tun-engine/src/routing.rs` | The route table, the kill-switch covers, and crash recovery of both         |
+| `Routing` | {src}`crates/tun-engine/src/routing.rs` | The route table and the kill-switch covers                                  |
 | `Dns`     | {src}`crates/bridge/src/dns/system.rs`  | Pointing the operating system's resolvers at the TUN device, and undoing it |
 
 The reason is test isolation. A unit test that reached the real `netsh`, `route` or `pfctl` would change the machine it
 runs on, so tests substitute a mock whose guard type counts its drops. {src}`clippy.toml` keeps the seam closed: route
 setup and teardown (`setup_routes`, `teardown_routes`) are disallowed methods outside `SystemRouting`, and so are the
-Windows DNS-settings calls and the FWPM calls outside their sanctioned modules. Resource guards are RAII: a `Routing::Installed` removes its routes on drop and a `Routing::Cover` removes its block on
+Windows DNS-settings calls and the FWPM calls outside their sanctioned modules. Crash recovery of routes is the free
+function `recover_routes`, which the bridge calls directly and not through the trait.
+
+Resource guards are RAII: a `Routing::Installed` removes its routes on drop and a `Routing::Cover` removes its block on
 drop, with the one exception that a cover can be *disarmed*, which leaves the block in force while the process lets go
 of it (see [the kill switch](kill-switch.md)).
 
-Cancellation is cooperative. The token a start observes descends from the root token that `handle_start` in
-{src}`crates/bridge/src/ipc.rs` creates, and a bridge source file may not create a fresh one (a disallowed method in
-{src}`clippy.toml`). Nothing cancels a start by dropping its future.
+Cancellation is cooperative: a start carries a token and checks it, and nothing cancels a start by dropping its future.
+Creating a token in `crates/bridge/src/` is a disallowed method in {src}`clippy.toml`, with a short list of sanctioned
+sites that each carry an `#[allow]`: the roots, such as `handle_start` in {src}`crates/bridge/src/ipc.rs` for a start
+from the app, and the process shutdown token that boot passes to `reconcile_once`, which connects with a child of it.
 
 ## Where to read next
 

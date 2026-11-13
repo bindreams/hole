@@ -28,14 +28,15 @@ accept side because a loopback connect is authorised in both directions.
 
 **One sublayer, arbitrated by weight.** The permits sit at `PERMIT_WEIGHT` and the block-all at `BLOCK_WEIGHT`, so within
 the sublayer the higher-weight permit wins. No persistent filter sets `CLEAR_ACTION_RIGHT`, which makes every persistent
-action *hard*. Hardness only matters between sublayers; within one it does nothing. A previous layout put the flag on the
-permits and not on the block-all, so the hard block-all vetoed every permit and the cover blocked everything. The layout
-is the one wireguard-windows uses. The accepted cost: a higher-weight third-party sublayer can in principle override the
-cover.
+action *hard*. This is the layout wireguard-windows uses. An earlier layout put the flag on the permits and not on the
+block-all, and the block-all then vetoed every permit, so the cover blocked everything. The cover's sublayer is created
+with the highest weight WFP allows (`add_sublayer`). What a filter in another sublayer can still do to the cover has not
+been measured here.
 
 **Persistent, not dynamic.** A dynamic session deletes its filters when the engaging process exits, which would reopen the
-host exactly when the bridge dies. Persistent filters survive a crash, and recovery deletes the compiled-in GUIDs, so the
-cover needs no state file on Windows. The DNS-egress confinement is the opposite on purpose: it is a dynamic,
+host exactly when the bridge dies. Persistent filters survive a crash, and recovery deletes the compiled-in GUIDs, so recovery needs no
+record of the filters themselves. The Windows cover still reads `bridge-lockdown.json` (the intent) and writes
+`bridge-boottime.json` at every engage ([the witness](#the-witness)). The DNS-egress confinement is the opposite on purpose: it is a dynamic,
 process-scoped session that dies with the bridge, because a DNS block that outlived the bridge would be pure harm with no
 bridge left to release it. The two lifetimes are not to be unified. FWPM calls are disallowed methods in
 {src}`clippy.toml` outside the two modules that are allowed to make them.
@@ -99,8 +100,8 @@ of absence, in either direction.
 
 - **Armed.** Only a read of the boot-time enumeration view while the object is live. A commit code says the transaction
   reached the object store and nothing about the record behind it, so after the commit `engage_lockdown` runs
-  `verify_boottime_twins` and refuses the engage when a view that *was* readable lacks the twin, or holds one that is not
-  boot-time or is disabled. It reads the view and not the key, because `FwpmFilterGetByKey0` would answer for any object
+  `verify_boottime_twins` and refuses the engage when every view was read and none holds the twin, or when the twin it
+  finds is not boot-time or is disabled. It reads the view and not the key, because `FwpmFilterGetByKey0` would answer for any object
   under that key whatever its lifetime. Absence is concluded only from a *complete* set of readable views
   (`readback::verdict`): one view erroring makes the other's empty answer evidence of nothing, and an unreadable view never
   fails an engage, because that would stop a user with the kill switch armed from connecting.
@@ -145,10 +146,12 @@ downgrade cannot strand a twin that a newer build installed under a GUID this on
 cover; another provider's filter is never touched. A layer is required in the enumeration (a template naming none is
 refused with `FWP_E_LAYER_NOT_FOUND`), so the layers are listed from the engine and the provider is selected in code.
 
-A delete of such a stranger that the OS refuses, and a view that cannot be read, never fail a sweep: a live boot-time
-filter is not enforced once BFE has started, and failing `unlock` or Unblock over it would keep them from recording the
-intent off, so the next start would re-engage the switch. Both are reported (`Clearance::refused_strangers`,
-`unenumerated_views`) and arm the witness. A persistent filter that a later build installed under a key this build never
+A delete of such a stranger that the OS refuses, and a view that cannot be read, never fail a sweep: the code records
+that a live boot-time filter is not enforced once BFE has started ([below](#what-is-measured-and-what-is-not)), and
+failing `unlock` or Unblock over it would keep them from recording the intent off, so the next start would re-engage the
+switch. Both are reported (`Clearance::refused_strangers`, `unenumerated_views`). A refused delete arms the witness. An
+unreadable view arms it only when the twin's siblings leave one possible, and otherwise only keeps an armed record from
+being disarmed. A persistent filter that a later build installed under a key this build never
 learned survives unlock, `release-covers` and uninstall ([#1242](https://github.com/bindreams/hole/issues/1242)).
 
 ## What is measured, and what is not
@@ -163,9 +166,12 @@ The privileged lane measures, on the real firewall and with no reboot, in
   boot-time view). The probe filter is a permit on a documentation address, never a block, so the test cannot itself block
   the machine it runs on.
 - Every engage re-creates the twins while the persistent block-all beside them is not re-created.
-- A live boot-time filter is not enforced after BFE has started: a boot-time block on a loopback port let a connect
-  through where a persistent block on the same port refused it. A stranded twin therefore harms the next boot's early
-  window and not the running host.
+
+The code also records, as measured, that a live boot-time filter is not enforced once BFE has started, and relies on it:
+it is why a refused delete of an unlisted twin and an unreadable view never fail a sweep, and on it a stranded twin
+affects the next boot's early window and not the running host. No test in this tree makes that measurement. The privileged
+lane's probes are permits on documentation addresses, because a boot-time block could lock the machine out, so if the
+measurement was made by hand, its record is not in the tree.
 
 Nothing measures anything that spans a reboot, and the lane does not reboot:
 
@@ -175,9 +181,10 @@ Nothing measures anything that spans a reboot, and the lane does not reboot:
 - whether a twin covers boots after the one that follows its install. Microsoft's pages disagree on the mechanic
   (boot-time filters are "removed" once BFE initialises, or "disabled") and none addresses re-provisioning at later boots.
   That silence is recorded as silence. Every path is correct under both readings, which is why the twins are pre-deleted;
-- whether Hole's provider survives a BFE start. `add_provider` passes no service name, the first condition Microsoft names
-  for a provider whose filters BFE disables at startup, and if it applies the persistent half would come back disabled
-  every boot. The `FWPM_FILTER_FLAG_DISABLED` bit read in the tests is not evidence either way: the filters were added
+- whether Hole's provider survives a BFE start. `add_provider` passes no service name. The code's comments quote Microsoft's
+  `FWPM_FILTER0` reference: a provider's filters are disabled when BFE starts if the provider has no associated service
+  name or its service is not set to auto-start. If that applies to Hole's persistent provider, the persistent half would
+  come back disabled every boot. The `FWPM_FILTER_FLAG_DISABLED` bit read in the tests is not evidence either way: the filters were added
   seconds earlier, so BFE had not started since.
 
 A stranded boot-time leftover has no self-healing path: BFE re-adds a persistent leftover at every start, so a later build
@@ -193,7 +200,9 @@ There is no in-box way to remove a WFP filter. `netsh wfp` is diagnostics only (
 `set` for capture options and `show`), and none takes a filter key. `netsh wfp show boottimepolicy` shows the operating
 system's boot-time policy and `show filters` lists only what is active now, which excludes a boot-time filter once BFE has
 started. Seeing is not removing: the only removal API is FWPM, and the only caller on a host is a Hole build that knows the
-key. Reinstalling Hole and then releasing the cover (the new bridge adopts a live one) is therefore the way back, which is why the uninstaller releases the covers
-([Uninstall and the service](kill-switch-uninstall.md)). The genuinely unrecoverable case is narrower than "a leftover":
+key. Reinstalling Hole and then releasing the cover is therefore the way back, which is why the uninstaller releases the
+covers ([Uninstall and the service](kill-switch-uninstall.md)). With the reinstalled service running, the release is
+**Unblock Network** or unticking Lockdown in the tray: `hole bridge release-covers` refuses while a bridge runs, so it
+needs the service stopped first. The genuinely unrecoverable case is narrower than "a leftover":
 BFE failing to start, where `FwpmEngineOpen0` fails and both `release_all` and `bridge unlock` return an error having issued
 nothing.
