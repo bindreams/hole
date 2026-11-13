@@ -4725,6 +4725,11 @@ Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
   `gh release create` (`hole=true`, others `false`); without it GitHub's legacy
   semver+date heuristic can promote the wrong track (#308).
 - **garter publish is idempotent** — it queries crates.io and skips `cargo publish` if the version exists; a `dry_run` input runs `--dry-run` only.
+- **garter publishes by trusted publishing** — no stored token. crates.io's
+  trusted publisher for `garter` names repository `bindreams/hole` and workflow
+  `publish-release-garter.yaml` (the caller, not the reusable workflow). crates.io
+  matches the top-level workflow, so a call through `workflow_call` from another
+  workflow is refused unless that one is registered too.
 - **garter publishes against crates.io's `cosca`** — the workspace pins a registry
   version, so `cargo package` accepts the dependency.
 - **Versions** live in each crate's `[package.metadata.hole-release].group`
