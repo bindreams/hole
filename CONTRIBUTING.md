@@ -4670,7 +4670,7 @@ The out-of-process plugin (`ex-ray`, `galoshes`) is otherwise invisible:
 
 ## CLI (dev/admin commands)
 
-User-facing commands are in [README.md](README.md#commands). The rest:
+User-facing commands are in [the CLI reference](docs/reference/cli.md). The rest:
 
 ```
 hole bridge run [--socket-path P] [--log-dir DIR] [--state-dir DIR]   run bridge (foreground, needs elevation)

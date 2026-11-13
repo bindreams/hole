@@ -22,12 +22,17 @@ extensions = [
     "myst_parser",
     "sphinx_design",
     "sphinx_copybutton",
+    "sphinx.ext.extlinks",
+    "sphinxcontrib.mermaid",
 ]
 # No colon_fence: the mdformat-myst prek hook escapes colon fences, so the
 # docs use backtick-fenced directives exclusively.
 myst_enable_extensions = ["substitution"]
 myst_heading_anchors = 3
 myst_substitutions = versions
+
+# The one way a page links to a file in the repository: {src}`crates/hole/src/cli.rs`.
+extlinks = {"src": ("https://github.com/bindreams/hole/blob/main/%s", "%s")}
 
 exclude_patterns = ["_build"]
 

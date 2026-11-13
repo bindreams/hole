@@ -2,11 +2,13 @@
 # /// script
 # requires-python = ">=3.13"
 # ///
-"""Build the documentation site and check that its version substitutions rendered.
+"""Build the documentation site and check what the build cannot.
 
 Builds `docs/` with warnings promoted to errors, then verifies the landing page's
 versions line carries the real manifest versions and that no substitution was
-left unrendered.
+left unrendered. Also checks every `{src}` link in `docs/`: its path must be
+tracked in the repository and, for a Markdown target, its `#anchor` must match a
+heading there (GitHub's slug rules).
 
 Usage:
     uv run scripts/validate-docs.py
@@ -20,6 +22,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -39,6 +42,13 @@ SUBSTITUTION_RE = re.compile(r"\{\{\s*(?:" + "|".join(SUBSTITUTIONS) + r")\s*\}\
 
 # Code samples may show the substitution syntax on purpose.
 CODE_REGION_RE = re.compile(r"<(pre|code)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+
+# A `{src}` role: {src}`path`, {src}`path#anchor` or {src}`title <path#anchor>`.
+SRC_ROLE_RE = re.compile(r"\{src\}`([^`]+)`")
+SRC_TITLED_RE = re.compile(r"^.*?<([^<>]+)>$", re.DOTALL)
+
+HEADING_RE = re.compile(r"^ {0,3}#{1,6}[ \t]+(.*?)[ \t]*$")
+FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*(.*?)[ \t]*$")
 
 # Sphinx writes these itself; their contents are not ours to check.
 GENERATED_PAGES = frozenset({"search.html", "genindex.html"})
@@ -68,6 +78,82 @@ def check_rendered(out_dir: Path, versions: dict[str, str]) -> list[str]:
     return problems
 
 
+def outside_fences(text: str) -> Iterator[tuple[int, str]]:
+    """Yield `(line number, line)` for each line of Markdown outside a code block.
+
+    A fence whose info string opens with `{` is a MyST directive, not code: its
+    body is Markdown (a `{glossary}` holds the page's `{src}` links) and is yielded.
+    """
+    open_fences: list[tuple[str, int, bool]] = []  # (fence char, fence length, is code)
+    for number, line in enumerate(text.splitlines(), start=1):
+        match = FENCE_RE.match(line)
+        if match and open_fences:
+            char, length, _ = open_fences[-1]
+            if match.group(1)[0] == char and len(match.group(1)) >= length and not match.group(2):
+                open_fences.pop()
+                continue
+        if match and not (open_fences and open_fences[-1][2]):
+            fence = match.group(1)
+            open_fences.append((fence[0], len(fence), not match.group(2).startswith("{")))
+            continue
+        if not any(is_code for _, _, is_code in open_fences):
+            yield number, line
+
+
+def heading_slugs(markdown: str) -> set[str]:
+    """The anchors GitHub generates for the headings of one Markdown file.
+
+    Lowercase, punctuation other than `-` and `_` dropped, spaces to `-`; a
+    repeated heading gets `-1`, `-2`, ... appended.
+    """
+    slugs: set[str] = set()
+    seen: dict[str, int] = {}
+    for _, line in outside_fences(markdown):
+        heading = HEADING_RE.match(line)
+        if not heading:
+            continue
+        text = re.sub(r"[ \t]+#+$", "", heading.group(1))
+        text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)  # a link contributes its text
+        slug = re.sub(r"[^\w\- ]", "", text.lower()).replace(" ", "-")
+        count = seen.get(slug, 0)
+        seen[slug] = count + 1
+        slugs.add(slug if count == 0 else f"{slug}-{count}")
+    return slugs
+
+
+def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
+    """Problems with the `{src}` links of every page under `docs/`.
+
+    `tracked` holds the repository's file paths, `/`-separated. A target names a
+    tracked file or a directory holding one; a `.md` target's `#anchor` must be
+    a heading slug of that file.
+    """
+    problems = []
+    for page in sorted((repo_root / "docs").rglob("*.md")):
+        where = page.relative_to(repo_root).as_posix()
+        for number, line in outside_fences(page.read_text(encoding="utf-8")):
+            for role in SRC_ROLE_RE.finditer(line):
+                titled = SRC_TITLED_RE.match(role.group(1))
+                target = titled.group(1) if titled else role.group(1)
+                path, _, anchor = target.strip().partition("#")
+                is_dir = any(name.startswith(path.rstrip("/") + "/") for name in tracked)
+                if path not in tracked and not is_dir:
+                    problems.append(f"{where}:{number}: {{src}} path is not tracked in the repository: {path}")
+                elif anchor and path.endswith(".md") and path in tracked:
+                    headings = heading_slugs((repo_root / path).read_text(encoding="utf-8"))
+                    if anchor not in headings:
+                        problems.append(f"{where}:{number}: {{src}} anchor matches no heading in {path}: #{anchor}")
+    return problems
+
+
+def tracked_files() -> frozenset[str]:
+    """Paths of the files in the git index (staged files included)."""
+    listing = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=REPO_ROOT, check=True, capture_output=True, text=True, encoding="utf-8"
+    )
+    return frozenset(listing.stdout.split("\0")) - {""}
+
+
 def sphinx_command(*sphinx_args: str) -> list[str]:
     """The `uv run` invocation of `sphinx-build` with the pinned docs requirements.
 
@@ -92,6 +178,8 @@ def main() -> int:
     if sys.argv[1:] == ["--fetch-only"]:
         return subprocess.run(sphinx_command("--version"), cwd=REPO_ROOT).returncode
 
+    problems = src_link_problems(REPO_ROOT, tracked_files())
+
     # A fresh output directory every run. Reusing one lets Sphinx build
     # incrementally -- it skips re-reading unchanged pages, so a broken
     # cross-reference passes here while a cold Read the Docs build fails -- and
@@ -106,9 +194,10 @@ def main() -> int:
             cwd=REPO_ROOT,
         )
         if build.returncode != 0:
+            print("\n".join(problems), file=sys.stderr)
             return build.returncode
 
-        problems = check_rendered(out_dir, manifest_versions(REPO_ROOT))
+        problems += check_rendered(out_dir, manifest_versions(REPO_ROOT))
 
     for problem in problems:
         print(problem, file=sys.stderr)
@@ -211,3 +300,49 @@ def test_sphinx_command_appends_args_after_the_pinned_requirements() -> None:
     assert command[-2:] == ["sphinx-build", "--version"]
     # The fetch and the build resolve the same environment only with the same flags.
     assert sphinx_command("-W", "-b", "html")[: len(command) - 1] == command[:-1]
+
+
+def _write_repo(root: Path, files: dict[str, str]) -> frozenset[str]:
+    """Write `files` under `root`; return the non-docs ones as the tracked set."""
+    for name, text in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text, encoding="utf-8")
+    return frozenset(name for name in files if not name.startswith("docs/"))
+
+
+def test_heading_slugs_follow_github_rules() -> None:
+    markdown = "# CLI (dev/admin commands)\n## Lockdown mode\n## Lockdown mode\n## [Link](#x) `code_x` & more\n"
+
+    assert heading_slugs(markdown) == {"cli-devadmin-commands", "lockdown-mode", "lockdown-mode-1", "link-code_x--more"}
+
+
+def test_heading_slugs_ignore_fenced_code() -> None:
+    assert heading_slugs("```sh\n# a comment\n```\n# Real\n") == {"real"}
+
+
+def test_src_links_accept_files_directories_and_anchors(tmp_path: Path) -> None:
+    page = "{src}`x/y.rs` {src}`dir` {src}`T <T.md#some-heading>` {src}`x/y.rs#L10`\n"
+    tracked = _write_repo(tmp_path, {"docs/a.md": page, "x/y.rs": "", "dir/f": "", "T.md": "## Some heading\n"})
+
+    assert src_link_problems(tmp_path, tracked) == []
+
+
+def test_src_links_report_a_missing_path_and_a_wrong_anchor(tmp_path: Path) -> None:
+    page = "{src}`nope.rs`\n{src}`T <T.md#other>`\n```\n{src}`ignored.rs`\n```\n"
+    tracked = _write_repo(tmp_path, {"docs/a.md": page, "T.md": "## Some heading\n"})
+
+    problems = src_link_problems(tmp_path, tracked)
+
+    assert len(problems) == 2
+    assert "a.md:1" in problems[0] and "nope.rs" in problems[0]
+    assert "a.md:2" in problems[1] and "#other" in problems[1]
+
+
+def test_src_links_are_read_inside_directives_but_not_inside_code(tmp_path: Path) -> None:
+    page = "```{glossary}\nterm\n  {src}`nope.rs`\n```\n\n```sh\n{src}`ignored.rs`\n```\n"
+    tracked = _write_repo(tmp_path, {"docs/a.md": page})
+
+    problems = src_link_problems(tmp_path, tracked)
+
+    assert len(problems) == 1
+    assert "a.md:3" in problems[0]

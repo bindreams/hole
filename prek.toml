@@ -185,9 +185,8 @@ entry = "uv run scripts/validate-docs.py"
 language = "system"
 pass_filenames = false
 # Gated rather than `always_run`: this runs a full Sphinx build. The pattern is
-# what the build reads, which includes LICENSE.md -- docs/license.md is nothing
-# but an `{include}` of it.
-files = "^(docs/|scripts/validate-docs\\.py$|LICENSE\\.md$|crates/(hole|galoshes|garter)/Cargo\\.toml$|crates/ex-ray/version\\.toml$)"
+# what the build reads.
+files = "^(docs/|scripts/validate-docs\\.py$|crates/(hole|galoshes|garter)/Cargo\\.toml$|crates/ex-ray/version\\.toml$)"
 
 # External hooks =======================================================================================================
 
