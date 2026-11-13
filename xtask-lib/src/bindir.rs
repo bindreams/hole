@@ -139,10 +139,6 @@ pub fn bindir_entries(os: Os) -> Vec<BindirEntry> {
     if os == Os::Windows {
         entries.push(entry("wintun.dll".to_string(), FileKind::NotExecutable));
     }
-    // NOTICES.md — Apache-2.0 §4(d) attribution for the bundled galoshes/garter
-    // components; the installer license dialog shows only GPL-3.0 text, so the
-    // NOTICE file must accompany the binaries on disk.
-    entries.push(entry("NOTICES.md".to_string(), FileKind::NotExecutable));
     entries
 }
 

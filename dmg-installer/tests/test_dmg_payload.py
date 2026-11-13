@@ -27,21 +27,18 @@ def test_dmg_ships_full_canonical_bindir(installed_app: Path) -> None:
     """Every file the macOS bundle must hold ships in the .app payload (#512).
 
     Derives the expected set from the single source of truth so a future bindir
-    addition nobody wired into the Tauri config fails here. We scan only the two
-    payload roots — Contents/MacOS (the binary, sidecars, and the dSYM bundle)
-    and Contents/Resources (NOTICES.md) — and do NOT recurse, so the DWARF
-    Mach-O named `hole` inside hole.dSYM cannot falsely satisfy the `hole`
-    entry. The dSYM's internal structure + UUID are covered by the two tests
-    below.
+    addition nobody wired into the Tauri config fails here. We scan
+    Contents/MacOS without recursing, so the DWARF Mach-O named `hole` inside
+    hole.dSYM cannot falsely satisfy the `hole` entry. The dSYM's internal structure + UUID are covered
+    by the two tests below.
     """
     expected = canonical_darwin_bindir()
     contents = installed_app / "Contents"
     present = {p.name for p in (contents / "MacOS").iterdir()}
-    present |= {p.name for p in (contents / "Resources").iterdir()}
     missing = expected - present
     assert not missing, (
         f"Hole.app payload is missing canonical BINDIR file(s) {sorted(missing)} "
-        f"(searched Contents/MacOS + Contents/Resources). Expected (from "
+        f"(searched Contents/MacOS). Expected (from "
         f"`cargo xtask bindir-names --os darwin --bundle`): {sorted(expected)}."
     )
 

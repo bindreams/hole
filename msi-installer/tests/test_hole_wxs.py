@@ -824,26 +824,6 @@ def test_main_feature_wraps_all_component_groups(package: ET.Element) -> None:
     assert refs == expected, f"Feature 'Main' must reference exactly {expected}; got {refs}"
 
 
-# Attribution file tests ===============================================================================================
-
-
-def test_notices_md_component_exists(package: ET.Element) -> None:
-    """NOTICES.md must ship alongside binaries (Apache-2.0 §4(d) attribution).
-
-    The License dialog displays only GPL-3.0 text; the NOTICE file preserving
-    Apache-2.0 attribution for galoshes/garter must be installed on disk.
-    """
-    comp = _find_component(package, "NoticesMd")
-    assert comp is not None, "Component 'NoticesMd' is required for Apache-2.0 attribution"
-    file_elem = next(
-        (f for f in comp.iter(f"{{{NS['wix']}}}File") if f.get("Id") == "NOTICES.md"),
-        None,
-    )
-    assert file_elem is not None, "NoticesMd component must contain <File Id='NOTICES.md'>"
-    source = file_elem.get("Source", "")
-    assert "!(bindpath.BinDir)" in source, f"NOTICES.md File Source must resolve via BinDir bindpath; got '{source}'"
-
-
 # BINDIR conformance tests =============================================================================================
 #
 # Guards the staging->packaging boundary: every file `cargo xtask stage` puts

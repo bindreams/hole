@@ -6,23 +6,13 @@ fn dest_names_per_os_are_exact() {
     // here AND in every installer manifest (caught by the conformance tests).
     assert_eq!(
         bindir_dest_names(Os::Windows),
-        vec![
-            "hole.exe",
-            "hole.pdb",
-            "ex-ray.exe",
-            "galoshes.exe",
-            "wintun.dll",
-            "NOTICES.md"
-        ]
+        vec!["hole.exe", "hole.pdb", "ex-ray.exe", "galoshes.exe", "wintun.dll"]
     );
     assert_eq!(
         bindir_dest_names(Os::Darwin),
-        vec!["hole", "hole.dSYM", "ex-ray", "galoshes", "NOTICES.md"]
+        vec!["hole", "hole.dSYM", "ex-ray", "galoshes"]
     );
-    assert_eq!(
-        bindir_dest_names(Os::Linux),
-        vec!["hole", "ex-ray", "galoshes", "NOTICES.md"]
-    );
+    assert_eq!(bindir_dest_names(Os::Linux), vec!["hole", "ex-ray", "galoshes"]);
 }
 
 #[skuld::test]
@@ -48,10 +38,7 @@ fn embedded_plugin_names_per_os() {
 
 #[skuld::test]
 fn bundle_payload_names_drop_only_the_embedded_names() {
-    assert_eq!(
-        bundle_payload_names(Os::Darwin),
-        vec!["hole", "hole.dSYM", "NOTICES.md"]
-    );
+    assert_eq!(bundle_payload_names(Os::Darwin), vec!["hole", "hole.dSYM"]);
     for os in [Os::Windows, Os::Linux] {
         assert_eq!(bundle_payload_names(os), bindir_dest_names(os), "{os}");
     }
