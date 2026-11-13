@@ -24,8 +24,18 @@ The cover decision reads two things. The **intent** comes from `bridge-lockdown.
   said no or could not be asked, a record `bridge-lockdown-pf.json` makes the answer `Recorded`. That is the ordinary
   state after a reboot, with pf off, the label gone and the record kept.
 
+The cover's records, all in the bridge's state directory:
+
+- `bridge-lockdown.json`: the intent.
+- `bridge-lockdown-pf.json` (macOS): the standing cover's pf enable token and the host's pre-cover rules. It is the record
+  behind `Recorded`.
+- `bridge-boottime.json` (Windows): the boot-time witness ([Windows](kill-switch-windows.md#the-witness)).
+- `bridge-failclosed.json` (macOS): the transient cover's pf token, which the transient sweep below replays.
+
+An unreadable record is not treated as absent; the details are under [Disclosed residuals](#disclosed-residuals).
+
 Windows can produce `Live`, `Absent`, `Indeterminate` and `Unreachable`; macOS produces `Live`, `Recorded`, `Absent` and
-`Unreachable`. The facade is {src}`crates/tun-engine/src/routing/failclosed.rs` (`lockdown_cover_presence`).
+`Unreachable` (each value is defined under [Vocabulary](kill-switch.md#vocabulary)). The facade is {src}`crates/tun-engine/src/routing/failclosed.rs` (`lockdown_cover_presence`).
 
 ## The decision
 
@@ -33,8 +43,8 @@ Windows can produce `Live`, `Absent`, `Indeterminate` and `Unreachable`; macOS p
 axes. Four rules produce it:
 
 1. `Absent` and `Unreachable` always give `Noop`.
-1. `Sweep` needs intent `Off` and a presence of `Live`, `Recorded` or `Indeterminate`. It is the only action that removes
-   protection, and the only one that touches the operating system.
+1. `Sweep` needs intent `Off` and a presence of `Live`, `Recorded` or `Indeterminate`. It is the only recovery action
+   that removes the cover, and the only one that touches the operating system.
 1. `Adopt` needs one of those presences and an intent of `On`, `Unreadable` or `Unset`; `Unset` additionally needs
    positive evidence (`Live` or `Recorded`), because no record plus an unusable answer is no evidence in either direction.
 1. The intent file is repaired to `enabled: true` only for `Unset` over `Live`, and never over `Unreadable`: that record
@@ -51,9 +61,8 @@ A sweep of the *transient* cover (`recover_cover`) runs after this, unconditiona
 and is told whether the standing cover is being adopted so that macOS skips the `/etc/pf.conf` reload that would wipe it.
 It exists for the leftovers of an older bridge. Startup therefore always touches the transient cover's objects. This
 step removes the standing cover only on an explicit recorded `Off`; an adopt leaves it in place apart from the one Windows
-reclaim of its TUN permit, below. The step after it can still release an adopted cover:
-`reconcile_once` folds the startup preference into the target, and a target of `Off` (**Do not connect**) releases
-whatever it finds, whatever the intent says ([#1294](https://github.com/bindreams/hole/issues/1294)).
+reclaim of its TUN permit, below. An adopted cover is not safe yet: the reconcile that follows can release it, on a
+target of `Off` and on an `Unset` intent as well (T16 in [Transitions](kill-switch.md#transitions)).
 
 ## What Adopt does
 

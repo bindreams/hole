@@ -61,8 +61,8 @@ whether pf is enabled and whether a record exists:
 
 The load is last in every case, so it cannot overwrite a snapshot that has not been taken yet. A cover already loaded when
 a record is first written means there is no pre-lockdown ruleset left to capture, so the record says so
-(`main_snapshot_captured: false`) and a restore reloads `/etc/pf.conf`. A failed load restores the host before it returns,
-and the caller, which is fail-fatal, aborts the start.
+(`main_snapshot_captured: false`) and a restore reloads `/etc/pf.conf`. A failed load restores the host before it returns, which also removes a cover that was already in force (T4 in
+[Transitions](kill-switch.md#transitions)), and the caller, which is fail-fatal, aborts the start.
 
 `pfctl -E` is refcounted: Hole's token is Hole's hold on pf being enabled. The token is parsed from the line
 `Token : <n>` that `pfctl -E` prints, on stderr or on some hosts stdout; that line is the only place pf exposes it.
@@ -80,37 +80,36 @@ the next `pfctl -E` of any app, so `pfctl -X` never runs while a record names th
 - The restore is the captured snapshot, composed by `build_lockdown_restore_ruleset`, or `/etc/pf.conf` when the record
   has no captured baseline or the snapshot will not load. Neither restores `set` options: pf exposes no dump of them, so
   both restore under pf defaults.
-- A failed restore leaves the block, its record and its token in place and returns the restore's own error. The ways out:
-  fix `/etc/pf.conf` and unblock again (the restore is retried); `sudo pfctl -d` turns pf off, and the record stays until a
-  later restore succeeds; a reboot resets pf and keeps the record, and a boot connect that reaches the cover's install step re-arms it
-  (`Reenable`, [below](#no-reboot-survival)). The target is `Off` after `unlock`, `release-covers` or a Disconnect. A failed release in Unblock or
-  untick writes no record, so it leaves the target as it was.
+- A failed restore leaves the block, its record and its token in place and returns the restore's own error. Hole's way
+  out is to fix `/etc/pf.conf` and release again; the restore is retried. `sudo pfctl -d` and a reboot are not Hole
+  escapes: each leaves the record, so the host is open but the cover can be installed again from it
+  (`Reenable`, [below](#no-reboot-survival)). Which records a failed release leaves is in
+  [The escapes](kill-switch.md#the-escapes).
 - A clear that cannot write is the release's error and drops nothing, so the retry still has its token. A token that will
   not drop is logged only: with the rules restored it blocks nothing.
 - A record that cannot be read is never treated as absent and never removed. After a good restore the release answers an
   error, never success.
 
 macOS never leaves a boot-time key unproven. pf has no boot-time analogue, so `STANDING_COVER_ARMS_BOOT_TIME` is `false`
-(a compile-time assertion keeps a platform from arming boot-time keys without also writing the witness), every macOS
+(a compile-time assertion keeps a platform from installing boot-time keys without also writing the witness), every macOS
 sweep answers `Clearance::proven()`, and the witness machinery is Windows-only.
 
 ## No reboot survival
 
-A pf ruleset does not survive a reboot, and neither does pf being enabled. After a reboot the host is open until a
-connect engages the cover again: the persisted record survives, `engage_pf_action` reads "record exists, pf disabled", and
-`Reenable` loads the ruleset into an *enabled* pf. The bridge starting does not do that. Startup reads the cover as
-`Recorded` and adopts it, and `Phase::Cover(Engage)` in the boot reconcile is a no-op; the engage happens inside the
-connect, after the routes. With the intent `On`, what follows a reboot is one of three things:
+A pf ruleset does not survive a reboot, and neither does pf being enabled (T17 in
+[Transitions](kill-switch.md#transitions)). The persisted record survives, so `engage_pf_action` reads "record exists,
+pf disabled" and `Reenable` loads the ruleset into an *enabled* pf. Only a connect does that: startup reads the cover as
+`Recorded`, and `Phase::Cover(Engage)` in the boot reconcile is a no-op. With the intent `On`, what follows a reboot is
+one of three things:
 
-- **The boot connect reaches the install step.** `Reenable` re-arms the cover. The reconcile narrows the gap by
-  connecting sooner than the user would.
-- **The boot connect fails before the install step.** Nothing is engaged and the host stays open. The record stays, so
-  the next connect that gets that far re-arms the cover. A connect that fails after the install releases what it
-  installed.
-- **There is no boot connect.** The startup-resolved target is `Off` (the startup preference **Do not connect**), so the
-  reconcile releases the record and the host stays open; the intent stays `On`, so a later connect installs a fresh
-  cover. A target that cannot be read holds the record and connects nothing, which leaves the host open too. Windows is meant to cover the equivalent window with
-  [boot-time filters](kill-switch-windows.md#the-boot-window), which has not been measured across a reboot.
+- **The boot connect reaches the install step** (T1). `Reenable` installs the cover again from the record.
+- **The boot connect fails before the install step** (T3). The host stays open and the record stays, so the next connect
+  that gets that far installs the cover again.
+- **There is no boot connect.** With the startup preference **Do not connect** the target is `Off` and T16 releases the
+  record, so the host stays open; the intent stays `On`, so a later connect installs a fresh cover. A target that cannot
+  be read holds the record and connects nothing, which leaves the host open too.
+
+Windows is meant to cover the equivalent window with [boot-time filters](kill-switch-windows.md#the-boot-window).
 
 ## What a macOS restart under the cover has to do
 

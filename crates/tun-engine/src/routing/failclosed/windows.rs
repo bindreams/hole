@@ -1,21 +1,20 @@
 //! Windows fail-closed cover via the Windows Filtering Platform (WFP/FWPM).
 //!
-//! Engage installs a persistent provider, sublayer and filter set in one FWPM transaction: permits for loopback
-//! (by address range on all four ALE layers, plus the `IS_LOOPBACK` flag at CONNECT), the TUN interface, the
-//! caller's App-IDs and the server address, and a block-all on `ALE_AUTH_CONNECT_V4`/`_V6` (the egress kill
-//! switch). Permits sit at `PERMIT_WEIGHT` and the block-all at `BLOCK_WEIGHT` in one sublayer, so within it the
-//! higher-weight permit wins; no persistent filter sets `CLEAR_ACTION_RIGHT`. Optionally one more permit, scoped to
-//! `RESOLVER_PERMIT_PORT`, lets a plugin's ECH-config fetch through (see `Routing::install_failclosed_cover`).
+//! Two filter sets, each installed in one FWPM transaction under a persistent provider and sublayer. The standing
+//! cover (`build_lockdown_spec`) has permits for loopback (by address range on all four ALE layers, plus the
+//! `IS_LOOPBACK` flag at CONNECT), the TUN interface, the caller's App-IDs and the server address, and a block-all on
+//! `ALE_AUTH_CONNECT_V4`/`_V6` (the egress kill switch); it has no resolver permit. The transient cover
+//! (`build_cover_spec`) has permits for loopback and the server address, optionally one more scoped to
+//! `RESOLVER_PERMIT_PORT` that lets a plugin's ECH-config fetch through (see `Routing::install_failclosed_cover`),
+//! and the block-all; it has no TUN or App-ID permit. In both, permits sit at `PERMIT_WEIGHT` and the block-all at
+//! `BLOCK_WEIGHT` in one sublayer, so the higher-weight permit wins.
 //!
 //! The filters are PERSISTENT, not a dynamic session, so a crashed bridge leaves traffic blocked, not leaked;
 //! recovery sweeps them by their fixed GUIDs. The standing cover's block-all pair also has BOOTTIME twins, two more
 //! filters, which are the only soft (`CLEAR_ACTION_RIGHT`) block in the set.
 //!
-//! The reasoning behind the layout is long and lives in
-//! docs/contributing/architecture/kill-switch-windows.md, which is the reference for: the weight arbitration
-//! and its precedent, the twins and why they carry only the block, the soft block and what it costs, what counts as
-//! evidence about a boot-time key, the version-independent provider sweep, what the privileged lane measures, and
-//! what no test here can reach (everything that spans a reboot). Read it before changing any of those.
+//! Why the layout is this way (weights, boot-time twins, soft block, sweeps, what is and is not measured) is in
+//! docs/contributing/architecture/kill-switch-windows.md; read it before changing any of it.
 
 use std::borrow::Cow;
 use std::net::IpAddr;
@@ -99,7 +98,7 @@ pub const LOCKDOWN_FILTER_GUIDS: [GUID; 12] = [
     GUID::from_u128(0xd766a20f_050a_4c40_8de3_33bf259b7e34), // loopback-net CONNECT V6 (::1/128)
 ];
 
-// Boot-time twin of the lockdown block-all pair (#998) — see
+// Boot-time twin of the lockdown block-all pair — see
 // kill-switch-windows.md, "The boot window". Disjoint from every other GUID in this file.
 // CROSS-VERSION CONTRACT, same as `FILTER_GUIDS`/`LOCKDOWN_FILTER_GUIDS`
 // above: never remove or reorder an entry. A build that never learned a newer
@@ -917,9 +916,8 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
 /// there, so the range is the only matcher). Block stays CONNECT-only — egress
 /// kill switch, not inbound. Permits at `PERMIT_WEIGHT`, block at `BLOCK_WEIGHT`;
 /// within the single sublayer the higher-weight permit wins. The block-all pair
-/// also gets a `Boottime` twin (see kill-switch-windows.md "The boot window"
-/// section — the twins are the only filters here whose block is SOFT) — every
-/// permit stays `Persistent`-only. The twins' keys go in `pre_delete` so every engage
+/// also gets a `Boottime` twin (the only filters here whose block is SOFT; see kill-switch-windows.md
+/// "The boot window"); every permit stays `Persistent`-only. The twins' keys go in `pre_delete` so every engage
 /// RE-ARMS them rather than short-circuiting on `FWP_E_ALREADY_EXISTS` — see
 /// [`lockdown_pre_delete_guids`]. Pure — no FFI.
 pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::path::PathBuf]) -> CoverSpec {
@@ -1024,8 +1022,7 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
     }
 }
 
-/// Always `Persistent` — no permit is ever boot-time twinned (see
-/// kill-switch-windows.md, "The boot window": only the block-all floor gets one).
+/// Always `Persistent`: only the block-all floor has a boot-time twin.
 fn permit(guid: GUID, layer: Layer, condition: Condition) -> FilterSpec {
     FilterSpec {
         guid,
@@ -1749,8 +1746,7 @@ impl Cover {
     /// block-all `Boottime` twins ([`FilterLifetime`]) are NOT re-added by BFE
     /// and are not in force while it runs, so they add nothing to the coverage
     /// being handed off here; they exist for a later boot's pre-BFE window
-    /// (kill-switch-windows.md "The boot window" — what about that is measured,
-    /// and what is not, is recorded there).
+    /// (see kill-switch-windows.md "The boot window").
     ///
     /// That is what lets a LONG-LIVED caller keep the host covered without
     /// leaking a handle per call: `std::mem::forget` alone, which this
@@ -2551,9 +2547,7 @@ fn classify_twin_readback(views: &[Result<Vec<FilterRecord>, u32>], key: GUID) -
 /// egress** until the cover is released, and a retry that fails the same way
 /// repeats it. The escape exists and is in-band (the tray's "Unblock Network",
 /// `hole bridge unlock`), so this is recoverable rather than a brick, but it
-/// is a real behaviour change over the pre-#998 engage and is disclosed in
-/// docs/contributing/architecture/kill-switch-windows.md rather than described
-/// as the status quo.
+/// is disclosed in docs/contributing/architecture/kill-switch-windows.md.
 ///
 /// It is still the chosen direction: the alternative is claiming the kill
 /// switch is armed over a pre-BFE window nothing covers, which is a silent

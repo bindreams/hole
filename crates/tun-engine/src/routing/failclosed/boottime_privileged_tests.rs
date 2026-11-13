@@ -55,7 +55,7 @@
 //!    install a live block; see its own doc.
 //! 6. **Is a live boot-time filter out of the DEFAULT filter view?** The
 //!    softness of the twins is defended by the two halves never being
-//!    arbitrated against each other, which until now rested on WFP's own prose.
+//!    arbitrated against each other.
 //!    The same enumeration minus `FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` answers
 //!    it directly, with that one flag the only difference between the reads.
 //!
@@ -413,8 +413,7 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
          nothing in the pre-BFE window can override it\n{evidence}"
     );
     // The twins' softness is sound only because the two halves are never in
-    // the same arbitration set (kill-switch-windows.md, "The boot window"), which until now was a quoted sentence
-    // from WFP's own pages.
+    // the same arbitration set (kill-switch-windows.md, "The boot window").
     // Here it is measured: the filter WFP just returned from the BOOTTIME_ONLY
     // view is absent from the DEFAULT one, taken seconds later on the same
     // host, with `FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` the only difference

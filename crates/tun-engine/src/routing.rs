@@ -1528,7 +1528,7 @@ where
     // `bridge-routes.json` there leaves `tun_name_hint` `None` and the
     // reclaim below a no-op, never a cross-install guess. Either way, only
     // the reclaim's server-IP counterpart is scoped by the per-install
-    // identity gap docs/contributing/architecture/kill-switch-recovery.md discloses, and this reclaim never
+    // identity gap described in kill-switch-recovery.md, and this reclaim never
     // touches that permit.
     lockdown_recover(&lock, decision.action, tun_name_hint.as_deref());
 
@@ -1694,10 +1694,10 @@ pub trait Routing: Send + Sync {
     /// did not author, so the config-authorship trust does not extend to it
     /// — a disclosed residual, see
     /// docs/contributing/architecture/kill-switch.md#the-transient-cover).
-    /// `None` is never permitted as "no restriction". That page also lists
-    /// the residuals of the retry repair (a resolver drift releases and
-    /// re-engages the cover with the corrected value) that this trait's
-    /// caller does not close.
+    /// `None` is never permitted as "no restriction". Residuals of the retry
+    /// repair (a resolver drift releases and re-engages the cover with the
+    /// corrected value) are in
+    /// docs/contributing/architecture/kill-switch.md#the-transient-cover.
     ///
     /// The cover survives a process crash (Windows: persistent WFP filters keyed by fixed
     /// GUID; macOS: pf enable token persisted to `bridge-failclosed.json`) and is

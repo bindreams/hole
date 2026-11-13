@@ -146,15 +146,10 @@ them before editing; the sections linked below are the authoritative source.
   earlier `mux=` overrides it. `mux` also picks the server's dokodemo
   destination, so a `mux=0` client cannot reach a `mux=1` server. →
   [CONTRIBUTING.md#galoshes-mux-default](CONTRIBUTING.md#galoshes-mux-default)
-- **Fail-closed covers.** The standing lockdown cover (`Routing::install_lockdown`,
-  the opt-in kill switch) is a persistent WFP filter set (Windows) or pf ruleset
-  (macOS) that outlives the bridge: the bridge **disarms-not-drops** it across
-  an update restart and the new bridge re-adopts it (`decide_cover_recovery == Adopt`). Windows adds soft boot-time twins of the block-all pair. One
-  persisted `Target` and the measured `CoverPresence` drive every release
-  (`reconciler::{cover_step,tunnel_step,step_order}`), the escape
-  (`Routing::release_all_covers`) is unconditional, and mutators take
-  `&CoverLock`. The transient `install_failclosed_cover` exists, but no start
-  engages it. →
+- **Fail-closed covers.** The standing lockdown cover (the opt-in kill switch) outlives
+  the bridge: the bridge **disarms-not-drops** it and the new bridge adopts it. Release
+  decisions come from the persisted `Target` and the measured `CoverPresence`;
+  `Routing::release_all_covers` is unconditional; mutators take `&CoverLock`. →
   [docs/contributing/architecture/kill-switch.md](docs/contributing/architecture/kill-switch.md)
 - **Server-address redaction.** The configured address — hostname, resolved IP,
   every textual form — is replaced by a `<server:XXXXXXXX>` token before it
@@ -225,7 +220,7 @@ them before editing; the sections linked below are the authoritative source.
   hazard outright over guarding it: `CoverGuard::disarm` had a "call only
   before process exit" precondition that no test could enforce, and closing the
   handle it leaked deleted the rule instead of policing it.
-  [→](docs/contributing/architecture/kill-switch.md)
+  [→](docs/contributing/architecture/kill-switch.md#the-decisions)
 - **Privileged code in a folder a user may own walks through handles** —
   `util::dir::Dir` (or `ReadDir`, for code that only reads), never a path call.
   The walk gets the path as given: never `canonicalize` it first, which follows

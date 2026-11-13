@@ -76,8 +76,8 @@ The field order of `Session` is the release order:
 1. `proxy`: the Shadowsocks client, stopped with `stop().await`.
 1. `routes`: removed by RAII.
 1. `lockdown`: the [standing kill-switch cover](kill-switch.md). `Session::teardown` does not release it: it hands the
-   cover back armed, after the routes are gone, and the caller releases it or lets go of it, so the cover's persistent
-   filters can outlive the routes.
+   cover back still in force, after the routes are gone, and the caller releases it or lets go of it, so the cover's
+   persistent filters can outlive the routes.
 
 A teardown never observes a cancel token: a cancelled start still runs it to the end.
 

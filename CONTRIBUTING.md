@@ -739,10 +739,8 @@ written through the same `Dir`.
 A write that reached the rename is complete: a failure of the directory flush after it is logged at warn and the call
 is `Ok`, because the caller acts on what is on disk. A refusal (`StoreError::Unreadable`, `ReadFailed`) names the file,
 never its directory. Every state file reader ignores a field it does not know (the owner's rule, "readers ignore unknown
-fields"): the version is the only compatibility signal. For the lockdown intent, the boot-time witness,
-`bridge-failclosed.json` and `bridge-lockdown-pf.json` that changed with `VersionedFile`, which replaced
-`deny_unknown_fields`: `{"version":1,"enabled":false,"stray":1}` now reads as the intent Off, where it was
-`Unreadable` (which keeps a standing cover at boot).
+fields"): the version is the only compatibility signal. What an unreadable cover record means for the cover is in
+[Recovery](docs/contributing/architecture/kill-switch-recovery.md).
 
 `Refused` follows the `ConfigError` precedent ([PII](#logging--diagnostics)): the
 lock sits in a user's profile, so neither its `Display` nor its `Debug` carries
@@ -1251,19 +1249,17 @@ leaves working DNS + broken routes, not the inverse):
   `installed` list of [`RouteId`](crates/tun-engine/src/routing.rs)s;
   `routing::recover_routes` tears down leaked routes. Teardown and recovery
   delete **only** the routes in `installed` — see
-  [Route ownership](#route-ownership). The same call also sweeps a stale
-  [fail-closed cover](docs/contributing/architecture/kill-switch.md) (Windows by fixed WFP GUID, macOS via
-  `bridge-failclosed.json`).
+  [Route ownership](#route-ownership). The same call also decides what becomes of a cover left behind; see
+  [Recovery](docs/contributing/architecture/kill-switch-recovery.md).
 - **`HoleDisabledByHole`** (Windows; a registry value under the service's
   own key, not a file in `<state_dir>`) — present while an uninstall's Disabled
   start type is in force; `repair_interrupted_change` (the cutover child,
   `bridge install`) and the next retirement reset what it names and sweep a
   stale one. It goes with the service's key. See
   [The Disabled service and its record](docs/contributing/architecture/kill-switch-uninstall.md#the-disabled-service-and-its-record).
-- **`bridge-failclosed.json`** (macOS only) — the `pfctl -E` enable token of an
-  engaged fail-closed cover; `routing::failclosed::recover_cover` restores
-  `/etc/pf.conf` and drops the refcount. Windows keys its cover by fixed WFP
-  GUIDs and needs no file. See [the kill switch](docs/contributing/architecture/kill-switch.md).
+- **The cover's records** (`bridge-lockdown.json`, `bridge-lockdown-pf.json`, `bridge-boottime.json`,
+  `bridge-failclosed.json`) — which file holds what, and what recovery does with each, is in
+  [Recovery](docs/contributing/architecture/kill-switch-recovery.md).
 - **`bridge-plugins.json`** — persisted cosca process identities;
   `plugin_recovery::reap_recorded_plugins` kills survivors by exact identity —
   no tolerance window — and deletes the file only after accounting for every
@@ -1397,15 +1393,11 @@ lockdown-off update **requires `consent: true`** (the enforcement seam — a bri
 leak is accepted only with informed consent); under lockdown-on the standing cover
 holds the gap, so consent is moot.
 
-Leak-correctness rides the **standing lockdown cover**, not a transient one. The
-bridge's marker-conditional shutdown sees the marker and `disarm`s the cover
-(persist-without-disengage: the guard is consumed and emptied, so its `Drop`
-disengages nothing) instead of dropping it, so the
-WFP/pf filters survive the restart and the new bridge re-adopts them
-(`decide_cover_recovery == Adopt`). The `cutover::os::CutoverOs` effects trait
-exposes no cover-mutating method, so a cutover structurally cannot engage a
-transient cover (the Mullvad-#8470 brick); a lockdown-off cutover is a plain
-restart that fails *open*.
+What becomes of the cover across the restart is in
+[Transitions](docs/contributing/architecture/kill-switch.md#transitions) (T10, then T15 and T16 at the new
+bridge's start). The `cutover::os::CutoverOs` effects trait exposes no
+cover-mutating method, so a cutover structurally cannot engage a transient cover
+(the Mullvad-#8470 brick).
 
 The **swap is rename-away-then-move-in** and **all-or-nothing**: the live binary
 is renamed aside (`std::fs::rename` uses POSIX semantics, renaming a running exe

@@ -4,15 +4,18 @@ A persistent cover has one sharp consequence: if Hole is uninstalled while the c
 can remove it. On Windows the filters are persistent, BFE re-adds them every boot, nothing shipped with Windows takes
 them off (`netsh wfp` has no delete verb), and the uninstaller is about to delete the only binary that could. So the
 uninstall releases the covers first, and most of this page is the care taken to make that release safe and to make it
-tell the truth. It assumes [the kill switch](kill-switch.md).
+tell the truth. It assumes [the kill switch](kill-switch.md). From [The Windows service stop](#the-windows-service-stop) on, the page is
+about the service's lifecycle and not about the cover; stop before it if your question is the kill switch.
 
 ## The three releases
 
-| Door                                                                                  | Releases                | Refuses against a live bridge? | Failure is fatal for                                                         |
-| ------------------------------------------------------------------------------------- | ----------------------- | ------------------------------ | ---------------------------------------------------------------------------- |
-| `hole bridge unlock` (`cutover::unlock`)                                              | The standing cover only | Yes, the service's bridge only | The whole command                                                            |
-| `hole bridge release-covers` (`cutover::release_covers`), and `hole bridge uninstall` | Every cover kind        | Yes                            | The target write and the release itself; the trailing bookkeeping only warns |
-| The in-process doors (Unblock, untick)                                                | Every cover kind        | No: they run inside the bridge | Their request                                                                |
+| Door                                                                                        | Refuses against a live bridge? | Failure is fatal for                                                         |
+| ------------------------------------------------------------------------------------------- | ------------------------------ | ---------------------------------------------------------------------------- |
+| `hole bridge unlock` (`cutover::unlock`, T13)                                               | Yes, the service's bridge only | The whole command                                                            |
+| `hole bridge release-covers` (`cutover::release_covers`), and `hole bridge uninstall` (T14) | Yes                            | The target write and the release itself; the trailing bookkeeping only warns |
+| The in-process doors (Unblock, untick; T12, T11)                                            | No: they run inside the bridge | Their request                                                                |
+
+What each door releases is in [Transitions](kill-switch.md#transitions).
 
 `unlock` clears only the standing cover because the transient cover's authority inside a live bridge is that bridge's own
 posture, and an out-of-process delete would leave it claiming a cover that no longer exists. The uninstall is wider,
@@ -32,7 +35,7 @@ record there, and a deleted record is the stranded-cover end state this path exi
 The release deletes no file. `scripts/network-reset.py`, the out-of-band escape for a host with no working bridge, reads
 `bridge-routes.json` and the DNS records from the state directory to undo a leaked bypass route or a rewritten adapter's
 DNS. An uninstall is the moment those become the only escape. What the release leaves on an installed host is
-`bridge-target.json` reading `Off` and `bridge-lockdown.json` disarmed.
+`bridge-target.json` reading `Off` and `bridge-lockdown.json` reading `Off`.
 
 ## The order of an uninstall
 
@@ -49,7 +52,7 @@ so the error names every failure:
    leaves the registration alone, because it is the only handle a later attempt has.
 1. **Release the covers**, unconditionally unless `--keep-covers` is passed. It is never gated on registration and never
    skipped because an earlier step failed. Recording the target `Off` before the release is what makes a late failure
-   safe: whatever happens after, a later start reconciles toward `Off` and sweeps.
+   safe: whatever happens after, a later start releases the cover (T16 in [Transitions](kill-switch.md#transitions)).
 
 On macOS the uninstall runs only when the user takes it: the tray's **Uninstall Helper** runs `hole bridge uninstall`
 elevated. Dragging the app to the trash runs none of this and leaves the launchd job, the helper and any cover in place,
@@ -63,21 +66,21 @@ which is survivable because pf does not survive a reboot.
   uninstall back with `hole.exe` still in place. A service that will not deregister is untidy; a cover that will not
   release is a lockout. The trailing bookkeeping only warns, since failing there would roll back an uninstall over a host
   that is already open.
-- **An upgrade skips it.** `BridgeUninstall` passes `--keep-covers` and `BridgeRelease` is conditioned on `NOT UPGRADINGPRODUCTCODE`, because the standing cover is what holds the update-cutover gap and the new bridge adopts it.
+- **An upgrade skips it.** `BridgeUninstall` passes `--keep-covers` and `BridgeRelease` is conditioned on `NOT UPGRADINGPRODUCTCODE`, because the standing cover is what holds the update-cutover gap (T10 in [Transitions](kill-switch.md#transitions)).
   `bridge release-covers` and the `--keep-covers` form of `uninstall` are hidden CLI surfaces: the uninstaller is their only
   sanctioned caller.
-- **`MajorUpgrade Schedule="afterInstallInitialize"`.** An upgrade that leaves covers armed is survivable only if a failed
+- **`MajorUpgrade Schedule="afterInstallInitialize"`.** An upgrade that leaves covers in force is survivable only if a failed
   upgrade puts the old product back. WiX's default removes the old product outside the new install's transaction, which
-  leaves armed filters and no binary. This placement puts `RemoveExistingProducts` inside the transaction, so a rollback
+  leaves the filters in force and no binary. This placement puts `RemoveExistingProducts` inside the transaction, so a rollback
   reinstalls the old product, and it does so before the new files land over a service that still holds `hole.exe` open.
 - **`BridgeUninstallRollback`** re-runs `bridge install` if the uninstall rolls back, because `BridgeRelease` can abort
   after `BridgeUninstall` has already torn the service down. Its return value is ignored by MSI, so it can only add
   recovery. The deleted service has no start type left to read, so an administrator's setting is not carried across.
 - **`LEAVE_NETWORK_BLOCKED=1`** skips the release and so leaves every cover in place. It is the escape from the escape: a
   release that can never succeed (BFE stopped, `hole.exe` quarantined) would otherwise make the product unremovable. The
-  way back from the block it leaves is to reinstall Hole and then release the cover from the running bridge: **Unblock
-  Network** or unticking Lockdown in the tray. `hole bridge release-covers` refuses while the reinstalled service runs, so
-  it needs the service stopped first.
+  way back from the block it leaves is to reinstall Hole and then release the cover from the running bridge (T11 or T12
+  in [Transitions](kill-switch.md#transitions)). `hole bridge release-covers` (T14) refuses while the reinstalled service
+  runs, so it needs the service stopped first ([#1289](https://github.com/bindreams/hole/issues/1289)).
 
 The release runs against a dead bridge on purpose: the service is stopped first, so no in-process posture is left claiming
 a cover that no longer exists.
@@ -87,7 +90,7 @@ a cover that no longer exists.
 A delete by key answers one of three things (removed, not found, failed), and "not found" was long read as benign. For a
 persistent filter that is sound, because BFE's store is the key's only record. For a boot-time filter it proves less: a
 boot-time object is live only between kernel start and BFE start, so on a later boot the key answers "not found" whether or
-not a policy record survives behind it, and on the boot where uninstall matters most (armed in an earlier session,
+not a policy record survives behind it, and on the boot where uninstall matters most (installed in an earlier session,
 uninstalled without connecting) every such key answers empty. A bare `Ok` once told the MSI it was safe to delete the only
 binary that could act on that.
 
@@ -105,11 +108,14 @@ having been installed. It names `netsh wfp show boottimepolicy` to *see*, says o
 names reinstalling the running build's own release as the only remedy, since only a build whose key list names a key can
 delete it. It runs at the last moment a Hole binary exists to say anything, so what it says has to be runnable. The in-process
 escapes (`disengage_lockdown`, `turn_lockdown_off`, Unblock) share the blind spot and deliberately do not gate on it: the
-binary stays on disk, the next engage re-arms the key, and `unlock` stays reachable. `Routing::release_all_covers` is the
+binary stays on disk, the next engage installs the key again, and `unlock` stays reachable. `Routing::release_all_covers` is the
 one site sanctioned to drop the `Clearance`.
 
 ## The Windows service stop
 
+How the uninstall stops the bridge service and waits it out. It matters to anyone who changes that code.
+
+```{dropdown} The stop contract
 The bridge service carries restart-on-failure, so a killed bridge goes STOPPED, START_PENDING and RUNNING again within
 seconds, and the SCM refuses a stop in every state but RUNNING. A stop decided from a state read before the act loses that
 race. The contract, with the reference in the module docs it points at:
@@ -119,7 +125,7 @@ race. The contract, with the reference in the module docs it points at:
   delete*. Hardening writes the record that the disable is ours, disables the start type and turns restart-on-failure off,
   because the SCM documents that a service must be explicitly disabled to stop it restarting. `settle_stopped`
   ({src}`crates/bridge/src/service_scm/settle.rs`) then loops over *looks* at the service, and each decision is taken on a
-  look; every wait is armed before the act it waits for, or armed and followed by a confirming look. Nothing is
+  look; every wait is set up before the act it waits for, or set up and followed by a confirming look. Nothing is
   concluded from a wait expiring, and no wait has a count.
 - **The process, not the state, is what is waited out.** The SCM reports STOPPED before the process has exited, and the
   process id is not valid once it has. Processes the service shows are opened while named (`hold.rs`), and the settle ends
@@ -131,9 +137,13 @@ race. The contract, with the reference in the module docs it points at:
   process is held only if its token carries it. The bridge also ensures the SID type at startup, since an in-app update is
   run by the old release's code. The gap is the one window after an update from a release without it, closed at that host's
   next service start.
+```
 
 ## The Disabled service and its record
 
+Why a retirement disables the start type, and how an interrupted one is told apart from an administrator's Disable.
+
+```{dropdown} The record and the repair table
 A retirement disables the start type so STOPPED is final, then restores it. A process killed in between would leave a
 Disabled service that looks exactly like one an administrator disabled, and the two want opposite treatment. Two writes
 cannot be one, so `disable_record` ({src}`crates/bridge/src/disable_record.rs`) holds a record, the registry value
@@ -157,9 +167,11 @@ exhaustive match (`RepairStep::of`):
   cutover, `bridge install` and the GUI's status read. `hole bridge enable` and the GUI's Enable action override it. A
   reinstall deletes and recreates the service, so a manual MSI major upgrade or a rolled-back uninstall registers it
   Automatic and starts it; no state is carried across.
+```
 
 ### The start-type lock
 
+```{dropdown} The machine-wide mutex and its two rules
 Every path that reads the start type and the record and then writes either holds one machine-wide mutex, `StartTypeLock`
 ({src}`crates/bridge/src/platform/windows/start_type_lock.rs`), from its first read to its last write: a retirement, the
 repair, `enable`, the update cutover and the elevated `install` and `uninstall`. Without it overlapping retirements left the
@@ -180,14 +192,15 @@ exact: the status read goes again unless the mark is equal before and after its 
 The update cutover hardens the service the same way a retirement does (record, Disabled, no restart), stops and swaps, and
 restores on every path out. A cutover killed between hardening and restore leaves what a killed retirement leaves, and the
 next cutover, `bridge install` or the GUI's Repair resets it.
+```
 
 ## Disclosed residuals
 
 - **The live-bridge refusal probes a known set of directories.** `unlock` probes the service's alone, so a bridge started
   by hand is not seen by it. For `release-covers`, a bridge given an explicit `--state-dir` outside `peer_state_dirs`, or running under a different account than the uninstaller (the MSI's actions run as SYSTEM), holds a
   lock nothing here can see. On Windows the consequence is the desync the refusal exists to prevent: `release_all` sweeps by
-  GUID, deletes that bridge's filters while its posture still claims them, and its next start would skip re-engagement and
-  run uncovered. `release-covers` is hidden and uninstall-only for this reason.
+  GUID and deletes that bridge's machine-wide filters while its session runs (T14 in
+  [Transitions](kill-switch.md#transitions)). `release-covers` is hidden and uninstall-only for this reason.
 - **Uninstall proves it issued the deletes, not that no filter remains.** On macOS `release_all` reads its own state files,
   so a cover engaged under a non-default `--state-dir` reads as absent against the fixed service directory and answers `Ok`
   over a blocked host. The recorded `Target::Off` limits the damage, since a later start reconciles toward it, and pf does
