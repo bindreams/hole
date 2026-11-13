@@ -48,9 +48,10 @@ async fn main() -> garter::Result<()> {
 }
 ```
 
-Plugins are added data-source side first in both modes. In `Mode::Client` (the default) data flows from the Shadowsocks
-client through the chain to the server; in `Mode::Server` it flows the other way, to a local Shadowsocks server. In the example, `v2ray-plugin` takes the Shadowsocks client's traffic and `obfs-local`
-is the outermost layer, the one that talks to the server.
+Plugins are added from the Shadowsocks side outward, in both modes: the first one added sits next to Shadowsocks and the
+last one added faces the network. In `Mode::Client` (the default) data flows from the Shadowsocks client through the
+chain to the server, and the last plugin talks to the server; in `Mode::Server` it flows the other way, and the last
+plugin listens for clients and the first forwards to a local Shadowsocks server.
 
 A `BinaryPlugin` decides it is ready by connecting to the port it was given, unless `.readiness(ReadinessMode::ExpectSitrep)`
 says the plugin speaks sitrep (below), which also lets the chain restart a hop that loses its port.
