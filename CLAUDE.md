@@ -7,8 +7,9 @@ is both the unprivileged Tauri GUI (no args) and the privileged bridge
 
 This file is the agent-facing architecture map. Product and install live in
 [README.md](README.md); the full contributor reference — build, dev, test, and
-every rule below in detail — lives in [CONTRIBUTING.md](CONTRIBUTING.md). Read it
-before editing; the sections linked below are the authoritative source.
+every rule below in detail — lives in [CONTRIBUTING.md](CONTRIBUTING.md) and, for
+build, development and testing, [docs/contributing/](docs/contributing/index.md). Read
+them before editing; the sections linked below are the authoritative source.
 
 **IMPORTANT:** NEVER PIPE TESTS TO `tail`! ALWAYS SET A TIMEOUT FOR THE SHELL COMMAND! Tests are known to hang, you WILL get stuck and WILL not have information to debug why if you tail.
 
@@ -92,7 +93,7 @@ before editing; the sections linked below are the authoritative source.
   so the cascade's consequence is assertable without an engine; the datapath
   seam generifies `Engine`/`Driver` over their packet I/O so the TUN loop is
   drivable from memory. →
-  [CONTRIBUTING.md#datapath-coverage-which-lane-proves-what](CONTRIBUTING.md#datapath-coverage-which-lane-proves-what)
+  [docs/contributing/testing.md#which-lane-proves-what](docs/contributing/testing.md#which-lane-proves-what)
 - **Plugin binaries.** The bridge runs only the plugins Hole ships, found in the one folder its
   `PluginSource` names, never `PATH`. On macOS `hole` carries both plugins and the service makes a root-owned
   folder (`/Library/Application Support/Hole`) hold exactly those at every start, before it serves; the app
@@ -273,11 +274,11 @@ before editing; the sections linked below are the authoritative source.
   [→](CONTRIBUTING.md#port-allocation)
 - **No sleeps / timeout-polls for synchronization** — use the codebase's
   rendezvous primitives; three narrow exception classes only.
-  [→](CONTRIBUTING.md#test-invariants)
+  [→](docs/contributing/testing.md#no-synchronization-by-elapsed-time)
 - **Tests use `#[skuld::test]`** with `register!()` per binary; install per-test
   subscribers via `set_default_in_current_thread` and never
   `tracing_subscriber::fmt().init()` (clippy-enforced).
-  [→](CONTRIBUTING.md#test-invariants)
+  [→](docs/contributing/testing.md#rules-every-test-follows)
 - **PII redaction** — errors carrying filesystem paths or other PII must be
   redacted before reaching any log, toast, or bundle; a path's detail still
   lands in `gui.log`, but the server address never does.
@@ -327,11 +328,16 @@ what is open before starting more.
 - Product, install → [README.md](README.md)
 - User-facing CLI, distributions → [docs/reference/cli.md](docs/reference/cli.md),
   [docs/reference/distributions.md](docs/reference/distributions.md)
-- Build, dev, test, coding rules, dev/admin CLI →
-  [CONTRIBUTING.md](CONTRIBUTING.md)
-  ([build](CONTRIBUTING.md#build) ·
-  [development](CONTRIBUTING.md#development) ·
-  [testing](CONTRIBUTING.md#testing) ·
-  [releases](CONTRIBUTING.md#releases))
+- Setup, build, development, testing, CI, commit messages, dev/admin CLI →
+  [docs/contributing/](docs/contributing/index.md)
+  ([setup](docs/contributing/setup.md) ·
+  [build](docs/contributing/build.md) ·
+  [development](docs/contributing/development.md) ·
+  [testing](docs/contributing/testing.md) ·
+  [CI](docs/contributing/ci.md) ·
+  [commit messages](docs/contributing/commit-messages.md) ·
+  [dev/admin CLI](docs/contributing/bridge-cli.md))
+- Architecture, releases → [CONTRIBUTING.md](CONTRIBUTING.md)
+  ([releases](CONTRIBUTING.md#releases))
 - Release ops (rollback, minisign key rotation) →
   [RELEASE-OPS.md](RELEASE-OPS.md)

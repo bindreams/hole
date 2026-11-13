@@ -38,7 +38,7 @@ verify Hole is free of malware. To open it anyway:
 - The [documentation](https://hole.readthedocs.io/en/latest/) has a [glossary](https://hole.readthedocs.io/en/latest/reference/glossary.html) of Hole's terms (TUN, SIP003 plugins, ECH, the
   kill switch), the [command line](https://hole.readthedocs.io/en/latest/reference/cli.html), and lists [what else ships from this
   repository](https://hole.readthedocs.io/en/latest/reference/distributions.html), such as plugins for running your own server.
-- To build Hole, run its tests or learn how it is put together, start at [CONTRIBUTING.md](CONTRIBUTING.md).
+- To build Hole or run its tests, start with the [contributor guide](https://hole.readthedocs.io/en/latest/contributing/index.html). How it is put together is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

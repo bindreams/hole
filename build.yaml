@@ -165,8 +165,7 @@ targets:
   hole-msi-install-tests:
     # The MSI is an input, never built here: `MSI_UNDER_TEST`, else
     # target\release\hole.msi (`cargo xtask build hole-msi`). Run it from an
-    # ELEVATED shell: it changes the machine (CONTRIBUTING.md, "Windows
-    # installer"). `cargo xtask run hole-msi-cleanup` finishes an interrupted run.
+    # ELEVATED shell: it changes the machine (docs/contributing/installers.md). `cargo xtask run hole-msi-cleanup` finishes an interrupted run.
     #
     # No `depends`: `frontend-build` would `npm ci` and rebuild ui/dist, which
     # CI's `hole-build` has already compiled in. The E2E needs the `node_modules`
@@ -405,7 +404,7 @@ targets:
     # docs are only read in source, never without private items); `garter` is
     # published and docs.rs omits private items, so it keeps the plain check.
     # Libs and bins are separate commands, and the bins command enables
-    # `tombstone/crash-child`; why: CONTRIBUTING.md, rustdoc section.
+    # `tombstone/crash-child`; why: the module doc of xtask/src/doc_targets_tests.rs.
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     run:
       - bash:

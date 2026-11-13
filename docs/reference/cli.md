@@ -21,4 +21,4 @@ sudo /Applications/Hole.app/Contents/MacOS/hole path add
 Network** action instead.
 
 The remaining `hole bridge` and `hole proxy` subcommands are for development and administration. They are listed in
-the {src}`dev/admin CLI section of CONTRIBUTING.md <CONTRIBUTING.md#cli-devadmin-commands>`.
+[Bridge and proxy commands](../contributing/bridge-cli.md).

@@ -1,11 +1,12 @@
 name: Semantic PR Title
 
-# Enforces the Conventional Commits convention on PR titles. Since this
-# repo squash-merges every PR, the PR title becomes the commit subject on
-# main, and the type prefix drives per-track release-notes categorization
-# (see scripts/generate-release-notes.py).
+# Enforces the Conventional Commits convention on PR titles. A squash merge
+# lands the PR title as the commit subject on main (or the commit's own
+# subject, for a one-commit PR); a rebase merge keeps each commit's own.
+# The type prefix drives per-track release-notes categorization (see
+# scripts/generate-release-notes.py).
 #
-# See CONTRIBUTING.md "Commit messages — Conventional Commits".
+# See docs/contributing/commit-messages.md.
 
 # `on: pull_request` (vs `pull_request_target`) runs the workflow from the
 # PR's branch using the default read-only GITHUB_TOKEN. We don't need
@@ -30,7 +31,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # Allowed types match the CONTRIBUTING.md list and the
+          # Allowed types match the
           # category buckets in .github/release-categories.yaml (shared
           # across all four release tracks). New types here fall into
           # the "Other" catch-all category by default; add to an explicit
