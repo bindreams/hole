@@ -8,9 +8,11 @@ versions line carries the real manifest versions and that no substitution was
 left unrendered. Also checks every `{src}` link in `docs/`: its path must be
 tracked in the repository and, for a Markdown target, its `#anchor` must match a
 heading there (GitHub's slug rules). A code fence that is never closed is
-reported in a page, a target and the README. Markdown is read with the parser the
-build itself uses, so it comes from `docs/requirements.txt` and not from this
-script: pages as MyST reads them, targets and the README as GitHub does. Every README link that starts with
+reported in a page, a target and the README. Pages are read as MyST reads them,
+targets and the README as GitHub does, with parsers pinned in
+`docs/requirements.txt` rather than in this script.
+
+Every README link that starts with
 `https://hole.readthedocs.io/en/latest/` must be the site root or `<page>.html`,
 where `docs/<page>.md` is tracked in the repository.
 
@@ -34,11 +36,15 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
 
+from docutils.parsers.rst.states import MarkupError
 from markdown_it import MarkdownIt
 from markdown_it.renderer import RendererHTML
 from markdown_it.token import Token
 from myst_parser.config.main import MdParserConfig
+from myst_parser.parsers.directives import parse_directive_text
 from myst_parser.parsers.mdit import create_md_parser
+from sphinx.directives.code import CodeBlock, LiteralInclude
+from sphinxcontrib.mermaid import Mermaid
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -65,31 +71,35 @@ CODE_REGION_RE = re.compile(r"<(pre|code)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNOR
 SRC_TITLED_RE = re.compile(r"^(.+?)\s*(?<!\x00)<([^<]*?)>$", re.DOTALL)
 
 # A README link into the published site: the page path after `/en/latest/`, if any.
-SITE_LINK_RE = re.compile(r"https://hole\.readthedocs\.io/en/latest/([^\s)#<>\"']*)")
+SITE_BASE = "https://hole.readthedocs.io/en/latest/"
+SITE_LINK_RE = re.compile(re.escape(SITE_BASE) + r"([^\s)#<>\"']*)")
 
-# Directives whose body is not Markdown: a role written in one is not a role. The
-# docutils, Sphinx, MyST, sphinx-design and sphinxcontrib-mermaid directives the
-# docs build registers whose body is code, RST, CSV or a list of document names.
+# GFM leaves these off the end of a bare URL in text.
+AUTOLINK_TRAILING = "?!.,:*_~"
+
+# Directives whose body is not Markdown, so a role written in one is not a role.
 LITERAL_DIRECTIVES = frozenset({
     "code",
     "code-block",
     "code-cell",
-    "csv-table",
-    "date",
     "eval-rst",
-    "line-block",
     "literalinclude",
     "math",
     "mermaid",
-    "meta",
-    "parsed-literal",
     "productionlist",
     "raw",
-    "replace",
     "role",
     "sourcecode",
     "toctree",
 })
+
+# The literal directives whose `:caption:` is inline Markdown, with the class that parses their options.
+CAPTIONED_DIRECTIVES = {
+    "code-block": CodeBlock,
+    "literalinclude": LiteralInclude,
+    "mermaid": Mermaid,
+    "sourcecode": CodeBlock,
+}
 
 # Sphinx writes these itself; their contents are not ours to check.
 GENERATED_PAGES = frozenset({"search.html", "genindex.html"})
@@ -130,20 +140,38 @@ def myst_parser() -> MarkdownIt:
     return create_md_parser(config, RendererHTML)
 
 
-def split_lines(text: str) -> list[str]:
-    """The lines of `text` as markdown-it numbers them."""
-    return re.split(r"\r\n|\r|\n", text)
+def block_map(token: Token) -> tuple[int, int]:
+    """The source lines a block token spans, 0-based and end-exclusive."""
+    assert token.map is not None, f"markdown-it gave a {token.type} token no source map"
+    return token.map[0], token.map[1]
 
 
-def fence_unclosed(fence: Token, lines: list[str]) -> bool:
+def fence_unclosed(fence: Token) -> bool:
     """Whether a fence token ended without a closing fence line.
 
-    The parser ends such a fence at the end of the file or of its container, so
-    its last line is not a fence of the same character and at least the same length.
+    A closed fence spans its opening line, its content and its closing line; an
+    unclosed one, which the parser ends at the end of the file or of its container,
+    has no closing line.
     """
-    start, end = fence.map or (0, 0)
-    closing = rf"[\s>]*{re.escape(fence.markup[0])}{{{len(fence.markup)},}}\s*"
-    return end - start < 2 or not re.fullmatch(closing, lines[end - 1])
+    start, end = block_map(fence)
+    content = fence.content
+    content_lines = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
+    return end - start == content_lines + 1
+
+
+def inline_tokens(parser: MarkdownIt, text: str) -> Iterator[Token]:
+    """The inline tokens of `text` parsed as one line of Markdown."""
+    for inline in parser.parseInline(text):
+        yield from inline.children or []
+
+
+def caption_tokens(parser: MarkdownIt, directive: str, argument: str, body: str) -> Iterator[Token]:
+    """The inline tokens of a literal directive's `:caption:` option, if it has one."""
+    try:
+        options = parse_directive_text(CAPTIONED_DIRECTIVES[directive], argument.strip(), body).options
+    except MarkupError:
+        return  # The docs build reports a malformed directive.
+    yield from inline_tokens(parser, options.get("caption") or "")
 
 
 def leaf_tokens(parser: MarkdownIt, text: str, directives: bool, offset: int = 0) -> Iterator[tuple[int, Token]]:
@@ -155,10 +183,9 @@ def leaf_tokens(parser: MarkdownIt, text: str, directives: bool, offset: int = 0
     also yields a token of type `unclosed_fence` on its opening line. With
     `directives`, `parser` is the MyST parser and a MyST directive fence (info
     string `{name}`) is read too: its argument as inline Markdown and its body as
-    Markdown, unless the body is literal (`LITERAL_DIRECTIVES`); the nested lines
-    are offset to the page's.
+    Markdown, unless the directive is literal (`LITERAL_DIRECTIVES`), where only a
+    caption is read (`CAPTIONED_DIRECTIVES`); the nested lines are offset to the page's.
     """
-    lines = split_lines(text)
     for token in parser.parse(text):
         if token.map is None:
             continue
@@ -172,15 +199,17 @@ def leaf_tokens(parser: MarkdownIt, text: str, directives: bool, offset: int = 0
         yield line, token
         if token.type != "fence":
             continue
-        if fence_unclosed(token, lines):
+        if fence_unclosed(token):
             yield line, Token("unclosed_fence", "", 0)
         if directives and token.info.startswith("{"):
             name, _, argument = token.info[1:].partition("}")
+            if name in CAPTIONED_DIRECTIVES:
+                for child in caption_tokens(parser, name, argument, token.content):
+                    yield line, child
             if name in LITERAL_DIRECTIVES:
                 continue
-            for inline in parser.parseInline(argument.strip()):
-                for child in inline.children or []:
-                    yield line, child
+            for child in inline_tokens(parser, argument.strip()):
+                yield line, child
             yield from leaf_tokens(parser, token.content, directives, line)
 
 
@@ -222,9 +251,7 @@ def read_target(markdown_file: Path) -> Target:
     then, for a slug already taken, the next free `-1`, `-2`, ... suffix. The file
     is read once per run.
     """
-    text = markdown_file.read_text(encoding="utf-8")
-    lines = split_lines(text)
-    tokens = github_parser().parse(text)
+    tokens = github_parser().parse(markdown_file.read_text(encoding="utf-8"))
     occurrences: dict[str, int] = {}
     for heading, inline in zip(tokens, tokens[1:]):
         if heading.type != "heading_open":
@@ -234,9 +261,7 @@ def read_target(markdown_file: Path) -> Target:
             occurrences[base] += 1
             slug = f"{base}-{occurrences[base]}"
         occurrences[slug] = 0
-    unclosed = tuple(
-        token.map[0] + 1 for token in tokens if token.type == "fence" and token.map and fence_unclosed(token, lines)
-    )
+    unclosed = tuple(block_map(token)[0] + 1 for token in tokens if token.type == "fence" and fence_unclosed(token))
     return Target(frozenset(occurrences), unclosed)
 
 
@@ -265,11 +290,12 @@ def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
                 continue
             titled = SRC_TITLED_RE.match(token.content)
             target = titled.group(2) if titled else token.content
-            path, _, anchor = target.partition("#")
+            location, _, anchor = target.partition("#")
+            path, query, _ = location.partition("?")
             is_dir = any(name.startswith(path.rstrip("/") + "/") for name in tracked)
             if path not in tracked and not is_dir:
                 problems.append(f"{where}:{number}: {{src}} path is not tracked in the repository: {path!r}")
-            elif anchor and path.endswith(".md") and path in tracked:
+            elif anchor and not query and path.endswith(".md") and path in tracked:
                 target_file = repo_root / path
                 if not target_file.is_file():
                     problems.append(f"{where}:{number}: {{src}} path is tracked but missing on disk: {path!r}")
@@ -309,18 +335,21 @@ def readme_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
         else:
             continue
         for link in SITE_LINK_RE.finditer(str(text)):
-            page = link.group(1)
+            written = link.group(1)
+            if token.type == "text":
+                written = written.rstrip(AUTOLINK_TRAILING)
+            url = SITE_BASE + written
+            page = written.partition("?")[0]
             if page.endswith(".html"):
                 source = f"docs/{page.removesuffix('.html')}.md"
             elif page == "":
                 source = "docs/index.md"
             else:
-                problems.append(f"README.md:{number}: site link is not a page or the site root: {link.group(0)!r}")
+                problems.append(f"README.md:{number}: site link is not a page or the site root: {url!r}")
                 continue
             if source not in tracked:
                 problems.append(
-                    f"README.md:{number}: site link's page source {source!r} is not tracked in the repository: "
-                    f"{link.group(0)!r}"
+                    f"README.md:{number}: site link's page source {source!r} is not tracked in the repository: {url!r}"
                 )
     return problems
 
@@ -358,9 +387,8 @@ def main() -> int:
     # leaves deleted pages behind for check_rendered to trip over.
     with tempfile.TemporaryDirectory(prefix="hole-docs-") as out:
         out_dir = Path(out)
-        # Output is inherited: capturing it would silence the warnings this
-        # script exists to surface.
-        # This interpreter holds the docs requirements, Sphinx included.
+        # `sys.executable` holds the docs requirements. Output is inherited: capturing
+        # it would silence the warnings this script exists to surface.
         build = subprocess.run(
             [sys.executable, "-m", "sphinx", "-W", "-b", "html", str(REPO_ROOT / "docs"), str(out_dir)],
             cwd=REPO_ROOT,
@@ -677,10 +705,11 @@ def test_readme_links_ignore_code_and_read_html_and_bare_urls(tmp_path: Path) ->
     assert [problem.split(": ")[0] for problem in problems] == ["README.md:7", "README.md:9"]
 
 
-def test_the_parsers_come_from_the_docs_build() -> None:
-    """The build's own parser, not a pin of this script's."""
-    assert myst_parser().options["myst_config"].enable_extensions == set(docs_conf.myst_enable_extensions)
-    assert "myst_role" in myst_parser().inline.ruler.get_all_rules()
+def test_the_myst_parser_applies_the_docs_build_extensions() -> None:
+    """`docs/conf.py` enables `substitution`; MyST's defaults do not."""
+    inline = myst_parser().parseInline("{{ hole_version }} and {src}`x`")[0].children or []
+
+    assert [token.type for token in inline if token.type != "text"] == ["substitution_inline", "myst_role"]
 
 
 def test_site_links_end_at_a_quote_in_html(tmp_path: Path) -> None:
@@ -753,11 +782,66 @@ def test_an_empty_unclosed_fence_at_the_end_of_a_page_is_reported(tmp_path: Path
     assert len(src_link_problems(tmp_path, tracked)) == 1
 
 
-def test_src_roles_are_not_read_in_any_literal_directive(tmp_path: Path) -> None:
-    page = "".join(f"```{{{name}}}\n{{src}}`ignored.rs`\n```\n\n" for name in sorted(LITERAL_DIRECTIVES))
+def test_src_roles_are_not_read_in_the_body_of_a_literal_directive(tmp_path: Path) -> None:
+    literal = "code-block code-cell eval-rst literalinclude math mermaid raw sourcecode toctree".split()
+    page = "".join(f"```{{{name}}}\n{{src}}`ignored.rs`\n```\n\n" for name in literal)
     tracked = _write_repo(tmp_path, {"docs/a.md": page})
 
     assert src_link_problems(tmp_path, tracked) == []
+
+
+def test_src_roles_are_read_in_the_body_of_a_directive_that_parses_markup(tmp_path: Path) -> None:
+    """Probed against a Sphinx build: each of these renders a role in its body as a link."""
+    names = ["csv-table", "line-block", "parsed-literal"]
+    page = "".join(f"```{{{name}}}\n{{src}}`nope.rs`\n```\n\n" for name in names)
+    tracked = _write_repo(tmp_path, {"docs/a.md": page})
+
+    assert len(src_link_problems(tmp_path, tracked)) == 3
+
+
+def test_src_roles_are_read_in_a_literal_directive_caption(tmp_path: Path) -> None:
+    page = (
+        "```{code-block} sh\n:caption: See {src}`one.rs`\n\nx\n```\n\n"
+        "```{mermaid}\n:caption: See {src}`two.rs`\n\ngraph TD\n```\n\n"
+        "```{literalinclude} f.rs\n:caption: See {src}`three.rs`\n```\n\n"
+        "```{code-block} sh\n{src}`ignored.rs`\n```\n"
+    )
+    tracked = _write_repo(tmp_path, {"docs/a.md": page})
+
+    problems = src_link_problems(tmp_path, tracked)
+
+    assert [problem.split(": ")[0] for problem in problems] == ["docs/a.md:1", "docs/a.md:7", "docs/a.md:13"]
+
+
+def test_src_roles_are_read_in_a_csv_table_title(tmp_path: Path) -> None:
+    tracked = _write_repo(tmp_path, {"docs/a.md": "~~~{csv-table} Title {src}`nope.rs`\na,b\n~~~\n"})
+
+    assert len(src_link_problems(tmp_path, tracked)) == 1
+
+
+def test_a_src_target_with_a_query_is_checked_without_it(tmp_path: Path) -> None:
+    page = "{src}`T <T.md?plain=1#L3>` {src}`T <T.md?plain=1>` {src}`T <nope.md?plain=1#L3>`\n"
+    tracked = _write_repo(tmp_path, {"docs/a.md": page, "T.md": "# Only\n"})
+
+    problems = src_link_problems(tmp_path, tracked)
+
+    assert len(problems) == 1
+    assert "'nope.md'" in problems[0]
+
+
+def test_readme_text_links_lose_trailing_punctuation_and_queries(tmp_path: Path) -> None:
+    site = "https://hole.readthedocs.io/en/latest/reference/cli.html"
+    (tmp_path / "README.md").write_text(
+        f"see {site}. Or {site}, {site}? {site}?x=1 and ({site}) {site}.\n\n[x]({site}?y=2)\n", encoding="utf-8"
+    )
+
+    assert readme_link_problems(tmp_path, frozenset({"docs/index.md", "docs/reference/cli.md"})) == []
+
+
+def test_a_readme_link_destination_is_not_trimmed(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("[x](https://hole.readthedocs.io/en/latest/cli.html.)\n", encoding="utf-8")
+
+    assert len(readme_link_problems(tmp_path, frozenset({"docs/index.md", "docs/cli.md"}))) == 1
 
 
 def test_src_roles_are_read_in_a_directive_argument(tmp_path: Path) -> None:
@@ -769,3 +853,51 @@ def test_src_roles_are_read_in_a_directive_argument(tmp_path: Path) -> None:
 
     assert len(problems) == 1
     assert "a.md:1" in problems[0] and "nope.rs" in problems[0]
+
+
+def test_a_fence_closed_by_a_shorter_run_is_unclosed(tmp_path: Path) -> None:
+    tracked = _write_repo(tmp_path, {"docs/a.md": "````\ncode\n```\n"})
+
+    problems = src_link_problems(tmp_path, tracked)
+
+    assert len(problems) == 1
+    assert "docs/a.md:1" in problems[0]
+
+
+def test_a_fence_is_closed_only_by_its_own_character(tmp_path: Path) -> None:
+    closed = _write_repo(tmp_path, {"docs/a.md": "~~~\ncode\n```\n\n```\n~~~\n"})
+    unclosed = _write_repo(tmp_path, {"docs/b.md": "~~~\ncode\n```\n"})
+
+    problems = src_link_problems(tmp_path, closed | unclosed)
+
+    assert len(problems) == 1
+    assert "docs/b.md:1" in problems[0]
+
+
+def test_a_closing_fence_indented_past_its_container_is_content(tmp_path: Path) -> None:
+    pages = {
+        "docs/a.md": "```\ncode\n    ```\n",
+        "docs/b.md": "1. step\n\n   ```sh\n   cmd\n       ```\n",
+        "docs/c.md": "> ```\n> x\n> > ```\n",
+    }
+    tracked = _write_repo(tmp_path, pages)
+
+    assert len(src_link_problems(tmp_path, tracked)) == 3
+
+
+def test_a_fence_followed_by_blank_lines_at_the_end_is_unclosed(tmp_path: Path) -> None:
+    tracked = _write_repo(tmp_path, {"docs/a.md": "```\ncode\n\n\n"})
+
+    assert len(src_link_problems(tmp_path, tracked)) == 1
+
+
+def test_an_unclosed_fence_is_reported_at_its_line_in_a_crlf_file(tmp_path: Path) -> None:
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "a.md").write_bytes(b"one\r\ntwo\r\n```sh\r\ncode\r\n")
+    (tmp_path / "README.md").write_bytes(b"one\r\ntwo\r\n```sh\r\ncode\r\n")
+
+    page = src_link_problems(tmp_path, frozenset())
+    readme = readme_link_problems(tmp_path, frozenset())
+
+    assert len(page) == 1 and "docs/a.md:3" in page[0]
+    assert len(readme) == 1 and "README.md:3" in readme[0]
