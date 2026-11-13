@@ -20,6 +20,9 @@ repository, and expect it to change until a second consumer has shaped it.
 ```toml
 [dependencies]
 tun-engine = { git = "https://github.com/bindreams/hole" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-util = "0.7"
 ```
 
 A `Router` has two methods, one per flow. This one drops everything; a real one would splice the flow to an upstream,
@@ -72,7 +75,8 @@ Opening the device and changing routes needs an elevated process (administrator 
 - `engine`: the packet loop, `Engine`, and the `Router` trait it dispatches to.
 - `routing`: a `Routing` trait and `SystemRouting`, which installs and removes the split routes with `netsh` on Windows
   and `route` on macOS. It records what it installed in a state file so a crashed run can be cleaned up, and it can
-  install a fail-closed cover that blocks the machine's egress except to loopback and the proxy server.
+  install a fail-closed cover that blocks the machine's egress except to loopback, the proxy server and, when a plugin
+  needs one, the DoH resolver it fetches ECH configs from.
 - `gateway`: finds the default gateway and its interface.
 - `helpers`: SOCKS5 CONNECT and UDP ASSOCIATE clients, and sockets bound to a chosen interface to bypass the tunnel.
 - `dns_steer` (macOS) publishes a resolver that sends the operating system's DNS to the tunnel; `dns_confine` (Windows)

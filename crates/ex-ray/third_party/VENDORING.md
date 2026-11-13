@@ -16,13 +16,13 @@ Patched so ex-ray's TLS engine survives real-world ECH:
 ### The ECH patch in v2ray-core
 
 - **Fail-closed gate.** Client dials build their TLS config through `(*tls.Config).GetTLSConfigForClient` (ECH-capable
-  transports) or `GetTLSConfigForUnsupportedClient` (engines that cannot do ECH: uTLS, hysteria2).
+  transports) or `GetTLSConfigForUnsupportedClient` (engines that cannot do ECH: hysteria2, and the uTLS presets whose ClientHello cannot carry an ECH extension).
   `RequireEchSatisfied` aborts an `ech=always` dial that cannot obtain an ECH config, so the real SNI is never sent in
   cleartext. Server listeners keep calling bare `GetTLSConfig`.
 - **`retry_configs` recovery (RFC 9849).** On an `*tls.ECHRejectionError`, `DialClientWithECHRetry` retries once with the
-  server-provided configs and refreshes the ECH cache through `RefreshECHCache`. It is wired for tcp, websocket, http,
-  quic and the `transportcommon` transports (httpupgrade and request-assembly). gRPC has no `security.Engine` seam, so it
-  is not wired; hysteria2 cannot do ECH.
+  server-provided configs and refreshes the ECH cache through `RefreshECHCache`. It is wired for tcp, websocket, http, uTLS
+  and the `transportcommon` transports (httpupgrade and request-assembly); quic does the same with its own
+  `dialQUICWithECHRetry`. gRPC has no `security.Engine` seam, so it is not wired; hysteria2 cannot do ECH.
 
 ### What guards the patches on a bump
 

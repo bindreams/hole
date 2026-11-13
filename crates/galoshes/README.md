@@ -4,8 +4,8 @@ galoshes is a [SIP003](https://shadowsocks.org/doc/sip003.html) plugin for Shado
 It is [Hole](https://github.com/bindreams/hole)'s UDP-capable plugin. It puts every TCP connection and every UDP
 exchange from the client on its own numbered stream inside one connection to the server, using the
 [yamux](https://github.com/hashicorp/yamux/blob/master/spec.md) multiplexing protocol, and sends that one connection
-through an [ex-ray](https://github.com/bindreams/hole/tree/main/crates/ex-ray) built into the same program. To
-the network, that connection looks the way an ex-ray connection does.
+through an [ex-ray](https://github.com/bindreams/hole/tree/main/crates/ex-ray) that is embedded in the galoshes binary
+and runs as a child process. To the network, that connection looks the way an ex-ray connection does.
 
 ## Who it is for
 
@@ -22,7 +22,8 @@ The server needs galoshes too. A stock plugin does not know the multiplexing lay
 
 Download the binary for your platform from a release tagged `releases/galoshes/v<version>` on the
 [releases page](https://github.com/bindreams/hole/releases). Releases cover Windows, macOS and Linux, each on amd64 and
-arm64, and the file is named `galoshes-<version>-<os>-<arch>` (`.exe` on Windows). ex-ray is inside it, so there is
+arm64, and the file is named `galoshes-<version>-<os>-<arch>`, where `<os>` is `windows`, `darwin` or `linux` and
+`<arch>` is `amd64` or `arm64` (`.exe` on Windows). ex-ray is inside it, so there is
 nothing else to install. galoshes is not published to crates.io.
 
 ## Use
@@ -41,8 +42,9 @@ tls;host=example.com;path=/ws
   would only add overhead. ex-ray reads the first value it finds for an option, so a `mux=` you write earlier wins. Both
   ends must agree: a client with `mux=0` cannot reach a server whose ex-ray expects `mux=1`.
 - `udp_timeout=<seconds>` is galoshes' own option: how long the client keeps an idle UDP association before evicting it.
-  The default is `DEFAULT_UDP_TIMEOUT` in [`yamux.rs`](src/yamux.rs). The value must be a positive whole number, and a
-  value that is not one stops galoshes from starting.
+  The default is `DEFAULT_UDP_TIMEOUT` in [`yamux.rs`](src/yamux.rs). The value must be a positive whole number of
+  seconds small enough to be a deadline from now. If any occurrence of the option is not, galoshes does not start,
+  even when an earlier occurrence is valid.
 
 galoshes speaks [sitrep](https://github.com/bindreams/hole/blob/main/crates/garter/SITREP.md) on its standard output to
 report readiness, so its logs go to standard error.

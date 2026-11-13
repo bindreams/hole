@@ -8,9 +8,11 @@ ordinary web traffic. It is [Hole](https://github.com/bindreams/hole)'s own plug
 ## Who it is for
 
 - **People who run a Shadowsocks server or client** and want a plugin that is wire-compatible with
-  [`shadowsocks/v2ray-plugin`](https://github.com/shadowsocks/v2ray-plugin): ex-ray talks to a stock v2ray-plugin
-  server, and a stock v2ray-plugin client talks to an ex-ray server. That makes it the way to pair a Hole client with a
-  server that already runs v2ray-plugin, or the other way around.
+  [`shadowsocks/v2ray-plugin`](https://github.com/shadowsocks/v2ray-plugin): over WebSocket, ex-ray talks to a stock
+  v2ray-plugin server, and a stock v2ray-plugin client talks to an ex-ray server. That makes it the way to pair a Hole
+  client with a server that already runs v2ray-plugin, or the other way around. Over QUIC only a stock client against an
+  ex-ray server is tested: the stock plugin panics as a QUIC server when built with Go 1.24 or later, so ex-ray's client
+  against it is not.
 - **People who want its additions:** Encrypted Client Hello and a tighter TCP keepalive, both below.
 
 If you use the Hole app you already have ex-ray: Hole ships it and runs it for you.
@@ -23,7 +25,8 @@ so it can have bugs the upstream project does not, and can fix ones it has. Its 
 
 Download the binary for your platform from a release tagged `releases/ex-ray/v<version>` on the
 [releases page](https://github.com/bindreams/hole/releases). Releases cover Windows, macOS and Linux, each on amd64
-and arm64, and the file is named `ex-ray-<version>-<os>-<arch>` (`.exe` on Windows). To build it yourself,
+and arm64, and the file is named `ex-ray-<version>-<os>-<arch>`, where `<os>` is `windows`, `darwin` or `linux` and
+`<arch>` is `amd64` or `arm64` (`.exe` on Windows). To build it yourself,
 `cargo xtask ex-ray` builds it; the [contributor guide](https://hole.readthedocs.io/en/latest/contributing/index.html)
 starts from a clean machine.
 
@@ -37,8 +40,10 @@ options go in `SS_PLUGIN_OPTIONS`, separated by semicolons. A typical client:
 tls;host=example.com;path=/ws
 ```
 
-The same string with `server` added runs the server end; a TLS server also needs a certificate (`cert` and `key`). TLS is off unless `tls` is set, and the transport is
-WebSocket unless `mode=quic` says otherwise (QUIC always uses TLS). `ex-ray -h` lists every option with its default.
+The same string with `server` added runs the server end. A TLS server needs a certificate: `cert` and `key` point to
+it, and default to the files `acme.sh` leaves under `~/.acme.sh/<host>/`. TLS is off unless `tls` is set, and the
+transport is WebSocket unless `mode=quic` says otherwise (QUIC always uses TLS). `ex-ray -h` lists every option with its
+default.
 
 ex-ray also speaks [sitrep](https://github.com/bindreams/hole/blob/main/crates/garter/SITREP.md) to the program that
 started it: a line-delimited JSON stream on standard output that reports readiness and any start failure. Everything
@@ -48,8 +53,9 @@ else it and v2ray-core log goes to standard error.
 
 ECH keeps the real server name out of the cleartext TLS handshake. It needs `tls`, and two options control it:
 
-- `ech-doh=<DoH URL>` is where ex-ray fetches the server's ECH config. It is empty by default, which turns ECH off;
-  Hole sets it for you.
+- `ech-doh=<DoH URL>` is where ex-ray fetches the server's ECH config. It is empty by default, which turns ECH off.
+  Hole supplies its own when it starts ex-ray, except where an `ech-doh` you wrote stays in place or `ech=never`
+  makes it moot.
 - `ech=auto|always|never` is the policy, `auto` by default. `auto` uses ECH when a config can be fetched and otherwise
   connects with the name in the clear. `always` never sends the name in the clear: a dial that cannot get a config
   fails, and ex-ray refuses to start without `tls` or without `ech-doh`. `never` leaves ECH off.
@@ -57,7 +63,7 @@ ECH keeps the real server name out of the cleartext TLS handshake. It needs `tls
 When a server has rotated its ECH key, the client's old config is rejected and the rejection carries the new ones. ex-ray
 retries once with them and refreshes its cached copy.
 
-[ECH and DoH](https://hole.readthedocs.io/en/latest/how-it-works/ech-and-doh.html) explains how Hole uses this.
+[ECH and DoH](https://hole.readthedocs.io/en/latest/how-it-works/ech-and-doh.html) explains how Hole chooses the resolver.
 
 ## TCP keepalive
 
@@ -65,8 +71,8 @@ A connection to the server that a network silently black-holes stays open and id
 the keepalive of the socket it opens to the server, so the kernel gives up on a dead connection sooner.
 
 `tcp-keepalive=<seconds>` is the idle time before probing starts; its default is `tcpKeepAliveDefault` in
-[`config.go`](config.go). A fixed number of probes (`keepAliveProbeCount`) then follows at the same spacing, so a dead
-idle connection is dropped after about the idle time plus the probes. `tcp-keepalive=0` turns keepalive off on that
+[`config.go`](config.go). `keepAliveProbeCount` probes then follow, each spaced by that same idle time, so a dead idle
+connection is dropped after about the idle time plus `keepAliveProbeCount` more of the same length. `tcp-keepalive=0` turns keepalive off on that
 connection, including Go's own default keepalive, which is a full opt-out and not a return to the old behaviour.
 
 It applies to the client's TCP connection to the server whatever `mux` says. It does nothing in `mode=quic`, which

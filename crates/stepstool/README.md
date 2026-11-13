@@ -5,8 +5,9 @@ elevated rights. The parent never gains or sheds privilege; only the child it st
 credential priming and sudo-wrapped command construction on Unix, and elevation detection on Windows.
 
 It is part of [Hole](https://github.com/bindreams/hole), a Shadowsocks client, where its callers are the developer
-console (which runs the privileged bridge as one such child) and the `hole` binary (which asks whether it is already
-privileged).
+console (which runs the privileged bridge as one such child, using `prime_sudo`, `require_elevated` and
+`preserve_env_arg` and building its own `sudo` command line) and the `hole` binary (which asks whether it is already
+privileged). Nothing in the repository calls `sudo_command` yet.
 
 ## Who it is for
 
@@ -39,9 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `prime_sudo` checks for cached credentials and, when there are none, runs `sudo -v` so sudo asks for the password on the
-terminal. `sudo_command` builds a `Command` that runs `program` under sudo and keeps the listed environment variables
-through sudo's scrub; pass an absolute path, since sudo's `secure_path` ignores the caller's `PATH`. `preserve_env_arg` builds just the
-`--preserve-env=` argument, for callers that assemble the sudo command line themselves.
+terminal. `sudo_command` builds a `Command` that runs `program` under sudo and asks sudo to keep the listed environment
+variables through its scrub (`--preserve-env`; a sudoers policy can still refuse it). Pass an absolute path, since
+sudo's `secure_path` ignores the caller's `PATH`. `preserve_env_arg` builds just the `--preserve-env=` argument, for
+callers that assemble the sudo command line themselves.
 
 On Windows, `is_elevated` reports whether the process token is elevated, and `require_elevated` fails with `NotElevated`
 when it is not. `is_privileged` answers the same question on every platform: root on Unix, an elevated token on Windows.
