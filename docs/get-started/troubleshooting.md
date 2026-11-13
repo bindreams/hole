@@ -41,16 +41,20 @@ connection.
 
 ## When connecting fails
 
-If Hole says **Connection failed**, a message explains why. Hole shows the first two messages below and the
-network-blocked message as they are. Every other message comes from the {term}`bridge` and is shown after the prefix
-"Bridge error:", for instance "Bridge error: server hostname is not a valid DNS name". The messages below that begin with
-a lower-case letter are the ones that follow the prefix. Where a message contains "(1234ms)", the number is how long the
-attempt ran, in milliseconds, and differs from case to case.
+If Hole says **Connection failed**, a message explains why. Hole writes the first six messages below, and the
+network-blocked one, itself and shows them as they are. Every other row is a message the {term}`bridge` sent, and Hole
+puts the prefix "Bridge error:" in front of it, for instance "Bridge error: server hostname is not a valid DNS name". The
+rows that begin with a lower-case letter are shown after that prefix. Where a message contains "(1234ms)", the number is how long
+the attempt ran, in milliseconds, and differs from case to case.
 
 | Message                                                                                                                                            | What it usually means                                                                                                                                                                                  |
 | -------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | No server is selected. Open the Dashboard and select a server before connecting.                                                                   | Click a server card to select it.                                                                                                                                                                      |
 | The Hole bridge must be installed to connect.                                                                                                      | You chose **Later** at the setup prompt. Connect again and choose **Install**. See [Install](install.md#why-hole-asks-for-administrator-rights).                                                       |
+| An interrupted uninstall or update left Hole's service disabled; it must be repaired to connect.                                                   | You declined the **Repair** prompt. Connect again and choose **Repair**.                                                                                                                               |
+| The Hole service is disabled on this computer; it must be enabled to connect.                                                                      | You declined the **Enable** prompt. Connect again and choose **Enable**.                                                                                                                               |
+| The Hole service is being changed by an uninstall, a repair or an update that is in progress. Try again when it finishes.                          | Wait for that to finish, then connect again.                                                                                                                                                           |
+| Another connect or disconnect is already in progress.                                                                                              | Wait for the one in progress to finish.                                                                                                                                                                |
 | The network is blocking the connection to this server ...                                                                                          | Same as the test result of that name above.                                                                                                                                                            |
 | Nothing came back through the tunnel (1234ms). Either the proxy connection could not be established, or the server cannot reach your DNS resolver. | Check the server with **Test**. If it passes, try another **Resolver** in [Settings](settings.md#dns-forwarder).                                                                                       |
 | Could not open a connection into the tunnel (1234ms). Every attempt to open one failed outright.                                                   | Hole cannot tell which side refused: the local proxy, or the connection onward to the server. Check the server with **Test**.                                                                          |
@@ -70,35 +74,31 @@ A message that is not here, or one that keeps coming back, is a reason to [colle
 
 Hole changes the computer's routes and DNS settings to send traffic through the tunnel, and it puts them back when it
 disconnects. If it is stopped in the middle, or the {term}`kill switch` is holding traffic back, the computer can be left
-without internet. Work down this list and stop when the internet is back. The first three steps need no terminal; the last resorts after them do.
+without internet. Work down this list and stop when the internet is back. The first two steps need no terminal; the last
+one is for someone technical.
 
-1. **Disconnect.** Click the power button, or choose **Disconnect** in the {term}`tray` menu. If the cause was a brief
-   drop with Lockdown on, this lifts the block.
-
-1. **Unblock Network.** If the tray menu shows **Unblock Network (disconnects, turns Lockdown off)**, choose it. It
-   disconnects, removes the block and turns the {term}`kill switch` off.
+1. **Disconnect or Unblock Network.** Click the power button, or choose **Disconnect** in the {term}`tray` menu. If the
+   tray menu shows **Unblock Network (disconnects, turns Lockdown off)**, choose that instead: it disconnects, removes
+   the block and turns the {term}`kill switch` off.
 
 1. **Restart the computer.** Hole's bridge starts with the computer, and when it starts it cleans up the routes, DNS
-   settings and plugin processes that a crashed run left behind. A restart does not lift a block while Lockdown is still
-   on: the bridge starts again and the block it left stays in force until Disconnect, Unblock Network or
-   `hole bridge unlock` lifts it.
+   settings and plugin processes that a crashed run left behind. If **Unblock Network** is in the tray menu afterwards,
+   choose it.
 
-### Last resorts, for someone comfortable with a terminal
-
-The steps below need an administrator terminal. If the person at the computer is not comfortable with one, they are for
-someone technical to do, in person.
-
-1. **Stop the bridge, then run `hole bridge unlock`**, if Lockdown is still blocking traffic and Hole's app cannot reach
-   its bridge. `hole bridge unlock` turns Lockdown off and clears the block it left behind, but it refuses while any
-   bridge is running, reachable or not. Its message then tells you to use **Unblock Network**, which cannot help here,
-   and a restart only starts the bridge again. So stop the bridge first, in an administrator terminal:
+1. **Last resort, for someone comfortable with a terminal.** The steps below need an administrator terminal. If the
+   person at the computer is not comfortable with one, they are for someone technical to do, in person. `hole bridge unlock` refuses while any bridge is running, including one the app cannot reach, so stop the service first, the way
+   the bridge stops itself, and then unlock.
 
    On Windows, in PowerShell run as administrator:
 
    ```powershell
    Stop-Service -Name HoleBridge -Force
-   hole bridge unlock
+   Start-Process -Wait -FilePath hole -ArgumentList 'bridge', 'unlock'
    ```
+
+   `hole.exe` is a graphical program that attaches to the terminal, so a plain `hole bridge unlock` can hand the prompt
+   back before it has finished. `Start-Process -Wait` makes PowerShell wait. Hole's messages may not appear in the
+   window; whether they do has not been measured. If you cannot tell that it finished, run the line again.
 
    On a Mac, in Terminal:
 
@@ -107,41 +107,47 @@ someone technical to do, in person.
    sudo /Applications/Hole.app/Contents/MacOS/hole bridge unlock
    ```
 
-   See the [command line reference](../reference/cli.md#hole-bridge-unlock). The bridge starts again the next time the
+   If stopping the service fails or does not finish, restart the computer and begin again from the top of this list. See
+   the [command line reference](../reference/cli.md#hole-bridge-unlock). The bridge starts again the next time the
    computer starts.
 
-1. **Run the network reset script**, if the cleanup did not fix it. The script is not installed with Hole: it is
-   `scripts/network-reset.py` in [Hole's repository](https://github.com/bindreams/hole), and needs `scripts/_lib.py`
-   saved in the same folder. You need Python 3.9 or newer, and you may have to fetch the two files from another computer
-   or a phone, since this computer has no internet.
+If that did not fix it, run the network reset script. It is also for someone technical.
 
-   Run it from an administrator terminal. On Windows, open PowerShell as administrator and run:
+### The network reset script
 
-   ```powershell
-   python network-reset.py
-   ```
+The script is not installed with Hole: it is `scripts/network-reset.py` in
+[Hole's repository](https://github.com/bindreams/hole), and needs `scripts/_lib.py` saved in the same folder. You need
+Python 3.9 or newer, and you may have to fetch the two files from another computer or a phone, since this computer has
+no internet.
 
-   On a Mac, in Terminal:
+Run it from an administrator terminal. On Windows, open PowerShell as administrator and run:
 
-   ```sh
-   sudo python3 network-reset.py
-   ```
+```powershell
+python network-reset.py
+```
 
-   What it does depends on the platform. Both remove Hole's four split routes, restore the DNS settings Hole recorded
-   and flush the DNS cache; both need Hole's route record to find the host route that leads to the server, and print how
-   to remove that route by hand when the record is missing or unreadable.
+On a Mac, stop the bridge's launchd job first, so launchd does not start the bridge again behind the script, and then run
+it:
 
-   - **Windows:** it stops the `HoleBridge` service, ends any bridge process and any `ex-ray` process, and removes Hole's
-     network adapter.
-   - **macOS:** it ends bridge processes and `ex-ray` processes, and flushes the route table. It does not remove an
-     adapter. The bridge's launchd job is set to be kept running, so launchd may start the bridge again afterwards.
+```sh
+sudo launchctl bootout system/com.hole.bridge
+sudo python3 network-reset.py
+```
 
-   The script does not stop `galoshes`, the other plugin Hole ships, so a `galoshes` process left behind by a crashed
-   connection survives it. Restart the computer afterwards. If DNS still looks wrong, run it again with
-   `--force-dns-restore`: by default it restores only DNS settings that still look like Hole's own.
+What it does depends on the platform. Both remove Hole's four split routes, restore the DNS settings Hole recorded and
+flush the DNS cache; both need Hole's route record to find the host route that leads to the server, and print how to
+remove that route by hand when the record is missing or unreadable.
 
-The script does not remove the block that Lockdown installs. Disconnect, Unblock Network and `hole bridge unlock` are
-the steps that lift it.
+- **Windows:** it stops the `HoleBridge` service, ends any bridge process and any `ex-ray` process, and removes Hole's
+  network adapter.
+- **macOS:** it ends bridge processes and `ex-ray` processes, and flushes the route table. It does not remove an adapter.
+
+The script does not stop `galoshes`, the other plugin Hole ships, so a `galoshes` process left behind by a crashed
+connection survives it. Restart the computer afterwards. If DNS still looks wrong, run it again with
+`--force-dns-restore`: by default it restores only DNS settings that still look like Hole's own.
+
+The script does not remove the block that Lockdown installs. Disconnect, Unblock Network and `hole bridge unlock` are the
+steps that lift it.
 
 ## Collect the logs
 

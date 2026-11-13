@@ -132,11 +132,8 @@ The menu shows the status, a **Connect** or **Disconnect** item, **Start at Logi
 **Exit**. When a new version is found, an **Install Update (v...)** item with the version appears too, and while a block
 is in force, an **Unblock Network** item.
 
-**Lockdown** is the {term}`kill switch`. Click it to turn it on or off. Once it is on and Hole connects, traffic that
-would leave outside the tunnel is blocked while Hole is connecting or connected, so a dropped connection does not quietly
-send your traffic around the tunnel. It is off by default. If you turn it on while already connected, nothing is blocked
-until the next time you connect. The [settings page](settings.md#the-tray-menu) explains what it blocks and how to lift
-it.
+**Lockdown** is the {term}`kill switch`. Click it to turn it on or off; it is off by default. The
+[settings page](settings.md#the-tray-menu) explains the menu item and how to lift a block.
 
 ## Next
 
