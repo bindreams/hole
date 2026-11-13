@@ -79,7 +79,8 @@ The recovery route for a {term}`kill switch` block that nothing else can lift: i
 administrator (`sudo` on macOS, with the full path to the binary, as above). In order, it records that Hole should not be connected, removes the standing block,
 clears the server remembered for the **Always connect** startup choice, and records the kill switch as off. It stops with
 an error before changing anything if a bridge is running: the message names the app's **Unblock Network** action as the
-route to use then. On Windows it may print a warning that it could not prove every boot-time filter gone.
+route to use then; when the app cannot reach the running bridge, stop the bridge service first, as
+[Troubleshooting](../get-started/troubleshooting.md#when-the-internet-stops-working) shows. On Windows it may print a warning that it could not prove every boot-time filter gone.
 
 Exit status is 0 on success and 1 on failure. Source: `unlock` in {src}`crates/bridge/src/cutover.rs`.
 

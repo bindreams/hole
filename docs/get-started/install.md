@@ -14,8 +14,9 @@ the file that matches the computer:
 | Mac with Apple silicon (M1 or later) | `hole-<version>-darwin-arm64.dmg`  |
 | Mac with an Intel processor          | `hole-<version>-darwin-amd64.dmg`  |
 
-`<version>` stands for the release's version number. The other files in the list (`.zip`, `.tar.gz`, `SHA256SUMS`) are
-for Hole's own updater; you do not need them.
+`<version>` stands for the release's version number. The `.zip`, `.tar.gz` and `SHA256SUMS.minisig` files in the
+list are for Hole's own updater; you do not need them. `SHA256SUMS` is the one to use for checking your
+download, as described below, and the updater reads it too.
 
 ````{tab-set}
 ---

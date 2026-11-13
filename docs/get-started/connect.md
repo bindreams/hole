@@ -102,7 +102,8 @@ A connected Hole. The address and flag are the server's.
 
 Hole looks the address up with a request to Cloudflare, so Cloudflare sees it; while connected, the request goes through
 the tunnel. It runs when the connection state changes and once a minute while the dashboard is visible, not while it is
-hidden or minimized. A `--` means the lookup failed, not that Hole is disconnected.
+hidden or minimized. A `--` shows before the first lookup has answered, and again whenever a lookup fails. It does not mean that Hole is
+disconnected.
 
 If the address does not change, or no website loads, see [Troubleshooting](troubleshooting.md).
 

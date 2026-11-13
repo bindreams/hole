@@ -55,7 +55,7 @@ The **Filters** section with one added rule.
 | **wildcard**        | `*.example.com`                | A domain pattern: `*` stands for any run of characters and `?` for one.      |
 | **subnet**          | `203.0.113.0/24`               | Every IP address in the block.                                               |
 
-**Order matters.** Hole checks the rules from the bottom up, and the last rule that matches wins, so a rule lower in the
+**Order matters.** Hole reads the list from top to bottom and the last rule that matches decides, so a rule lower in the
 list overrides one above it. The first row is the default rule, which sends everything through the server; it is locked
 and cannot be edited, moved or deleted. Drag a rule by its handle to reorder it.
 
@@ -93,7 +93,9 @@ What Hole does when the computer starts.
 
 The choice is carried out by the {term}`bridge` when it starts, which is when the computer starts, so the connection can
 come up before you sign in and without the dashboard open. If the automatic connection fails, the internet works as it
-did before Hole, unprotected, unless the {term}`kill switch` is on.
+did before Hole, unprotected, unless the {term}`kill switch` is on and its block is already in force. Hole puts the block
+in place partway through connecting, so a connection that fails before that point leaves the internet open even with the
+kill switch on.
 
 ### Theme
 
@@ -105,15 +107,16 @@ is **Dark**.
 Hole's tunnel needs no setup in the apps you use: the {term}`TUN` device catches their traffic. The local proxy server is
 for the occasional app that you want to point at Hole yourself. It is a proxy that listens on this computer only.
 
-| Control                        | What it does                                                                               |
-| ------------------------------ | ------------------------------------------------------------------------------------------ |
-| **Local proxy server**         | The master switch. Off, Hole opens no port you can point an app at.                        |
-| **SOCKS5**                     | A SOCKS5 proxy on the SOCKS5 port. On by default.                                          |
-| **HTTP**                       | An HTTP proxy on the HTTP port. Off by default.                                            |
-| **SOCKS5 port**, **HTTP port** | The ports to listen on. The two must differ. The HTTP port shows only when **HTTP** is on. |
+| Control                        | What it does                                                                                              |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| **Local proxy server**         | The master switch. Off, Hole opens no port you can point an app at, and the next two keep their settings. |
+| **SOCKS5**                     | A SOCKS5 proxy on the SOCKS5 port. On by default.                                                         |
+| **HTTP**                       | An HTTP proxy on the HTTP port. Off by default.                                                           |
+| **SOCKS5 port**, **HTTP port** | The ports to listen on. The HTTP port shows only when **HTTP** is on.                                     |
 
-**HTTP** cannot be on alone: turn on **SOCKS5** as well, or turn **HTTP** off. Otherwise connecting fails with a message
-that says so.
+With **Local proxy server** on, two rules apply, and connecting fails with a message that says so when one is broken.
+**HTTP** cannot be on alone: turn on **SOCKS5** as well, or turn **HTTP** off. When both are on, their ports must
+differ. With **Local proxy server** off, neither rule applies.
 
 ### DNS forwarder
 

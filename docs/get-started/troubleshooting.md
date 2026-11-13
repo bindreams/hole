@@ -41,24 +41,27 @@ connection.
 
 ## When connecting fails
 
-If Hole says **Connection failed**, a message explains why. Most are shown with the prefix "Bridge error:", and the ones
-that begin with a lower-case letter below follow it.
+If Hole says **Connection failed**, a message explains why. Hole shows the first two messages below and the
+network-blocked message as they are. Every other message comes from the {term}`bridge` and is shown after the prefix
+"Bridge error:", for instance "Bridge error: server hostname is not a valid DNS name". The messages below that begin with
+a lower-case letter are the ones that follow the prefix. Where a message contains "(1234ms)", the number is how long the
+attempt ran, in milliseconds, and differs from case to case.
 
 | Message                                                                                                                                            | What it usually means                                                                                                                                                                                  |
 | -------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | No server is selected. Open the Dashboard and select a server before connecting.                                                                   | Click a server card to select it.                                                                                                                                                                      |
 | The Hole bridge must be installed to connect.                                                                                                      | You chose **Later** at the setup prompt. Connect again and choose **Install**. See [Install](install.md#why-hole-asks-for-administrator-rights).                                                       |
 | The network is blocking the connection to this server ...                                                                                          | Same as the test result of that name above.                                                                                                                                                            |
-| Nothing came back through the tunnel (... ms). Either the proxy connection could not be established, or the server cannot reach your DNS resolver. | Check the server with **Test**. If it passes, try another **Resolver** in [Settings](settings.md#dns-forwarder).                                                                                       |
-| Could not open a connection into the tunnel (... ms). Every attempt to open one failed outright.                                                   | Hole cannot tell which side refused: the local proxy, or the connection onward to the server. Check the server with **Test**.                                                                          |
-| The tunnel did not finish connecting (... ms). The connection to the server was still being set up ...                                             | The server is slow, or unreachable from this network.                                                                                                                                                  |
+| Nothing came back through the tunnel (1234ms). Either the proxy connection could not be established, or the server cannot reach your DNS resolver. | Check the server with **Test**. If it passes, try another **Resolver** in [Settings](settings.md#dns-forwarder).                                                                                       |
+| Could not open a connection into the tunnel (1234ms). Every attempt to open one failed outright.                                                   | Hole cannot tell which side refused: the local proxy, or the connection onward to the server. Check the server with **Test**.                                                                          |
+| The tunnel did not finish connecting (1234ms). The connection to the server was still being set up ...                                             | The server is slow, or unreachable from this network.                                                                                                                                                  |
 | could not reach a secure DNS resolver / a secure DNS resolver did not respond in time / the connection to a secure DNS resolver failed             | Hole looks up the server's name through the **Resolver** over {term}`DoH`, and could not reach it. Try another resolver, or see **Allow insecure bootstrap** in [Settings](settings.md#dns-forwarder). |
 | a secure DNS resolver presented a certificate that could not be verified ...                                                                       | Something on the network may be intercepting encrypted connections. Try another network.                                                                                                               |
 | could not resolve the proxy server address via secure DNS                                                                                          | The resolver answered but has no address for the server's name. Check the address in the config.                                                                                                       |
 | a secure DNS resolver returned a reply that is not valid DNS                                                                                       | The resolver's answer was unusable. Try another **Resolver**.                                                                                                                                          |
 | server hostname is not a valid DNS name                                                                                                            | The address in the config is not a valid domain name. Check it for typos.                                                                                                                              |
 | tunnel_mode=full with proxy_http requires the SOCKS5 listener ...                                                                                  | **HTTP** is on without **SOCKS5**. See [Settings](settings.md#local-proxy-server).                                                                                                                     |
-| local_port and local_port_http must differ ...                                                                                                     | The SOCKS5 and HTTP ports are the same. Change one.                                                                                                                                                    |
+| local_port and local_port_http must differ ...                                                                                                     | **SOCKS5** and **HTTP** are both on and use the same port. Change one.                                                                                                                                 |
 | wintun.dll not found ... / wintun.dll load failed ...                                                                                              | Part of the Windows install is missing or damaged. Reinstall Hole.                                                                                                                                     |
 
 A message that is not here, or one that keeps coming back, is a reason to [collect the logs](#collect-the-logs).
@@ -76,20 +79,36 @@ without internet. Work down this list and stop when the internet is back. The fi
    disconnects, removes the block and turns the {term}`kill switch` off.
 
 1. **Restart the computer.** Hole's bridge starts with the computer, and when it starts it cleans up the routes, DNS
-   settings and plugin processes that a crashed run left behind. This is also the way out when the bridge is running
-   but the app cannot reach it, which is the one case the next step refuses. A restart does not lift a block while Lockdown is still on.
+   settings and plugin processes that a crashed run left behind. A restart does not lift a block while Lockdown is still
+   on: the bridge starts again and the block it left stays in force until Disconnect, Unblock Network or
+   `hole bridge unlock` lifts it.
 
 ### Last resorts, for someone comfortable with a terminal
 
-The two steps below need an administrator terminal. If the person at the computer is not comfortable with one, they are
-for someone technical to do, in person.
+The steps below need an administrator terminal. If the person at the computer is not comfortable with one, they are for
+someone technical to do, in person.
 
-1. **Run `hole bridge unlock`** in an administrator terminal, if Lockdown is still blocking traffic and Hole's app
-   cannot reach its {term}`bridge`. It turns Lockdown off and clears the block it left behind. It refuses while any
-   bridge is running, reachable or not; the message then tells you to use **Unblock Network**, which cannot help if the
-   app cannot reach the bridge, so restart instead. On a Mac, run it with `sudo` and the full path:
-   `sudo /Applications/Hole.app/Contents/MacOS/hole bridge unlock`. See the
-   [command line reference](../reference/cli.md#hole-bridge-unlock).
+1. **Stop the bridge, then run `hole bridge unlock`**, if Lockdown is still blocking traffic and Hole's app cannot reach
+   its bridge. `hole bridge unlock` turns Lockdown off and clears the block it left behind, but it refuses while any
+   bridge is running, reachable or not. Its message then tells you to use **Unblock Network**, which cannot help here,
+   and a restart only starts the bridge again. So stop the bridge first, in an administrator terminal:
+
+   On Windows, in PowerShell run as administrator:
+
+   ```powershell
+   Stop-Service -Name HoleBridge -Force
+   hole bridge unlock
+   ```
+
+   On a Mac, in Terminal:
+
+   ```sh
+   sudo launchctl bootout system/com.hole.bridge
+   sudo /Applications/Hole.app/Contents/MacOS/hole bridge unlock
+   ```
+
+   See the [command line reference](../reference/cli.md#hole-bridge-unlock). The bridge starts again the next time the
+   computer starts.
 
 1. **Run the network reset script**, if the cleanup did not fix it. The script is not installed with Hole: it is
    `scripts/network-reset.py` in [Hole's repository](https://github.com/bindreams/hole), and needs `scripts/_lib.py`
@@ -108,12 +127,18 @@ for someone technical to do, in person.
    sudo python3 network-reset.py
    ```
 
-   It stops Hole's bridge and plugin processes and removes Hole's routes and, on Windows, Hole's network adapter. It
-   restores the DNS settings Hole recorded. What it can do depends on Hole's record files being readable: without the
-   route record on Windows, it cannot tell which host route is Hole's and prints how to remove it by hand. On a Mac
-   it deletes Hole's four split routes whether or not the record is readable. Restart the computer afterwards. If DNS
-   still looks wrong, run it again with `--force-dns-restore`: by default it restores only DNS settings that still look
-   like Hole's own.
+   What it does depends on the platform. Both remove Hole's four split routes, restore the DNS settings Hole recorded
+   and flush the DNS cache; both need Hole's route record to find the host route that leads to the server, and print how
+   to remove that route by hand when the record is missing or unreadable.
+
+   - **Windows:** it stops the `HoleBridge` service, ends any bridge process and any `ex-ray` process, and removes Hole's
+     network adapter.
+   - **macOS:** it ends bridge processes and `ex-ray` processes, and flushes the route table. It does not remove an
+     adapter. The bridge's launchd job is set to be kept running, so launchd may start the bridge again afterwards.
+
+   The script does not stop `galoshes`, the other plugin Hole ships, so a `galoshes` process left behind by a crashed
+   connection survives it. Restart the computer afterwards. If DNS still looks wrong, run it again with
+   `--force-dns-restore`: by default it restores only DNS settings that still look like Hole's own.
 
 The script does not remove the block that Lockdown installs. Disconnect, Unblock Network and `hole bridge unlock` are
 the steps that lift it.
