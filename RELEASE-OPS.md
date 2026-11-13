@@ -124,6 +124,8 @@ The `garter` draft workflow runs `cargo publish --dry-run -p garter` at validate
 
 On publish failure:
 
+1. First check whether the release is already published: the auth action's post-step token revoke can fail after the release flip. A re-run then fails at "Release ... is not a draft"; the token expires on its own.
+
 1. Read the failed `cargo publish` output to identify the yanked or unavailable dep.
 
 1. Pick a recovery path based on the failure mode:
