@@ -64,9 +64,10 @@ pub fn prime_sudo_with(sudo: &Path) -> Result<(), PrimeSudoError> {
 /// config. `program` should be an absolute path (sudoers `secure_path`
 /// ignores the caller's PATH).
 ///
-/// Set `stdin(Stdio::null())` on the result before spawning: with a null
-/// stdin an expired sudo timestamp gets EOF and exits non-zero instead of
-/// hanging on an invisible password prompt (pair with [`prime_sudo`]).
+/// Call [`prime_sudo`] first so the spawn does not prompt. If the cached
+/// credentials have expired, sudo prompts on the controlling terminal; a null
+/// stdin does not prevent that, since sudo reads the password from the
+/// terminal and not from stdin.
 ///
 /// Library surface: no in-repo consumer exercises this yet (dev-console
 /// builds its argv via its own policy layer for exact-pin testability);

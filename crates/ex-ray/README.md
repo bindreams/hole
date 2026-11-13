@@ -1,89 +1,93 @@
 # ex-ray
 
-ex-ray is a first-party SIP003 shadowsocks plugin built on
-[v2ray-core](https://github.com/v2fly/v2ray-core). It builds the same
-v2ray-core data-plane configuration that
-[`shadowsocks/v2ray-plugin`](https://github.com/shadowsocks/v2ray-plugin)
-builds, so it is **wire-compatible** with stock v2ray-plugin servers and
-clients: a Hole client running ex-ray talks to a server running stock
-v2ray-plugin, and vice versa.
+ex-ray is a [SIP003](https://shadowsocks.org/doc/sip003.html) plugin for Shadowsocks. It carries the connection between
+a Shadowsocks client and its server inside WebSocket (or QUIC), optionally over TLS, so that the connection looks like
+ordinary web traffic. It is [Hole](https://github.com/bindreams/hole)'s own plugin, built on
+[v2ray-core](https://github.com/v2fly/v2ray-core).
 
-ex-ray is **not** the upstream `shadowsocks/v2ray-plugin` project. It is
-our own module, maintained in this repository. That means it can have
-bugs the upstream project does not (and can fix bugs the upstream project
-has). Its config-building construction is derived from
-`shadowsocks/v2ray-plugin` (MIT-licensed); see [`LICENSE`](LICENSE) for attribution.
+## Who it is for
 
-ex-ray exists to give Hole a plugin it fully controls: it speaks a "sitrep"
-control protocol on stdout (see [`../garter/SITREP.md`](../garter/SITREP.md))
-and forces all v2ray-core logs to stderr.
+- **People who run a Shadowsocks server or client** and want a plugin that is wire-compatible with
+  [`shadowsocks/v2ray-plugin`](https://github.com/shadowsocks/v2ray-plugin): over WebSocket, ex-ray talks to a stock
+  v2ray-plugin server, and a stock v2ray-plugin client talks to an ex-ray server. That makes it the way to pair a Hole
+  client with a server that already runs v2ray-plugin, or the other way around. Over QUIC only a stock client against an
+  ex-ray server is tested: the stock plugin panics as a QUIC server when built with Go 1.24 or later, so ex-ray's client
+  against it is not.
+- **People who want its additions:** Encrypted Client Hello and a tighter TCP keepalive, both below.
+
+If you use the Hole app you already have ex-ray: Hole ships it and runs it for you.
+
+ex-ray is not the upstream `shadowsocks/v2ray-plugin` project. It is a separate module, maintained in this repository,
+so it can have bugs the upstream project does not, and can fix ones it has. Its config-building code is derived from
+`shadowsocks/v2ray-plugin` (MIT-licensed); [`LICENSE`](LICENSE) carries the attribution.
+
+## Install
+
+Download the binary for your platform from a release tagged `releases/ex-ray/v<version>` on the
+[releases page](https://github.com/bindreams/hole/releases). The platforms and the file naming are in
+[What ships from the Hole repository](https://hole.readthedocs.io/en/latest/reference/distributions.html). To build it yourself,
+`cargo xtask ex-ray` builds it; the [contributor guide](https://hole.readthedocs.io/en/latest/contributing/index.html)
+starts from a clean machine.
+
+## Use
+
+You do not run ex-ray by hand. A Shadowsocks client or server starts it as its plugin and hands it the SIP003
+environment (`SS_LOCAL_HOST`, `SS_LOCAL_PORT`, `SS_REMOTE_HOST`, `SS_REMOTE_PORT` and `SS_PLUGIN_OPTIONS`). The
+options go in `SS_PLUGIN_OPTIONS`, separated by semicolons. A typical client:
+
+```text
+tls;host=example.com;path=/ws
+```
+
+The same string with `server` added runs the server end. A TLS server needs a certificate: `cert` and `key` point to
+it, and when they are not given ex-ray looks for the files `acme.sh` leaves under `~/.acme.sh/<host>/`. TLS is off
+unless `tls` is set, and the transport is WebSocket unless `mode=quic` says otherwise; `mode=quic` turns TLS on itself.
+`ex-ray -h` lists every option with its default, and the flag definitions at the top of [`config.go`](config.go) are
+the source of those defaults.
+
+ex-ray also speaks [sitrep](https://github.com/bindreams/hole/blob/main/crates/garter/SITREP.md) to the program that
+started it: a line-delimited JSON stream on standard output that reports readiness and any start failure. Everything
+else it and v2ray-core log goes to standard error.
 
 ## ECH (Encrypted Client Hello)
 
-ex-ray supports ECH to keep the real proxy domain out of the cleartext TLS SNI.
-SIP003 opts: `ech=auto|always|never` (default `auto` — opportunistic; `always`
-fails closed) and `ech-doh=<DoH URL>` (where to fetch the rotating ECH config;
-the bridge injects this).
+ECH keeps the real server name out of the cleartext TLS handshake. It needs TLS (`tls`, or `mode=quic`, which turns it
+on), and two options control it:
 
-The vendored v2ray-core (`third_party/v2ray-core`, a git-subrepo of v5.51.2 and
-the build truth via the local `go.mod replace`) carries a **first-party ECH
-patch** beyond stock v2ray-core, in two parts:
+- `ech-doh=<DoH URL>` is where ex-ray fetches the server's ECH config. With no value (the `ech-doh` flag's default in
+  [`config.go`](config.go)) ECH is off. Hole supplies its own when it starts ex-ray; see ECH and DoH below.
+- `ech=auto|always|never` is the policy; the `ech` flag in [`config.go`](config.go) holds the default. `auto` uses ECH
+  when a config can be fetched and otherwise connects with the name in the clear. `always` never sends the name in the
+  clear: a dial that cannot get a config fails, and ex-ray refuses to start without TLS or without `ech-doh`. `never`
+  leaves ECH off.
 
-- **Fail-closed gate.** Client dials build their TLS config via
-  `(*tls.Config).GetTLSConfigForClient` (ECH-capable transports) or
-  `GetTLSConfigForUnsupportedClient` (ECH-incapable engines: uTLS, hysteria2);
-  `RequireEchSatisfied` aborts an `ech=always` dial that cannot obtain an ECH
-  config, so the real SNI is never sent in cleartext. Server listeners keep
-  calling bare `GetTLSConfig`.
-- **`retry_configs` recovery (RFC 9849).** On an `*tls.ECHRejectionError` (a
-  stale config after the server rotated its ECH key), `DialClientWithECHRetry`
-  retries once with the server-provided configs threaded directly into the retry
-  (and best-effort-refreshes the ECH cache via `RefreshECHCache`). Wired for
-  tcp, websocket, http, quic, and the `transportcommon` transports
-  (httpupgrade / request-assembly); gRPC is an upstream follow-up (no
-  `security.Engine` seam); hysteria2 is ECH-incapable.
+When a server has rotated its ECH key, the client's old config is rejected and the rejection carries the new ones. ex-ray
+retries once with them and refreshes its cached copy.
 
-**Maintenance.** On every `third_party/v2ray-core` subrepo bump, re-verify the
-patch survives — the `ex-ray-tests` CI lane (`cargo xtask run ex-ray-tests`)
-runs the gate / refuse / `retry_configs` Go tests plus a fake-TLS-server
-reject-then-accept behavioral test, so a bump that drops or breaks the patch
-fails CI. (golangci-lint excludes the vendored tree, so this go-test lane — not
-the linter — is the guard.)
+[ECH and DoH](https://hole.readthedocs.io/en/latest/how-it-works/ech-and-doh.html) explains how Hole chooses the resolver.
 
 ## TCP keepalive
 
-A transport that is silently black-holed leaves an idle connection wedged:
-nothing is written, so nothing errors. ex-ray tightens the socket's own keepalive
-timers on the connection to the server so the kernel notices sooner.
+A connection to the server that a network silently black-holes stays open and idle, and nothing errors. ex-ray tightens
+the keepalive of the socket it opens to the server, so the kernel gives up on a dead connection sooner.
 
-SIP003 opt: `tcp-keepalive=<seconds>` — idle time before probing (default `15`).
-Three probes follow at the same spacing, so a black-holed idle connection is
-dropped after roughly `4 x seconds`. Without it, Go's defaults give 15s idle + 9
-probes ≈ 150s.
+`tcp-keepalive=<seconds>` is the idle time before probing starts; its default is `tcpKeepAliveDefault` in
+[`config.go`](config.go). `keepAliveProbeCount` probes then follow, each spaced by that same idle time.
+`tcp-keepalive=0` turns keepalive off on that connection, including Go's own default keepalive, which is a full opt-out
+and not a return to the old behaviour.
 
-`tcp-keepalive=0` turns keepalive off on that connection entirely, including the
-~150s Go would otherwise apply — a full opt-out, not a return to the previous
-behaviour. Other internal dials (the ECH DoH bootstrap) keep Go's defaults either
-way.
+It applies to the client's TCP connection to the server whatever `mux` says. It does nothing in `mode=quic`, which
+runs over UDP, or in server mode. A connection stalled with unacknowledged data is governed by the TCP retransmit timer
+instead, which keepalive does not shorten.
 
-This sits on the WAN socket, below Mux.Cool, so it applies regardless of `mux`.
-It has no effect in `mode=quic`, which is UDP and carries its own keepalive, nor
-in server mode. A connection stalled with unacknowledged data is governed by the
-retransmit timer rather than keepalive and is not covered here (see
-[#707](https://github.com/bindreams/hole/issues/707)).
+## Documentation
 
-**Maintenance.** `TestDialSystemAppliesKeepAlive` pins the two vendored
-behaviours this leans on — a registered dialer controller still reaching the fd,
-and `SocketConfig`'s keepalive fields still suppressing Go's own post-connect
-defaults — so a `third_party/v2ray-core` bump that breaks either fails CI rather
-than silently restoring the 150s bound.
-
-## Build
-
-```sh
-go build ./...
-```
+- [Shadowsocks and its plugins](https://hole.readthedocs.io/en/latest/how-it-works/plugins.html), including how Hole
+  runs ex-ray.
+- [What ships from the Hole repository](https://hole.readthedocs.io/en/latest/reference/distributions.html).
+- [The vendored v2ray-core and its patches](third_party/VENDORING.md), for people changing ex-ray.
 
 ## License
 
-Apache-2.0. See [`LICENSE`](LICENSE).
+Apache-2.0. [`LICENSE`](LICENSE) is the full text, and also holds the MIT notice for the code derived from
+`shadowsocks/v2ray-plugin`.

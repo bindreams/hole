@@ -29,7 +29,7 @@ publishes an ECH config; against one that does not, `auto` connects without it.
 A server can rotate its ECH key. A client holding an old config is rejected, and the rejection carries the new
 configs (`retry_configs`, RFC 9849). ex-ray retries once with them and also refreshes its cached copy, so a rotation
 costs one extra handshake and not a failed connection. The cache lives in ex-ray's patched copy of v2ray-core; see
-{src}`its README <crates/ex-ray/README.md#ech-encrypted-client-hello>`.
+{src}`the vendoring notes <crates/ex-ray/third_party/VENDORING.md#the-ech-patch-in-v2ray-core>`.
 ```
 
 ## DoH carries the lookups Hole must make privately

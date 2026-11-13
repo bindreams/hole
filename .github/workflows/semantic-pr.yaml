@@ -31,7 +31,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # Allowed types match the
+          # Allowed types match docs/contributing/commit-messages.md and the
           # category buckets in .github/release-categories.yaml (shared
           # across all four release tracks). New types here fall into
           # the "Other" catch-all category by default; add to an explicit

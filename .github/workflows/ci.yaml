@@ -172,7 +172,7 @@ jobs:
         if: ${{ matrix.portable-lint == true }}
         timeout-minutes: 5
         shell: bash
-        run: .github/scripts/retry.sh uv run --with-requirements docs/requirements.txt scripts/validate-docs.py --fetch-only
+        run: .github/scripts/retry.sh uv run --with-requirements docs/requirements.txt python -c ""
 
       # macOS runners ship only Apple's frozen Bash 3.2.57 on /usr/bin/bash,
       # ahead of Homebrew's on PATH; git-subrepo's `#!/usr/bin/env bash`
