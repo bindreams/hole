@@ -42,9 +42,9 @@ galoshes
   connection. See [Distributions](distributions.md).
 
 kill switch
-  An optional setting, off by default, that the tray calls **Lockdown**. Once Hole has connected with it on, traffic
-  that would leave outside the tunnel is blocked, including to devices on your local network such as a printer, through
-  brief drops and reconnects. The block lifts when you disconnect or when Hole gives up on the connection. See
+  An optional setting, off by default, that the tray calls **Lockdown**. With it on, Hole blocks traffic that would
+  leave the computer outside the tunnel, including to devices on your local network such as a printer, so that a
+  dropped tunnel does not expose it; while the block is in force, the tray offers **Unblock Network**. See
   {src}`the contributor reference <CONTRIBUTING.md#lockdown-mode>`.
 
 lockdown

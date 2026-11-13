@@ -43,9 +43,8 @@ connection.
 
 If Hole says **Connection failed**, a message explains why. Hole writes the first six messages below, and the
 network-blocked one, itself and shows them as they are. Every other row is a message the {term}`bridge` sent, and Hole
-puts the prefix "Bridge error:" in front of it, for instance "Bridge error: server hostname is not a valid DNS name". The
-rows that begin with a lower-case letter are shown after that prefix. Where a message contains "(1234ms)", the number is how long
-the attempt ran, in milliseconds, and differs from case to case.
+puts the prefix "Bridge error:" in front of it, for instance "Bridge error: server hostname is not a valid DNS name".
+Where a message contains "(1234ms)", the number is how long the attempt ran, in milliseconds.
 
 | Message                                                                                                                                            | What it usually means                                                                                                                                                                                  |
 | -------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -86,19 +85,19 @@ one is for someone technical.
    choose it.
 
 1. **Last resort, for someone comfortable with a terminal.** The steps below need an administrator terminal. If the
-   person at the computer is not comfortable with one, they are for someone technical to do, in person. `hole bridge unlock` refuses while any bridge is running, including one the app cannot reach, so stop the service first, the way
-   the bridge stops itself, and then unlock.
+   person at the computer is not comfortable with one, they are for someone technical to do, in person.
+   `hole bridge unlock` refuses while any bridge is running, including one the app cannot reach, so stop the service
+   first, then unlock.
 
    On Windows, in PowerShell run as administrator:
 
    ```powershell
    Stop-Service -Name HoleBridge -Force
-   Start-Process -Wait -FilePath hole -ArgumentList 'bridge', 'unlock'
+   (Start-Process -Wait -PassThru -FilePath hole -ArgumentList 'bridge', 'unlock').ExitCode
    ```
 
-   `hole.exe` is a graphical program that attaches to the terminal, so a plain `hole bridge unlock` can hand the prompt
-   back before it has finished. `Start-Process -Wait` makes PowerShell wait. Hole's messages may not appear in the
-   window; whether they do has not been measured. If you cannot tell that it finished, run the line again.
+   `hole.exe` is a graphical program, so PowerShell would not wait for a plain `hole bridge unlock`; `Start-Process -Wait` makes it wait, and the number it prints is the result. `0` means the block is lifted. Anything else means
+   unlock refused or failed: run both lines again.
 
    On a Mac, in Terminal:
 
@@ -107,7 +106,8 @@ one is for someone technical.
    sudo /Applications/Hole.app/Contents/MacOS/hole bridge unlock
    ```
 
-   If stopping the service fails or does not finish, restart the computer and begin again from the top of this list. See
+   On a Mac, if `launchctl bootout` says the service could not be found, it is already stopped: run the unlock line.
+   If stopping the service does not finish, restart the computer and begin again from the top of this list. See
    the [command line reference](../reference/cli.md#hole-bridge-unlock). The bridge starts again the next time the
    computer starts.
 

@@ -92,8 +92,8 @@ What Hole does when the computer starts.
 | **Always connect**     | Hole connects to the last server it connected to, even if you had disconnected.                                                         |
 
 The choice is carried out by the {term}`bridge` when it starts, which is when the computer starts, so the connection can
-come up before you sign in and without the dashboard open. If the automatic connection fails, Hole gives up and the
-computer is online without the tunnel; the {term}`kill switch` entry says when its block lifts.
+come up before you sign in and without the dashboard open. If it fails, see
+[When connecting fails](troubleshooting.md#when-connecting-fails).
 
 ### Theme
 
@@ -183,11 +183,10 @@ are covered in [Connect](connect.md), and **Start at Login** is described above.
 ### Lockdown
 
 **Lockdown** is the {term}`kill switch`, and it is off by default. Click the item in the tray menu to turn it on or off.
-The glossary entry says what it blocks and when the block lifts.
 
 The menu item shows **Lockdown: On** when the switch is on and the block is in force. **Lockdown: On (warning: not
-engaged)** means the switch is on but no block is in force right now, because Hole is not connected, or because you
-turned Lockdown on while connected. Disconnect and connect again to engage it.
+engaged)** means the switch is on but no block is in force right now. Connect to engage it; if you turned Lockdown on
+while connected, disconnect and connect again.
 
 While a block is in force, the menu offers **Unblock Network (disconnects, turns Lockdown off)**. It disconnects Hole,
 removes the block and turns Lockdown off. If Hole cannot reach its bridge, [Troubleshooting](troubleshooting.md) has the
