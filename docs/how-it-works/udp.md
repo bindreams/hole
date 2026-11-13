@@ -28,8 +28,7 @@ flowchart TD
 
 Only the last drop is the UDP rule. The others are a **Block** rule doing what it says, and a **Bypass** flow that has no
 usable route. Drops are logged by the {term}`bridge`, once per rule and destination for a stretch of time rather than per packet.
-The UDP rule's entry is a warning that names the plugin that cannot carry the flow. A **Block** rule's drop of a TCP
-connection is logged only at debug level, so a default log does not show it.
+The UDP rule's entry is a warning that names the plugin that cannot carry the flow.
 
 ## Who can carry UDP
 

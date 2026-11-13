@@ -35,7 +35,7 @@ sequenceDiagram
 
 Hole points the operating system's DNS at the resolver addresses in its settings. Public resolver addresses, such as the defaults, fall in the halves of
 the address space that [the routes](tun.md#two-routes-per-address-family) send into the TUN device, so the
-lookup arrives at the bridge. A UDP packet to port 53 always goes to the forwarder, whatever the [filter](tun.md#from-packets-to-connections) rules
+lookup arrives at the bridge. With the forwarder on (the default), a UDP packet to port 53 always goes to it, whatever the [filter](tun.md#from-packets-to-connections) rules
 say. This holds for any destination, not only the configured resolvers, so an application that hard-codes its
 own resolver is answered by the forwarder too, and a rule that blocks that resolver does not stop the answer.
 
@@ -73,8 +73,7 @@ your own DNS configuration is read or changed.
 ````
 `````
 
-On both platforms a failure to set this up fails the connection. A session that said "connected" while lookups leaked
-would be worse than one that said it could not connect.
+On both platforms a failure to set this up fails the connection.
 
 ## What Hole checks first
 

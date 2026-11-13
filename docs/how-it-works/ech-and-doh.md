@@ -16,11 +16,11 @@ In Hole, ECH is done by {term}`ex-ray`, for the connection from the plugin to yo
 server's domain, not the sites you browse. It applies only when the plugin's options turn TLS on. The `ech` option has
 three values:
 
-| `ech=`               | Behaviour                                                                                                        |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `auto` (the default) | Use ECH when the server's ECH config can be fetched. When it cannot, connect anyway, with the name in the clear. |
-| `always`             | Never send the name in the clear. If the config cannot be fetched, refuse to connect.                            |
-| `never`              | Do not use ECH.                                                                                                  |
+| `ech=`               | Behaviour                                                                                                         |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `auto` (the default) | Use ECH when the server's ECH config can be fetched. When it cannot, connect anyway, with the name in the clear.  |
+| `always`             | Never send the name in the clear. If the config cannot be fetched, or `host` is an IP address, refuse to connect. |
+| `never`              | Do not use ECH.                                                                                                   |
 
 Choose `always` when exposing the name is worse than failing to connect. ECH also needs a server whose domain actually
 publishes an ECH config; against one that does not, `auto` connects without it.
@@ -41,9 +41,10 @@ inside an HTTPS connection to a resolver:
 1. **Finding the server.** Before it connects, Hole looks up the server's name over DoH, through the resolvers in
    its DNS settings, and never through the operating system. The connection to the resolver is made straight to the
    resolver's address. Where Hole knows the provider, its name is sent as the server name and checked against the
-   certificate; the name is never looked up, so nothing has to be looked up to look something up. A server given as an IP address needs no lookup.
+   certificate. A server given as an IP address needs no lookup.
 1. **Fetching the ECH config.** ex-ray asks a DoH resolver for the ECH config of the TLS server name, which is the plugin's `host` option, and its
-   lookup supports only DoH. With no domain there to look up (`host` is an IP address), ECH is not applied.
+   lookup supports only DoH. With no domain there to look up (`host` is an IP address), ECH is not applied: under `ech=auto` the connection goes
+   ahead without it, and under `ech=always` it is refused.
 1. **DNS inside the tunnel,** when the DNS protocol is DoH, which is the default. See [DNS through the
    tunnel](dns.md).
 

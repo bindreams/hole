@@ -96,7 +96,7 @@ What the decision means:
 - **Block.** A TCP connection is accepted and then closed with an ordinary close, not a reset. A UDP flow is discarded
   without a reply.
 
-DNS is the exception: a UDP lookup to port 53 always goes to the {term}`DNS forwarder`, whatever the rules say. See
+DNS is the exception: with the {term}`DNS forwarder` on (the default), a UDP lookup to port 53 always goes to it, whatever the rules say. See
 [DNS through the tunnel](dns.md).
 
 ```{dropdown} Where in the code
