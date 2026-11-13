@@ -165,14 +165,14 @@ jobs:
         run: .github/scripts/retry.sh uv tool install prek
 
       # The `validate-docs` hook is a `system` hook whose `uv run` downloads
-      # Sphinx when the hook runs, which `prek install-hooks` does not cover.
-      # Fetch it here under retry.
+      # the docs requirements (Sphinx, the Markdown parsers) when the hook runs,
+      # which `prek install-hooks` does not cover. Fetch them here under retry.
       - id: fetch-docs-tools
         name: Fetch docs build tools (portable lint leg)
         if: ${{ matrix.portable-lint == true }}
         timeout-minutes: 5
         shell: bash
-        run: .github/scripts/retry.sh uv run scripts/validate-docs.py --fetch-only
+        run: .github/scripts/retry.sh uv run --with-requirements docs/requirements.txt scripts/validate-docs.py --fetch-only
 
       # macOS runners ship only Apple's frozen Bash 3.2.57 on /usr/bin/bash,
       # ahead of Homebrew's on PATH; git-subrepo's `#!/usr/bin/env bash`
@@ -216,7 +216,7 @@ jobs:
         shell: bash
         run: |
           # Fetch the test dependencies under retry.
-          with=(--with pytest --with PyYAML --with pathspec --with "markdown-it-py>=4,<5" --with "mdit-py-plugins>=0.5")
+          with=(--with pytest --with PyYAML --with pathspec --with-requirements docs/requirements.txt)
           .github/scripts/retry.sh uv run "${with[@]}" python -c ""
           uv run "${with[@]}" pytest -o python_files="*.py" scripts/
 

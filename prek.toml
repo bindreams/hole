@@ -174,14 +174,15 @@ pass_filenames = false
 # inherit the root ty.toml's unresolved-import ignore, so their imports
 # must resolve for real. pathspec/PyYAML are the scripts' own PEP 723
 # deps; pytest is their inline test runner (supplied here the same way
-# CI's "Test release scripts" step supplies it).
+# CI's "Test release scripts" step supplies it). scripts/validate-docs.py
+# imports the docs build's parsers, so the docs requirements install here too.
 # renovate: datasource=pypi depName=ty
-additional_dependencies = ["ty==0.0.65", "pathspec>=0.12", "PyYAML>=6", "pytest", "markdown-it-py>=4,<5", "mdit-py-plugins>=0.5"]
+additional_dependencies = ["ty==0.0.65", "pathspec>=0.12", "PyYAML>=6", "pytest", "-r", "docs/requirements.txt"]
 
 [[repos.hooks]]
 id = "validate-docs"
 name = "validate docs build"
-entry = "uv run scripts/validate-docs.py"
+entry = "uv run --with-requirements docs/requirements.txt scripts/validate-docs.py"
 language = "system"
 pass_filenames = false
 # Gated rather than `always_run`: this runs a full Sphinx build. The
@@ -192,7 +193,7 @@ files = "^(docs/|scripts/validate-docs\\.py$|crates/(hole|galoshes|garter)/Cargo
 [[repos.hooks]]
 id = "validate-docs-links"
 name = "validate docs links"
-entry = "uv run scripts/validate-docs.py --links-only"
+entry = "uv run --with-requirements docs/requirements.txt scripts/validate-docs.py --links-only"
 language = "system"
 pass_filenames = false
 always_run = true
