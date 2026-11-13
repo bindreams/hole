@@ -29,9 +29,9 @@ func keepAliveDialerController(p keepAliveParams) func(network, address string, 
 		}
 		if err := setTCPKeepAlive(fd, p); err != nil {
 			// Unreachable on installed builds (pre-16299 Windows only, see
-			// README); v2ray-core discards this error, so a loud log is the
-			// only recourse. The wrapped error names the option that failed
-			// rather than asserting the resulting socket state: on linux and
+			// keepalive_windows.go); v2ray-core discards this error, so a loud
+			// log is the only recourse. The wrapped error names the option that
+			// failed rather than asserting the resulting socket state: on linux and
 			// darwin the vendored applyOutboundSocketOptions has already
 			// applied idle and interval from the same SocketConfig, so a
 			// failure on the probe count alone leaves those intact.

@@ -12,19 +12,15 @@ reported in a page, a target and the README. Pages are read as MyST reads them,
 targets and the README as GitHub does, with parsers pinned in
 `docs/requirements.txt` rather than in this script.
 
-Every README link that starts with
+Every link in a tracked README (the root's and each crate's) that starts with
 `https://hole.readthedocs.io/en/latest/` must be the site root or `<page>.html`,
 where `docs/<page>.md` is tracked in the repository.
 
 Usage, from the repository root:
     uv run --with-requirements docs/requirements.txt scripts/validate-docs.py
-    uv run --with-requirements docs/requirements.txt scripts/validate-docs.py --fetch-only
     uv run --with-requirements docs/requirements.txt scripts/validate-docs.py --links-only
 
-`--fetch-only` builds nothing: `uv` has resolved and downloaded the requirements
-by the time it runs, so CI can run the fetch under a retry without retrying a
-docs failure. `--links-only` runs the `{src}` and README link checks without the
-build.
+`--links-only` runs the `{src}` and README link checks without the build.
 """
 
 import functools
@@ -310,21 +306,28 @@ def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
 
 
 def readme_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
-    """Problems with the README's links into the published site.
+    """Problems with the links into the published site in every README.
 
+    The root README and every tracked `README.md`, each reported by its own path.
     `<page>.html` must have a tracked `docs/<page>.md` source; the bare site root
     maps to `docs/index.md`. Any other link under the site's base is a problem.
     Link destinations, plain text and raw HTML are read, once each; code, and the
     text of a link (which is not itself a link), are not.
     """
+    readmes = {"README.md"} | {path for path in tracked if path.endswith("/README.md")}
+    return [problem for readme in sorted(readmes) for problem in single_readme_problems(repo_root, tracked, readme)]
+
+
+def single_readme_problems(repo_root: Path, tracked: frozenset[str], readme: str) -> list[str]:
+    """`readme_link_problems` for one README, given by its path from the repository root."""
     problems = []
-    readme_file = repo_root / "README.md"
+    readme_file = repo_root / readme
     if not readme_file.is_file():
-        return ["README.md: missing on disk"]
+        return [f"{readme}: missing on disk"]
     in_link = False
     for number, token in leaf_tokens(github_parser(), readme_file.read_text(encoding="utf-8"), directives=False):
         if token.type == "unclosed_fence":
-            problems.append(unclosed_fence_problem(f"README.md:{number}"))
+            problems.append(unclosed_fence_problem(f"{readme}:{number}"))
             continue
         if token.type in ("link_open", "link_close"):
             in_link = token.type == "link_open"
@@ -345,11 +348,11 @@ def readme_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
             elif page == "":
                 source = "docs/index.md"
             else:
-                problems.append(f"README.md:{number}: site link is not a page or the site root: {url!r}")
+                problems.append(f"{readme}:{number}: site link is not a page or the site root: {url!r}")
                 continue
             if source not in tracked:
                 problems.append(
-                    f"README.md:{number}: site link's page source {source!r} is not tracked in the repository: {url!r}"
+                    f"{readme}:{number}: site link's page source {source!r} is not tracked in the repository: {url!r}"
                 )
     return problems
 
@@ -368,12 +371,9 @@ def report(problems: list[str]) -> None:
 
 
 def main() -> int:
-    if sys.argv[1:] not in ([], ["--fetch-only"], ["--links-only"]):
-        print(f"usage: {Path(sys.argv[0]).name} [--fetch-only | --links-only]", file=sys.stderr)
+    if sys.argv[1:] not in ([], ["--links-only"]):
+        print(f"usage: {Path(sys.argv[0]).name} [--links-only]", file=sys.stderr)
         return 2
-
-    if sys.argv[1:] == ["--fetch-only"]:
-        return 0
 
     tracked = tracked_files()
     problems = src_link_problems(REPO_ROOT, tracked) + readme_link_problems(REPO_ROOT, tracked)
@@ -692,6 +692,20 @@ def test_readme_links_report_a_page_that_is_not_tracked(tmp_path: Path) -> None:
 
     assert len(problems) == 1
     assert "README.md:2" in problems[0] and "docs/reference/gone.md" in problems[0]
+
+
+def test_readme_links_are_checked_in_every_tracked_readme_by_its_own_path(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("[ok](https://hole.readthedocs.io/en/latest/)\n", encoding="utf-8")
+    (tmp_path / "crates" / "foo").mkdir(parents=True)
+    (tmp_path / "crates" / "foo" / "README.md").write_text(
+        "ok\n[a](https://hole.readthedocs.io/en/latest/reference/gone.html)\n", encoding="utf-8"
+    )
+    tracked = frozenset({"docs/index.md", "README.md", "crates/foo/README.md"})
+
+    problems = readme_link_problems(tmp_path, tracked)
+
+    assert len(problems) == 1
+    assert problems[0].startswith("crates/foo/README.md:2") and "docs/reference/gone.md" in problems[0]
 
 
 def test_readme_links_ignore_code_and_read_html_and_bare_urls(tmp_path: Path) -> None:
