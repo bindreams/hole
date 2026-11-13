@@ -17,7 +17,8 @@ either without you installing anything. Without a plugin, Hole speaks plain Shad
 
 - **Using Hole:** the [README](https://github.com/bindreams/hole#readme) has the download and the server options. The
   [glossary](reference/glossary.md) explains the terms, and the [command line](reference/cli.md) lists the commands.
-- **How it works:** the picture below, then the [glossary](reference/glossary.md).
+- **How it works:** the picture below, then [how Hole is put together](how-it-works/overview.md) and the pages that
+  follow it.
 - **Contributing:** {src}`CONTRIBUTING.md` covers building Hole, running its tests and how it is put together.
 
 ## Hole in one picture
@@ -48,6 +49,20 @@ Component versions: hole {{ hole_version }}, galoshes {{ galoshes_version }}, ga
 
 Hole is free software under the [GNU GPL version 3 or later](reference/licensing.md); the source lives in the
 [GitHub repository](https://github.com/bindreams/hole).
+
+```{toctree}
+---
+caption: How it works
+hidden:
+---
+How Hole is put together <how-it-works/overview.md>
+The TUN device and the routes <how-it-works/tun.md>
+Shadowsocks and its plugins <how-it-works/plugins.md>
+ECH and DoH <how-it-works/ech-and-doh.md>
+DNS through the tunnel <how-it-works/dns.md>
+UDP: dropped, never bypassed <how-it-works/udp.md>
+The kill switch <how-it-works/kill-switch.md>
+```
 
 ```{toctree}
 ---
