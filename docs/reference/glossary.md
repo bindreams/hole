@@ -80,5 +80,6 @@ VPN client
   service: it comes with no server.
 
 Unblock Network
-  The tray action, shown while Hole is blocking traffic, that disconnects and turns the {term}`kill switch` off.
+  The tray action, shown while Hole is blocking traffic, that lifts the {term}`kill switch`'s block and turns Lockdown
+  off, so Hole will not reconnect by itself at the next start. It does not end a running connection.
 ```

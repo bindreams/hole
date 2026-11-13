@@ -24,12 +24,13 @@ adds four routes that are more specific than the default one, each covering half
 | `8000::/1`    | The second half of IPv6 |
 
 Between them they cover every address, and a more specific route wins over the default, so all traffic goes into the
-TUN device while the original default route stays in place untouched. When Hole disconnects and removes the four routes,
-the machine is back as it was.
+TUN device while the original default route stays in place untouched. When Hole disconnects it removes the routes it
+added, and the machine is back as it was.
 
 One address must not go into the tunnel: the {term}`Shadowsocks` server's. The tunnel's own connection to it would otherwise
 loop back into the tunnel. Hole adds a fifth route, a host route for the server's address that goes out through the
-machine's real gateway. It is left out when the server is on the same machine, since loopback is already more specific
+machine's real network, not the tunnel: through the real gateway, or for an IPv6 server straight out of the real
+interface, since the gateway is not reliably detectable for IPv6. It is left out when the server is on the same machine, since loopback is already more specific
 than the halves.
 
 ```{dropdown} Why Hole deletes only routes it recorded
@@ -43,7 +44,7 @@ record is {src}`crates/tun-engine/src/routing/state.rs`; the route list is `Rout
 
 On Windows the adapter is always called `hole-tun`, and you can see it in the list of network adapters while Hole is
 connected. On macOS the kernel picks the name, a `utun` followed by a number, and Hole reads it back rather than
-assuming one; everything that needs the name, such as the DNS settings and the {term}`kill switch`, asks for it.
+assuming one; the routes and the {term}`kill switch` take the name from what the kernel assigned.
 
 The tunnel's own addresses are fixed, one IPv4 and one IPv6 network, named `TUN_SUBNET` and `TUN_SUBNET6` in
 {src}`crates/bridge/src/proxy/config.rs`.
@@ -51,7 +52,7 @@ The tunnel's own addresses are fixed, one IPv4 and one IPv6 network, named `TUN_
 ## IPv6
 
 IPv6 goes through the tunnel like IPv4: the proxy path carries any IPv6 destination, and reaching it is up to the server. The tunnel's IPv6 network is a
-private one whose prefix was generated at random, as RFC 4193 prescribes, instead of the easily typed `fd00::` that
+private one whose prefix was chosen at random once, as RFC 4193 prescribes, instead of the easily typed `fd00::` that
 many tools hand out. The tunnel's network becomes a real on-link route on the adapter,
 so a prefix shared with one of your own networks would let the tunnel swallow its traffic.
 
@@ -59,7 +60,8 @@ The adapter holds its IPv6 address with the operating system as well as inside H
 no global IPv6 address would otherwise have no source address for the IPv6 routes, and every IPv6 connection would fail
 instead of going through the tunnel.
 
-The IPv6 routes are skipped, rather than failing the connect, when the tunnel adapter has no IPv6 at all.
+If the tunnel adapter has no IPv6 at all, Hole still issues the two IPv6 routes but tolerates their failing, rather than
+failing the connect.
 
 ## From packets to connections
 

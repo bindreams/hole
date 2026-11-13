@@ -15,8 +15,8 @@ tunnel. The pages after it zoom in on the parts.
 The two talk over a local socket. The app sends requests such as "connect to this server" and "what is the status?",
 and the bridge answers. The socket is a local one, not a network port.
 
-Splitting the program keeps the part with administrator rights small and fixed, and it lets the bridge outlive the
-window. Closing the dashboard does not disconnect, and the bridge makes its decision about connecting at system startup
+Splitting the program keeps the part that needs administrator rights apart from the window, and it lets the bridge
+outlive it. Closing the dashboard does not disconnect, and the bridge makes its decision about connecting at system startup
 before any app exists. The service is registered by the Windows installer; on a Mac, Hole asks for your password to
 register it at the first connect.
 
@@ -71,17 +71,20 @@ sequenceDiagram
     B-->>App: Connected
 ```
 
-The order matters, and it is chosen so that nothing about the machine changes until the tunnel is known to work.
+The order matters. With the DNS forwarder on, which is the default, it is chosen so that nothing about the machine
+changes until one lookup has gone through the proxy. With it off, there is no such test, and the TUN device and the
+routes go in as soon as the proxy is up.
 
 1. When the server is given by name, the name is looked up over {term}`DoH` through your configured resolver, not through the operating system,
    and before any tunnel exists. See [ECH and DoH](ech-and-doh.md).
 1. A configured {term}`SIP003 plugin` is started and waited for, and the {term}`Shadowsocks` client is started pointing
    at it, or at the server directly.
-1. With the DNS forwarder on, which is the default, it is built and sends one test lookup through the proxy. If that
-   fails the connection fails here, before the bridge has changed any network setting.
+1. With the DNS forwarder on, it is built and sends one test lookup through the proxy. If that fails the connection
+   fails here, before the bridge has changed any network setting.
 1. Only then does the bridge open the TUN device and install the routes, which is the moment traffic starts to flow
    through Hole. With the {term}`kill switch` on, the block goes up right after the routes.
-1. Last, the operating system's DNS is pointed at the TUN device, so lookups reach the forwarder.
+1. Last, with the forwarder on, the operating system's DNS is pointed at the TUN device, so lookups reach the forwarder.
+   With it off, Hole leaves DNS settings alone.
 
 A start that fails at any step releases everything it had already taken, including the kill switch's block, and
 reports an error. Disconnecting does the same release on purpose.

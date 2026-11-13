@@ -27,8 +27,9 @@ flowchart TD
 ```
 
 Only the last drop is the UDP rule. The others are a **Block** rule doing what it says, and a **Bypass** flow that has no
-usable route. Each drop is recorded in the {term}`bridge`'s log with the reason and, for the UDP rule, the plugin that cannot
-carry the flow.
+usable route. Drops are logged by the {term}`bridge`, once per rule and destination for a stretch of time rather than per packet.
+The UDP rule's entry is a warning that names the plugin that cannot carry the flow. A **Block** rule's drop of a TCP
+connection is logged only at debug level, so a default log does not show it.
 
 ## Who can carry UDP
 
@@ -39,6 +40,10 @@ It depends on what runs between the {term}`Shadowsocks` client and your server.
 | None                            | Yes: the Shadowsocks client relays UDP to the server, and Hole assumes the server relays it onward |
 | {term}`ex-ray` (`v2ray-plugin`) | No: it carries TCP only                                                                            |
 | {term}`galoshes`                | Yes: it carries UDP over its multiplexed connection                                                |
+
+With no plugin, UDP to the server is blocked by [the kill switch](kill-switch.md) on macOS, which permits only TCP to
+the server. With Lockdown on, UDP stops working there while the dashboard dot stays green. {term}`galoshes` and
+{term}`ex-ray` are unaffected, since their connection to the server is TCP.
 
 Hole does not guess from the plugin's name. Each plugin reports the transports it can carry when it starts, and Hole
 uses that report. The dashboard shows the result as the **UDP proxy** dot, red when UDP is unavailable on the current

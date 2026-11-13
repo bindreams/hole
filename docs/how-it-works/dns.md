@@ -41,7 +41,7 @@ own resolver is answered by the forwarder too, and a rule that blocks that resol
 
 The forwarder tries your resolvers in order and returns the first answer. Each question goes out over one of four
 transports: {term}`DoH` (the default), DNS over TLS, plain DNS over TCP, or plain DNS over UDP. The first three work
-with any plugin. Plain UDP works only if the plugin can carry UDP or a **Bypass** rule covers the resolver. If every
+with any plugin. Plain UDP works only if the connection to the server can carry UDP (see [the UDP rule](udp.md)). If every
 resolver fails, the forwarder answers the application with a server failure rather than with silence.
 
 The forwarder reaches its resolvers through the Shadowsocks client's local {term}`SOCKS5` listener, the same path
@@ -80,8 +80,10 @@ would be worse than one that said it could not connect.
 
 Before it opens the TUN device, installs any route or touches any DNS setting, the bridge sends one test lookup,
 `example.com`, through the forwarder and the proxy. If the lookup is not answered, the connection fails with an error
-that names the likeliest cause: no connection to the server could be made, a connection was still being set up when the
-time ran out, or the tunnel opened and then stayed silent. Because the check runs first, a dead tunnel never takes the
+that says which of three things happened: every attempt to open a connection into the tunnel failed outright, a
+connection was still being set up when the time ran out, or the tunnel opened and then nothing came back. The message
+does not pick a side where it cannot tell: a dead plugin and a server that cannot reach your resolver look the same
+from here. Because the check runs first, a dead tunnel never takes the
 machine's DNS with it.
 
 ## Settings

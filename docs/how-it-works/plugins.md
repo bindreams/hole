@@ -44,8 +44,9 @@ plugin does no lookup of its own.
 | `galoshes`       | {term}`galoshes` | Everything ex-ray does, and UDP                 |
 
 A config that names any other plugin is refused at import with an error that lists the plugins Hole ships. The bridge
-has administrator rights, and a plugin runs under its control, so it runs only the plugins Hole ships, from the one
-folder where the installer or the service put them, and never one found by searching the `PATH`. On a Mac the
+has administrator rights, and a plugin runs under its control, so it runs only the plugins Hole ships, from one
+folder, and never one found by searching the `PATH`. For the app and the installed service that is the folder
+the installer or the service put them in; an administrator can point a bridge at another with `--plugin-dir`. On a Mac the
 `hole` program carries both plugins inside itself, and the service writes them into a folder only an administrator can
 change.
 
@@ -62,7 +63,6 @@ tls;host=example.com;path=/ws
 ```
 
 With TLS on, the connection is an HTTPS WebSocket connection to the name in `host`, which is what camouflages it.
-[Postern](https://postern.readthedocs.io) generates configs of this kind.
 
 ## galoshes
 

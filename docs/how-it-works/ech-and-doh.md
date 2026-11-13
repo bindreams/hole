@@ -40,9 +40,10 @@ inside an HTTPS connection to a resolver:
 
 1. **Finding the server.** Before it connects, Hole looks up the server's name over DoH, through the resolvers in
    its DNS settings, and never through the operating system. The connection to the resolver is made straight to the
-   resolver's address, with the provider's name, where Hole knows it, used only to check the certificate, so nothing has to
-   be looked up to look something up. A server given as an IP address needs no lookup.
-1. **Fetching the ECH config.** ex-ray asks a DoH resolver for the server's domain, and its lookup supports only DoH.
+   resolver's address. Where Hole knows the provider, its name is sent as the server name and checked against the
+   certificate; the name is never looked up, so nothing has to be looked up to look something up. A server given as an IP address needs no lookup.
+1. **Fetching the ECH config.** ex-ray asks a DoH resolver for the ECH config of the TLS server name, which is the plugin's `host` option, and its
+   lookup supports only DoH. With no domain there to look up (`host` is an IP address), ECH is not applied.
 1. **DNS inside the tunnel,** when the DNS protocol is DoH, which is the default. See [DNS through the
    tunnel](dns.md).
 
@@ -54,7 +55,9 @@ DNS. It exists for networks where every DoH resolver is blocked; with it on, the
 up, and could change the answer. It applies whether or not the {term}`DNS forwarder` is on.
 
 A resolver you add yourself must therefore speak DoH, since the server lookup always uses it, whichever protocol you
-chose for DNS in the tunnel.
+chose for DNS in the tunnel. For an address Hole has no entry for, it asks `https://<ip>/dns-query` on port 443 and checks
+the certificate against the IP address, so the resolver's certificate has to list that address. A resolver whose
+certificate carries only a hostname fails the lookup.
 
 ## Which resolver ex-ray is told to use
 
