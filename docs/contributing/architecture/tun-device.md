@@ -22,8 +22,9 @@ The name is requested differently per platform, through `TunName`
 | Windows  | `Requested("hole-tun")` | wintun creates an adapter with that name. The alias is `WINDOWS_TUN_ALIAS` ({src}`crates/bridge/src/proxy/config.rs`), never read back.                           |
 | macOS    | `KernelAssigned`        | The `tun` crate leaves the name unset, the kernel picks the next free `utunN`, and the name is read back from the open handle. A failed read-back fails the open. |
 
-`Device::build` refuses `KernelAssigned` on any other platform with `DeviceError::InvalidConfig`, and macOS refuses a
-requested name that does not already look like `utunN`, which is why `Dispatcher::new` cannot ask for `hole-tun` there.
+`Device::build` refuses `KernelAssigned` on any other platform with `DeviceError::InvalidConfig`. On macOS the `tun`
+crate, not Hole, refuses a requested name that does not already look like `utunN`, which is why `Dispatcher::new` cannot
+ask for `hole-tun` there.
 
 Who reads the identity afterwards:
 

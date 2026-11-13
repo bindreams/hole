@@ -93,7 +93,8 @@ adds a resolver. An older build's own rewrite of another adapter's DNS after a c
 
 ## The start-time gate
 
-The order of `bring_up_tunnel` in {src}`crates/bridge/src/proxy_manager.rs` is load-bearing:
+The order of the start in {src}`crates/bridge/src/proxy_manager.rs` is load-bearing. The first step is in `acquire`; the
+rest are in `bring_up_tunnel`, which begins at step 2:
 
 1. The Shadowsocks client starts and binds its SOCKS5 listener.
 1. `build_local_dns` builds the endpoint and the forwarder.
@@ -125,14 +126,15 @@ its code would file it under the wrong sentence. The first row that holds wins:
 | a connect was still outstanding when its budget fired  | `TunnelSetupPending`    | `TunnelSetupIncomplete`   |
 | nothing opened, and every attempt failed definitely    | `NoConnection`          | `NoTunnelConnection`      |
 
-A SOCKS5 CONNECT is not acknowledged until the plugin's outer connection is up, so an outstanding one means the tunnel was
-still being set up, not that the local proxy turned the attempt away. An ASSOCIATE never reaches the plugin and proves
-nothing about it. An out-of-band reachability probe of the server runs beside the gate, so it adds no latency, and its
-verdict can replace the self-test's reading (`self_test_error_for`): `Blocked` becomes `ProxyError::NetworkBlocked`, and a
-refused or timed-out server port rewrites the reason. The probe is skipped when a cover is, or is about to be, in force
-(`suppresses_reachability_probe`), because Hole's own block would read as censorship. The plugin's recent output is quoted
-beside a failure only when the self-test's reading implicates the transport and the probe has not blamed the network
-(`implicates_plugin_transport`).
+A SOCKS5 CONNECT is not acknowledged until the plugin's outer connection is up, so an outstanding one means the tunnel
+was still being set up, not that the local proxy turned the attempt away. An ASSOCIATE never reaches the plugin and
+proves nothing about it. An out-of-band reachability probe of the server runs beside the gate, so a passing gate waits
+on nothing. On failure the start awaits the probe's verdict, which costs at most the probe's remaining budget, and the
+verdict can replace the self-test's reading (`self_test_error_for`): `Blocked` becomes `ProxyError::NetworkBlocked`, and
+a refused or timed-out server port rewrites the reason. The probe is skipped when a cover is, or is about to be, in
+force (`suppresses_reachability_probe`), because Hole's own block would read as censorship. The plugin's recent output
+is quoted beside a failure only when the self-test's reading implicates the transport and the probe has not blamed the
+network (`implicates_plugin_transport`).
 
 ## Failure reporting and budgets
 

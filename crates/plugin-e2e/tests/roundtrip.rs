@@ -192,10 +192,10 @@ mod roundtrips {
                 start_real_ss_server_with_plugin_ws_opts(TEST_METHOD, TEST_PASSWORD, &g, &server_opts).await;
             let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
             // The teardown here is slower than the default read budget: the server
-            // stops reading without closing, and the close only follows once the
-            // keepalive errors the poisoned pipe — see
-            // docs/contributing/architecture/galoshes-transport.md. Outlive that bound so the
-            // assertion observes the teardown instead of racing it.
+            // stops reading without closing, and the close is presumed to follow
+            // only once the keepalive declares the transport dead (unproven; see
+            // docs/contributing/architecture/galoshes-transport.md). Outlive that
+            // bound so the assertion observes the teardown instead of racing it.
             let config = RoundtripConfig {
                 read_timeout: Duration::from_secs(90),
                 ..RoundtripConfig::default()

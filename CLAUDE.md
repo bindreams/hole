@@ -6,10 +6,12 @@ is both the unprivileged Tauri GUI (no args) and the privileged bridge
 (`hole bridge run`, root/SYSTEM).
 
 This file is the agent-facing architecture map. Product and install live in
-[README.md](README.md); the full contributor reference — build, dev, test, and
-every rule below in detail — lives in [CONTRIBUTING.md](CONTRIBUTING.md) and, for
-build, development and testing, [docs/contributing/](docs/contributing/index.md). Read
-them before editing; the sections linked below are the authoritative source.
+[README.md](README.md); the contributor reference lives in
+[docs/contributing/](docs/contributing/index.md) (setup, build, development,
+testing, and the architecture under
+[docs/contributing/architecture/](docs/contributing/architecture/overview.md)).
+What has not moved yet stays in [CONTRIBUTING.md](CONTRIBUTING.md). Read them
+before editing; the sections linked below are the authoritative source.
 
 **IMPORTANT:** NEVER PIPE TESTS TO `tail`! ALWAYS SET A TIMEOUT FOR THE SHELL COMMAND! Tests are known to hang, you WILL get stuck and WILL not have information to debug why if you tail.
 
@@ -40,9 +42,10 @@ them before editing; the sections linked below are the authoritative source.
   no global IPv6 still has a source address for those routes. The ULA's
   global ID is generated per RFC 4193, not `fd00::`. Windows waits for the
   interface's IPv6 half itself (`tun` waits only for the IPv4 one) and
-  creates the address `IpDadStatePreferred`; assignment is fatal on Windows,
-  warn-only on macOS, and route-install fatality reads
-  `gateway::tun_ipv6_available`, not the assignment's outcome. →
+  creates the address `IpDadStatePreferred`; on Windows `Ipv6StackAbsent` only
+  warns and any other IP Helper failure is fatal, on macOS every failure
+  warns, and route-install fatality reads `gateway::tun_ipv6_available`, not
+  the assignment's outcome. →
   [docs/contributing/architecture/tun-device.md#ipv6-in-the-tunnel](docs/contributing/architecture/tun-device.md#ipv6-in-the-tunnel)
 - **TCP accept refusal.** The accept verdict lands while the listener is still
   in `SynReceived` with its SYN-ACK paused, so a declined connection is refused
@@ -256,7 +259,10 @@ what is open before starting more.
   [CI](docs/contributing/ci.md) ·
   [commit messages](docs/contributing/commit-messages.md) ·
   [dev/admin CLI](docs/contributing/bridge-cli.md))
-- Architecture, releases → [CONTRIBUTING.md](CONTRIBUTING.md)
+- Architecture →
+  [docs/contributing/architecture/](docs/contributing/architecture/overview.md)
+- The rest of the architecture still in CONTRIBUTING.md, releases →
+  [CONTRIBUTING.md](CONTRIBUTING.md)
   ([releases](CONTRIBUTING.md#releases))
 - Release ops (rollback, minisign key rotation) →
   [RELEASE-OPS.md](RELEASE-OPS.md)

@@ -97,8 +97,9 @@ listener is either the one the user enabled (**Local proxy server** on) or an in
 
 - `build_ss_config` pushes at most two local instances: SOCKS5 (`Mode::TcpAndUdp`, always) and HTTP CONNECT
   (`Mode::TcpOnly`, because CONNECT is TCP-only).
-- `validate_proxy_config` runs `validate_listeners` before anything starts, which rejects four combinations, each a
-  `ProxyError` (it also rejects a cipher name it cannot parse, `InvalidMethod`):
+- `validate_proxy_config` runs `validate_listeners`, which rejects four combinations, each a `ProxyError` (it also
+  rejects a cipher name it cannot parse, `InvalidMethod`). `build_ss_config` calls it, and the pure-VPN start calls it
+  directly. Both run inside `ProxyManager::acquire`, after the plugin chain has started:
 
 | Error                   | When                                                                     |
 | ----------------------- | ------------------------------------------------------------------------ |
