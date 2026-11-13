@@ -19,7 +19,7 @@ A new Hole has no servers. The status on the right reads "You are Disconnected".
 
 ## Import the config
 
-There are three ways to import a config. They all do the same thing.
+There are three ways to import a config.
 
 - Click **+ Import servers from file** under **Servers**.
 - Choose **File** → **Import...** (Ctrl+O on Windows, Cmd+O on a Mac). On a Mac the menu bar is at the top of the screen
@@ -102,8 +102,7 @@ A connected Hole. The address and flag are the server's.
 
 Hole looks the address up with a request to Cloudflare, so Cloudflare sees it; while connected, the request goes through
 the tunnel. It runs when the connection state changes and once a minute while the dashboard is visible, not while it is
-hidden or minimized. A `--` shows before the first lookup has answered, and again whenever a lookup fails. It does not mean that Hole is
-disconnected.
+hidden or minimized. A `--` shows before the first lookup has answered, and again whenever a lookup fails.
 
 If the address does not change, or no website loads, see [Troubleshooting](troubleshooting.md).
 

@@ -12,13 +12,12 @@ getting a server, and that is the step that takes the longest.
 Setting Hole up involves two jobs. They are often done by two people, for instance when you set Hole up for a relative in
 another country. Do the server's job first, because the other job needs what it produces.
 
-| Job                         | Who does it                                   | What it produces or needs                                                | Page                                              |
-| --------------------------- | --------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------- |
-| 1. Run the server           | You, or someone you know who already runs one | A {term}`config` file for each person who will use the server            | [Get a server](server.md)                         |
-| 2. Install Hole and connect | Whoever uses the computer                     | The config file, the installer, and administrator rights for the install | [Install](install.md), then [Connect](connect.md) |
+| Job                         | Who does it                                   | What it produces or needs                                                |
+| --------------------------- | --------------------------------------------- | ------------------------------------------------------------------------ |
+| 1. Run the server           | You, or someone you know who already runs one | A {term}`config` file for each person who will use the server            |
+| 2. Install Hole and connect | Whoever uses the computer                     | The config file, the installer, and administrator rights for the install |
 
-If you are setting Hole up for someone else, you can do the second job over a video call or in person: the config file
-and the installer are the only two things that have to reach them.
+If you are setting Hole up for someone else, you can do the second job over a video call or in person.
 
 ## What you need
 

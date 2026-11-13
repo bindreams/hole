@@ -27,8 +27,7 @@ Running a server takes a rented server, a domain name and comfort with a termina
 technical to do this job for you, or take [Route 1](#route-1-someone-gives-you-a-config) and ask them for a config. The
 installer and the config are all the other person needs from you.
 
-Postern's own pages are the authority on setting it up, and this guide does not repeat them. To decide whether you want
-to, here is what it asks of you:
+Postern's own pages are the authority on setting it up. It asks for:
 
 - **A rented server.** A Linux machine you rent from a hosting company, with Docker and Docker Compose installed, that
   stays on all the time. Python 3.9 or newer must be on it too.
@@ -63,8 +62,8 @@ install anything extra on the computer to match either.
 ---
 class: warning
 ---
-A galoshes client and a galoshes server must be on the same side of the change in how galoshes frames traffic that came
-with galoshes v0.4.0, and a newer one is not automatically safer. Hole updates its bundled galoshes together with the
+Hole's galoshes and the server's galoshes must be on the same side of the change in how galoshes frames traffic in
+version 0.4.0: older and newer ones cannot talk to each other. Hole updates its bundled galoshes together with the
 app, so a galoshes connection can stop working after a Hole update if the server has not been upgraded. Upgrade the
 server first. Postern's [Connecting as a user](https://postern.readthedocs.io/en/latest/connecting.html) page has the
 detail.

@@ -167,18 +167,14 @@ whether or not the forwarder is on.
   and **Internet** come from the selected server's last test, and hovering over either shows the result; the other three
   have no hover text. **VPN Server** is red after a failed test. **Internet** turns green only after a real **Test**, not
   merely after connecting, and is gray otherwise, never red.
-- **Capabilities.** Two dots that describe the current connection and change nothing. Both are gray while Hole is
-  disconnected. **UDP proxy** is green when the
-  connection can carry UDP traffic. It is red with a plugin that carries TCP only, such as ex-ray; Hole then drops the UDP
+- **Capabilities.** Two dots that describe the current connection. Both are gray while Hole is disconnected.
+  **UDP proxy** is green when the connection can carry UDP traffic. It is red with a plugin that carries TCP only, such as ex-ray; Hole then drops the UDP
   traffic that would go through the server, rather than sending it around the tunnel. **IPv6 bypass** is red when the
   computer's network has no working IPv6, so a **Bypass** rule cannot send IPv6 traffic around the tunnel.
 
 ## The tray menu
 
-The tray menu has the status, **Connect** or **Disconnect**, **Start at Login**, **Lockdown**, **Dashboard...** and
-**Exit**, plus **Install Update (v...)** with the version when a new one is found, and **Unblock Network** while a block
-is in force. **Connect**, **Disconnect**, **Dashboard...** and **Exit**
-are covered in [Connect](connect.md), and **Start at Login** is described above.
+The items are listed in [Connect](connect.md#the-tray). **Start at Login** is described above, and **Lockdown** below.
 
 ### Lockdown
 
