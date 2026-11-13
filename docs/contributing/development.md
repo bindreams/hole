@@ -40,8 +40,8 @@ first has already left root-owned files in `target/` by then.
 `dev-console` supervisor. The supervisor builds nothing. It does this, in order:
 
 1. Runs `npm install`, every time, so a dependency added by a pulled commit is never missed.
-1. Stages the build into a per-process directory, `hole-dev-<pid>` under the temp directory. The running bridge locks its
-   own executable, and this copy lets you rebuild while it runs.
+1. Stages the build into a per-process directory, `hole-dev-<pid>` under the temp directory. On Windows the running
+   bridge locks its own executable, and this copy lets you rebuild while it runs.
 1. Refuses to continue if Vite's port (`VITE_PORT` in {src}`crates/dev-console/src/banner.rs`) is already taken, which usually means an earlier run's Vite is still alive.
 1. Runs `hole bridge grant-access`, the production code path that creates the `hole` group and adds your user to it, so
    dev mode exercises the same access rules as an install. The group stays after you exit, as it does in production.
@@ -73,8 +73,8 @@ reboot), then run it again. This happens once per machine.
 
 ## Run the pieces yourself
 
-Separate terminals give you more control. Terminal 1 is the bridge. Build and stage as your normal user; only
-`bridge grant-access` and `bridge run` need elevation.
+Separate terminals give you more control. Terminal 1 is the bridge. On macOS, build and stage as your normal user; only
+`bridge grant-access` and `bridge run` need `sudo`. On Windows, one elevated PowerShell does all of it.
 
 `````{tab-set}
 ---
@@ -83,7 +83,7 @@ sync-group: os
 ````{tab-item} Windows
 :sync: windows
 
-From an elevated PowerShell.
+From an elevated PowerShell, which also builds and stages.
 
 ```powershell
 cargo xtask build hole

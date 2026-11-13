@@ -36,7 +36,8 @@ A runner provisions once, then runs its lanes as steps in a fixed order, on one 
 
 **Lint is split by whether the host matters.** {src}`.github/lint.toml` lists the prek hooks whose result depends on the
 platform that runs them (today, the Go linter, which type-checks for the host's OS). `cargo xtask prek platform-dependent`
-runs those on every runner; `cargo xtask prek portable` runs every other hook once, on linux/amd64. A new hook is portable
+runs those on every runner; `cargo xtask prek portable` runs every other hook except Clippy once, on linux/amd64. Clippy
+is a step of its own on each runner (`clippy-hole`, `clippy-ex-galoshes`), so neither prek run includes it. A new hook is portable
 unless it is listed.
 
 **Test lanes compile nothing.** `hole-build` compiles the test binaries once. The lanes after it only run them, and
@@ -47,17 +48,24 @@ names the units that rebuilt.
 
 ## What you can run locally
 
-| CI lane                                | Locally                                                 |
-| -------------------------------------- | ------------------------------------------------------- |
-| Hole tests (`hole-test-non-tun`)       | `SKULD_LABELS='!tun' cargo xtask run hole-tests`        |
-| Hole tests, elevated (`hole-test-tun`) | `SKULD_LABELS=tun cargo xtask run hole-tests`, elevated |
-| Lint                                   | `prek run --all-files`, or `cargo xtask run prek`       |
-| Documentation checks                   | `cargo xtask run doc-hole` or `doc-ex-galoshes`         |
-| Front end                              | `cargo xtask run frontend-check`                        |
-| Installers                             | [The installers](installers.md)                         |
+| CI lane                                | Locally                                                                   |
+| -------------------------------------- | ------------------------------------------------------------------------- |
+| Hole tests (`hole-test-non-tun`)       | `SKULD_LABELS='!tun' cargo xtask run hole-tests`                          |
+| Hole tests, elevated (`hole-test-tun`) | `SKULD_LABELS=tun cargo xtask run hole-tests`, elevated                   |
+| Lint, hooks                            | `prek run --all-files`; `cargo xtask run prek` is the same without Clippy |
+| Lint, Clippy                           | `cargo xtask run clippy-hole` or `clippy-ex-galoshes`, by platform        |
+| Documentation checks                   | `cargo xtask run doc-hole` or `doc-ex-galoshes`, by platform              |
+| Front end                              | `cargo xtask run frontend-check`                                          |
+| Installers                             | [The installers](installers.md)                                           |
 
 CI's Hole test steps run exactly the command of the `hole-tests` target in {src}`build.yaml` (the audit
 `ci_test_hole_steps_match_the_hole_tests_target` holds them equal), with `SKULD_LABELS` and a nextest profile on top.
+
+The table shows POSIX syntax; [Set up and build](setup.md#run-the-tests-once) has the PowerShell form of `SKULD_LABELS`.
+On Windows, run the elevated lane from an elevated shell. On macOS, never put `sudo` before `cargo xtask`: it builds
+first and leaves root-owned files in `target/`. CI builds as the user, then runs only `cargo nextest` under `sudo` over
+the built binaries, with `NEXTEST_PROFILE=tun`; the `hole-test-tun-macos` step in {src}`.github/workflows/ci.yaml` has
+the exact command.
 
 ## Provisioning retries until it works
 

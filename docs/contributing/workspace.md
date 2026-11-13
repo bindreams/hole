@@ -60,7 +60,8 @@ When `ech=always` is set, ex-ray must not send a ClientHello that names the real
 
 - `GetTLSConfigForClient` for transports that can carry {term}`ECH`. It fails when `ech=always` is set and no ECH
   config could be obtained.
-- `GetTLSConfigForUnsupportedClient` for engines that cannot (uTLS, hysteria2). It refuses `ech=always`, and warns on
+- `GetTLSConfigForUnsupportedClient` for engines that cannot (hysteria2, and the uTLS presets whose ClientHello cannot
+  hold an ECH extension; an ECH-capable uTLS preset uses `GetTLSConfigForClient`). It refuses `ech=always`, and warns on
   `ech=auto`.
 
 Every client dial path takes its config from one of them. The bare `GetTLSConfig` belongs to server listeners. The one
@@ -68,7 +69,7 @@ client-side exception is the retry after the server rejects ECH and supplies a r
 builds the bare config and sets the non-empty list itself, so it cannot produce a clear-text name.
 
 Two things keep this true. The `ech=always` round trips in {src}`crates/plugin-e2e/tests/roundtrip.rs` check that an
-unreachable ECH resolver refuses the tunnel, and the `ex-ray-tests` target (`cargo xtask run ex-ray-tests`) runs ex-ray's Go
+unreachable ECH resolver refuses the tunnel (they are compiled out on Windows), and the `ex-ray-tests` target (`cargo xtask run ex-ray-tests`) runs ex-ray's Go
 tests and those of the vendored `tls`, `quic`, `hysteria2` and `transportcommon` packages. Neither covers the case that a merge of upstream v2ray-core
 brings back a bare `GetTLSConfig` on a client path, because the vendored tree is excluded from the linters. After every
 such merge, search the client dial paths for it.

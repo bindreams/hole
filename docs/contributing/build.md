@@ -16,8 +16,10 @@ A few targets to know (`cargo xtask list` has the rest):
   ([Development](development.md)).
 - `hole-tests`: builds the Hole test binaries without running them; its run step is the canonical `cargo nextest` run.
 - `hole-msi`, `hole-dmg`: the Windows installer and the macOS disk image ([The installers](installers.md)).
-- `doc-hole`, `doc-ex-galoshes`: rustdoc with warnings denied, for the crates each platform builds.
-- `prek`: every pre-commit hook over all files.
+- `doc-hole`, `doc-ex-galoshes`: rustdoc with warnings denied, for the crates each platform builds. `doc-hole` is for
+  Windows on amd64 and macOS, `doc-ex-galoshes` for Linux and Windows on arm64; the other one is an error on a host.
+- `prek`: every pre-commit hook over all files except Clippy, which the `clippy-hole` and `clippy-ex-galoshes` targets
+  run.
 - The per-crate `*-tests` targets (`garter-tests`, `util-tests` and so on): the crates outside the Hole test lane.
 
 `cargo xtask build hole` and `hole-tests` do not build a release. A release build is `hole-msi` or `hole-dmg`, which run
@@ -61,9 +63,9 @@ target of a workspace crate is documented by no command.
 plugins, debug symbols (`hole.pdb` on Windows, `hole.dSYM` on macOS) and, on Windows, `wintun.dll`. It matches what the
 installer puts in `Program Files\hole\bin`.
 
-It exists because the running bridge locks its own executable, so a bridge cannot run from Cargo's `target/` directory
-and be rebuilt. The plugins must sit beside the bridge: a foreground bridge looks there, unless `--plugin-dir` names
-another folder.
+It exists because on Windows the running bridge locks its own executable, so a bridge cannot run from Cargo's `target/`
+directory and be rebuilt. The plugins must sit beside the bridge: a foreground bridge looks there, unless `--plugin-dir`
+names another folder.
 
 The list of files, per OS, is one function: `bindir_entries` in {src}`xtask-lib/src/bindir.rs`. The installer manifests
 are checked against it, and `cargo xtask bindir-names [--os OS] [--bundle]` prints it as JSON.
@@ -71,12 +73,14 @@ are checked against it, and `cargo xtask bindir-names [--os OS] [--bundle]` prin
 ## Hardened binaries
 
 The shipped Rust binaries (`hole`, `galoshes`, `garter`) call `libsearch_guard::bins()` in their `build.rs`. On Windows
-that has two effects:
+that has three effects:
 
 - the VC runtime is linked statically. The MSI ships no Visual C++ redistributable, so a dynamic import would stop the
   program starting on a machine without one;
 - the loader is told to search System32 only for the executable's imports, so a DLL planted beside the executable is not
-  loaded.
+  loaded;
+- before `main`, the process is told to search System32 only for every `LoadLibrary` call made without flags,
+  including calls made inside system DLLs.
 
 `wintun.dll` is loaded by absolute path in {src}`crates/tun-engine/src/device/wintun.rs` before the `tun` crate asks for
 it by bare name, and that later request resolves to the module already loaded. Any other DLL a binary needs must be loaded

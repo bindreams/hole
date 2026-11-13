@@ -19,9 +19,10 @@ npm test                           # the front end's unit tests (Vitest)
 Use `cargo xtask run`, or `cargo nextest` directly, rather than `cargo test`: {src}`.config/nextest.toml` serializes tests
 that change global OS network state across test binaries, which `cargo test` does not.
 
-The browser-level end-to-end specs in {src}`tests/webdriver/` run the app through WebDriver, with `tauri-driver` and
-`msedgedriver`. `npm run test:e2e` runs them against the app named by `HOLE_TEST_APP_PATH`, or `target/release/hole.exe`.
-CI runs them inside the Windows installer lane ([The installers](installers.md)).
+The browser-level end-to-end specs in {src}`tests/webdriver/` run the app through WebDriver, on Windows. `npm run test:e2e` runs them against the app named by `HOLE_TEST_APP_PATH`, or `target/release/hole.exe`, which exists only after
+a release build. It starts `tauri-driver` from `PATH` and needs `msedgedriver`; `npm install` provides neither. Only the
+installer lane's `provision-e2e-tools` step downloads them, and puts them on `PATH` for that run's child processes alone
+([The installers](installers.md)); CI runs the specs there.
 
 ### The elevated lane
 
@@ -42,10 +43,15 @@ does not find it, fails with a message that says what is missing and how to get 
 does not return early. To leave a lane out, say so with a filter such as `SKULD_LABELS='!tun'`. A test that skips on its
 own lets a lane go quiet while it stays green. Nothing checks this mechanically; review does.
 
+The rule has exceptions today: `get_default_gateway_info_returns_valid_result` in
+{src}`crates/tun-engine/src/gateway_tests.rs` is `#[ignore]`d to be run by hand, one test in
+{src}`crates/plugin-e2e/tests/interop.rs` is disabled with `#[ignore]`, and the installer projects' Python tests skip
+on a host that is not the platform they test.
+
 ### Test observability
 
-Every crate with tests has `hole-test-observability` as a dev-dependency and
-calls `hole_test_observability::register!()` once per test binary. Before `main`, that installs a process-wide `tracing`
+Every Rust crate with tests, apart from `xtask`, `xtask-lib` and `payload-archive`, has `hole-test-observability` as a
+dev-dependency and calls `hole_test_observability::register!()` once per test binary. Before `main`, that installs a process-wide `tracing`
 subscriber on stderr, sets `RUST_BACKTRACE=full` if it is unset, and chains Hole's panic hook. The default log filter
 pins Hole's own crates to `debug`; `HOLE_TEST_LOG` adds directives on top of it. A test binary that does not use
 `register!()` must call `hole_test_observability::install()` first in `main`.
@@ -103,8 +109,10 @@ locators xtask provides.
 The `global_net_state` group in
 {src}`.config/nextest.toml` runs on one thread across binaries, because a real WFP filter or `pf` rule in one test would
 corrupt another's. Membership is by test name, and `cargo xtask verify-global-net-state-labels` checks that the name
-filter and the skuld label at each test select the same tests. `cargo xtask verify-global-net-state-executed` checks,
-from the JUnit reports, that every member ran. CI runs both.
+filter and the skuld label at each test select the same tests, and CI runs it on every `hole` runner.
+`cargo xtask verify-global-net-state-executed --expected FILE --junit FILE` checks, from the two lanes' JUnit reports,
+that every member that `verify-global-net-state-labels --record FILE` wrote down ran. CI runs it on the windows/amd64
+runner only.
 
 ## Windows notes
 
@@ -113,6 +121,10 @@ from the JUnit reports, that every member ran. CI runs both.
 Bridge tests bind a TCP listener on all interfaces, so Windows Firewall prompts again after every rebuild: Cargo gives each
 test binary a new content-hash name, and the consent attaches to the name. Stage the test binaries at a stable path and
 approve the prompt once:
+
+`stage` copies what `cargo xtask build hole` built, and then runs `cargo test --no-run --workspace` with default
+features, which builds `hole` in production mode. So run `cargo xtask build hole` first, and have a real `ui/dist/`
+(`cargo xtask build frontend-build`; [Building in detail](build.md#the-front-end-toggle)).
 
 ```sh
 cargo xtask stage --with-tests \

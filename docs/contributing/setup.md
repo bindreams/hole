@@ -1,19 +1,22 @@
 # Set up and build
 
-This page takes a machine with nothing on it to a first build and a first test run. It assumes Windows 11 or macOS; the
-commands are the same on both except where a tab says otherwise.
+This page takes a machine with nothing on it to a first build and a first test run. It assumes Windows 11 on amd64 or
+macOS; the commands are the same on both except where a tab says otherwise. `hole`, `hole-tests` and every target that
+depends on them are built only on those, so on Linux or Windows on arm64 `cargo xtask build hole` is an error. Those
+hosts build the other targets, such as ex-ray, galoshes and garter; `cargo xtask list` shows what each platform supports.
 
 ## Install the tools
 
-| Tool                              | What needs it                                       | Which version                                                                    |
-| --------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------- |
-| [Git](https://git-scm.com)        | the checkout; `cargo xtask` reads tags for versions | any                                                                              |
-| [rustup](https://rustup.rs)       | every Rust crate                                    | the `channel` in {src}`rust-toolchain.toml`; rustup installs it on first `cargo` |
-| [Go](https://go.dev/dl/)          | {term}`ex-ray`, which `cargo xtask deps` builds     | the `toolchain` directive in {src}`crates/ex-ray/go.mod`                         |
-| [Node.js](https://nodejs.org)     | the front end (`ui/`), Vite, the WebDriver E2E      | the `engines.node` range in {src}`package.json`                                  |
-| [uv](https://docs.astral.sh/uv/)  | the installer projects, `scripts/`, the docs build  | any recent                                                                       |
-| [cargo-nextest](https://nexte.st) | running the Rust tests                              | at least `nextest-version` in {src}`.config/nextest.toml`                        |
-| [prek](https://prek.j178.dev)     | the pre-commit hooks in {src}`prek.toml`            | any recent                                                                       |
+| Tool                                                     | What needs it                                              | Which version                                                                                                                                                         |
+| -------------------------------------------------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Git](https://git-scm.com)                               | the checkout; `cargo xtask` reads tags for versions        | any; on Windows, Git for Windows (see the Windows tab)                                                                                                                |
+| [rustup](https://rustup.rs)                              | every Rust crate                                           | the `channel` in {src}`rust-toolchain.toml`, with the components it lists                                                                                             |
+| [Go](https://go.dev/dl/)                                 | {term}`ex-ray`, which `cargo xtask deps` builds            | the `toolchain` directive in {src}`crates/ex-ray/go.mod`                                                                                                              |
+| [Node.js](https://nodejs.org)                            | the front end (`ui/`), Vite, the WebDriver E2E             | the `engines.node` range in {src}`package.json`                                                                                                                       |
+| [uv](https://docs.astral.sh/uv/)                         | the installer projects, `scripts/`, the docs build         | any recent                                                                                                                                                            |
+| [cargo-nextest](https://nexte.st)                        | running the Rust tests                                     | at least `nextest-version` in {src}`.config/nextest.toml`                                                                                                             |
+| [prek](https://prek.j178.dev)                            | the pre-commit hooks in {src}`prek.toml`                   | any recent                                                                                                                                                            |
+| [git-subrepo](https://github.com/ingydotnet/git-subrepo) | only `cargo xtask`'s own tests, which drive `pull_subrepo` | the version CI installs (the `Install git-subrepo` step of {src}`.github/workflows/ci.yaml`); on macOS it needs Bash 4 or newer, which Apple's `/usr/bin/bash` is not |
 
 ````{tab-set}
 ---
@@ -28,7 +31,9 @@ Visual Studio* with the **Desktop development with C++** workload before you run
 [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/) is the web engine the Tauri app draws with. Windows
 11 ships it.
 
-Run commands in PowerShell or Git Bash. Building needs no elevation; running Hole in dev mode does (see
+Install [Git for Windows](https://gitforwindows.org): `cargo xtask` runs the steps of {src}`build.yaml` with its Git Bash,
+and with the one `HOLE_BUILD_BASH` names if you set it, and stops with an error if it finds neither. Run commands in
+PowerShell or Git Bash. Building needs no elevation; running Hole in dev mode does (see
 [Development](development.md)).
 ```
 
@@ -120,8 +125,10 @@ SKULD_LABELS='!tun' cargo xtask run hole-tests
 prek install
 ```
 
-installs the pre-commit and commit-message hooks from {src}`prek.toml`: formatting, Clippy with warnings denied, the
-Go linter, the docs build and several repository checks. CI runs the same hooks.
+installs the pre-commit hook from {src}`prek.toml`: formatting, Clippy with warnings denied, the Go linter, the docs
+build and several repository checks. CI runs the same hooks, with Clippy as a step of its own and the hooks split across
+runners as [Continuous integration](ci.md) describes. No commit message is checked on your machine; the format is checked
+on the pull request title ([Commit messages](commit-messages.md)).
 
 ## Next
 

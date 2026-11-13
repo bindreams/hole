@@ -17,7 +17,7 @@ command below; the definitions are in {src}`crates/hole/src/cli.rs`.
 | `hole bridge status`                                         | Prints whether the bridge is installed and running.                                                      |
 | `hole bridge log [path \| watch [--tail N]]`                 | With no argument, prints the bridge log; `path` prints where it is; `watch` streams it, after `N` lines. |
 | `hole bridge grant-access`                                   | Creates the `hole` group and adds the current user to it. Needs elevation.                               |
-| `hole bridge ipc-send (--base64 B64 \| --request-file PATH)` | Sends one IPC request to the bridge. Needs elevation.                                                    |
+| `hole bridge ipc-send (--base64 B64 \| --request-file PATH)` | Sends one IPC request to the installed bridge. Needs elevation.                                          |
 
 Options of `bridge run`:
 
@@ -31,12 +31,13 @@ Options of `bridge run`:
 - `--ready-notify HOST:PORT/TOKEN` connects to that address and echoes the token once the IPC socket is bound and its
   permissions are applied. The dev supervisor uses it; it is not for the service.
 
-`bridge install`, `enable`, `uninstall` and `grant-access` take `--log-dir`, and so does `bridge log`. `bridge grant-access` can send an IPC request afterwards (`--then-send`, `--then-send-file`).
-The GUI's elevated paths run these commands, and pass `--result-file` to `grant-access` and `ipc-send` to read the outcome
-back across stripped stdio.
+`bridge install`, `enable` and `uninstall` take `--log-dir`, and so does `bridge log`. `bridge grant-access` can send an
+IPC request afterwards (`--then-send`, `--then-send-file`). The GUI's elevated paths run these commands, and pass
+`--result-file` to `grant-access` and `ipc-send` to read the outcome back across stripped stdio.
 
-The GUI reads the bridge's socket from the `HOLE_BRIDGE_SOCKET` environment variable when it is set, which is how a dev
-app finds a dev bridge ([Development](development.md)).
+`ipc-send` and the `hole proxy` commands below connect to the installed bridge's default socket. Only the GUI reads
+`HOLE_BRIDGE_SOCKET` to find another, which is how a dev app finds a dev bridge ([Development](development.md)), so a
+bridge started with `--socket-path` cannot be driven from them.
 
 ```{dropdown} Internal subcommands
 `hole bridge cutover --payload DIR --target-version V` swaps the staged binaries during an update and restarts the
@@ -54,7 +55,7 @@ recovery.
 
 These wrap the IPC requests the app sends, and read a `ServerEntry` (`server`, `server_port`, `method`, `password`, and
 optionally `plugin` and `plugin_opts`) from a JSON file. They are for reproducing a bug: write a config by hand and drive
-the running bridge from a shell without the GUI.
+the installed bridge from a shell without the GUI.
 
 | Command                                     | What it does                                               |
 | ------------------------------------------- | ---------------------------------------------------------- |

@@ -1,9 +1,9 @@
 name: Semantic PR Title
 
-# Enforces the Conventional Commits convention on PR titles. Since this
-# repo squash-merges every PR, the PR title becomes the commit subject on
-# main, and the type prefix drives per-track release-notes categorization
-# (see scripts/generate-release-notes.py).
+# Enforces the Conventional Commits convention on PR titles. A squash merge
+# makes the PR title the commit subject on main (a rebase merge keeps each
+# commit's own), and the type prefix drives per-track release-notes
+# categorization (see scripts/generate-release-notes.py).
 #
 # See docs/contributing/commit-messages.md.
 

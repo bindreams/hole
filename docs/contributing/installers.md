@@ -34,7 +34,9 @@ cargo xtask run hole-msi-install-tests    # MSI_UNDER_TEST=<path\to\hole.msi> te
 cargo xtask run hole-msi-cleanup          # after an interrupted run
 ```
 
-The run refuses to start, before it changes anything, when:
+It needs the MSI built beforehand (`cargo xtask build hole-msi`, or the one `MSI_UNDER_TEST` names) and the repo's
+`node_modules`; the target builds neither, so run `cargo xtask build frontend-build` once if `hole-msi` has not left
+them. The run refuses to start, before it changes anything, when:
 
 - the shell is not elevated, or there is no MSI at `target\release\hole.msi` (or at the path `MSI_UNDER_TEST` names);
 - a Hole MSI product is registered, the `HoleBridge` service exists, `C:\Program Files\hole` exists (even empty), its
@@ -83,7 +85,9 @@ Three things about the payload are checked by `hole-dmg-tests` ({src}`dmg-instal
   symlink, which the bundler would ship dangling, so the build copies it dereferenced into `.cache/` first.
 - **The build leaves the tree clean.** The Tauri CLI can rewrite tracked files, `crates/hole/Cargo.toml` among them,
   before compiling, which would add `.dirty` to the version baked into the binary. The committed file already has the
-  form the CLI writes. The tests fail if a build modifies a tracked file or the binary reports `.dirty`.
+  form the CLI writes. The tests fail if a build modifies a tracked file or the binary reports `.dirty`. They need a
+  checkout with no uncommitted changes to tracked files, so with local edits `hole-dmg-tests` fails on these two
+  checks alone.
 
 ### Installing the built app for real
 
