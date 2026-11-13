@@ -17,5 +17,5 @@ Some libraries and plugins are Apache-2.0 so that others can reuse them. Each ca
 | `ex-ray`     | The first-party SIP003 plugin (a Go module)                 | {src}`crates/ex-ray/LICENSE`     |
 
 Code Hole builds on keeps its own license. The Go code vendored into ex-ray carries its license files under
-`crates/ex-ray/third_party/`. {src}`NOTICES.md` collects the attributions for third-party code and bundled assets; shipping
-them inside every release artifact is tracked in [bindreams/hole#1261](https://github.com/bindreams/hole/issues/1261).
+`crates/ex-ray/third_party/`. Attributions for other third-party code and bundled assets are not yet collected or
+shipped inside release artifacts; that is tracked in [bindreams/hole#1261](https://github.com/bindreams/hole/issues/1261).

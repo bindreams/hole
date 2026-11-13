@@ -35,10 +35,11 @@ galoshes
 kill switch
   An optional setting, off by default. It blocks every connection except local (loopback) traffic, traffic through the
   tunnel and traffic to the server itself, so a dropped tunnel cannot leak, and it stays switched on across restarts
-  until you turn it off. See {src}`the contributor reference <CONTRIBUTING.md#lockdown-mode>`.
+  until you turn it off. The tray calls it **Lockdown**. See
+  {src}`the contributor reference <CONTRIBUTING.md#lockdown-mode>`.
 
 lockdown
-  Hole's name for the {term}`kill switch`, as it appears in the app.
+  See {term}`kill switch`: the name the tray menu uses.
 
 Postern
   A self-hosted portal that runs Shadowsocks servers and gives each person you invite a ready-made client config. It is
@@ -63,4 +64,7 @@ TUN
 VPN client
   An app that sends a machine's traffic through a server somebody else runs. Hole is a client of that kind, not a VPN
   service: it comes with no server. Get a config from whoever runs one, or run your own with {term}`Postern`.
+
+Unblock Network
+  See {term}`kill switch`: the tray action, offered when Hole is not connected, that turns it off.
 ```

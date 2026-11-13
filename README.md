@@ -36,14 +36,14 @@ verify Hole is free of malware. To open it anyway:
 
 ## Learn more
 
-- The [documentation](docs/index.md) has a [glossary](docs/reference/glossary.md) of Hole's terms (TUN, SIP003
-  plugins, ECH, the kill switch), the [command line](docs/reference/cli.md), and lists [what else ships from this
-  repository](docs/reference/distributions.md), such as plugins for running your own server.
-- Building Hole, or changing it, starts at [CONTRIBUTING.md](CONTRIBUTING.md).
+- The [documentation](https://hole.readthedocs.io/en/latest/) has a [glossary](https://hole.readthedocs.io/en/latest/reference/glossary.html) of Hole's terms (TUN, SIP003 plugins, ECH, the
+  kill switch), the [command line](https://hole.readthedocs.io/en/latest/reference/cli.html), and lists [what else ships from this
+  repository](https://hole.readthedocs.io/en/latest/reference/distributions.html), such as plugins for running your own server.
+- To build Hole, run its tests or learn how it is put together, start at [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
 Copyright (C) 2026, Anna Zhukova
 
 Hole is licensed under the [GNU GPL version 3 or later](LICENSE.md), unless a component's own `LICENSE` file says
-otherwise: several libraries and plugins are Apache-2.0. [Licensing](docs/reference/licensing.md) lists them.
+otherwise: several libraries and plugins are Apache-2.0. [Licensing](https://hole.readthedocs.io/en/latest/reference/licensing.html) lists them.
