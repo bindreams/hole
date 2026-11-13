@@ -295,7 +295,7 @@ impl ServiceProcesses {
     /// held an interval is slept whole and `None` returns at once.
     fn wait_on_each(&self, millis: Option<u32>) -> io::Result<()> {
         if let (Some(millis), 0) = (millis, self.held()) {
-            // Paced re-check (CONTRIBUTING's sleep exceptions): paces a poll that re-checks
+            // Paced re-check (class 3 of docs/contributing/testing.md#no-synchronization-by-elapsed-time): paces a poll that re-checks
             // the SCM's real state on every return, concludes nothing from the interval and
             // has no cap. With no process there is no event to block on, and the SCM sends none.
             std::thread::sleep(std::time::Duration::from_millis(millis.into()));

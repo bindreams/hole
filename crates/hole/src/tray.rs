@@ -1556,7 +1556,7 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
 /// (no webview poll): an external stop, a bridge crash, or `hole proxy
 /// stop` must reach the tray (#462).
 ///
-/// Sanctioned timing exception (CONTRIBUTING.md test-invariants, the
+/// Sanctioned timing exception (docs/contributing/testing.md#no-synchronization-by-elapsed-time, the
 /// "external process whose state changes out-of-band" class): this polls
 /// a SEPARATE PROCESS for presentation reconciliation — the same class as
 /// the webview's 5s status poll — and synchronizes nothing in-process

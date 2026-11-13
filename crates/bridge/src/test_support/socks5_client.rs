@@ -146,7 +146,7 @@ const UDP_RETRANSMIT_INTERVAL: Duration = Duration::from_millis(500);
 /// implementation under test.
 ///
 /// `reply_deadline` bounds the wait for a reply: a class-2 failure-to-human
-/// bound (CONTRIBUTING.md#test-invariants) on an external round-trip — through
+/// bound (docs/contributing/testing.md#no-synchronization-by-elapsed-time) on an external round-trip — through
 /// the real bridge SOCKS5 relay and, for the galoshes variant, the whole
 /// ex-ray/galoshes plugin chain — that may never return if the chain is wedged.
 /// Size it to absorb the chain's cold first-datagram latency on a loaded

@@ -1461,7 +1461,7 @@ async fn log_sink_receives_a_frame_the_sitrep_parser_consumes() {
 /// spawned `mock-plugin` child process (`common::mock_plugin_path`), so a
 /// child that never becomes ready and never exits either leaves nothing to
 /// wake this await; the child is the sanctioned "may genuinely never happen"
-/// case CONTRIBUTING.md's no-synchronizing-via-time rule carves out. Without
+/// case the no-synchronizing-via-time rule (docs/contributing/testing.md#no-synchronization-by-elapsed-time) carves out. Without
 /// a bound this reads as a 10-minute CI job-timeout kill with no assertion
 /// and no test output instead of a named failure. Readiness itself is not one
 /// mechanism: `ReadinessMode::ExpectSitrep` reads it off the child's sitrep

@@ -25,7 +25,7 @@
 //! (the only park of
 //! `shutdown_cancels_in_flight_connection_without_panic`). Each waits on a
 //! task this test spawns and controls, not an out-of-process op, so
-//! CONTRIBUTING.md's no-synchronizing-via-time rule does not sanction a
+//! the no-synchronizing-via-time rule (docs/contributing/testing.md#no-synchronization-by-elapsed-time) does not sanction a
 //! per-await `tokio::time::timeout` (that exception is scoped to a remote or
 //! child-process op that might never succeed). The close wait is raced
 //! against the plugin task, so a tap that exits first fails the test. The

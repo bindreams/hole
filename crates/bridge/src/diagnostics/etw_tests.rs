@@ -811,8 +811,8 @@ fn other_stop_failures_are_not_read_as_already_stopped() {
 /// regression reverted the `if session_reclaimed` gate to an unconditional
 /// join (as it was before this split), `drop(etw_guard)` would block on
 /// that thread forever instead of returning. That hang is the sanctioned
-/// "no other happens-before edge" exception CONTRIBUTING.md carves out for
-/// this class of assertion — same shape as the tun-engine driver and
+/// "no other happens-before edge" exception that docs/contributing/testing.md#no-synchronization-by-elapsed-time
+/// carves out for this class of assertion — same shape as the tun-engine driver and
 /// `run_with_tap` cases documented in `.config/nextest.toml`, which is
 /// where this test's name is listed so the hang fails loud instead of
 /// consuming the job budget.
