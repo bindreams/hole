@@ -4,9 +4,9 @@
 //! survives disconnects): this file records what the user last asked to
 //! connect to, and is the one fact the bridge can read before any GUI
 //! exists — the boot requirement forces it to be root-owned and
-//! process-independent. See `CONTRIBUTING.md#fail-closed-cover` for why the
-//! connection parameters live here rather than being read from the user's
-//! own config file at reconcile time.
+//! process-independent. That is why the connection parameters live here rather
+//! than being read from the user's own config file at reconcile time; see
+//! `docs/contributing/architecture/kill-switch.md`.
 //!
 //! Both files here are `VersionedFile`s of role `Decision`, like the sibling
 //! `lockdown_state.rs`, but note the *opposite* lean on load failure: an

@@ -55,7 +55,7 @@
 //!    install a live block; see its own doc.
 //! 6. **Is a live boot-time filter out of the DEFAULT filter view?** The
 //!    softness of the twins is defended by the two halves never being
-//!    arbitrated against each other, which until now rested on WFP's own prose.
+//!    arbitrated against each other.
 //!    The same enumeration minus `FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` answers
 //!    it directly, with that one flag the only difference between the reads.
 //!
@@ -79,7 +79,7 @@
 //! `KeyObservation::proves_empty`, tracked as bindreams/hole#1043 — this lane
 //! cannot grade it), or whether the record is
 //! re-provisioned at boots after that (Microsoft documents no answer to the
-//! last one either way — see the `windows.rs` module doc). Those need a real
+//! last one either way — see kill-switch-windows.md). Those need a real
 //! reboot, which no CI runner offers — the same disclosed limit
 //! `a_simulated_reboot_rearms_the_cover` carries on macOS.
 //! `netsh wfp show boottimepolicy` is the manual cross-check for the
@@ -401,7 +401,7 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
          exclusive on one filter\n{evidence}"
     );
     // The twins' block is deliberately SOFT (see `FilterLifetime::filter_flags`
-    // and the module doc's "Boot-time coverage"), and this is the only lane
+    // and kill-switch-windows.md "The boot window"), and this is the only lane
     // that can show WFP took the combination rather than rejecting or dropping
     // it. A silent drop would leave the boot→BFE window carrying an
     // unoverridable block-all on a host whose boot may need egress — the exact
@@ -413,8 +413,7 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
          nothing in the pre-BFE window can override it\n{evidence}"
     );
     // The twins' softness is sound only because the two halves are never in
-    // the same arbitration set — the module doc's "The twins do not enter that
-    // argument", which until now was a quoted sentence from WFP's own pages.
+    // the same arbitration set (kill-switch-windows.md, "The boot window").
     // Here it is measured: the filter WFP just returned from the BOOTTIME_ONLY
     // view is absent from the DEFAULT one, taken seconds later on the same
     // host, with `FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` the only difference
@@ -724,7 +723,7 @@ fn boottime_global_net_state_every_engage_rearms_the_twins_instead_of_reporting_
     //
     // It is NOT a check that Hole's `serviceName`-less provider survives a BFE
     // start — that needs a provider which outlived a reboot, which no
-    // single-boot lane can produce. See the `windows.rs` module doc, which
+    // single-boot lane can produce. See kill-switch-windows.md, which
     // records that question as open rather than pretending this covers it.
     for (guid, _, flags) in &second_floor {
         assert_eq!(

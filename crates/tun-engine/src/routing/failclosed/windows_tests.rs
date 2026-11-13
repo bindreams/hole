@@ -444,11 +444,11 @@ fn lockdown_spec_v6_server_lands_on_v6_layer() {
 
 #[skuld::test]
 fn lockdown_spec_blockall_has_boottime_twins() {
-    // #998: the block-all floor must be enforced from boot, before BFE starts
+    // The block-all floor must be enforced from boot, before BFE starts
     // re-adding the Persistent pair — so each of ConnectV4/ConnectV6 needs
     // both a Persistent AND a Boottime block, the latter keyed on the fixed
-    // LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS pair (see the module doc's "Boot-time
-    // coverage" section).
+    // LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS pair (see kill-switch-windows.md,
+    // "The boot window").
     let s = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
     let blocks: Vec<_> = s.filters.iter().filter(|f| f.action == Action::Block).collect();
 
@@ -524,11 +524,10 @@ fn every_transient_filter_is_swept_under_the_lifetime_it_is_installed_with() {
 
 #[skuld::test]
 fn lockdown_spec_permits_are_never_boottime() {
-    // Only the block-all floor gets a boot-time twin (#998's scope decision:
-    // TUN-LUID/server-IP permits carry runtime-discovered values that would
-    // be stale pre-BFE, and a boot-time loopback/App-ID permit has no
-    // hand-off to its persistent counterpart). See the module doc's
-    // "Boot-time coverage" section.
+    // Only the block-all floor gets a boot-time twin (TUN-LUID/server-IP permits carry
+    // runtime-discovered values that would be stale pre-BFE, and a boot-time loopback/App-ID
+    // permit has no hand-off to its persistent counterpart). See kill-switch-windows.md,
+    // "The boot window".
     let s = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
     for f in s.filters.iter().filter(|f| f.action == Action::Permit) {
         assert_eq!(
