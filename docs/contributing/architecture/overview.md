@@ -111,5 +111,10 @@ from the app, and the process shutdown token that boot passes to `reconcile_once
 
 - [The kill switch](kill-switch.md): the one subsystem that outlives the bridge process, and so the one with the most
   state to reconcile.
-- The datapath (UDP policy, DNS forwarder, TUN naming, TCP admission), the route and recovery rules, and the process
-  model are still in {src}`CONTRIBUTING.md`, under *Architecture*.
+- The datapath, from a packet to an endpoint:
+  - [The datapath](datapath.md): the router's cascade, the UDP drop policy and the listener the datapath dials.
+  - [The TUN device](tun-device.md): where its name comes from, and its IPv6 address.
+  - [TCP accept refusal](tcp-admission.md): admitting, refusing and retiring TCP connections.
+  - [The DNS forwarder](dns-forwarder.md): carrying DNS over the tunnel, and the check before a connection starts.
+- Plugins: [where the plugin binaries come from](plugin-binaries.md) and [the galoshes transport](galoshes-transport.md).
+- The route and recovery rules, and the process model, are still in {src}`CONTRIBUTING.md`, under *Architecture*.

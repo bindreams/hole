@@ -194,7 +194,7 @@ mod roundtrips {
             // The teardown here is slower than the default read budget: the server
             // stops reading without closing, and the close only follows once the
             // keepalive errors the poisoned pipe — see
-            // CONTRIBUTING.md#galoshes-mux-default. Outlive that bound so the
+            // docs/contributing/architecture/galoshes-transport.md. Outlive that bound so the
             // assertion observes the teardown instead of racing it.
             let config = RoundtripConfig {
                 read_timeout: Duration::from_secs(90),

@@ -1,8 +1,8 @@
 //! The start-time DNS forwarder self-test gate: builds the in-TUN endpoint +
 //! forwarder, runs a bounded probe query through it, and classifies a failure
 //! into one of the claims `start_inner`'s toast/`bridge.log` may make — see
-//! [`SelfTestReason`]. See `CLAUDE.md` ("DNS forwarder") for the
-//! architectural context.
+//! [`SelfTestReason`]. The architecture is in
+//! `docs/contributing/architecture/dns-forwarder.md`.
 //!
 //! Self-contained: only `proxy_manager::start_inner` calls into this module,
 //! and it only calls back into `crate::dns::forwarder` / `crate::proxy`.
