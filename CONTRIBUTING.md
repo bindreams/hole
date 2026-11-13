@@ -3667,7 +3667,7 @@ Each publishable member declares a release group in
 | `ui/`, `scripts/`, `tests/`        | —                                      | Frontend (Vite), utility scripts, E2E specs (WebDriverIO)                            |
 
 Hole is GPL-3.0-or-later ([LICENSE.md](LICENSE.md)) unless a crate's own `LICENSE`
-file says otherwise: the Apache crates above are Apache-2.0. Combined distributions
+file says otherwise (the Apache crates). Combined distributions
 (`hole.exe`, `hole.msi`, bundled `galoshes.exe`) ship as a whole under GPL via
 Apache→GPL one-way compatibility.
 
@@ -3854,9 +3854,11 @@ cargo xtask run hole-dmg-tests   # mount + assert payload + code signature are i
 ```
 
 The DMG does not use `cargo xtask stage`; Tauri bundles the canonical BINDIR via
-`crates/hole/tauri.conf.json` — `macOS.files` (`hole.dSYM` → `Contents/MacOS/hole.dSYM`). The plugin sidecars are not in the app: `hole` embeds them
-(`crates/hole/tauri.macos.conf.json` drops `externalBin` on macOS, see
-[plugin binaries](#plugin-binaries-where-each-platform-gets-them)). The dSYM ships **next to the binary** because std's
+`crates/hole/tauri.conf.json` — `macOS.files` (`hole.dSYM` →
+`Contents/MacOS/hole.dSYM`). The plugin sidecars are not in the app: `hole`
+embeds them (`crates/hole/tauri.macos.conf.json` drops `externalBin` on macOS,
+see [plugin binaries](#plugin-binaries-where-each-platform-gets-them)). The dSYM
+ships **next to the binary** because std's
 backtrace symbolizer locates a `*.dSYM` by scanning the running binary's directory
 and matching its Mach-O UUID — so production panic backtraces resolve frame names +
 line numbers (the Windows `hole.pdb` analog; see #393). `bundle.macOS.files` is

@@ -6,7 +6,9 @@ Per-product release procedure: see [CONTRIBUTING.md § Releases](CONTRIBUTING.md
 
 Conditions under which a `hole` release must not go out, recorded here because the code that states them is not where a release operator looks.
 
-None at present.
+- **The first `hole` release without `NOTICES.md` in its Windows update archive**: its release notes must tell Windows
+  users on 0.5.0 to 0.7.0 that the in-app update will fail and that they must uninstall Hole and install the new MSI.
+  Their installed update code requires that file (owner 2026-11-13: no compatibility work before 1.0).
 
 ## Stated limits
 

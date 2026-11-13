@@ -27,10 +27,9 @@ def test_dmg_ships_full_canonical_bindir(installed_app: Path) -> None:
     """Every file the macOS bundle must hold ships in the .app payload (#512).
 
     Derives the expected set from the single source of truth so a future bindir
-    addition nobody wired into the Tauri config fails here. We scan only
-    Contents/MacOS (the binary and the dSYM bundle) and do NOT
-    recurse, so the DWARF Mach-O named `hole` inside hole.dSYM cannot falsely
-    satisfy the `hole` entry. The dSYM's internal structure + UUID are covered
+    addition nobody wired into the Tauri config fails here. We scan
+    Contents/MacOS without recursing, so the DWARF Mach-O named `hole` inside
+    hole.dSYM cannot falsely satisfy the `hole` entry. The dSYM's internal structure + UUID are covered
     by the two tests below.
     """
     expected = canonical_darwin_bindir()
