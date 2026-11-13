@@ -5,8 +5,8 @@
 # Per-track files (.github/release-<track>.yaml) declare include_paths
 # and the initial_release stub, but inherit categories from here.
 #
-# The type list mirrors CONTRIBUTING.md "Commit messages — Conventional
-# Commits" and .github/workflows/semantic-pr.yaml `types:` list.
+# The type list mirrors .github/workflows/semantic-pr.yaml `types:` list
+# (docs/contributing/commit-messages.md).
 #
 # To add a new Conventional-Commit type:
 #   1. Add it to .github/workflows/semantic-pr.yaml `types:` list.

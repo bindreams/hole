@@ -19,7 +19,8 @@ either without you installing anything. Without a plugin, Hole speaks plain Shad
   [glossary](reference/glossary.md) explains the terms, and the [command line](reference/cli.md) lists the commands.
 - **How it works:** the picture below, then [how Hole is put together](how-it-works/overview.md) and the pages that
   follow it.
-- **Contributing:** {src}`CONTRIBUTING.md` covers building Hole, running its tests and how it is put together.
+- **Contributing:** [Contributing](contributing/index.md) covers building Hole, running its tests and developing it.
+  How it is put together is in {src}`CONTRIBUTING.md` for now.
 
 ## Hole in one picture
 
@@ -62,6 +63,14 @@ ECH and DoH <how-it-works/ech-and-doh.md>
 DNS through the tunnel <how-it-works/dns.md>
 UDP: dropped, never bypassed <how-it-works/udp.md>
 The kill switch <how-it-works/kill-switch.md>
+```
+
+```{toctree}
+---
+caption: Contributing
+hidden:
+---
+Contributing <contributing/index.md>
 ```
 
 ```{toctree}

@@ -1554,16 +1554,14 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
 
 /// Keep the GUI's view of the bridge honest when the dashboard is closed
 /// (no webview poll): an external stop, a bridge crash, or `hole proxy
-/// stop` must reach the tray (#462).
+/// stop` must reach the tray.
 ///
-/// Sanctioned timing exception (CONTRIBUTING.md test-invariants, the
-/// "external process whose state changes out-of-band" class): this polls
-/// a SEPARATE PROCESS for presentation reconciliation — the same class as
-/// the webview's 5s status poll — and synchronizes nothing in-process
-/// (`BridgeLink::send` commits synchronously; no code waits on this
-/// loop). The immediate first tick doubles as the startup reconcile.
+/// Paced re-check (testing.md class 3): the bridge's state changes with no
+/// event reaching this process, so every tick re-reads it. No code waits on
+/// this loop (`BridgeLink::send` commits synchronously). The immediate first
+/// tick doubles as the startup reconcile.
 ///
-/// Startup auto-connect is no longer this loop's concern (#979): the bridge
+/// Startup auto-connect is no longer this loop's concern: the bridge
 /// decides and applies it at its own boot, before any GUI runs. This poll is
 /// purely presentational.
 pub fn spawn_status_reconciler(app: &AppHandle, _settled: LaunchWindowsSettled) {

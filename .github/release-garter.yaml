@@ -1,7 +1,7 @@
 # Per-track release notes config for the `garter` release group.
 # Consumed by scripts/generate-release-notes.py at release time.
 #
-# See CONTRIBUTING.md "Commit messages — Conventional Commits".
+# See docs/contributing/commit-messages.md.
 
 initial_release: |
   Initial release of `garter`, the SIP003u plugin-chain runner library
