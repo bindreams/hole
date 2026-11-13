@@ -4782,16 +4782,4 @@ the OS to match the menu bar. Runtime icon updates must use
 the first state change; `set_icon`/`set_icon_as_template` (tauri and inner
 `tray_icon` layers) are clippy-banned (#469).
 
-## Emergency network reset
-
-If routing gets into a bad state during development:
-
-```sh
-sudo python scripts/network-reset.py    # macOS
-python scripts/network-reset.py         # Windows (run as Administrator)
-```
-
-It reads the bridge's route-state file and tears down the exact leaked routes
-(reaping plugins by name and stopping ETW sessions as a last resort).
-
 [template image]: https://developer.apple.com/documentation/appkit/nsimage/1520017-template

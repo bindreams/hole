@@ -17,8 +17,61 @@ On Windows the installer runs `hole path add` for you. On macOS `hole` is not on
 sudo /Applications/Hole.app/Contents/MacOS/hole path add
 ```
 
-`hole bridge unlock` is the recovery route when no bridge is running. While one is, it refuses: use the app's **Unblock
-Network** action instead.
+## hole upgrade
+
+```text
+hole upgrade [-y | --yes]
+```
+
+Checks GitHub for a newer release of Hole, downloads the archive for this platform, verifies it against the release's
+signed `SHA256SUMS`, and hands it to the running {term}`bridge`, which swaps the files and restarts the service. The
+command returns once the swap has started, not when the restart has finished.
+
+Installing restarts the VPN. With the {term}`kill switch` off, traffic briefly leaves unencrypted during the restart, so
+the command asks for consent:
+
+- With the kill switch on, it does not ask.
+- With it off and a terminal attached, it prints a prompt and proceeds only on `y` or `yes`. Anything else, including
+  Enter, cancels with exit status 0.
+- With it off and no terminal attached, it refuses and exits with status 1, unless `-y` is given. `-y` answers yes in
+  advance.
+
+Exit status is 0 when Hole is already up to date, when the update has started, and when you declined at the prompt. It is
+1 when the check, the download, the verification or the hand-off fails. Sources: {src}`crates/hole/src/cli.rs` and
+{src}`crates/hole/src/update/consent.rs`.
+
+## hole path
+
+```text
+hole path add
+hole path remove
+```
+
+`add` puts `hole` on the system `PATH`; `remove` takes it off. Both need administrator rights, and both exit with status 1
+on failure. Open a new terminal afterwards: one that was already open does not see the change.
+
+- **Windows:** `add` appends the folder that holds `hole.exe` to the system `Path` (`HKEY_LOCAL_MACHINE`) and `remove`
+  deletes that entry. An entry that is already there, or already gone, is reported and is not an error.
+- **macOS:** `add` creates the symlink `/usr/local/bin/hole` pointing at the running binary, replacing a stale `hole`
+  link; `remove` deletes it. `remove` refuses a link that does not point at a file named `hole`. `add` refuses to run
+  from a translocated copy of the app: move Hole.app to `/Applications` first. Run it with the full path to the binary,
+  as shown above.
+
+Source: {src}`crates/hole/src/path_management.rs`.
+
+## hole bridge unlock
+
+```text
+hole bridge unlock
+```
+
+The recovery route for a {term}`kill switch` block that nothing else can lift: it works with no bridge running. Run it as
+administrator (`sudo` on macOS). In order, it records that Hole should not be connected, removes the standing block,
+clears the server remembered for the **Always connect** startup choice, and records the kill switch as off. It stops with
+an error before changing anything if a bridge is running: the message names the app's **Unblock Network** action as the
+route to use then. On Windows it may print a warning that it could not prove every boot-time filter gone.
+
+Exit status is 0 on success and 1 on failure. Source: `unlock` in {src}`crates/bridge/src/cutover.rs`.
 
 The remaining `hole bridge` and `hole proxy` subcommands are for development and administration. They are listed in
 the {src}`dev/admin CLI section of CONTRIBUTING.md <CONTRIBUTING.md#cli-devadmin-commands>`.

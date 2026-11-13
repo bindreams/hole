@@ -10,6 +10,15 @@ bridge
   The privileged half of Hole. It runs as a background service with administrator rights, owns the {term}`TUN` device
   and the routes, and does what the app asks over a local socket. See [Hole in one picture](../index.md#hole-in-one-picture).
 
+config
+  A small `.json` file that describes one or more Shadowsocks servers: address, port, password, cipher and an optional
+  plugin. Hole imports it; whoever runs the server hands it out, and it is as private as a password. See
+  [Get a server](../get-started/server.md).
+
+dashboard
+  Hole's main window: the list of servers, the filters, the settings, and the connection status. See
+  [Settings explained](../get-started/settings.md).
+
 DoH
   DNS over HTTPS: DNS queries sent inside an HTTPS connection, so the network can neither read nor alter them. Hole uses
   it for DNS inside the tunnel by default, and ex-ray uses it to fetch {term}`ECH` configs. See
@@ -56,6 +65,10 @@ SIP003 plugin
   A program that Shadowsocks starts on each end to wrap its traffic in another protocol, such as WebSocket over TLS.
   SIP003 is the specification of how it is started and configured. See
   [the specification](https://shadowsocks.org/doc/sip003.html).
+
+tray
+  Hole's icon in the Windows notification area or the macOS menu bar. Click it to open the {term}`dashboard`; right-click
+  it for the menu. See [Connect](../get-started/connect.md#the-tray).
 
 TUN
   A virtual network adapter that a program creates through the operating system. Hole routes the machine's traffic into
