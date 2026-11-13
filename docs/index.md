@@ -19,8 +19,8 @@ either without you installing anything. Without a plugin, Hole speaks plain Shad
   [glossary](reference/glossary.md) explains the terms, and the [command line](reference/cli.md) lists the commands.
 - **How it works:** the picture below, then [how Hole is put together](how-it-works/overview.md) and the pages that
   follow it.
-- **Contributing:** [Contributing](contributing/index.md) covers building Hole, running its tests and developing it.
-  How it is put together is in {src}`CONTRIBUTING.md` for now.
+- **Contributing:** [Contributing](contributing/index.md) covers building Hole, running its tests and developing it. How
+  it is put together starts at the [architecture overview](contributing/architecture/overview.md).
 
 ## Hole in one picture
 
@@ -71,6 +71,21 @@ caption: Contributing
 hidden:
 ---
 Contributing <contributing/index.md>
+Set up and build <contributing/setup.md>
+The workspace <contributing/workspace.md>
+Architecture overview <contributing/architecture/overview.md>
+The kill switch <contributing/architecture/kill-switch.md>
+Recovery, adoption and the cover lock <contributing/architecture/kill-switch-recovery.md>
+Windows: filters and the boot window <contributing/architecture/kill-switch-windows.md>
+macOS: the pf ruleset <contributing/architecture/kill-switch-macos.md>
+Uninstall and the service <contributing/architecture/kill-switch-uninstall.md>
+Development <contributing/development.md>
+Testing <contributing/testing.md>
+Continuous integration <contributing/ci.md>
+Commit messages <contributing/commit-messages.md>
+Building in detail <contributing/build.md>
+The installers <contributing/installers.md>
+Bridge and proxy commands <contributing/bridge-cli.md>
 ```
 
 ```{toctree}

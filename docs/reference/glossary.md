@@ -10,6 +10,11 @@ bridge
   The privileged half of Hole. It runs as a background service with administrator rights, owns the {term}`TUN` device
   and the routes, and does what the app asks over a local socket. See [How Hole is put together](../how-it-works/overview.md).
 
+cover
+  The operating-system firewall rule the {term}`bridge` installs to block outgoing traffic that is not on a short permit
+  list. The **standing** cover is the {term}`kill switch`; a **transient** cover is a bounded block for one connect
+  attempt, which no start engages today. See [the contributor reference](../contributing/architecture/kill-switch.md).
+
 DoH
   DNS over HTTPS: DNS queries sent inside an HTTPS connection, so the network can neither read nor alter them. Hole uses
   it for DNS inside the tunnel by default, and ex-ray uses it to fetch {term}`ECH` configs. See
@@ -40,7 +45,7 @@ kill switch
   An optional setting, off by default, that the tray calls **Lockdown**. While it is on and Hole is connecting or
   connected, traffic that would leave outside the tunnel is blocked, including to devices on your local network such as
   a printer, through brief drops, reconnects and restarts; the block lifts when you disconnect or Hole gives up on the
-  connection. See {src}`the contributor reference <CONTRIBUTING.md#lockdown-mode>`.
+  connection. See [the contributor reference](../contributing/architecture/kill-switch.md).
 
 lockdown
   See {term}`kill switch`: the name the tray menu uses.

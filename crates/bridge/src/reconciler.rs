@@ -412,8 +412,10 @@ where
                 // so any bug in the connect sequence strands them with no
                 // network and no visible cause — a worse failure than the leak
                 // it prevents. Users who want the strict trade turn the kill
-                // switch on, which engages the STANDING cover instead; that
-                // path is untouched and still holds on failure.
+                // switch on, which engages the STANDING cover instead: a start
+                // that fails before that install leaves a cover already in
+                // force, and one that fails after it releases what it
+                // installed (`release_failed_start_cover`).
                 if let Err(error) = pm
                     .start_cancellable(config, Coverage::Uncovered, cancel.child_token())
                     .await
