@@ -1,6 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.13"
+# dependencies = ["markdown-it-py>=4,<5", "mdit-py-plugins>=0.5"]
 # ///
 """Build the documentation site and check what the build cannot.
 
@@ -8,9 +9,9 @@ Builds `docs/` with warnings promoted to errors, then verifies the landing page'
 versions line carries the real manifest versions and that no substitution was
 left unrendered. Also checks every `{src}` link in `docs/`: its path must be
 tracked in the repository and, for a Markdown target, its `#anchor` must match a
-heading there (GitHub's slug rules). A fence left open at the end of a page, or
-in a Markdown target, is a problem too, since the rest of the file goes
-unchecked. Every README link that starts with
+heading there (GitHub's slug rules). Markdown is read with `markdown-it-py`, the
+parser under MyST: pages as MyST reads them, targets and the README as GitHub
+does. Every README link that starts with
 `https://hole.readthedocs.io/en/latest/` must be the site root or `<page>.html`,
 where `docs/<page>.md` is tracked in the repository.
 
@@ -24,12 +25,19 @@ can run the fetch under a retry without retrying a docs failure. `--links-only`
 runs the `{src}` and README link checks without the build.
 """
 
+import functools
 import re
 import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+
+from markdown_it import MarkdownIt
+from markdown_it.token import Token
+from mdit_py_plugins.front_matter import front_matter_plugin
+from mdit_py_plugins.myst_blocks import myst_block_plugin
+from mdit_py_plugins.myst_role import myst_role_plugin
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -49,8 +57,7 @@ SUBSTITUTION_RE = re.compile(r"\{\{\s*(?:" + "|".join(SUBSTITUTIONS) + r")\s*\}\
 # Code samples may show the substitution syntax on purpose.
 CODE_REGION_RE = re.compile(r"<(pre|code)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
 
-# A `{src}` role: {src}`path`, {src}`path#anchor` or {src}`title <path#anchor>`.
-SRC_ROLE_RE = re.compile(r"\{src\}`([^`]+)`")
+# A `{src}` role is {src}`path`, {src}`path#anchor` or {src}`title <path#anchor>`.
 # Sphinx's `explicit_title_re`, which its extlinks role splits a target with. The
 # target is used as written: no strip, and `<path>` without a title is a path.
 SRC_TITLED_RE = re.compile(r"^(.+?)\s*(?<!\x00)<([^<]*?)>$", re.DOTALL)
@@ -58,14 +65,17 @@ SRC_TITLED_RE = re.compile(r"^(.+?)\s*(?<!\x00)<([^<]*?)>$", re.DOTALL)
 # A README link into the published site: the page path after `/en/latest/`, if any.
 SITE_LINK_RE = re.compile(r"https://hole\.readthedocs\.io/en/latest/([^\s)#>]*)")
 
-HEADING_RE = re.compile(r"^ {0,3}#{1,6}[ \t]+(.*?)[ \t]*$")
-SETEXT_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
-# A line that starts a block other than a paragraph, so it cannot be a setext heading's text.
-BLOCK_START_RE = re.compile(r"^ {0,3}(?:>|[-*+][ \t]|\d+[.)][ \t]|(?:[-*_][ \t]*){3,}$)")
-HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
-HTML_TAG_RE = re.compile(r"<[^>]*>")
-# A backtick fence's info string holds no backtick: "```x``` is code" is a code span.
-FENCE_RE = re.compile(r"^ {0,3}(`{3,}(?=[^`]*$)|~{3,})[ \t]*(.*?)[ \t]*$")
+# Directives whose body is literal text, not Markdown: a role written in one is not a role.
+LITERAL_DIRECTIVES = frozenset({
+    "code",
+    "code-block",
+    "sourcecode",
+    "literalinclude",
+    "parsed-literal",
+    "math",
+    "raw",
+    "mermaid",
+})
 
 # Sphinx writes these itself; their contents are not ours to check.
 GENERATED_PAGES = frozenset({"search.html", "genindex.html"})
@@ -95,109 +105,86 @@ def check_rendered(out_dir: Path, versions: dict[str, str]) -> list[str]:
     return problems
 
 
-def scan_fences(text: str, directives: bool = True) -> tuple[list[tuple[int, str]], list[int]]:
-    """Split Markdown into the lines outside code blocks and the fences left open.
+def markdown_parser(myst: bool) -> MarkdownIt:
+    """A parser that reads Markdown as GitHub does, or as MyST does with `myst`.
 
-    Returns `(number, line)` for each line outside a code block, and the line
-    number of every fence still open at the end of the text. With `directives`,
-    a fence whose info string opens with `{` is a MyST directive, not code: its
-    body is Markdown (a `{glossary}` holds the page's `{src}` links) and is
-    returned. Without it every fence is code, as on GitHub.
+    MyST adds what `myst_parser` enables by default: front matter, `%` line
+    comments and `(target)=` lines, and `{role}` syntax.
     """
-    outside: list[tuple[int, str]] = []
-    open_fences: list[tuple[str, int, bool, int]] = []  # (fence char, fence length, is code, line number)
-    for number, line in enumerate(text.splitlines(), start=1):
-        match = FENCE_RE.match(line)
-        if match and open_fences:
-            char, length, _, _ = open_fences[-1]
-            if match.group(1)[0] == char and len(match.group(1)) >= length and not match.group(2):
-                open_fences.pop()
-                continue
-        if match and not (open_fences and open_fences[-1][2]):
-            fence = match.group(1)
-            open_fences.append((fence[0], len(fence), not (directives and match.group(2).startswith("{")), number))
+    parser = MarkdownIt("commonmark").enable("table")
+    if myst:
+        parser.use(front_matter_plugin).use(myst_block_plugin).use(myst_role_plugin)
+    return parser
+
+
+def leaf_tokens(tokens: list[Token], directives: bool, offset: int = 0) -> Iterator[tuple[int, Token]]:
+    """Yield `(line, token)` for every token that holds content: inline children and block leaves.
+
+    Lines are 1-based. A line inside a paragraph counts its soft and hard breaks,
+    so it is one line too early after a code span or role that wrapped. With
+    `directives`, the body of a MyST directive fence (info string `{name}`) is
+    parsed as Markdown and read too, unless the directive's body is literal
+    (`LITERAL_DIRECTIVES`); the nested lines are offset to the page's.
+    """
+    for token in tokens:
+        if token.map is None:
             continue
-        if not any(is_code for _, _, is_code, _ in open_fences):
-            outside.append((number, line))
-    return outside, [number for _, _, _, number in open_fences]
+        line = offset + token.map[0] + 1
+        if token.type == "inline":
+            for child in token.children or []:
+                yield line, child
+                if child.type in ("softbreak", "hardbreak"):
+                    line += 1
+            continue
+        yield line, token
+        if directives and token.type == "fence" and token.info.startswith("{"):
+            name = token.info[1:].partition("}")[0]
+            if name not in LITERAL_DIRECTIVES:
+                yield from leaf_tokens(markdown_parser(myst=True).parse(token.content), directives, line)
 
 
-def paragraphs(lines: list[tuple[int, str]]) -> Iterator[tuple[int, str]]:
-    """Yield `(first line number, text)` for each run of consecutive non-blank lines."""
-    run: list[str] = []
-    first = previous = 0
-    for number, line in lines:
-        if run and (number != previous + 1 or not line.strip()):
-            yield first, "\n".join(run)
-            run = []
-        if line.strip():
-            if not run:
-                first = number
-            run.append(line)
-        previous = number
-    if run:
-        yield first, "\n".join(run)
+def plain_text(children: list[Token]) -> str:
+    """The text of inline tokens as a reader sees it: no markup, no HTML tags.
+
+    A code span's characters and an image's alt text count; a soft break is a space.
+    """
+    parts = []
+    for child in children:
+        if child.type == "html_inline":
+            continue
+        if child.type == "image":
+            parts.append(plain_text(child.children or []))
+        elif child.type in ("softbreak", "hardbreak"):
+            parts.append(" ")
+        else:
+            parts.append(child.content)
+    return "".join(parts)
 
 
 def github_slug(title: str) -> str:
-    """The anchor GitHub derives from one heading's text, before collision suffixes.
-
-    Markdown links and HTML tags are read; emphasis, entities and autolinks are
-    not, so an anchor to a heading holding one needs checking by hand.
-    """
-    title = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", title)  # a link contributes its text
-    title = HTML_TAG_RE.sub("", title)
+    """The anchor GitHub derives from a heading's plain text, before collision suffixes."""
     return re.sub(r"[^\w\- ]", "", title.lower()).replace(" ", "-")
 
 
-def heading_slugs(markdown: str) -> set[str]:
+@functools.cache
+def heading_slugs(markdown_file: Path) -> frozenset[str]:
     """The anchors GitHub generates for the headings of one Markdown file.
 
-    Follows github-slugger (see `github_slug` for what it leaves out): lowercase,
-    HTML tags and punctuation other than `-` and `_` dropped, spaces to `-`; a
-    slug already taken gets the next free `-1`, `-2`, ... suffix. ATX and setext
-    headings count; code blocks (every fence is one on GitHub) and HTML comments
-    do not.
+    Follows github-slugger: the slug of the heading's plain text (`plain_text`),
+    then, for a slug already taken, the next free `-1`, `-2`, ... suffix. The file
+    is read once per run.
     """
-    lines, _ = scan_fences(markdown, directives=False)
-    text = HTML_COMMENT_RE.sub("", "\n".join(line for _, line in lines))
+    tokens = markdown_parser(myst=False).parse(markdown_file.read_text(encoding="utf-8"))
     occurrences: dict[str, int] = {}
-    paragraph: list[str] = []
-    for line in text.splitlines():
-        heading = HEADING_RE.match(line)
-        if SETEXT_RE.match(line) and paragraph:
-            title = " ".join(paragraph)
-        elif heading:
-            title = re.sub(r"[ \t]+#+$", "", heading.group(1))
-        else:
-            if line.strip() and not BLOCK_START_RE.match(line):
-                paragraph.append(line.strip())
-            else:
-                paragraph = []
+    for heading, inline in zip(tokens, tokens[1:]):
+        if heading.type != "heading_open":
             continue
-        paragraph = []
-        base = slug = github_slug(title)
+        base = slug = github_slug(plain_text(inline.children or []))
         while slug in occurrences:
             occurrences[base] += 1
             slug = f"{base}-{occurrences[base]}"
         occurrences[slug] = 0
-    return set(occurrences)
-
-
-def target_defects(markdown: str) -> list[str]:
-    """What hides the headings after it in one Markdown target, as GitHub reads it.
-
-    An unclosed fence or HTML comment swallows the rest of the file, so a later
-    heading would be reported as missing for the wrong reason.
-    """
-    lines, open_fences = scan_fences(markdown, directives=False)
-    defects = [f"{number}: fence is never closed" for number in open_fences]
-    text = "\n".join(line for _, line in lines)
-    for comment in HTML_COMMENT_RE.finditer(text):
-        if not comment.group().endswith("-->"):
-            number = lines[text.count("\n", 0, comment.start())][0]
-            defects.append(f"{number}: HTML comment is never closed")
-    return defects
+    return frozenset(occurrences)
 
 
 def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
@@ -208,35 +195,25 @@ def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
     a heading slug of that file.
     """
     problems = []
-    defective: set[str] = set()  # targets already reported as unreadable past a point
+    parser = markdown_parser(myst=True)
     for page in sorted((repo_root / "docs").rglob("*.md")):
         where = page.relative_to(repo_root).as_posix()
-        outside, unclosed = scan_fences(page.read_text(encoding="utf-8"))
-        for number in unclosed:
-            problems.append(f"{where}:{number}: fence is never closed: the rest of the page is unchecked")
-        for first, text in paragraphs(outside):
-            for role in SRC_ROLE_RE.finditer(text):
-                number = first + text.count("\n", 0, role.start())
-                titled = SRC_TITLED_RE.match(role.group(1))
-                target = titled.group(2) if titled else role.group(1)
-                path, _, anchor = target.partition("#")
-                is_dir = any(name.startswith(path.rstrip("/") + "/") for name in tracked)
-                if path not in tracked and not is_dir:
-                    problems.append(f"{where}:{number}: {{src}} path is not tracked in the repository: {path}")
-                elif anchor and path.endswith(".md") and path in tracked:
-                    target_file = repo_root / path
-                    if not target_file.is_file():
-                        problems.append(f"{where}:{number}: {{src}} path is tracked but missing on disk: {path}")
-                    else:
-                        markdown = target_file.read_text(encoding="utf-8")
-                        defects = target_defects(markdown)
-                        if defects and path not in defective:
-                            defective.add(path)
-                            problems.extend(
-                                f"{path}:{defect}: the headings after it are unchecked" for defect in defects
-                            )
-                        if not defects and anchor not in heading_slugs(markdown):
-                            problems.append(f"{where}:{number}: {{src}} anchor matches no heading in {path}: #{anchor}")
+        tokens = parser.parse(page.read_text(encoding="utf-8"))
+        for number, token in leaf_tokens(tokens, directives=True):
+            if token.type != "myst_role" or token.meta["name"] != "src":
+                continue
+            titled = SRC_TITLED_RE.match(token.content)
+            target = titled.group(2) if titled else token.content
+            path, _, anchor = target.partition("#")
+            is_dir = any(name.startswith(path.rstrip("/") + "/") for name in tracked)
+            if path not in tracked and not is_dir:
+                problems.append(f"{where}:{number}: {{src}} path is not tracked in the repository: {path!r}")
+            elif anchor and path.endswith(".md") and path in tracked:
+                target_file = repo_root / path
+                if not target_file.is_file():
+                    problems.append(f"{where}:{number}: {{src}} path is tracked but missing on disk: {path!r}")
+                elif anchor not in heading_slugs(target_file):
+                    problems.append(f"{where}:{number}: {{src}} anchor matches no heading in {path!r}: {anchor!r}")
     return problems
 
 
@@ -245,25 +222,33 @@ def readme_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
 
     `<page>.html` must have a tracked `docs/<page>.md` source; the bare site root
     maps to `docs/index.md`. Any other link under the site's base is a problem.
+    Link destinations, plain text and raw HTML are read; code is not.
     """
     problems = []
     readme_file = repo_root / "README.md"
     if not readme_file.is_file():
         return ["README.md: missing on disk"]
-    readme = readme_file.read_text(encoding="utf-8")
-    for number, line in enumerate(readme.splitlines(), start=1):
-        for link in SITE_LINK_RE.finditer(line):
+    tokens = markdown_parser(myst=False).parse(readme_file.read_text(encoding="utf-8"))
+    for number, token in leaf_tokens(tokens, directives=False):
+        if token.type in ("link_open", "image"):
+            text = token.attrGet("href") or token.attrGet("src") or ""
+        elif token.type in ("text", "html_inline", "html_block"):
+            text = token.content
+        else:
+            continue
+        for link in SITE_LINK_RE.finditer(str(text)):
             page = link.group(1)
             if page.endswith(".html"):
                 source = f"docs/{page.removesuffix('.html')}.md"
             elif page == "":
                 source = "docs/index.md"
             else:
-                problems.append(f"README.md:{number}: site link is not a page or the site root: {link.group(0)}")
+                problems.append(f"README.md:{number}: site link is not a page or the site root: {link.group(0)!r}")
                 continue
             if source not in tracked:
                 problems.append(
-                    f"README.md:{number}: site link's page source {source} is not tracked in the repository: {link.group(0)}"
+                    f"README.md:{number}: site link's page source {source!r} is not tracked in the repository: "
+                    f"{link.group(0)!r}"
                 )
     return problems
 
@@ -447,40 +432,81 @@ def _write_files(root: Path, files: dict[str, str]) -> None:
         (root / name).write_text(text, encoding="utf-8")
 
 
-def test_heading_slugs_follow_github_rules() -> None:
+def _slugs(tmp_path: Path, markdown: str) -> frozenset[str]:
+    """`heading_slugs` of `markdown`, written to a file of its own under `tmp_path`."""
+    _write_files(tmp_path, {"t.md": markdown})
+    return heading_slugs(tmp_path / "t.md")
+
+
+def test_heading_slugs_follow_github_rules(tmp_path: Path) -> None:
     markdown = "# CLI (dev/admin commands)\n## Lockdown mode\n## Lockdown mode\n## [Link](#x) `code_x` & more\n"
 
-    assert heading_slugs(markdown) == {"cli-devadmin-commands", "lockdown-mode", "lockdown-mode-1", "link-code_x--more"}
+    assert _slugs(tmp_path, markdown) == {
+        "cli-devadmin-commands",
+        "lockdown-mode",
+        "lockdown-mode-1",
+        "link-code_x--more",
+    }
 
 
-def test_heading_slugs_ignore_fenced_code() -> None:
-    assert heading_slugs("```sh\n# a comment\n```\n# Real\n") == {"real"}
+def test_heading_slugs_ignore_fenced_code(tmp_path: Path) -> None:
+    assert _slugs(tmp_path, "```sh\n# a comment\n```\n# Real\n") == {"real"}
 
 
-def test_heading_slugs_take_the_next_free_suffix() -> None:
-    assert heading_slugs("# a\n# a-1\n# a\n") == {"a", "a-1", "a-2"}
+def test_heading_slugs_ignore_a_fence_inside_a_list_item(tmp_path: Path) -> None:
+    markdown = "1. step\n\n   ```sh\n   # a comment\n   ```\n\n- item\n\n      # indented code\n\n# Real\n"
+
+    assert _slugs(tmp_path, markdown) == {"real"}
 
 
-def test_heading_slugs_drop_html_tags_and_commented_headings_and_read_setext() -> None:
-    markdown = "# Foo <kbd>Ctrl</kbd>\n<!--\n# hidden\n-->\nTitle\n=====\n\nSub\n---\n"
-
-    assert heading_slugs(markdown) == {"foo-ctrl", "title", "sub"}
+def test_heading_slugs_take_the_next_free_suffix(tmp_path: Path) -> None:
+    assert _slugs(tmp_path, "# a\n# a-1\n# a\n") == {"a", "a-1", "a-2"}
 
 
-def test_a_backtick_run_with_a_backtick_after_it_is_not_a_fence() -> None:
-    outside, unclosed = scan_fences("```x``` is code\n{src}`nope.rs`\n")
-
-    assert [number for number, _ in outside] == [1, 2]
-    assert unclosed == []
+def test_heading_slugs_read_setext_headings(tmp_path: Path) -> None:
+    assert _slugs(tmp_path, "Title\n=====\n\nSub\n---\n\n- list\n---\n") == {"title", "sub"}
 
 
-def test_an_unclosed_fence_is_reported(tmp_path: Path) -> None:
+def test_heading_slugs_use_the_rendered_text_of_the_heading(tmp_path: Path) -> None:
+    markdown = (
+        "# Foo <kbd>Ctrl</kbd>\n"
+        "## *Emphasis* and __strong__\n"
+        "## Fish &amp; chips &copy;\n"
+        "## See <https://a.b/c>\n"
+        "## An ![alt text](x.png) image\n"
+        "## Inline <!-- gone --> comment\n"
+    )
+
+    assert _slugs(tmp_path, markdown) == {
+        "foo-ctrl",
+        "emphasis-and-strong",
+        "fish--chips-",
+        "see-httpsabc",
+        "an-alt-text-image",
+        "inline--comment",
+    }
+
+
+def test_heading_slugs_skip_html_comments_and_stop_at_an_unclosed_one(tmp_path: Path) -> None:
+    markdown = "<!--\n# hidden\n-->\n<!-- one line -->\n# Real\n<!--\n# swallowed\n"
+
+    assert _slugs(tmp_path, markdown) == {"real"}
+
+
+def test_an_unclosed_fence_hides_the_rest_of_a_target(tmp_path: Path) -> None:
+    assert _slugs(tmp_path, "# Early\n```sh\n# Late\n") == {"early"}
+
+
+def test_every_fence_in_a_github_target_is_code(tmp_path: Path) -> None:
+    markdown = "# Real\n\n```{code-block} sh\n# Lockdown mode\n```\n\n## Lockdown mode\n"
+
+    assert _slugs(tmp_path, markdown) == {"real", "lockdown-mode"}
+
+
+def test_an_unclosed_fence_runs_to_the_end_of_a_page(tmp_path: Path) -> None:
     tracked = _write_repo(tmp_path, {"docs/a.md": "text\n```sh\n{src}`nope.rs`\n"})
 
-    problems = src_link_problems(tmp_path, tracked)
-
-    assert len(problems) == 1
-    assert "a.md:2" in problems[0] and "never closed" in problems[0]
+    assert src_link_problems(tmp_path, tracked) == []
 
 
 def test_src_links_that_wrap_across_lines_are_checked_at_their_first_line(tmp_path: Path) -> None:
@@ -519,21 +545,14 @@ def test_src_targets_are_split_the_way_sphinx_splits_them(tmp_path: Path) -> Non
     assert " x/y.rs " in problems[1]
 
 
-def test_every_fence_in_a_github_target_is_code() -> None:
-    markdown = "# Real\n\n```{code-block} sh\n# Lockdown mode\n```\n\n## Lockdown mode\n"
+def test_a_target_is_parsed_once_per_run(tmp_path: Path) -> None:
+    page = "{src}`T <T.md#a>` {src}`T <T.md#b>`\n"
+    tracked = _write_repo(tmp_path, {"docs/a.md": page, "docs/b.md": page, "T.md": "# A\n# B\n"})
+    before = heading_slugs.cache_info().misses
 
-    assert heading_slugs(markdown) == {"real", "lockdown-mode"}
+    assert src_link_problems(tmp_path, tracked) == []
 
-
-def test_an_unclosed_fence_or_comment_in_a_target_is_reported_not_misread_as_a_missing_heading(tmp_path: Path) -> None:
-    files = {"docs/a.md": "{src}`T <T.md#late>` {src}`T <T.md#late>`\n", "T.md": "# Early\n<!--\n# Late\n"}
-    tracked = _write_repo(tmp_path, files)
-
-    problems = src_link_problems(tmp_path, tracked)
-
-    assert len(problems) == 1
-    assert "T.md:2: HTML comment is never closed" in problems[0]
-    assert target_defects("# a\n```sh\n# b\n") == ["2: fence is never closed"]
+    assert heading_slugs.cache_info().misses == before + 1
 
 
 def test_src_links_report_a_missing_path_and_a_wrong_anchor(tmp_path: Path) -> None:
@@ -543,18 +562,52 @@ def test_src_links_report_a_missing_path_and_a_wrong_anchor(tmp_path: Path) -> N
     problems = src_link_problems(tmp_path, tracked)
 
     assert len(problems) == 2
-    assert "a.md:1" in problems[0] and "nope.rs" in problems[0]
-    assert "a.md:2" in problems[1] and "#other" in problems[1]
+    assert "a.md:1" in problems[0] and "'nope.rs'" in problems[0]
+    assert "a.md:2" in problems[1] and "'other'" in problems[1]
 
 
 def test_src_links_are_read_inside_directives_but_not_inside_code(tmp_path: Path) -> None:
-    page = "```{glossary}\nterm\n  {src}`nope.rs`\n```\n\n```sh\n{src}`ignored.rs`\n```\n"
+    page = (
+        "```{glossary}\nterm\n  {src}`nope.rs`\n```\n\n"
+        "```sh\n{src}`ignored.rs`\n```\n\n"
+        "```{code-block} sh\n{src}`ignored.rs`\n```\n\n"
+        "```{mermaid}\n{src}`ignored.rs`\n```\n"
+    )
     tracked = _write_repo(tmp_path, {"docs/a.md": page})
 
     problems = src_link_problems(tmp_path, tracked)
 
     assert len(problems) == 1
     assert "a.md:3" in problems[0]
+
+
+def test_src_links_are_read_in_nested_directives_and_lists_and_quotes(tmp_path: Path) -> None:
+    page = (
+        "````{note}\n```{glossary}\nterm\n  {src}`one.rs`\n```\n````\n\n"
+        "- item\n\n  ```{glossary}\n  term\n    {src}`two.rs`\n  ```\n\n"
+        "> {src}`three.rs`\n"
+    )
+    tracked = _write_repo(tmp_path, {"docs/a.md": page})
+
+    problems = src_link_problems(tmp_path, tracked)
+
+    assert [problem.split(": ")[0] for problem in problems] == ["docs/a.md:4", "docs/a.md:12", "docs/a.md:15"]
+
+
+def test_src_roles_in_comments_and_code_spans_are_not_roles(tmp_path: Path) -> None:
+    page = "<!-- {src}`one.rs` -->\n\n% {src}`two.rs`\n\n``{src}`three.rs` ``\n\n    {src}`four.rs`\n\n{ref}`five`\n"
+    tracked = _write_repo(tmp_path, {"docs/a.md": page})
+
+    assert src_link_problems(tmp_path, tracked) == []
+
+
+def test_src_roles_after_front_matter_are_checked(tmp_path: Path) -> None:
+    tracked = _write_repo(tmp_path, {"docs/a.md": "---\ntitle: {src}`ignored.rs`\n---\n\n{src}`nope.rs`\n"})
+
+    problems = src_link_problems(tmp_path, tracked)
+
+    assert len(problems) == 1
+    assert "a.md:5" in problems[0]
 
 
 def test_readme_links_accept_pages_and_the_site_root(tmp_path: Path) -> None:
@@ -575,3 +628,14 @@ def test_readme_links_report_a_page_that_is_not_tracked(tmp_path: Path) -> None:
 
     assert len(problems) == 1
     assert "README.md:2" in problems[0] and "docs/reference/gone.md" in problems[0]
+
+
+def test_readme_links_ignore_code_and_read_html_and_bare_urls(tmp_path: Path) -> None:
+    site = "https://hole.readthedocs.io/en/latest/reference/gone.html"
+    (tmp_path / "README.md").write_text(
+        f'`{site}`\n\n```sh\ncurl {site}\n```\n\nbare {site}\n\n<a href="{site}">x</a>\n', encoding="utf-8"
+    )
+
+    problems = readme_link_problems(tmp_path, frozenset({"docs/index.md"}))
+
+    assert [problem.split(": ")[0] for problem in problems] == ["README.md:7", "README.md:9"]

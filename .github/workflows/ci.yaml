@@ -216,7 +216,7 @@ jobs:
         shell: bash
         run: |
           # Fetch the test dependencies under retry.
-          with=(--with pytest --with PyYAML --with pathspec)
+          with=(--with pytest --with PyYAML --with pathspec --with "markdown-it-py>=4,<5" --with "mdit-py-plugins>=0.5")
           .github/scripts/retry.sh uv run "${with[@]}" python -c ""
           uv run "${with[@]}" pytest -o python_files="*.py" scripts/
 
