@@ -116,7 +116,7 @@ before editing; the sections linked below are the authoritative source.
   crash marker; the next start of the same kind sweeps it. On macOS
   `on_crash` terminates the process instead of returning — see crash.rs's
   module doc before touching either half. →
-  [CONTRIBUTING.md#native-crash-observability-tombstone](CONTRIBUTING.md#native-crash-observability-tombstone)
+  [docs/contributing/architecture/native-crashes.md](docs/contributing/architecture/native-crashes.md)
 - **Route ownership.** Teardown and recovery delete only the `RouteId`s
   `bridge-routes.json` records as installed. On macOS no delete-side qualifier
   can substitute: `RTM_DELETE` matches on destination + netmask only, and the
@@ -124,15 +124,15 @@ before editing; the sections linked below are the authoritative source.
   traffic. Windows' bypass delete can additionally be scoped by the
   install-time gateway, carried in `original_gateway`. Leftovers a sweep
   can't confirm gone are carried forward in `stale`, never dropped. →
-  [CONTRIBUTING.md#route-ownership](CONTRIBUTING.md#route-ownership)
+  [docs/contributing/architecture/route-ownership.md](docs/contributing/architecture/route-ownership.md)
 - **Route-command failure policy.** Install is fatal, teardown/crash recovery
   are best-effort — the type system (`FatalPhase`/`BestEffortPhase`) enforces
   which runner a phase gets, and per-command fatality tolerates the IPv6
   splits failing on a TUN with no IPv6 binding. →
-  [CONTRIBUTING.md#route-command-failure-policy](CONTRIBUTING.md#route-command-failure-policy)
+  [docs/contributing/architecture/route-failure-policy.md](docs/contributing/architecture/route-failure-policy.md)
 - **Crash-recovery sweep.** `bridge-{routes,plugins,dns}.json` + ETW sessions are
   replayed/cleaned on next startup after the IPC socket binds. →
-  [CONTRIBUTING.md#crash-recovery](CONTRIBUTING.md#crash-recovery)
+  [docs/contributing/architecture/crash-recovery.md](docs/contributing/architecture/crash-recovery.md)
 - **Yamux transport self-heal.** The galoshes yamux client reconnects after a
   transport reset instead of wedging; death is detected via the driver's
   inbound channel closing, and reconnect backoff is floored and resets on
@@ -173,7 +173,7 @@ before editing; the sections linked below are the authoritative source.
   under the ownership-transition rule (`util::dir::Dir`), and the lock and the
   state-file writers listed in the section below go through that handle, never
   back through the path. →
-  [CONTRIBUTING.md#file-lock](CONTRIBUTING.md#file-lock)
+  [docs/contributing/architecture/file-lock.md](docs/contributing/architecture/file-lock.md)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay
   tee, `HOLE_BRIDGE_LOG` directives, and the plugin tap. →
   [CONTRIBUTING.md#logging--diagnostics](CONTRIBUTING.md#logging--diagnostics)
@@ -191,10 +191,10 @@ before editing; the sections linked below are the authoritative source.
   [→](CONTRIBUTING.md#bridge-cancellation-contract)
 - **Delete only recorded routes** — a route whose install failed belongs to
   whoever holds it now; deleting it takes down another VPN's tunnel.
-  [→](CONTRIBUTING.md#route-ownership)
+  [→](docs/contributing/architecture/route-ownership.md)
 - **Ephemeral ports via `bind_ephemeral`, never raw `free_port`** — the retry is
   unbounded by design, no budget (clippy-enforced).
-  [→](CONTRIBUTING.md#port-allocation)
+  [→](docs/contributing/architecture/contention-and-ports.md#port-allocation)
 - **No sleeps / timeout-polls for synchronization** — use the codebase's
   rendezvous primitives; three narrow exception classes only.
   [→](docs/contributing/testing.md#no-synchronization-by-elapsed-time)
@@ -233,7 +233,7 @@ before editing; the sections linked below are the authoritative source.
   a user's link into the system's or another account's is refused); the final name
   is never followed; mode and owner are set through the open file; nothing touches
   a path after a rename.
-  [→](CONTRIBUTING.md#privileged-code-in-folders-a-user-may-own)
+  [→](docs/contributing/architecture/privileged-folders.md)
 - **Hole never writes the server address or the password** — no `Display` on
   `ServerAddress` or `Password` (compiler-enforced), `.expose()` is the only
   exit from either, and every `Serialize` type transitively holding one needs

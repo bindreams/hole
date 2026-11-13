@@ -38,7 +38,8 @@ than the halves.
 Hole writes down each route it installs, and teardown and crash recovery delete only those. A route that failed to
 install belongs to whoever holds it now, often another VPN, and deleting it would take that VPN's tunnel down. The
 record is {src}`crates/tun-engine/src/routing/state.rs`; the route list is `RouteId` in
-{src}`crates/tun-engine/src/routing.rs`.
+{src}`crates/tun-engine/src/routing.rs`. [Route ownership](../contributing/architecture/route-ownership.md) has the
+details.
 ```
 
 ## Names and addresses

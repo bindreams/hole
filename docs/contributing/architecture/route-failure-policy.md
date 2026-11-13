@@ -1,0 +1,84 @@
+# Route commands and what failing means
+
+The {term}`bridge` points the machine's routes at the {term}`TUN` device by running the platform's `route` and `netsh`
+tools. Whether a failed command stops what is running is a security decision, and the code makes it by type. This page
+is for a developer who changes route install, teardown or recovery. It assumes [the architecture
+overview](overview.md). Which routes Hole may delete is a separate question, answered in [route
+ownership](route-ownership.md).
+
+## Two runners
+
+Every route command runs in a *phase*, and a phase belongs to one of two families. The code is in
+{src}`crates/tun-engine/src/routing.rs`.
+
+|                                 | Fatal                                                                                                                             | Best-effort                                                                                                        |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Phases                          | `FatalPhase::Setup` (and the macOS firewall engage)                                                                               | `BestEffortPhase`: `Teardown`, `RecoverSplit`, `RecoverBypass` (and the macOS firewall recovery)                   |
+| Runner                          | `run_setup_commands`, reached through `setup_routes`                                                                              | `run_teardown_commands`, reached through `teardown_routes` and `recover_routes`                                    |
+| A command that does not confirm | Stops the phase and returns a `RouteCommandError`                                                                                 | Is logged and kept in the record; the next command still runs                                                      |
+| Why                             | A route that was never installed but is reported as installed sends traffic outside the tunnel while the app says it is protected | A cleanup that stops at the first failure strands routes, and leaves the user worse off than if Hole had never run |
+
+Install is not transactional: a command can fail halfway through the set. That is why *teardown* is best-effort too, and
+not only crash recovery. The defensive teardown after a failed install may be asked to delete a route that never went in,
+and the platform tools exit non-zero for that.
+
+## The pairing is a type
+
+A phase is a value of `FatalPhase` or `BestEffortPhase`. Both implement the sealed trait `Phase`, whose constant
+`BEST_EFFORT` also picks the log level (a failure in a best-effort phase is expected, so it is logged at debug) and which
+question the runner asks of a command's result ([what confirmed means](#what-confirmed-means)). Each runner accepts only
+its own family, and the two command types differ as well (`SetupCommand` and `RouteCommand`). Wiring a teardown phase into
+the fatal runner does not compile.
+
+A best-effort runner narrows a `Vec<RouteId>` accumulator and returns nothing, so there is no `Result` for a later edit to
+`?` out of. That is the second half of the guarantee: the cleanup path has no way to stop early.
+
+## What confirmed means
+
+The runner reports a command as confirmed when the route's state is now what the phase wanted: *it went in* for the fatal
+phase, *it is gone* for every best-effort phase. The two questions are separate functions (`route_command_installed` and
+`route_confirmed_absent`), and they read different evidence per platform. The evidence, and why a best-effort delete that
+fails stays recorded, is under [what counts as gone](route-ownership.md#what-counts-as-gone).
+
+## Fatality is per command
+
+Within the fatal phase, one field decides: `SetupCommand::fatal`. The IPv4 splits and the server bypass are always fatal.
+The two IPv6 splits (`::/1` and `8000::/1`) are fatal only when the TUN device has an IPv6 binding, which
+`gateway::tun_ipv6_available` probes by the TUN's own name once the OS has created it.
+
+Where a host has no IPv6 on the TUN (a `DisabledComponents` setting, or an EDR policy that unbinds IPv6 from new
+adapters), adding an IPv6 route to it can fail outright, and a host with no IPv6 stack has no IPv6 traffic to leak.
+Aborting there would lose the whole tunnel and protect nothing. The two commands are still *issued*, and only their
+failure is tolerated: a bound TUN accepts the route whatever the upstream connectivity, so only a genuinely unbound TUN
+makes the add itself fail. The probe is of the TUN, not of the upstream interface that `GatewayInfo::ipv6_available`
+measures, because the TUN's name is what those commands carry.
+
+## A failed install
+
+A partial route set is a real state. When `setup_routes` reports a failure, `SystemRouting::install_with` does four
+things and nothing else; its doc comment is the source of truth.
+
+1. It issues no further setup commands.
+1. It runs teardown narrowed to the routes that the per-command checkpointing confirmed installed, never to the planned set.
+1. It clears the persisted record only once nothing is left unconfirmed. A command whose fate is unknown stays recorded for
+   the next start to retry.
+1. It returns `Err(RoutingError::RouteSetup)`. No `SystemRoutes` guard is built, so no caller can report the tunnel up.
+
+A command that ran but did not confirm is the same failure. If `setup_routes` finishes without error but fewer routes are
+confirmed than `planned_routes(server_ip)` lists, `install_with` rolls back and returns `Err` too. A partial tunnel is
+worse than no tunnel: the user believes traffic is captured when some of it is not. The case that matters in practice is
+another VPN that already holds `0.0.0.0/1`: Hole's add fails, the route is never recorded, and Hole's stop leaves it
+alone.
+
+## The accepted trade
+
+A false start failure is preferred to a silent leak. Nothing in the tree measures whether a healthy install can legitimately
+exit non-zero, for example over a route that is already there, and no test runs `setup_routes` against a real elevated
+`netsh` or `route` under that condition. Install therefore treats every unconfirmed command as a failure. Do not add
+tolerance for an "already exists" exit code to make a start succeed: a stranded route is better surfaced than routed around.
+
+## Error text
+
+`RouteCommandError`'s `Display` carries the program name, the command's position in the phase and the exit code, and
+nothing else. It reaches a toast verbatim through `StartError::Failed`, so it must not hold the server address or an
+interface name. The full argv and the child's output go to `bridge.log` from the runner (`run_command`).

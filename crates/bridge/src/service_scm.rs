@@ -414,7 +414,7 @@ mod system {
     /// callback from an earlier arm can never see a buffer a later arm is filling.
     /// A record is freed only after its callback has run, so an APC the SCM
     /// already queued still finds live memory at the thread's next alertable
-    /// wait. An unsettled record is leaked (see CONTRIBUTING.md): one record
+    /// wait. An unsettled record is leaked (see `docs/contributing/architecture/update-cutover.md`): one record
     /// (88 bytes on 64-bit Windows) per `NotifyServiceStatusChangeW` call that
     /// did not settle, i.e. that dropped pending, failed, or returned
     /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`. Nothing caps how many such calls

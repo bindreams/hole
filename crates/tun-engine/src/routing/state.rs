@@ -35,7 +35,7 @@ use super::{planned_routes, RouteId};
 /// different facts. Collapsing them would make a migrated record — which
 /// really did have a real gateway, just an unrecorded one — look on-link,
 /// emitting the interface-scoped delete for a route that was actually
-/// installed through a gateway. See CONTRIBUTING's Route ownership section.
+/// installed through a gateway. See docs/contributing/architecture/route-ownership.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RouteForm {
@@ -62,8 +62,8 @@ pub struct RouteState {
     /// The gateway `install` bypassed the tunnel through when this record's
     /// own routes went in. `None` only for a record migrated from schema 1
     /// or 2, which never persisted it — those deletes fall back to the old
-    /// unscoped form (a disclosed residual; see CONTRIBUTING's Route
-    /// ownership section). A fresh schema-3 write always sets `Some`.
+    /// unscoped form (a disclosed residual; see docs/contributing/architecture/route-ownership.md). A fresh write
+    /// always sets `Some`.
     pub original_gateway: Option<IpAddr>,
     /// The form `original_gateway`'s bypass route was installed in — see
     /// [`RouteForm`]. Migrated records default to [`RouteForm::Via`], same as
