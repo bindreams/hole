@@ -570,8 +570,8 @@ func generateConfig() (*core.Config, error) {
 				socketConfig.TcpKeepAliveIdle = keepAlive.IdleSeconds
 				socketConfig.TcpKeepAliveInterval = keepAlive.IntervalSeconds
 			} else {
-				// tcp-keepalive=0: a negative idle is the sentinel that
-				// suppresses Go's own keepalive too (see README for why).
+				// tcp-keepalive=0: an idle of 0 would leave Go's own default keepalive
+				// in place, so a negative idle is the sentinel that suppresses it too.
 				socketConfig.TcpKeepAliveIdle = -1
 			}
 		}

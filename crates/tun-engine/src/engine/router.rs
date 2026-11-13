@@ -47,7 +47,7 @@ pub trait Router: Send + Sync + 'static {
     ///
     /// The flow is an `AsyncRead + AsyncWrite` with an extra
     /// [`TcpFlow::peek`] for sniffing the first bytes (SNI, HTTP Host).
-    /// Dropping the flow causes the underlying smoltcp socket to emit RST.
+    /// Dropping the flow closes the connection with a FIN.
     async fn route_tcp(&self, meta: TcpMeta, flow: TcpFlow) -> io::Result<()>;
 
     /// Handle a new UDP flow (first datagram seen for this 5-tuple).

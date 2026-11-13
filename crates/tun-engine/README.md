@@ -32,6 +32,7 @@ for which `tun_engine::helpers` has SOCKS5 and interface-bound sockets.
 use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
+use tun_engine::device::TunName;
 use tun_engine::{Device, Engine, Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta};
 
 struct MyRouter;
@@ -40,7 +41,7 @@ struct MyRouter;
 impl Router for MyRouter {
     async fn route_tcp(&self, _meta: TcpMeta, flow: TcpFlow) -> std::io::Result<()> {
         // `flow.peek` reads the first bytes without consuming them, for routing on SNI or a Host header.
-        drop(flow); // dropping the flow resets the connection
+        drop(flow); // dropping the flow closes the connection with a FIN
         Ok(())
     }
 
@@ -55,7 +56,8 @@ impl Router for MyRouter {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::build(|c| {
-        c.tun_name = "my-tun".into();
+        // macOS lets the kernel pick the name; Windows needs one.
+        c.tun_name = if cfg!(target_os = "macos") { TunName::KernelAssigned } else { "my-tun".into() };
         c.mtu = 1400;
         c.ipv4 = Some("10.255.0.1/24".parse().unwrap());
     })?;
@@ -82,10 +84,10 @@ Opening the device and changing routes needs an elevated process (administrator 
 - `dns_steer` (macOS) publishes a resolver that sends the operating system's DNS to the tunnel; `dns_confine` (Windows)
   blocks DNS on every path but the tunnel, loopback and the proxy server.
 - `sim` (behind the `test-utils` feature): in-memory doubles, so a `Router` can be tested without an operating-system
-  device.
+  device. It is hidden from the generated docs; its module comment in [`sim.rs`](src/sim.rs) is the reference.
 
-The API is documented in the source: run `cargo doc -p tun-engine --open` in a checkout. How Hole uses the crate is in
-[The TUN device and the routes](https://hole.readthedocs.io/en/latest/how-it-works/tun.html).
+The rest of the API is documented in the source: run `cargo doc -p tun-engine --open` in a checkout. How Hole uses
+the crate is in [The TUN device and the routes](https://hole.readthedocs.io/en/latest/how-it-works/tun.html).
 
 ## License
 

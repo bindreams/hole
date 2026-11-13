@@ -21,9 +21,8 @@ The server needs galoshes too. A stock plugin does not know the multiplexing lay
 ## Install
 
 Download the binary for your platform from a release tagged `releases/galoshes/v<version>` on the
-[releases page](https://github.com/bindreams/hole/releases). Releases cover Windows, macOS and Linux, each on amd64 and
-arm64, and the file is named `galoshes-<version>-<os>-<arch>`, where `<os>` is `windows`, `darwin` or `linux` and
-`<arch>` is `amd64` or `arm64` (`.exe` on Windows). ex-ray is inside it, so there is
+[releases page](https://github.com/bindreams/hole/releases). The platforms and the file naming are in
+[What ships from the Hole repository](https://hole.readthedocs.io/en/latest/reference/distributions.html). ex-ray is inside it, so there is
 nothing else to install. galoshes is not published to crates.io.
 
 ## Use

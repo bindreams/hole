@@ -24,9 +24,8 @@ so it can have bugs the upstream project does not, and can fix ones it has. Its 
 ## Install
 
 Download the binary for your platform from a release tagged `releases/ex-ray/v<version>` on the
-[releases page](https://github.com/bindreams/hole/releases). Releases cover Windows, macOS and Linux, each on amd64
-and arm64, and the file is named `ex-ray-<version>-<os>-<arch>`, where `<os>` is `windows`, `darwin` or `linux` and
-`<arch>` is `amd64` or `arm64` (`.exe` on Windows). To build it yourself,
+[releases page](https://github.com/bindreams/hole/releases). The platforms and the file naming are in
+[What ships from the Hole repository](https://hole.readthedocs.io/en/latest/reference/distributions.html). To build it yourself,
 `cargo xtask ex-ray` builds it; the [contributor guide](https://hole.readthedocs.io/en/latest/contributing/index.html)
 starts from a clean machine.
 
@@ -41,9 +40,10 @@ tls;host=example.com;path=/ws
 ```
 
 The same string with `server` added runs the server end. A TLS server needs a certificate: `cert` and `key` point to
-it, and default to the files `acme.sh` leaves under `~/.acme.sh/<host>/`. TLS is off unless `tls` is set, and the
-transport is WebSocket unless `mode=quic` says otherwise (QUIC always uses TLS). `ex-ray -h` lists every option with its
-default.
+it, and when they are not given ex-ray looks for the files `acme.sh` leaves under `~/.acme.sh/<host>/`. TLS is off
+unless `tls` is set, and the transport is WebSocket unless `mode=quic` says otherwise; `mode=quic` turns TLS on itself.
+`ex-ray -h` lists every option with its default, and the flag definitions at the top of [`config.go`](config.go) are
+the source of those defaults.
 
 ex-ray also speaks [sitrep](https://github.com/bindreams/hole/blob/main/crates/garter/SITREP.md) to the program that
 started it: a line-delimited JSON stream on standard output that reports readiness and any start failure. Everything
@@ -51,14 +51,17 @@ else it and v2ray-core log goes to standard error.
 
 ## ECH (Encrypted Client Hello)
 
-ECH keeps the real server name out of the cleartext TLS handshake. It needs `tls`, and two options control it:
+ECH keeps the real server name out of the cleartext TLS handshake. It needs TLS (`tls`, or `mode=quic`, which turns it
+on), and two options control it:
 
-- `ech-doh=<DoH URL>` is where ex-ray fetches the server's ECH config. It is empty by default, which turns ECH off.
-  Hole supplies its own when it starts ex-ray, except where an `ech-doh` you wrote stays in place or `ech=never`
-  makes it moot.
-- `ech=auto|always|never` is the policy, `auto` by default. `auto` uses ECH when a config can be fetched and otherwise
-  connects with the name in the clear. `always` never sends the name in the clear: a dial that cannot get a config
-  fails, and ex-ray refuses to start without `tls` or without `ech-doh`. `never` leaves ECH off.
+- `ech-doh=<DoH URL>` is where ex-ray fetches the server's ECH config. With no value (the `ech-doh` flag's default in
+  [`config.go`](config.go)) ECH is off. Hole supplies its own when it starts ex-ray, except where an `ech-doh` you wrote
+  stays in place, `ech=never` or the absence of TLS makes it moot, or Hole has no DNS resolver configured and no pinned
+  one to name.
+- `ech=auto|always|never` is the policy; the `ech` flag in [`config.go`](config.go) holds the default. `auto` uses ECH
+  when a config can be fetched and otherwise connects with the name in the clear. `always` never sends the name in the
+  clear: a dial that cannot get a config fails, and ex-ray refuses to start without TLS or without `ech-doh`. `never`
+  leaves ECH off.
 
 When a server has rotated its ECH key, the client's old config is rejected and the rejection carries the new ones. ex-ray
 retries once with them and refreshes its cached copy.

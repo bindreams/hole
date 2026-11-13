@@ -25,7 +25,8 @@ cargo add tokio --features macros,rt-multi-thread
 ```
 
 `garter` is a library. The `garter` command is a separate binary, on the Hole
-[releases page](https://github.com/bindreams/hole/releases) for Windows, macOS and Linux (each on amd64 and arm64).
+[releases page](https://github.com/bindreams/hole/releases); the platforms are listed in
+[What ships from the Hole repository](https://hole.readthedocs.io/en/latest/reference/distributions.html).
 
 ## Use
 

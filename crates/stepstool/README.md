@@ -7,7 +7,7 @@ credential priming and sudo-wrapped command construction on Unix, and elevation 
 It is part of [Hole](https://github.com/bindreams/hole), a Shadowsocks client, where its callers are the developer
 console (which runs the privileged bridge as one such child, using `prime_sudo`, `require_elevated` and
 `preserve_env_arg` and building its own `sudo` command line) and the `hole` binary (which asks whether it is already
-privileged). Nothing in the repository calls `sudo_command` yet.
+privileged). `sudo_command` has no caller in the repository except its own test.
 
 ## Who it is for
 
@@ -26,14 +26,10 @@ stepstool = { git = "https://github.com/bindreams/hole" }
 On Unix, prime sudo once so the spawn that follows does not stop at a password prompt, then wrap the child:
 
 ```rust,no_run
-use std::process::Stdio;
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     stepstool::prime_sudo()?;
 
-    let mut child = stepstool::sudo_command("/usr/local/bin/daemon", &["MY_VAR"])
-        .stdin(Stdio::null()) // an expired sudo timestamp then fails instead of hanging on a prompt
-        .spawn()?;
+    let mut child = stepstool::sudo_command("/usr/local/bin/daemon", &["MY_VAR"]).spawn()?;
     child.wait()?;
     Ok(())
 }
@@ -44,6 +40,10 @@ terminal. `sudo_command` builds a `Command` that runs `program` under sudo and a
 variables through its scrub (`--preserve-env`; a sudoers policy can still refuse it). Pass an absolute path, since
 sudo's `secure_path` ignores the caller's `PATH`. `preserve_env_arg` builds just the `--preserve-env=` argument, for
 callers that assemble the sudo command line themselves.
+
+Priming is what keeps the spawn from prompting. If the cached credentials expire before the spawn, sudo asks for the
+password on the controlling terminal; redirecting the child's stdin does not stop it, because sudo reads the password
+from the terminal and not from stdin.
 
 On Windows, `is_elevated` reports whether the process token is elevated, and `require_elevated` fails with `NotElevated`
 when it is not. `is_privileged` answers the same question on every platform: root on Unix, an elevated token on Windows.
