@@ -1,6 +1,6 @@
 // The webdriver side of the UI-readiness handshake.
 //
-// See `ui/main.ts` for the page side and CONTRIBUTING.md for the rules the
+// See `ui/main.ts` for the page side and docs/contributing/testing.md for the rules the
 // handshake has to satisfy (no sleeps, no timeout-polls).
 
 declare global {

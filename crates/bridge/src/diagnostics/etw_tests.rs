@@ -809,13 +809,13 @@ fn other_stop_failures_are_not_read_as_already_stopped() {
 /// itself controls and never signals until after `drop` below returns. This
 /// is the only way to observe "did not join" from outside `Drop`: if a
 /// regression reverted the `if session_reclaimed` gate to an unconditional
-/// join (as it was before this split), `drop(etw_guard)` would block on
-/// that thread forever instead of returning. That hang is the sanctioned
-/// "no other happens-before edge" exception CONTRIBUTING.md carves out for
-/// this class of assertion — same shape as the tun-engine driver and
-/// `run_with_tap` cases documented in `.config/nextest.toml`, which is
-/// where this test's name is listed so the hang fails loud instead of
-/// consuming the job budget.
+/// join, `drop(etw_guard)` would block on
+/// that thread forever instead of returning. The test spawns the thread
+/// itself, so it is not a class-2 wait (testing.md) and has
+/// no timeout of its own. Like the tun-engine driver and `run_with_tap`
+/// tests, it is bounded from outside, in `.config/nextest.toml`, where this
+/// test's name is listed so the hang fails loud instead of consuming the
+/// job budget.
 #[skuld::test]
 fn drop_abandons_the_processing_thread_without_joining_when_the_session_is_not_reclaimed() {
     use crate::test_support::log_capture::VecWriter;

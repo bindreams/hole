@@ -6,11 +6,14 @@ Per-product release procedure: see [CONTRIBUTING.md § Releases](CONTRIBUTING.md
 
 Conditions under which a `hole` release must not go out, recorded here because the code that states them is not where a release operator looks.
 
-- **The first `hole` release without `NOTICES.md` in its Windows update archive.** The update code installed in 0.5.0
-  to 0.7.0 requires that file, so the release notes must tell Windows users on those versions that the in-app update
-  fails (on 0.5.0 and 0.6.0 a retry is then refused until the computer restarts), and that they update by running the
-  new MSI over the existing install, not by uninstalling first: on 0.5.0 and 0.6.0 an uninstall after the failed
-  update leaves the kill switch's block in place.
+- **The first `hole` release without `NOTICES.md` in its Windows payload (the MSI and the update archive).** Every
+  Windows updater from 0.3.0 to 0.7.0 requires that file: 0.3.0 and 0.4.0 update from the `.msi` asset (`msiexec /a`),
+  0.5.0 to 0.7.0 from the update archive, and each then plans a swap of every bin-dir name, `NOTICES.md` included. So
+  the release notes must tell Windows users on 0.3.0 to 0.7.0 that the in-app update fails, and that they update by
+  running the new MSI over the existing install, not by uninstalling first. On 0.3.0 to 0.6.0 a retry after the
+  failure is also refused until the bridge service next starts (a restart), because planning returns before the
+  update marker is cleared (0.7.0 clears it); and an uninstall after the failed update leaves the kill switch's block
+  in place, because the marker's presence makes the service's stop disarm the cover instead of disengaging it.
 
 ## Stated limits
 

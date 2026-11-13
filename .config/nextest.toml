@@ -281,10 +281,9 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 # start-failure tests park on `failed_start`'s `ready` and `run` awaits (or, for
 # `shutdown_before_the_inner_is_ready_drops_ready_unsent`, on `run` itself). All
 # wait on tasks the test itself spawns, not an out-of-process op, so
-# CONTRIBUTING.md's no-synchronizing-via-time rule does not sanction a
-# per-await `tokio::time::timeout` there (see that file's module doc). A
-# regression that stops one of those from completing is bounded here
-# instead, the same `slow-timeout`/`terminate-after` mechanism as the
+# testing.md's no-synchronization-by-elapsed-time rule does not sanction a
+# per-await `tokio::time::timeout` there. A regression that stops one of those from
+# completing is bounded here instead, the same `slow-timeout`/`terminate-after` mechanism as the
 # `tun-engine` driver tests above, for the identical reason: the wait has no
 # happens-before edge to bound any other way. Every test in the file that
 # reaches `run_with_tap`, `failed_start`, `run` or the inline twin is listed;
