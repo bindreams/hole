@@ -12,8 +12,7 @@ ex-ray is **not** the upstream `shadowsocks/v2ray-plugin` project. It is
 our own module, maintained in this repository. That means it can have
 bugs the upstream project does not (and can fix bugs the upstream project
 has). Its config-building construction is derived from
-`shadowsocks/v2ray-plugin` (MIT-licensed); see the root
-[`NOTICES.md`](../../NOTICES.md) for attribution.
+`shadowsocks/v2ray-plugin` (MIT-licensed); see [`LICENSE`](LICENSE) for attribution.
 
 ex-ray exists to give Hole a plugin it fully controls: it speaks a "sitrep"
 control protocol on stdout (see [`../garter/SITREP.md`](../garter/SITREP.md))

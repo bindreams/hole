@@ -78,8 +78,7 @@
 //!    chain's `drain_timeout` aborts it), so it never outlives the tap.
 //!
 //! License: this module is part of `garter` (Apache-2.0). The bridge
-//! (GPL-3.0-or-later) imports it; one-way Apache → GPL compatibility
-//! per the workspace `NOTICES.md`.
+//! (GPL-3.0-or-later) imports it; one-way Apache → GPL compatibility.
 
 use std::future::Future;
 use std::io;

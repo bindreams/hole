@@ -3666,10 +3666,10 @@ Each publishable member declares a release group in
 | `msi-installer/`, `dmg-installer/` | —                                      | Windows MSI (WiX) + macOS DMG signature checks (Python, #364)                        |
 | `ui/`, `scripts/`, `tests/`        | —                                      | Frontend (Vite), utility scripts, E2E specs (WebDriverIO)                            |
 
-The Apache crates are Apache-2.0 per-crate (see [NOTICES.md](NOTICES.md)); Hole's
-own crates are GPL-3.0-or-later. Combined distributions (`hole.exe`, `hole.msi`,
-bundled `galoshes.exe`) ship as a whole under GPL via Apache→GPL one-way
-compatibility.
+Hole is GPL-3.0-or-later ([LICENSE.md](LICENSE.md)) unless a crate's own `LICENSE`
+file says otherwise: the Apache crates above are Apache-2.0. Combined distributions
+(`hole.exe`, `hole.msi`, bundled `galoshes.exe`) ship as a whole under GPL via
+Apache→GPL one-way compatibility.
 
 **ex-ray embedding.** `galoshes` embeds the ex-ray Go binary at compile time:
 `cargo xtask ex-ray` builds it into `.cache/ex-ray/`;
@@ -3854,8 +3854,7 @@ cargo xtask run hole-dmg-tests   # mount + assert payload + code signature are i
 ```
 
 The DMG does not use `cargo xtask stage`; Tauri bundles the canonical BINDIR via
-`crates/hole/tauri.conf.json` — `resources` (`NOTICES.md` → `Contents/Resources/`), and `macOS.files` (`hole.dSYM`
-→ `Contents/MacOS/hole.dSYM`). The plugin sidecars are not in the app: `hole` embeds them
+`crates/hole/tauri.conf.json` — `macOS.files` (`hole.dSYM` → `Contents/MacOS/hole.dSYM`). The plugin sidecars are not in the app: `hole` embeds them
 (`crates/hole/tauri.macos.conf.json` drops `externalBin` on macOS, see
 [plugin binaries](#plugin-binaries-where-each-platform-gets-them)). The dSYM ships **next to the binary** because std's
 backtrace symbolizer locates a `*.dSYM` by scanning the running binary's directory
@@ -3984,7 +3983,7 @@ HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 ```
 
 `cargo xtask stage` populates a BINDIR (`hole` + the `ex-ray` and `galoshes`
-plugin sidecars + `NOTICES.md` + per-platform debug symbols + `wintun.dll` on
+plugin sidecars + per-platform debug symbols + `wintun.dll` on
 Windows) matching the installed `Program Files\hole\bin\`. The bridge must be
 staged out of the cargo target dir because the running bridge file-locks its own
 exe; the plugin sidecars must be siblings, the only place a foreground bridge

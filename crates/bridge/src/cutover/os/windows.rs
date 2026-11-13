@@ -26,7 +26,7 @@ pub struct ImageMove {
 
 pub struct WindowsCutoverOs {
     /// Every bundled binary to swap (the full BINDIR set: hole.exe, plugins,
-    /// wintun.dll, debug symbols, NOTICES), in order.
+    /// wintun.dll, debug symbols), in order.
     pub images: Vec<ImageMove>,
     /// Target version, used for the `.old-<ver>` rename-away name.
     pub target_version: String,

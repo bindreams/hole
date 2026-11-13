@@ -58,9 +58,3 @@ def test_main_binary_is_not_linker_signed(installed_app: Path) -> None:
         f"main binary still carries the linker-applied ad-hoc signature "
         f"(0x20000 flag bit) — Tauri's codesign step did not re-sign it:\n{output}"
     )
-
-
-def test_notices_present_in_bundle(installed_app: Path) -> None:
-    """Apache-2.0 §4(d): the NOTICE file must ship with the bundle (#512)."""
-    notices = installed_app / "Contents" / "Resources" / "NOTICES.md"
-    assert notices.exists(), "NOTICES.md missing from the .app bundle"
