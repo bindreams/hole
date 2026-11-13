@@ -7,7 +7,7 @@ own server or tools.
 Four products ship from this repository. Each is tagged `releases/<product>/v<X.Y.Z>` and has its own
 [GitHub release](https://github.com/bindreams/hole/releases).
 
-- **`hole`**: the desktop app, for everyone who uses Hole. A `.msi` installer for 64-bit Intel or AMD Windows (x64;
+- **`hole`**: the desktop app, for everyone who uses Hole. A `.msi` installer for 64-bit Intel or AMD Windows (amd64;
   Windows on ARM is not supported) and a `.dmg` for macOS (amd64 and arm64). It is the product that GitHub's
   [latest release](https://github.com/bindreams/hole/releases/latest) points at, and each release's `SHA256SUMS` is
   signed with minisign (`SHA256SUMS.minisig`).

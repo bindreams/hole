@@ -173,7 +173,9 @@ def readme_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
                 problems.append(f"README.md:{number}: site link is not a page or the site root: {link.group(0)}")
                 continue
             if source not in tracked:
-                problems.append(f"README.md:{number}: site link has no page source {source}: {link.group(0)}")
+                problems.append(
+                    f"README.md:{number}: site link's page source {source} is not tracked in the repository: {link.group(0)}"
+                )
     return problems
 
 

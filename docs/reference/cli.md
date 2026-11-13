@@ -10,7 +10,7 @@ The app is the main way to use Hole. These commands are for scripting and recove
 | `hole path add` / `hole path remove` | Add or remove `hole` from the system `PATH`. Run it as administrator (`sudo` on macOS). See below.                 |
 | `hole bridge unlock`                 | Turn the {term}`kill switch` off and clear the block it left behind. Run it as administrator (`sudo` on macOS).    |
 
-On Windows the installer already runs `hole path add`, so `hole` works in a new terminal. On macOS `hole` is not on
+On Windows the installer runs `hole path add` for you. On macOS `hole` is not on
 `PATH` until you add it, so give the full path to the app's binary:
 
 ```sh

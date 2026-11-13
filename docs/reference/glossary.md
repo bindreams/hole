@@ -33,10 +33,10 @@ galoshes
   connection. See [Distributions](distributions.md).
 
 kill switch
-  An optional setting, off by default. While Hole is meant to be connected, it blocks traffic that would otherwise
-  leave outside the tunnel, so a tunnel that drops, crashes or restarts cannot leak; a deliberate Disconnect releases
-  it. While it blocks, devices on your local network, such as a printer or a NAS, are unreachable too. The tray calls
-  it **Lockdown**. See {src}`the contributor reference <CONTRIBUTING.md#lockdown-mode>`.
+  An optional setting, off by default, that the tray calls **Lockdown**. While it is on and Hole is connecting or
+  connected, traffic that would leave outside the tunnel is blocked, including to devices on your local network such as
+  a printer, through brief drops, reconnects and restarts; the block lifts when you disconnect or Hole gives up on the
+  connection. See {src}`the contributor reference <CONTRIBUTING.md#lockdown-mode>`.
 
 lockdown
   See {term}`kill switch`: the name the tray menu uses.
