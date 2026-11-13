@@ -8,8 +8,9 @@ Builds `docs/` with warnings promoted to errors, then verifies the landing page'
 versions line carries the real manifest versions and that no substitution was
 left unrendered. Also checks every `{src}` link in `docs/`: its path must be
 tracked in the repository and, for a Markdown target, its `#anchor` must match a
-heading there (GitHub's slug rules). Every README link into the published site
-must name a page that exists under `docs/`.
+heading there (GitHub's slug rules). Every README link that starts with
+`https://hole.readthedocs.io/en/latest/` must be the site root or `<page>.html`,
+where `docs/<page>.md` is tracked in the repository.
 
 Usage:
     uv run scripts/validate-docs.py
@@ -153,11 +154,11 @@ def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
     return problems
 
 
-def readme_link_problems(repo_root: Path) -> list[str]:
+def readme_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
     """Problems with the README's links into the published site.
 
-    `<page>.html` must have a `docs/<page>.md` source; the bare site root maps to
-    `docs/index.md`.
+    `<page>.html` must have a tracked `docs/<page>.md` source; the bare site root
+    maps to `docs/index.md`. Any other link under the site's base is a problem.
     """
     problems = []
     readme = (repo_root / "README.md").read_text(encoding="utf-8")
@@ -171,7 +172,7 @@ def readme_link_problems(repo_root: Path) -> list[str]:
             else:
                 problems.append(f"README.md:{number}: site link is not a page or the site root: {link.group(0)}")
                 continue
-            if not (repo_root / source).is_file():
+            if source not in tracked:
                 problems.append(f"README.md:{number}: site link has no page source {source}: {link.group(0)}")
     return problems
 
@@ -205,10 +206,15 @@ def sphinx_command(*sphinx_args: str) -> list[str]:
 
 
 def main() -> int:
+    if sys.argv[1:] not in ([], ["--fetch-only"], ["--links-only"]):
+        print(f"usage: {Path(sys.argv[0]).name} [--fetch-only | --links-only]", file=sys.stderr)
+        return 2
+
     if sys.argv[1:] == ["--fetch-only"]:
         return subprocess.run(sphinx_command("--version"), cwd=REPO_ROOT).returncode
 
-    problems = src_link_problems(REPO_ROOT, tracked_files()) + readme_link_problems(REPO_ROOT)
+    tracked = tracked_files()
+    problems = src_link_problems(REPO_ROOT, tracked) + readme_link_problems(REPO_ROOT, tracked)
     if sys.argv[1:] == ["--links-only"]:
         for problem in problems:
             print(problem, file=sys.stderr)
@@ -338,10 +344,14 @@ def test_sphinx_command_appends_args_after_the_pinned_requirements() -> None:
 
 def _write_repo(root: Path, files: dict[str, str]) -> frozenset[str]:
     """Write `files` under `root`; return the non-docs ones as the tracked set."""
+    _write_files(root, files)
+    return frozenset(name for name in files if not name.startswith("docs/"))
+
+
+def _write_files(root: Path, files: dict[str, str]) -> None:
     for name, text in files.items():
         (root / name).parent.mkdir(parents=True, exist_ok=True)
         (root / name).write_text(text, encoding="utf-8")
-    return frozenset(name for name in files if not name.startswith("docs/"))
 
 
 def test_heading_slugs_follow_github_rules() -> None:
@@ -383,22 +393,20 @@ def test_src_links_are_read_inside_directives_but_not_inside_code(tmp_path: Path
 
 
 def test_readme_links_accept_pages_and_the_site_root(tmp_path: Path) -> None:
-    _write_repo(tmp_path, {"docs/index.md": "", "docs/reference/cli.md": ""})
     (tmp_path / "README.md").write_text(
         "[a](https://hole.readthedocs.io/en/latest/) [b](https://hole.readthedocs.io/en/latest/reference/cli.html#x)\n",
         encoding="utf-8",
     )
 
-    assert readme_link_problems(tmp_path) == []
+    assert readme_link_problems(tmp_path, frozenset({"docs/index.md", "docs/reference/cli.md"})) == []
 
 
-def test_readme_links_report_a_missing_page(tmp_path: Path) -> None:
-    _write_repo(tmp_path, {"docs/index.md": ""})
+def test_readme_links_report_a_page_that_is_not_tracked(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text(
         "ok\n[a](https://hole.readthedocs.io/en/latest/reference/gone.html)\n", encoding="utf-8"
     )
 
-    problems = readme_link_problems(tmp_path)
+    problems = readme_link_problems(tmp_path, frozenset({"docs/index.md"}))
 
     assert len(problems) == 1
     assert "README.md:2" in problems[0] and "docs/reference/gone.md" in problems[0]

@@ -7,9 +7,10 @@ own server or tools.
 Four products ship from this repository. Each is tagged `releases/<product>/v<X.Y.Z>` and has its own
 [GitHub release](https://github.com/bindreams/hole/releases).
 
-- **`hole`**: the desktop app, for everyone who uses Hole. A `.msi` installer for Windows (amd64) and a `.dmg` for macOS
-  (amd64 and arm64). It is the product that GitHub's [latest release](https://github.com/bindreams/hole/releases/latest)
-  points at, and each release's `SHA256SUMS` is signed with minisign (`SHA256SUMS.minisig`).
+- **`hole`**: the desktop app, for everyone who uses Hole. A `.msi` installer for 64-bit Intel or AMD Windows (x64;
+  Windows on ARM is not supported) and a `.dmg` for macOS (amd64 and arm64). It is the product that GitHub's
+  [latest release](https://github.com/bindreams/hole/releases/latest) points at, and each release's `SHA256SUMS` is
+  signed with minisign (`SHA256SUMS.minisig`).
 - **`galoshes`**: a {term}`SIP003 plugin` for people who run a Shadowsocks server. Pair it with a Hole client to carry
   UDP as well as TCP: it multiplexes streams over one connection and embeds {term}`ex-ray`. A standalone binary for
   Windows, macOS and Linux, each on amd64 and arm64. Apache-2.0.
