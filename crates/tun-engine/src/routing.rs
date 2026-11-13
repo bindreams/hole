@@ -1528,7 +1528,7 @@ where
     // `bridge-routes.json` there leaves `tun_name_hint` `None` and the
     // reclaim below a no-op, never a cross-install guess. Either way, only
     // the reclaim's server-IP counterpart is scoped by the per-install
-    // identity gap CONTRIBUTING.md discloses, and this reclaim never
+    // identity gap docs/contributing/architecture/kill-switch-recovery.md discloses, and this reclaim never
     // touches that permit.
     lockdown_recover(&lock, decision.action, tun_name_hint.as_deref());
 
@@ -1692,12 +1692,12 @@ pub trait Routing: Send + Sync {
     /// configured, a plugin that takes no Hole directives, malformed plugin options, or an
     /// OPERATOR's own `ech-doh` winning instead of Hole's (an address Hole
     /// did not author, so the config-authorship trust does not extend to it
-    /// — a disclosed residual, see CONTRIBUTING.md). `None` is never
-    /// permitted as "no restriction". See CONTRIBUTING.md's "Transient
-    /// cutover cover" section for the full retry-repair state machine (a
-    /// resolver drift releases and re-engages the cover with the corrected
-    /// value) and the disclosed residuals this trait's caller does not
-    /// close.
+    /// — a disclosed residual, see
+    /// docs/contributing/architecture/kill-switch.md#the-transient-cover).
+    /// `None` is never permitted as "no restriction". That page also lists
+    /// the residuals of the retry repair (a resolver drift releases and
+    /// re-engages the cover with the corrected value) that this trait's
+    /// caller does not close.
     ///
     /// The cover survives a process crash (Windows: persistent WFP filters keyed by fixed
     /// GUID; macOS: pf enable token persisted to `bridge-failclosed.json`) and is

@@ -1038,8 +1038,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // the cover meanwhile) only skips the reachability probe.
         let transient_pending = self.posture.pending().is_some();
 
-        // Disclosed residual (see CONTRIBUTING.md's "Transient cutover
-        // cover" section) gated on `effective_ech_doh`, the value that will
+        // Disclosed residual (see the transient cover in
+        // docs/contributing/architecture/kill-switch.md) gated on `effective_ech_doh`, the value that will
         // ACTUALLY reach ex-ray: `Holes` still stalls only if a repair's
         // restore left the LIVE held permit different from what this
         // attempt needs (`live_permit != ech_resolver_permit`); `Operators(url)`

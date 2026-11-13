@@ -40,6 +40,7 @@ After that, what happens to the block depends on whether you or Hole decided to 
 | The network drops and comes back while Hole's processes keep running | Stays in force                                                                                                                                           |
 | Hole restarts the session to apply a changed setting                 | Stays in force across the restart (see the macOS note below)                                                                                             |
 | The bridge is restarted by an update                                 | Stays in force, and the new bridge takes it over (see the macOS note below)                                                                              |
+| A connect fails after the block went up                              | Lifted. A connect that fails before it installs the block leaves any block already in force                                                              |
 | You click **Disconnect**, or choose **Exit**                         | Lifted. Lockdown stays ticked, so the next connect puts it back                                                                                          |
 | The machine shuts down or restarts while Hole is connected           | Windows: stays in force through the reboot. macOS: the firewall forgets the rule at reboot, and traffic is open until the bridge starts and puts it back |
 | The Shadowsocks client or the plugin stops on its own                | Lifted when the app next asks for the status, because Hole gives up and disconnects then                                                                 |
@@ -67,7 +68,7 @@ only the computer it runs on, and only outgoing traffic.
 
 The contributor reference covers the rest in detail: the platform differences, how the block and the tunnel are
 reconciled toward the state you last asked for, and the cases in which a block outlives a connection.
-See {src}`Lockdown mode <CONTRIBUTING.md#lockdown-mode>`.
+See [the kill switch](../contributing/architecture/kill-switch.md).
 
 ```{dropdown} Where in the code
 The permitted set: `Routing::install_lockdown` in {src}`crates/tun-engine/src/routing.rs` and the platform code under

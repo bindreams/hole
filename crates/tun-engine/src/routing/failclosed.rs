@@ -443,7 +443,7 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 ///    out from under a genuinely live cover (not corrupt — entirely absent,
 ///    e.g. an external wipe of `state_dir`) is therefore indistinguishable
 ///    from a clean host and `release_all` reports `Ok` without touching pf.
-///    See CONTRIBUTING.md's disclosed residuals.
+///    See the residuals in docs/contributing/architecture/kill-switch-recovery.md.
 /// 2. **Total.** Clears BOTH cover kinds. Clearing only one would leave a
 ///    user with no way out at all.
 /// 3. **No short-circuit.** Every clear is attempted before any failure is
@@ -539,7 +539,7 @@ pub enum KeyLifetime {
     /// leaves no second record there for an earlier boot to have staged. That
     /// is a reading of the assumption, not a separate measurement, and it is
     /// what makes the delete on boot N+1 speak for boot N's provisioning too.
-    /// See CONTRIBUTING.md's fail-closed residuals.
+    /// See docs/contributing/architecture/kill-switch-windows.md.
     ///
     /// The harm is bounded: BFE's start is what takes a boot-time filter out
     /// of effect, so a stranded record blocks egress across the boot→BFE

@@ -112,9 +112,9 @@
 //!
 //! Both twins reference the same [`PROVIDER_GUID`]/[`SUBLAYER_GUID`] the
 //! persistent filters already use, which is a MEASURED choice rather than a
-//! documented one. **CONTRIBUTING.md's "Windows, boot-time coverage" is the
-//! long-form home** for the shipped-precedent survey, the risk sizing, the
-//! out-of-band recovery options and the full measurement results; this section
+//! documented one. **docs/contributing/architecture/kill-switch-windows.md is the
+//! long-form home** for the risk sizing, the out-of-band recovery options and
+//! the measurement results; this section
 //! keeps only what a maintainer needs at these call sites and does not restate
 //! it.
 //!
@@ -297,7 +297,7 @@ pub const SUBLAYER_GUID: GUID = GUID::from_u128(0xb4e2d3c5_6c7f_58b9_ad1e_2f3a4b
 // that knows all twelve GUIDs engages, crashes, and an OLDER build that
 // only knows ten runs recovery) leaves the two new resolver-permit filters
 // un-swept inside the sublayer the standing lockdown cover also uses; see
-// CONTRIBUTING.md's "Transient cutover cover" section, and no version-independent
+// docs/contributing/architecture/kill-switch.md#the-transient-cover, and no version-independent
 // sweep reaches them: `provider_sweep` takes boot-time filters only. They are
 // PERSISTENT, so BFE re-adds them every boot and the next build that knows
 // their GUIDs deletes them by key; until one runs, they stay.
@@ -2153,7 +2153,7 @@ pub(crate) fn classify_presence(engine_opened: bool, codes: &[u32]) -> crate::ro
 /// installed, by querying every GUID in [`swept_lockdown_keys`] with
 /// `FwpmFilterGetByKey0`. `state_dir` is unused: the lockdown GUIDs are
 /// compile-time constants, so this answers "is a Hole lockdown cover present",
-/// never "is it mine" (see CONTRIBUTING.md's disclosed residual).
+/// never "is it mine" (see docs/contributing/architecture/kill-switch-recovery.md).
 ///
 /// A failed engine open means the Base Filtering Engine could not be reached
 /// (BFE not yet running, or an RPC failure) — NOT "not elevated"; FWPM opens
@@ -2800,8 +2800,8 @@ fn classify_twin_readback(views: &[Result<Vec<FilterRecord>, u32>], key: GUID) -
 /// repeats it. The escape exists and is in-band (the tray's "Unblock Network",
 /// `hole bridge unlock`), so this is recoverable rather than a brick, but it
 /// is a real behaviour change over the pre-#998 engage and is disclosed in
-/// CONTRIBUTING.md's fail-closed residuals rather than described as the status
-/// quo.
+/// docs/contributing/architecture/kill-switch-windows.md rather than described
+/// as the status quo.
 ///
 /// It is still the chosen direction: the alternative is claiming the kill
 /// switch is armed over a pre-BFE window nothing covers, which is a silent
