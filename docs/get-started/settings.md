@@ -184,8 +184,8 @@ The menu item shows **Lockdown: On** when the switch is on and the block is in f
 engaged)** means the switch is on but no block is in force right now. Connect to engage it; if you turned Lockdown on
 while connected, disconnect and connect again.
 
-While a block is in force, the menu offers **Unblock Network (disconnects, turns Lockdown off)**. It disconnects Hole,
-removes the block and turns Lockdown off. If Hole cannot reach its bridge, [Troubleshooting](troubleshooting.md) has the
+While a block is in force, the menu offers **Unblock Network (disconnects, turns Lockdown off)**. It removes the block
+and turns Lockdown off; despite its label, a running connection stays up. If Hole cannot reach its bridge, [Troubleshooting](troubleshooting.md) has the
 command-line route.
 
 ## Next

@@ -77,8 +77,8 @@ without internet. Work down this list and stop when the internet is back. The fi
 one is for someone technical.
 
 1. **Disconnect or Unblock Network.** Click the power button, or choose **Disconnect** in the {term}`tray` menu. If the
-   tray menu shows **Unblock Network (disconnects, turns Lockdown off)**, choose that instead: it disconnects, removes
-   the block and turns the {term}`kill switch` off.
+   tray menu shows **Unblock Network (disconnects, turns Lockdown off)**, choose that: it removes the block and turns the
+   {term}`kill switch` off.
 
 1. **Restart the computer.** Hole's bridge starts with the computer, and when it starts it cleans up the routes, DNS
    settings and plugin processes that a crashed run left behind. If **Unblock Network** is in the tray menu afterwards,
