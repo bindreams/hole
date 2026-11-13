@@ -8,9 +8,8 @@ that filter VPNs.
 
 ## Hole is a client, not a VPN service
 
-Hole does not come with a server, and there is nothing to sign up for. Two jobs make it work: one person runs the
-server, and everyone who uses it installs Hole and imports a config from that server. You can do both jobs or just the
-second. To use Hole you need a Shadowsocks server, and there are two ways to get one:
+Hole does not come with a server, and there is nothing to sign up for. To use it you need a Shadowsocks server, and
+there are two ways to get one:
 
 - **Someone gives you a config.** Whoever runs the server sends you a config file, and Hole imports it.
 - **You run a server yourself.** [Postern](https://github.com/bindreams/postern) is Hole's companion project for that:

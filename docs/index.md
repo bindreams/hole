@@ -42,7 +42,7 @@ how the machine's network behaves. The app tells the bridge what to do over a lo
 
 The bridge creates the {term}`TUN` device and points the machine's routes at it, so the traffic of every app lands in
 the bridge. It sends that traffic through a Shadowsocks client to your server. If the server's config names a
-{term}`SIP003 plugin`, the traffic goes through that plugin on the way, which disguises it (the dotted path). The thick arrow is not traffic: it is the app telling the bridge what to do.
+{term}`SIP003 plugin`, the traffic goes through that plugin on the way, which disguises it (the dotted path).
 
 Component versions: hole {{ hole_version }}, galoshes {{ galoshes_version }}, garter {{ garter_version }}, ex-ray {{ exray_version }}.
 

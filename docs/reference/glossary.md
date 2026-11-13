@@ -63,8 +63,8 @@ TUN
 
 VPN client
   An app that sends a machine's traffic through a server somebody else runs. Hole is a client of that kind, not a VPN
-  service: it comes with no server. Get a config from whoever runs one, or run your own with {term}`Postern`.
+  service: it comes with no server.
 
 Unblock Network
-  See {term}`kill switch`: the tray action, shown whenever Hole is blocking traffic, connected or not, that disconnects and turns it off.
+  The tray action, shown while Hole is blocking traffic, that disconnects and turns the {term}`kill switch` off.
 ```

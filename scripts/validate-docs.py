@@ -8,7 +8,8 @@ Builds `docs/` with warnings promoted to errors, then verifies the landing page'
 versions line carries the real manifest versions and that no substitution was
 left unrendered. Also checks every `{src}` link in `docs/`: its path must be
 tracked in the repository and, for a Markdown target, its `#anchor` must match a
-heading there (GitHub's slug rules). Every README link that starts with
+heading there (GitHub's slug rules); a fence left open at the end of a page is
+a problem too, since the rest of the page goes unchecked. Every README link that starts with
 `https://hole.readthedocs.io/en/latest/` must be the site root or `<page>.html`,
 where `docs/<page>.md` is tracked in the repository.
 
@@ -56,7 +57,13 @@ SRC_TITLED_RE = re.compile(r"^.*?<([^<>]+)>$", re.DOTALL)
 SITE_LINK_RE = re.compile(r"https://hole\.readthedocs\.io/en/latest/([^\s)#>]*)")
 
 HEADING_RE = re.compile(r"^ {0,3}#{1,6}[ \t]+(.*?)[ \t]*$")
-FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*(.*?)[ \t]*$")
+SETEXT_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
+# A line that starts a block other than a paragraph, so it cannot be a setext heading's text.
+BLOCK_START_RE = re.compile(r"^ {0,3}(?:>|[-*+][ \t]|\d+[.)][ \t]|(?:[-*_][ \t]*){3,}$)")
+HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
+HTML_TAG_RE = re.compile(r"<[^>]*>")
+# A backtick fence's info string holds no backtick: "```x``` is code" is a code span.
+FENCE_RE = re.compile(r"^ {0,3}(`{3,}(?=[^`]*$)|~{3,})[ \t]*(.*?)[ \t]*$")
 
 # Sphinx writes these itself; their contents are not ours to check.
 GENERATED_PAGES = frozenset({"search.html", "genindex.html"})
@@ -86,47 +93,87 @@ def check_rendered(out_dir: Path, versions: dict[str, str]) -> list[str]:
     return problems
 
 
-def outside_fences(text: str) -> Iterator[tuple[int, str]]:
-    """Yield `(line number, line)` for each line of Markdown outside a code block.
+def scan_fences(text: str) -> tuple[list[tuple[int, str]], list[int]]:
+    """Split Markdown into the lines outside code blocks and the fences left open.
 
-    A fence whose info string opens with `{` is a MyST directive, not code: its
-    body is Markdown (a `{glossary}` holds the page's `{src}` links) and is yielded.
+    Returns `(number, line)` for each line outside a code block, and the line
+    number of every fence still open at the end of the text. A fence whose info
+    string opens with `{` is a MyST directive, not code: its body is Markdown
+    (a `{glossary}` holds the page's `{src}` links) and is returned.
     """
-    open_fences: list[tuple[str, int, bool]] = []  # (fence char, fence length, is code)
+    outside: list[tuple[int, str]] = []
+    open_fences: list[tuple[str, int, bool, int]] = []  # (fence char, fence length, is code, line number)
     for number, line in enumerate(text.splitlines(), start=1):
         match = FENCE_RE.match(line)
         if match and open_fences:
-            char, length, _ = open_fences[-1]
+            char, length, _, _ = open_fences[-1]
             if match.group(1)[0] == char and len(match.group(1)) >= length and not match.group(2):
                 open_fences.pop()
                 continue
         if match and not (open_fences and open_fences[-1][2]):
             fence = match.group(1)
-            open_fences.append((fence[0], len(fence), not match.group(2).startswith("{")))
+            open_fences.append((fence[0], len(fence), not match.group(2).startswith("{"), number))
             continue
-        if not any(is_code for _, _, is_code in open_fences):
-            yield number, line
+        if not any(is_code for _, _, is_code, _ in open_fences):
+            outside.append((number, line))
+    return outside, [number for _, _, _, number in open_fences]
+
+
+def paragraphs(lines: list[tuple[int, str]]) -> Iterator[tuple[int, str]]:
+    """Yield `(first line number, text)` for each run of consecutive non-blank lines."""
+    run: list[str] = []
+    first = previous = 0
+    for number, line in lines:
+        if run and (number != previous + 1 or not line.strip()):
+            yield first, "\n".join(run)
+            run = []
+        if line.strip():
+            if not run:
+                first = number
+            run.append(line)
+        previous = number
+    if run:
+        yield first, "\n".join(run)
+
+
+def github_slug(title: str) -> str:
+    """The anchor GitHub derives from one heading's text, before collision suffixes."""
+    title = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", title)  # a link contributes its text
+    title = HTML_TAG_RE.sub("", title)
+    return re.sub(r"[^\w\- ]", "", title.lower()).replace(" ", "-")
 
 
 def heading_slugs(markdown: str) -> set[str]:
     """The anchors GitHub generates for the headings of one Markdown file.
 
-    Lowercase, punctuation other than `-` and `_` dropped, spaces to `-`; a
-    repeated heading gets `-1`, `-2`, ... appended.
+    Follows github-slugger: lowercase, HTML tags and punctuation other than `-`
+    and `_` dropped, spaces to `-`; a slug already taken gets the next free
+    `-1`, `-2`, ... suffix. ATX and setext headings count; code blocks and HTML
+    comments do not.
     """
-    slugs: set[str] = set()
-    seen: dict[str, int] = {}
-    for _, line in outside_fences(markdown):
+    lines, _ = scan_fences(markdown)
+    text = HTML_COMMENT_RE.sub("", "\n".join(line for _, line in lines))
+    occurrences: dict[str, int] = {}
+    paragraph: list[str] = []
+    for line in text.splitlines():
         heading = HEADING_RE.match(line)
-        if not heading:
+        if SETEXT_RE.match(line) and paragraph:
+            title = " ".join(paragraph)
+        elif heading:
+            title = re.sub(r"[ \t]+#+$", "", heading.group(1))
+        else:
+            if line.strip() and not BLOCK_START_RE.match(line):
+                paragraph.append(line.strip())
+            else:
+                paragraph = []
             continue
-        text = re.sub(r"[ \t]+#+$", "", heading.group(1))
-        text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)  # a link contributes its text
-        slug = re.sub(r"[^\w\- ]", "", text.lower()).replace(" ", "-")
-        count = seen.get(slug, 0)
-        seen[slug] = count + 1
-        slugs.add(slug if count == 0 else f"{slug}-{count}")
-    return slugs
+        paragraph = []
+        base = slug = github_slug(title)
+        while slug in occurrences:
+            occurrences[base] += 1
+            slug = f"{base}-{occurrences[base]}"
+        occurrences[slug] = 0
+    return set(occurrences)
 
 
 def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
@@ -139,8 +186,12 @@ def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
     problems = []
     for page in sorted((repo_root / "docs").rglob("*.md")):
         where = page.relative_to(repo_root).as_posix()
-        for number, line in outside_fences(page.read_text(encoding="utf-8")):
-            for role in SRC_ROLE_RE.finditer(line):
+        outside, unclosed = scan_fences(page.read_text(encoding="utf-8"))
+        for number in unclosed:
+            problems.append(f"{where}:{number}: fence is never closed: the rest of the page is unchecked")
+        for first, text in paragraphs(outside):
+            for role in SRC_ROLE_RE.finditer(text):
+                number = first + text.count("\n", 0, role.start())
                 titled = SRC_TITLED_RE.match(role.group(1))
                 target = titled.group(1) if titled else role.group(1)
                 path, _, anchor = target.strip().partition("#")
@@ -148,8 +199,10 @@ def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
                 if path not in tracked and not is_dir:
                     problems.append(f"{where}:{number}: {{src}} path is not tracked in the repository: {path}")
                 elif anchor and path.endswith(".md") and path in tracked:
-                    headings = heading_slugs((repo_root / path).read_text(encoding="utf-8"))
-                    if anchor not in headings:
+                    target_file = repo_root / path
+                    if not target_file.is_file():
+                        problems.append(f"{where}:{number}: {{src}} path is tracked but missing on disk: {path}")
+                    elif anchor not in heading_slugs(target_file.read_text(encoding="utf-8")):
                         problems.append(f"{where}:{number}: {{src}} anchor matches no heading in {path}: #{anchor}")
     return problems
 
@@ -161,7 +214,10 @@ def readme_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
     maps to `docs/index.md`. Any other link under the site's base is a problem.
     """
     problems = []
-    readme = (repo_root / "README.md").read_text(encoding="utf-8")
+    readme_file = repo_root / "README.md"
+    if not readme_file.is_file():
+        return ["README.md: missing on disk"]
+    readme = readme_file.read_text(encoding="utf-8")
     for number, line in enumerate(readme.splitlines(), start=1):
         for link in SITE_LINK_RE.finditer(line):
             page = link.group(1)
@@ -364,6 +420,50 @@ def test_heading_slugs_follow_github_rules() -> None:
 
 def test_heading_slugs_ignore_fenced_code() -> None:
     assert heading_slugs("```sh\n# a comment\n```\n# Real\n") == {"real"}
+
+
+def test_heading_slugs_take_the_next_free_suffix() -> None:
+    assert heading_slugs("# a\n# a-1\n# a\n") == {"a", "a-1", "a-2"}
+
+
+def test_heading_slugs_drop_html_tags_and_commented_headings_and_read_setext() -> None:
+    markdown = "# Foo <kbd>Ctrl</kbd>\n<!--\n# hidden\n-->\nTitle\n=====\n\nSub\n---\n"
+
+    assert heading_slugs(markdown) == {"foo-ctrl", "title", "sub"}
+
+
+def test_a_backtick_run_with_a_backtick_after_it_is_not_a_fence() -> None:
+    outside, unclosed = scan_fences("```x``` is code\n{src}`nope.rs`\n")
+
+    assert [number for number, _ in outside] == [1, 2]
+    assert unclosed == []
+
+
+def test_an_unclosed_fence_is_reported(tmp_path: Path) -> None:
+    tracked = _write_repo(tmp_path, {"docs/a.md": "text\n```sh\n{src}`nope.rs`\n"})
+
+    problems = src_link_problems(tmp_path, tracked)
+
+    assert len(problems) == 1
+    assert "a.md:2" in problems[0] and "never closed" in problems[0]
+
+
+def test_src_links_that_wrap_across_lines_are_checked_at_their_first_line(tmp_path: Path) -> None:
+    tracked = _write_repo(tmp_path, {"docs/a.md": "intro\n\nsee {src}`the CLI\n<nope/cli.rs>` here\n"})
+
+    problems = src_link_problems(tmp_path, tracked)
+
+    assert len(problems) == 1
+    assert "a.md:3" in problems[0] and "nope/cli.rs" in problems[0]
+
+
+def test_a_tracked_markdown_target_missing_on_disk_is_a_problem_not_a_crash(tmp_path: Path) -> None:
+    _write_files(tmp_path, {"docs/a.md": "{src}`T <T.md#x>`\n"})
+
+    problems = src_link_problems(tmp_path, frozenset({"T.md"}))
+
+    assert len(problems) == 1
+    assert "missing on disk" in problems[0]
 
 
 def test_src_links_accept_files_directories_and_anchors(tmp_path: Path) -> None:
