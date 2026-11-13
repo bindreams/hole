@@ -82,10 +82,10 @@ func dialSystem(t *testing.T, dialer *internet.DefaultSystemDialer, sockopt *int
 	return tcpConn
 }
 
-// Pins the two vendored behaviours the README's "TCP keepalive" section
-// describes: a registered controller reaching the fd, and SocketConfig's fields
-// suppressing Go's post-connect defaults. A subrepo bump breaking either must
-// fail here.
+// Pins the two vendored behaviours the `tcp-keepalive` option relies on
+// (third_party/VENDORING.md, "What guards the patches on a bump"): a
+// registered controller reaching the fd, and SocketConfig's fields suppressing
+// Go's post-connect defaults. A subrepo bump breaking either must fail here.
 //
 // Probes is the load-bearing value: on linux and darwin the vendored
 // applyOutboundSocketOptions sets idle and interval from the SocketConfig

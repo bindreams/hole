@@ -658,7 +658,7 @@ itself, uncapped, one hop at a time just before that hop starts, and verifies
 TCP only: every in-repo hop that is not the public one binds TCP alone. A hop that loses that port to another process reports a typed
 `BindConflict` and is run again alone on a fresh pick, uncapped; a hop that does
 not speak sitrep (`ReadinessMode::Probe`) cannot, so its lost port is a failed
-start and is not restarted ([garter README](crates/garter/README.md)).
+start and is not restarted ([`ReadinessMode::Probe`](crates/garter/src/binary.rs)).
 
 ### File lock
 
