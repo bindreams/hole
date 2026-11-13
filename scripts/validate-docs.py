@@ -8,8 +8,9 @@ Builds `docs/` with warnings promoted to errors, then verifies the landing page'
 versions line carries the real manifest versions and that no substitution was
 left unrendered. Also checks every `{src}` link in `docs/`: its path must be
 tracked in the repository and, for a Markdown target, its `#anchor` must match a
-heading there (GitHub's slug rules); a fence left open at the end of a page is
-a problem too, since the rest of the page goes unchecked. Every README link that starts with
+heading there (GitHub's slug rules). A fence left open at the end of a page, or
+in a Markdown target, is a problem too, since the rest of the file goes
+unchecked. Every README link that starts with
 `https://hole.readthedocs.io/en/latest/` must be the site root or `<page>.html`,
 where `docs/<page>.md` is tracked in the repository.
 
@@ -20,8 +21,7 @@ Usage:
 
 `--fetch-only` resolves and downloads the build's tools and builds nothing, so CI
 can run the fetch under a retry without retrying a docs failure. `--links-only`
-runs the `{src}` and README link checks without the build: those read files
-anywhere in the repository, so the pre-commit hook for them runs on every commit.
+runs the `{src}` and README link checks without the build.
 """
 
 import re
@@ -51,7 +51,9 @@ CODE_REGION_RE = re.compile(r"<(pre|code)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNOR
 
 # A `{src}` role: {src}`path`, {src}`path#anchor` or {src}`title <path#anchor>`.
 SRC_ROLE_RE = re.compile(r"\{src\}`([^`]+)`")
-SRC_TITLED_RE = re.compile(r"^.*?<([^<>]+)>$", re.DOTALL)
+# Sphinx's `explicit_title_re`, which its extlinks role splits a target with. The
+# target is used as written: no strip, and `<path>` without a title is a path.
+SRC_TITLED_RE = re.compile(r"^(.+?)\s*(?<!\x00)<([^<]*?)>$", re.DOTALL)
 
 # A README link into the published site: the page path after `/en/latest/`, if any.
 SITE_LINK_RE = re.compile(r"https://hole\.readthedocs\.io/en/latest/([^\s)#>]*)")
@@ -93,13 +95,14 @@ def check_rendered(out_dir: Path, versions: dict[str, str]) -> list[str]:
     return problems
 
 
-def scan_fences(text: str) -> tuple[list[tuple[int, str]], list[int]]:
+def scan_fences(text: str, directives: bool = True) -> tuple[list[tuple[int, str]], list[int]]:
     """Split Markdown into the lines outside code blocks and the fences left open.
 
     Returns `(number, line)` for each line outside a code block, and the line
-    number of every fence still open at the end of the text. A fence whose info
-    string opens with `{` is a MyST directive, not code: its body is Markdown
-    (a `{glossary}` holds the page's `{src}` links) and is returned.
+    number of every fence still open at the end of the text. With `directives`,
+    a fence whose info string opens with `{` is a MyST directive, not code: its
+    body is Markdown (a `{glossary}` holds the page's `{src}` links) and is
+    returned. Without it every fence is code, as on GitHub.
     """
     outside: list[tuple[int, str]] = []
     open_fences: list[tuple[str, int, bool, int]] = []  # (fence char, fence length, is code, line number)
@@ -112,7 +115,7 @@ def scan_fences(text: str) -> tuple[list[tuple[int, str]], list[int]]:
                 continue
         if match and not (open_fences and open_fences[-1][2]):
             fence = match.group(1)
-            open_fences.append((fence[0], len(fence), not match.group(2).startswith("{"), number))
+            open_fences.append((fence[0], len(fence), not (directives and match.group(2).startswith("{")), number))
             continue
         if not any(is_code for _, _, is_code, _ in open_fences):
             outside.append((number, line))
@@ -137,7 +140,11 @@ def paragraphs(lines: list[tuple[int, str]]) -> Iterator[tuple[int, str]]:
 
 
 def github_slug(title: str) -> str:
-    """The anchor GitHub derives from one heading's text, before collision suffixes."""
+    """The anchor GitHub derives from one heading's text, before collision suffixes.
+
+    Markdown links and HTML tags are read; emphasis, entities and autolinks are
+    not, so an anchor to a heading holding one needs checking by hand.
+    """
     title = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", title)  # a link contributes its text
     title = HTML_TAG_RE.sub("", title)
     return re.sub(r"[^\w\- ]", "", title.lower()).replace(" ", "-")
@@ -146,12 +153,13 @@ def github_slug(title: str) -> str:
 def heading_slugs(markdown: str) -> set[str]:
     """The anchors GitHub generates for the headings of one Markdown file.
 
-    Follows github-slugger: lowercase, HTML tags and punctuation other than `-`
-    and `_` dropped, spaces to `-`; a slug already taken gets the next free
-    `-1`, `-2`, ... suffix. ATX and setext headings count; code blocks and HTML
-    comments do not.
+    Follows github-slugger (see `github_slug` for what it leaves out): lowercase,
+    HTML tags and punctuation other than `-` and `_` dropped, spaces to `-`; a
+    slug already taken gets the next free `-1`, `-2`, ... suffix. ATX and setext
+    headings count; code blocks (every fence is one on GitHub) and HTML comments
+    do not.
     """
-    lines, _ = scan_fences(markdown)
+    lines, _ = scan_fences(markdown, directives=False)
     text = HTML_COMMENT_RE.sub("", "\n".join(line for _, line in lines))
     occurrences: dict[str, int] = {}
     paragraph: list[str] = []
@@ -176,6 +184,22 @@ def heading_slugs(markdown: str) -> set[str]:
     return set(occurrences)
 
 
+def target_defects(markdown: str) -> list[str]:
+    """What hides the headings after it in one Markdown target, as GitHub reads it.
+
+    An unclosed fence or HTML comment swallows the rest of the file, so a later
+    heading would be reported as missing for the wrong reason.
+    """
+    lines, open_fences = scan_fences(markdown, directives=False)
+    defects = [f"{number}: fence is never closed" for number in open_fences]
+    text = "\n".join(line for _, line in lines)
+    for comment in HTML_COMMENT_RE.finditer(text):
+        if not comment.group().endswith("-->"):
+            number = lines[text.count("\n", 0, comment.start())][0]
+            defects.append(f"{number}: HTML comment is never closed")
+    return defects
+
+
 def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
     """Problems with the `{src}` links of every page under `docs/`.
 
@@ -184,6 +208,7 @@ def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
     a heading slug of that file.
     """
     problems = []
+    defective: set[str] = set()  # targets already reported as unreadable past a point
     for page in sorted((repo_root / "docs").rglob("*.md")):
         where = page.relative_to(repo_root).as_posix()
         outside, unclosed = scan_fences(page.read_text(encoding="utf-8"))
@@ -193,8 +218,8 @@ def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
             for role in SRC_ROLE_RE.finditer(text):
                 number = first + text.count("\n", 0, role.start())
                 titled = SRC_TITLED_RE.match(role.group(1))
-                target = titled.group(1) if titled else role.group(1)
-                path, _, anchor = target.strip().partition("#")
+                target = titled.group(2) if titled else role.group(1)
+                path, _, anchor = target.partition("#")
                 is_dir = any(name.startswith(path.rstrip("/") + "/") for name in tracked)
                 if path not in tracked and not is_dir:
                     problems.append(f"{where}:{number}: {{src}} path is not tracked in the repository: {path}")
@@ -202,8 +227,16 @@ def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
                     target_file = repo_root / path
                     if not target_file.is_file():
                         problems.append(f"{where}:{number}: {{src}} path is tracked but missing on disk: {path}")
-                    elif anchor not in heading_slugs(target_file.read_text(encoding="utf-8")):
-                        problems.append(f"{where}:{number}: {{src}} anchor matches no heading in {path}: #{anchor}")
+                    else:
+                        markdown = target_file.read_text(encoding="utf-8")
+                        defects = target_defects(markdown)
+                        if defects and path not in defective:
+                            defective.add(path)
+                            problems.extend(
+                                f"{path}:{defect}: the headings after it are unchecked" for defect in defects
+                            )
+                        if not defects and anchor not in heading_slugs(markdown):
+                            problems.append(f"{where}:{number}: {{src}} anchor matches no heading in {path}: #{anchor}")
     return problems
 
 
@@ -263,6 +296,11 @@ def sphinx_command(*sphinx_args: str) -> list[str]:
     ]
 
 
+def report(problems: list[str]) -> None:
+    for problem in problems:
+        print(problem, file=sys.stderr)
+
+
 def main() -> int:
     if sys.argv[1:] not in ([], ["--fetch-only"], ["--links-only"]):
         print(f"usage: {Path(sys.argv[0]).name} [--fetch-only | --links-only]", file=sys.stderr)
@@ -274,8 +312,7 @@ def main() -> int:
     tracked = tracked_files()
     problems = src_link_problems(REPO_ROOT, tracked) + readme_link_problems(REPO_ROOT, tracked)
     if sys.argv[1:] == ["--links-only"]:
-        for problem in problems:
-            print(problem, file=sys.stderr)
+        report(problems)
         return 1 if problems else 0
 
     # A fresh output directory every run. Reusing one lets Sphinx build
@@ -292,13 +329,12 @@ def main() -> int:
             cwd=REPO_ROOT,
         )
         if build.returncode != 0:
-            print("\n".join(problems), file=sys.stderr)
+            report(problems)
             return build.returncode
 
         problems += check_rendered(out_dir, manifest_versions(REPO_ROOT))
 
-    for problem in problems:
-        print(problem, file=sys.stderr)
+    report(problems)
     return 1 if problems else 0
 
 
@@ -396,7 +432,6 @@ def test_sphinx_command_appends_args_after_the_pinned_requirements() -> None:
     requirements = command[command.index("--with-requirements") + 1]
     assert Path(requirements) == REPO_ROOT / "docs" / "requirements.txt"
     assert command[-2:] == ["sphinx-build", "--version"]
-    # The fetch and the build resolve the same environment only with the same flags.
     assert sphinx_command("-W", "-b", "html")[: len(command) - 1] == command[:-1]
 
 
@@ -471,6 +506,34 @@ def test_src_links_accept_files_directories_and_anchors(tmp_path: Path) -> None:
     tracked = _write_repo(tmp_path, {"docs/a.md": page, "x/y.rs": "", "dir/f": "", "T.md": "## Some heading\n"})
 
     assert src_link_problems(tmp_path, tracked) == []
+
+
+def test_src_targets_are_split_the_way_sphinx_splits_them(tmp_path: Path) -> None:
+    page = "{src}`<x/y.rs>` {src}`T < x/y.rs >` {src}`T <x/y.rs>`\n"
+    tracked = _write_repo(tmp_path, {"docs/a.md": page, "x/y.rs": ""})
+
+    problems = src_link_problems(tmp_path, tracked)
+
+    assert len(problems) == 2
+    assert "<x/y.rs>" in problems[0]
+    assert " x/y.rs " in problems[1]
+
+
+def test_every_fence_in_a_github_target_is_code() -> None:
+    markdown = "# Real\n\n```{code-block} sh\n# Lockdown mode\n```\n\n## Lockdown mode\n"
+
+    assert heading_slugs(markdown) == {"real", "lockdown-mode"}
+
+
+def test_an_unclosed_fence_or_comment_in_a_target_is_reported_not_misread_as_a_missing_heading(tmp_path: Path) -> None:
+    files = {"docs/a.md": "{src}`T <T.md#late>` {src}`T <T.md#late>`\n", "T.md": "# Early\n<!--\n# Late\n"}
+    tracked = _write_repo(tmp_path, files)
+
+    problems = src_link_problems(tmp_path, tracked)
+
+    assert len(problems) == 1
+    assert "T.md:2: HTML comment is never closed" in problems[0]
+    assert target_defects("# a\n```sh\n# b\n") == ["2: fence is never closed"]
 
 
 def test_src_links_report_a_missing_path_and_a_wrong_anchor(tmp_path: Path) -> None:
