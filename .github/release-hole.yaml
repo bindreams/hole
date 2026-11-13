@@ -1,8 +1,7 @@
 # Per-track release notes config for the `hole` release group.
 # Consumed by scripts/generate-release-notes.py at release time.
 #
-# See docs/contributing/commit-messages.md for the
-# PR-title convention this config relies on.
+# PR-title convention this config relies on: docs/contributing/commit-messages.md.
 
 # Initial-release stub. Used when no prior `releases/hole/v...` tag
 # exists on the branch. The script emits this verbatim instead of the

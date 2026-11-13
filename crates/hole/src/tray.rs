@@ -1554,15 +1554,14 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
 
 /// Keep the GUI's view of the bridge honest when the dashboard is closed
 /// (no webview poll): an external stop, a bridge crash, or `hole proxy
-/// stop` must reach the tray (#462).
+/// stop` must reach the tray.
 ///
-/// Paced re-check (class 3 of docs/contributing/testing.md#no-synchronization-by-elapsed-time):
-/// the bridge's state changes with no event reaching this process, so
-/// every tick re-reads it, nothing is concluded from the interval, and
-/// no code waits on this loop (`BridgeLink::send` commits synchronously).
-/// The immediate first tick doubles as the startup reconcile.
+/// Paced re-check (testing.md class 3): the bridge's state changes with no
+/// event reaching this process, so every tick re-reads it. No code waits on
+/// this loop (`BridgeLink::send` commits synchronously). The immediate first
+/// tick doubles as the startup reconcile.
 ///
-/// Startup auto-connect is no longer this loop's concern (#979): the bridge
+/// Startup auto-connect is no longer this loop's concern: the bridge
 /// decides and applies it at its own boot, before any GUI runs. This poll is
 /// purely presentational.
 pub fn spawn_status_reconciler(app: &AppHandle, _settled: LaunchWindowsSettled) {

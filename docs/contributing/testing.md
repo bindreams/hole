@@ -19,10 +19,10 @@ npm test                           # the front end's unit tests (Vitest)
 Use `cargo xtask run`, or `cargo nextest` directly, rather than `cargo test`: {src}`.config/nextest.toml` serializes tests
 that change global OS network state across test binaries, which `cargo test` does not.
 
-The browser-level end-to-end specs in {src}`tests/webdriver/` run the app through WebDriver, on Windows. `npm run test:e2e` runs them against the app named by `HOLE_TEST_APP_PATH`, or `target/release/hole.exe`, which exists only after
-a release build. It starts `tauri-driver` from `PATH` and needs `msedgedriver`; `npm install` provides neither. Only the
-installer lane's `provision-e2e-tools` step downloads them, and puts them on `PATH` for that run's child processes alone
-([The installers](installers.md)); CI runs the specs there.
+The browser-level end-to-end specs in {src}`tests/webdriver/` run the app through WebDriver, on Windows.
+`npm run test:e2e` runs them against `HOLE_TEST_APP_PATH` or `target/release/hole.exe` (a release build). It needs
+`tauri-driver` and `msedgedriver` on `PATH`; `npm install` provides neither, and only the installer lane's
+`provision-e2e-tools` step fetches them ([The installers](installers.md)), which is where CI runs the specs.
 
 ### The elevated lane
 
@@ -43,11 +43,8 @@ does not find it, fails with a message that says what is missing and how to get 
 does not return early. To leave a lane out, say so with a filter such as `SKULD_LABELS='!tun'`. A test that skips on its
 own lets a lane go quiet while it stays green. Nothing checks this mechanically; review does.
 
-The rule has exceptions today: `get_default_gateway_info_returns_valid_result` in
-{src}`crates/tun-engine/src/gateway_tests.rs` is `#[ignore]`d to be run by hand, `bypass_socket_connects_to_loopback` in
-{src}`crates/tun-engine/src/helpers/bypass_tests.rs` is ignored because it hangs on Windows CI, one test in
-{src}`crates/plugin-e2e/tests/interop.rs` is disabled with `#[ignore]`, and the installer projects' Python tests skip
-on a host that is not the platform they test.
+The installer projects' Python tests skip on a host that is not the platform they test. An ignored Rust test is
+either run by hand (`get_default_gateway_info_returns_valid_result`) or names its tracking issue.
 
 ### Test observability
 

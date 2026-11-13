@@ -809,10 +809,9 @@ fn other_stop_failures_are_not_read_as_already_stopped() {
 /// itself controls and never signals until after `drop` below returns. This
 /// is the only way to observe "did not join" from outside `Drop`: if a
 /// regression reverted the `if session_reclaimed` gate to an unconditional
-/// join (as it was before this split), `drop(etw_guard)` would block on
+/// join, `drop(etw_guard)` would block on
 /// that thread forever instead of returning. The test spawns the thread
-/// itself, so it is not a class-2 wait of
-/// docs/contributing/testing.md#no-synchronization-by-elapsed-time and has
+/// itself, so it is not a class-2 wait (testing.md) and has
 /// no timeout of its own. Like the tun-engine driver and `run_with_tap`
 /// tests, it is bounded from outside, in `.config/nextest.toml`, where this
 /// test's name is listed so the hang fails loud instead of consuming the
