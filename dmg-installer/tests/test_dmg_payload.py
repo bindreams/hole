@@ -28,7 +28,7 @@ def test_dmg_ships_full_canonical_bindir(installed_app: Path) -> None:
 
     Derives the expected set from the single source of truth so a future bindir
     addition nobody wired into the Tauri config fails here. We scan only
-    Contents/MacOS (the binary, sidecars, and the dSYM bundle) and do NOT
+    Contents/MacOS (the binary and the dSYM bundle) and do NOT
     recurse, so the DWARF Mach-O named `hole` inside hole.dSYM cannot falsely
     satisfy the `hole` entry. The dSYM's internal structure + UUID are covered
     by the two tests below.

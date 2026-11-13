@@ -5,8 +5,8 @@ resolver = "2"
 [workspace.package]
 # Galoshes crates (moved into `crates/` via the monorepo merge) reference
 # `edition.workspace = true`; providing it here keeps their manifests
-# resolvable. `license` is deliberately NOT set at the workspace level:
-# each crate declares its own, and an Apache-2.0 crate carries a LICENSE file.
+# resolvable. `license` is deliberately NOT set at the workspace level: code is
+# GPL-3.0-or-later unless the crate's own LICENSE file says otherwise.
 edition = "2021"
 
 [workspace.dependencies]
