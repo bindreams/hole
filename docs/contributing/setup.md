@@ -125,10 +125,11 @@ SKULD_LABELS='!tun' cargo xtask run hole-tests
 prek install
 ```
 
-installs the pre-commit hook from {src}`prek.toml`: formatting, Clippy with warnings denied, the Go linter, the docs
-build and several repository checks. CI runs the same hooks, with Clippy as a step of its own and the hooks split across
-runners as [Continuous integration](ci.md) describes. No commit message is checked on your machine; the format is checked
-on the pull request title ([Commit messages](commit-messages.md)).
+installs git hooks of two types, `pre-commit` and `commit-msg` (`default_install_hook_types` in {src}`prek.toml`). The
+hooks in `prek.toml` all run before a commit: formatting, Clippy with warnings denied, the Go linter, the docs build and
+several repository checks. None uses the `commit-msg` stage, so no commit message is checked on your machine; the format
+is checked on the pull request title ([Commit messages](commit-messages.md)). CI runs the same hooks, with Clippy as a
+step of its own and the hooks split across runners as [Continuous integration](ci.md) describes.
 
 ## Next
 

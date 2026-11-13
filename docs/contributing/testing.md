@@ -44,7 +44,8 @@ does not return early. To leave a lane out, say so with a filter such as `SKULD_
 own lets a lane go quiet while it stays green. Nothing checks this mechanically; review does.
 
 The rule has exceptions today: `get_default_gateway_info_returns_valid_result` in
-{src}`crates/tun-engine/src/gateway_tests.rs` is `#[ignore]`d to be run by hand, one test in
+{src}`crates/tun-engine/src/gateway_tests.rs` is `#[ignore]`d to be run by hand, `bypass_socket_connects_to_loopback` in
+{src}`crates/tun-engine/src/helpers/bypass_tests.rs` is ignored because it hangs on Windows CI, one test in
 {src}`crates/plugin-e2e/tests/interop.rs` is disabled with `#[ignore]`, and the installer projects' Python tests skip
 on a host that is not the platform they test.
 

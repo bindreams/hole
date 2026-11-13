@@ -1,8 +1,8 @@
 # Continuous integration
 
-Every pull request runs one workflow, {src}`.github/workflows/ci.yaml`, with one job, `ci`, on six runners:
-`windows`, `darwin` and `linux`, each on `amd64` and `arm64`. A pull request therefore costs six runners, two of them
-macOS. Each runner builds, lints and tests what its platform ships. A **lane** is one kind of work, such as the Hole
+Every pull request runs two workflows. {src}`.github/workflows/semantic-pr.yaml` checks the title ([Commit
+messages](commit-messages.md)). {src}`.github/workflows/ci.yaml` has one job, `ci`, on six runners: `windows`, `darwin`
+and `linux`, each on `amd64` and `arm64`. A pull request therefore costs six runners, two of them macOS. Each runner builds, lints and tests what its platform ships. A **lane** is one kind of work, such as the Hole
 tests, an installer build or the lint, and the matrix flags in `ci.yaml` say which runners run which lanes.
 
 The comments in `ci.yaml` are the detailed description: why each step sits where it does, and the measurements behind the

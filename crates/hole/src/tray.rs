@@ -1556,12 +1556,11 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
 /// (no webview poll): an external stop, a bridge crash, or `hole proxy
 /// stop` must reach the tray (#462).
 ///
-/// Sanctioned timing exception (docs/contributing/testing.md#no-synchronization-by-elapsed-time, the
-/// "external process whose state changes out-of-band" class): this polls
-/// a SEPARATE PROCESS for presentation reconciliation — the same class as
-/// the webview's 5s status poll — and synchronizes nothing in-process
-/// (`BridgeLink::send` commits synchronously; no code waits on this
-/// loop). The immediate first tick doubles as the startup reconcile.
+/// Paced re-check (class 3 of docs/contributing/testing.md#no-synchronization-by-elapsed-time):
+/// the bridge's state changes with no event reaching this process, so
+/// every tick re-reads it, nothing is concluded from the interval, and
+/// no code waits on this loop (`BridgeLink::send` commits synchronously).
+/// The immediate first tick doubles as the startup reconcile.
 ///
 /// Startup auto-connect is no longer this loop's concern (#979): the bridge
 /// decides and applies it at its own boot, before any GUI runs. This poll is

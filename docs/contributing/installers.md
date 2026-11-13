@@ -59,16 +59,17 @@ test lane runs only once the cleanup passed or no MSI was built.
 
 ## macOS installer
 
-The DMG is built from a Tauri app bundle in {src}`dmg-installer/`.
+The app is built and bundled by Tauri, from the config in {src}`crates/hole/tauri.conf.json`. {src}`dmg-installer/` is the
+Python project that wraps the app in the DMG (`dmgbuild`) and holds the tests of the result.
 
 ```sh
 cargo xtask build hole-dmg       # writes the .dmg
 cargo xtask run hole-dmg-tests   # mounts it and checks the payload and the code signature
 ```
 
-`hole-dmg` runs the steps listed under its target in {src}`build.yaml`: a Tauri build without bundling, a copy of the
-debug symbols, the installer background (`cargo xtask dmg-background`), `tauri bundle` to assemble the `.app`, and
-`dmgbuild` to wrap it in the styled DMG.
+`hole-dmg` runs the steps listed under its target in {src}`build.yaml`: `npx tauri build --no-bundle`, a copy of the
+debug symbols, the installer background (`cargo xtask dmg-background`), `npx tauri bundle` to assemble the `.app`, and
+`dmgbuild` (through `uv run --directory dmg-installer build`) to wrap it in the styled DMG.
 
 `hole-dmg-tests` attaches the DMG with `hdiutil` and checks the one it finds in the release build, or the one
 `DMG_UNDER_TEST` names.

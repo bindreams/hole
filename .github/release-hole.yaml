@@ -40,6 +40,7 @@ include_paths:
   - .github/workflows/publish-release-hole.yaml
   - .github/release-hole.yaml
   - CLAUDE.md
+  - docs/**
   - CONTRIBUTING.md
   - README.md
   - Cargo.toml

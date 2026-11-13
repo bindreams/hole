@@ -7,17 +7,17 @@ command below; the definitions are in {src}`crates/hole/src/cli.rs`.
 
 ## `hole bridge`
 
-| Command                                                      | What it does                                                                                             |
-| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
-| `hole bridge run`                                            | Runs the bridge in the foreground. It creates the TUN device and the routes, so run it elevated.         |
-| `hole bridge run --service`                                  | Runs the bridge as a service. The service installer passes this; the SCM or launchd starts it.           |
-| `hole bridge install`                                        | Installs and starts the bridge service.                                                                  |
-| `hole bridge enable`                                         | Sets the service to start automatically and starts it. Needs elevation.                                  |
-| `hole bridge uninstall`                                      | Stops and removes the service.                                                                           |
-| `hole bridge status`                                         | Prints whether the bridge is installed and running.                                                      |
-| `hole bridge log [path \| watch [--tail N]]`                 | With no argument, prints the bridge log; `path` prints where it is; `watch` streams it, after `N` lines. |
-| `hole bridge grant-access`                                   | Creates the `hole` group and adds the current user to it. Needs elevation.                               |
-| `hole bridge ipc-send (--base64 B64 \| --request-file PATH)` | Sends one IPC request to the installed bridge. Needs elevation.                                          |
+| Command                                                      | What it does                                                                                                                |
+| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `hole bridge run`                                            | Runs the bridge in the foreground, elevated. It serves IPC only; `hole proxy start` in full mode brings the TUN and routes. |
+| `hole bridge run --service`                                  | Runs the bridge as a service. The service installer passes this; the SCM or launchd starts it.                              |
+| `hole bridge install`                                        | Installs and starts the bridge service.                                                                                     |
+| `hole bridge enable`                                         | Sets the service to start automatically and starts it. Needs elevation.                                                     |
+| `hole bridge uninstall`                                      | Stops and removes the service.                                                                                              |
+| `hole bridge status`                                         | Prints whether the bridge is installed and running.                                                                         |
+| `hole bridge log [path \| watch [--tail N]]`                 | With no argument, prints the bridge log; `path` prints where it is; `watch` streams it, after `N` lines.                    |
+| `hole bridge grant-access`                                   | Creates the `hole` group and adds the current user to it. Needs elevation.                                                  |
+| `hole bridge ipc-send (--base64 B64 \| --request-file PATH)` | Sends one IPC request to the installed bridge. Needs elevation.                                                             |
 
 Options of `bridge run`:
 
