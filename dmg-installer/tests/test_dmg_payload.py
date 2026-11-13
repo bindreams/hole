@@ -28,9 +28,8 @@ def test_dmg_ships_full_canonical_bindir(installed_app: Path) -> None:
 
     Derives the expected set from the single source of truth so a future bindir
     addition nobody wired into the Tauri config fails here. We scan
-    Contents/MacOS without recursing, so the DWARF Mach-O named `hole` inside
-    hole.dSYM cannot falsely satisfy the `hole` entry. The dSYM's internal structure + UUID are covered
-    by the two tests below.
+    Contents/MacOS without recursing, so the DWARF Mach-O named `hole` inside hole.dSYM cannot falsely satisfy the
+    `hole` entry. The dSYM's internal structure and UUID are covered by the two tests below.
     """
     expected = canonical_darwin_bindir()
     contents = installed_app / "Contents"

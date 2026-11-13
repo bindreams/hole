@@ -324,7 +324,9 @@ what is open before starting more.
 
 ## Pointers
 
-- Product, install, user-facing CLI, distributions → [README.md](README.md)
+- Product, install → [README.md](README.md)
+- User-facing CLI, distributions → [docs/reference/cli.md](docs/reference/cli.md),
+  [docs/reference/distributions.md](docs/reference/distributions.md)
 - Build, dev, test, coding rules, dev/admin CLI →
   [CONTRIBUTING.md](CONTRIBUTING.md)
   ([build](CONTRIBUTING.md#build) ·

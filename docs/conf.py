@@ -1,5 +1,6 @@
 """https://www.sphinx-doc.org/en/master/usage/configuration.html"""
 
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -22,12 +23,19 @@ extensions = [
     "myst_parser",
     "sphinx_design",
     "sphinx_copybutton",
+    "sphinx.ext.extlinks",
+    "sphinxcontrib.mermaid",
 ]
 # No colon_fence: the mdformat-myst prek hook escapes colon fences, so the
 # docs use backtick-fenced directives exclusively.
 myst_enable_extensions = ["substitution"]
 myst_heading_anchors = 3
 myst_substitutions = versions
+
+# The one way a page links to a file in the repository: {src}`crates/hole/src/cli.rs`.
+# A Read the Docs build links the commit it built; any other build links `main`.
+source_ref = os.environ.get("READTHEDOCS_GIT_COMMIT_HASH") or "main"
+extlinks = {"src": (f"https://github.com/bindreams/hole/blob/{source_ref}/%s", "%s")}
 
 exclude_patterns = ["_build"]
 

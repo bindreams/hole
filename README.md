@@ -1,79 +1,48 @@
 # Hole
 
-Shadowsocks GUI with transparent proxy (TUN), system tray, and v2ray-plugin
-support (the v2ray-plugin wire protocol, served by the bundled first-party
-`ex-ray` binary) for macOS and Windows.
+Hole is a free [Shadowsocks](https://shadowsocks.org/) client for Windows and macOS computers; there is no phone or
+Linux version. Switch it on and, by default, your computer's internet traffic goes through a Shadowsocks server,
+including the apps that ignore proxy settings. When the server is set up to disguise its traffic, as
+[Postern](https://github.com/bindreams/postern) does, the traffic looks like ordinary HTTPS web traffic, for networks
+that filter VPNs.
 
-## Features
+## Hole is a client, not a VPN service
 
-- **Transparent proxy** via TUN interface — zero config for all apps, including
-  those that ignore system proxy settings
-- **SOCKS5 proxy** on port 4073 for advanced users
-- **DNS leak prevention** — all DNS traffic routed through the tunnel
-- **System tray** — Enable/Disable, Start at Login, Settings, Exit
-- **Server import** — from shadowsocks client config files (single and multi-server)
-- **v2ray-plugin** support — served by the bundled first-party `ex-ray` binary
-- **Logging** to stderr + a size-rotated file (10 MiB, one backup kept)
+Hole does not come with a server, and there is nothing to sign up for. To use it you need a Shadowsocks server, and
+there are two ways to get one:
 
-## Architecture
+- **Someone gives you a config.** Whoever runs the server sends you a config file, and Hole imports it.
+- **You run a server yourself.** [Postern](https://github.com/bindreams/postern) is Hole's companion project for that:
+  a self-hosted portal that sets up Shadowsocks servers, including the plugins that disguise their traffic, so you do
+  not pick or install those by hand. It hands each person you invite a ready-made client config. Its
+  [documentation](https://postern.readthedocs.io) walks through the setup.
 
-`hole` is a single binary that serves as both the Tauri GUI and a privileged
-bridge, depending on CLI arguments:
+## Download
 
-| Mode              | Privilege     | Role                                                        |
-| ----------------- | ------------- | ----------------------------------------------------------- |
-| `hole` (no args)  | User          | Tauri GUI — system tray, settings window, config management |
-| `hole bridge run` | Root / SYSTEM | Privileged helper — TUN, routing, shadowsocks-service       |
+Get the installer for your system from the [latest release](https://github.com/bindreams/hole/releases/latest):
 
-The two communicate over IPC (Unix socket on macOS, named pipe on Windows) using
-HTTP/1.1 REST (JSON).
+- **Windows:** the `.msi` installer, for 64-bit Intel or AMD PCs (`amd64`). Windows on ARM is not supported.
+- **macOS:** the `.dmg` for your Mac, `arm64` for Apple silicon or `amd64` for Intel. To tell which you have, open the
+  Apple menu, choose **About This Mac**, and look at the **Chip** line: "Apple" followed by a name such as M1 means Apple
+  silicon.
 
-## Install
+Apple doesn't recognise Hole's developer yet, so macOS blocks the first launch with a warning that Apple could not
+verify Hole is free of malware. To open it anyway:
 
-Download the installer for your platform from the
-[latest release](https://github.com/bindreams/hole/releases/latest).
+- **macOS 15 or later:** click **Done**, open **System Settings** → **Privacy & Security**, scroll down and click
+  **Open Anyway** next to Hole.
+- **Earlier macOS:** Control-click Hole and choose **Open**.
 
-**macOS first launch:** Hole is ad-hoc-signed but not yet notarized by Apple. On
-first launch after installing from the DMG, macOS says "Hole cannot be opened
-because the developer cannot be verified." Right-click the app → **Open** →
-**Open** in the dialog. This is a one-time step per machine and goes away once the
-app is notarized.
+## Learn more
 
-## Commands
-
-The GUI is the primary interface; these CLI commands are also available:
-
-| Command                              | Description                                                                                         |
-| ------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| `hole [--no-show-dashboard]`         | Launch the GUI (default); opens the dashboard                                                       |
-| `hole version`                       | Print version information                                                                           |
-| `hole upgrade`                       | Check for updates and install the latest version                                                    |
-| `hole path add` / `hole path remove` | Add / remove `hole` from the system PATH                                                            |
-| `hole bridge unlock`                 | Turn off the kill switch and clear the block it left behind (run as administrator; `sudo` on macOS) |
-
-## Distributions
-
-Four products ship from this repository, each tagged
-`releases/<product>/v<X.Y.Z>` with its own GitHub release. Build and release
-details are in [CONTRIBUTING.md](CONTRIBUTING.md#releases).
-
-- **`hole`** — the Tauri GUI for end users. MSI + DMG installers (amd64 + arm64),
-  signed via minisign for auto-update integrity.
-- **`galoshes`** — standalone SIP003u plugin binaries for shadowsocks server
-  operators who want to pair non-Hole servers with Hole clients (YAMUX-multiplexed
-  TCP+UDP, embedded ex-ray). 6 platforms. Apache-2.0.
-- **`garter`** — the plugin-chain runner library on
-  [crates.io](https://crates.io/crates/garter), plus `garter` CLI binaries for
-  plugin developers. Apache-2.0.
-- **`ex-ray`** — the first-party SIP003u plugin (wire-compatible with
-  shadowsocks/v2ray-plugin) for pairing with a non-Hole shadowsocks deployment.
-  6 platforms. Apache-2.0.
-
-## Contributing
-
-Building from source, the development workflow, the architecture, and the test
-suite are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+- The [documentation](https://hole.readthedocs.io/en/latest/) has a [glossary](https://hole.readthedocs.io/en/latest/reference/glossary.html) of Hole's terms (TUN, SIP003 plugins, ECH, the
+  kill switch), the [command line](https://hole.readthedocs.io/en/latest/reference/cli.html), and lists [what else ships from this
+  repository](https://hole.readthedocs.io/en/latest/reference/distributions.html), such as plugins for running your own server.
+- To build Hole, run its tests or learn how it is put together, start at [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-TBD
+Copyright (C) 2026, Anna Zhukova
+
+Hole is licensed under the [GNU GPL version 3 or later](LICENSE.md), unless a component's own `LICENSE` file says
+otherwise: several libraries and plugins are Apache-2.0. [Licensing](https://hole.readthedocs.io/en/latest/reference/licensing.html) lists them.
