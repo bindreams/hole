@@ -110,7 +110,6 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
             "galoshes" | "galoshes.exe" => BindirFile::new(repo_root.join("target").join("release").join(&name), name),
             // wintun.dll — downloaded by `cargo xtask wintun` into `.cache/wintun/`.
             "wintun.dll" => BindirFile::new(repo_root.join(".cache").join("wintun").join("wintun.dll"), name),
-            "NOTICES.md" => BindirFile::new(repo_root.join("NOTICES.md"), name),
             other => return Err(anyhow!("BINDIR name {other:?} has no source mapping in bindir_files")),
         };
         files.push(file);

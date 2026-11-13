@@ -184,12 +184,6 @@
       <Component Id="WintunDll" Guid="C3D4E5F6-A7B8-9012-CDEF-123456789012">
         <File Id="wintun.dll" Source="!(bindpath.BinDir)\wintun.dll" KeyPath="yes" />
       </Component>
-      <!-- NOTICES.md preserves Apache-2.0 §4(d) attribution for the bundled
-           galoshes/garter components. The License dialog only displays GPL-3.0
-           text; the NOTICE file must accompany the binaries on disk. -->
-      <Component Id="NoticesMd" Guid="F6A7B8C9-D0E1-2345-F012-456789012345">
-        <File Id="NOTICES.md" Source="!(bindpath.BinDir)\NOTICES.md" KeyPath="yes" />
-      </Component>
     </ComponentGroup>
 
     <!-- Start Menu shortcut. Conditioned on INSTALL_START_MENU; component GUID

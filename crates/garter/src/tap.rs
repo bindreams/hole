@@ -76,10 +76,6 @@
 //!    tap stops the inner as in step 3 and fails with an error naming the
 //!    accept failure. The inner task is aborted if the tap is dropped (the
 //!    chain's `drain_timeout` aborts it), so it never outlives the tap.
-//!
-//! License: this module is part of `garter` (Apache-2.0). The bridge
-//! (GPL-3.0-or-later) imports it; one-way Apache → GPL compatibility
-//! per the workspace `NOTICES.md`.
 
 use std::future::Future;
 use std::io;
