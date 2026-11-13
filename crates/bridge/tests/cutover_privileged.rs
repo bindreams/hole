@@ -92,7 +92,10 @@ fn cutover_global_net_state_running_exe_rename_flips_handle_identity() {
     let idle = std::path::Path::new(env!("CARGO_BIN_EXE_test_idle"));
     let exe = dir.path().join("live.exe");
     std::fs::copy(idle, &exe).unwrap();
-    let mut child = std::process::Command::new(&exe).spawn().expect("spawn the idle image");
+    // cosca kills the child on drop; `contain()` also kills it if this process dies.
+    let mut cmd = cosca::Command::new();
+    cmd.executable(&exe).arg(&exe).contain();
+    let child = cmd.spawn().expect("spawn the idle image");
 
     let before = same_file::Handle::from_path(&exe).unwrap();
     let renamed = dir.path().join("live.exe.old-0.3.0");
@@ -111,8 +114,6 @@ fn cutover_global_net_state_running_exe_rename_flips_handle_identity() {
         child.try_wait().unwrap().is_none(),
         "the child must still be running after its image was renamed underneath it"
     );
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Waits for the SCM to finish deleting a service: `DeleteService` only marks
