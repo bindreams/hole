@@ -29,8 +29,9 @@ added, and the machine is back as it was.
 
 One address must not go into the tunnel: the {term}`Shadowsocks` server's. The tunnel's own connection to it would otherwise
 loop back into the tunnel. Hole adds a fifth route, a host route for the server's address that goes out through the
-machine's real network, not the tunnel: through the real gateway, or for an IPv6 server straight out of the real
-interface, since the gateway is not reliably detectable for IPv6. It is left out when the server is on the same machine, since loopback is already more specific
+machine's real network, not the tunnel. It names the real gateway as the next hop, or the real network interface itself
+where there is no gateway to name: for an IPv6 server always, and on Windows for an IPv4 server whose route has no
+gateway. It is left out when the server is on the same machine, since loopback is already more specific
 than the halves.
 
 ```{dropdown} Why Hole deletes only routes it recorded
@@ -95,8 +96,8 @@ What the decision means:
 - **Block.** A TCP connection is accepted and then closed with an ordinary close, not a reset. A UDP flow is discarded
   without a reply.
 
-DNS is the exception that sits in front of all of this: a UDP lookup to port 53 goes to the {term}`DNS forwarder` before the
-rules are read. See [DNS through the tunnel](dns.md).
+DNS is the exception: a UDP lookup to port 53 always goes to the {term}`DNS forwarder`, whatever the rules say. See
+[DNS through the tunnel](dns.md).
 
 ```{dropdown} Where in the code
 The decision loop is {src}`crates/bridge/src/filter/engine.rs`; the three outcomes and the UDP and IPv6 drop cases are

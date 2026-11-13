@@ -16,9 +16,10 @@ While the rule is in force, an outgoing connection is allowed only if it is one 
 
 - traffic to the machine itself (loopback);
 - traffic through Hole's own {term}`TUN` device, so [everything the tunnel carries](tun.md) flows normally;
-- the connection from Hole to your {term}`Shadowsocks` server, which has to leave outside the tunnel (on Windows any
-  protocol, on macOS TCP only);
-- on Windows, anything started by Hole's own programs, the bridge and the plugin, which are identified by their file.
+- traffic to your {term}`Shadowsocks` server's address, from any program, since Hole's own connection to it has to leave
+  outside the tunnel (on Windows any protocol, on macOS TCP only);
+- on Windows, anything run from the files of Hole's own programs, the bridge and the plugin, which are identified by
+  their file. The bridge, the app and the `hole` command line are one file, so the app's own connections pass too.
   That includes the connections the bridge opens for a **Bypass** rule, so on Windows Bypass traffic still leaves. macOS
   cannot tell programs apart, so there a Bypass rule's traffic is blocked like the rest.
 
@@ -28,8 +29,8 @@ stops connections leaving the machine and sets no rule against incoming ones.
 ## When it is in force
 
 Ticking **Lockdown** records a preference, which the bridge keeps across disconnects and restarts. The block is not
-installed until Hole next connects. During a connect, it goes up once the TUN device and the routes exist, before DNS is
-pointed at the tunnel, so from the moment traffic starts to flow it is already held. If you tick Lockdown while
+installed until Hole next connects. During a connect, it goes up right after the routes, before DNS is pointed at the
+tunnel. If you tick Lockdown while
 connected, nothing is blocked yet: the block arrives at the next connect.
 
 After that, what happens to the block depends on whether you or Hole decided to disconnect.
@@ -37,19 +38,23 @@ After that, what happens to the block depends on whether you or Hole decided to 
 | What happens                                                         | The block                                                                                                                            |
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | The network drops and comes back while Hole's processes keep running | Stays in force                                                                                                                       |
-| Hole restarts the session to apply a changed setting                 | Stays in force across the restart                                                                                                    |
-| The bridge is restarted by an update                                 | Stays in force, and the new bridge takes it over                                                                                     |
+| Hole restarts the session to apply a changed setting                 | Stays in force across the restart (see the macOS note below)                                                                         |
+| The bridge is restarted by an update                                 | Stays in force, and the new bridge takes it over (see the macOS note below)                                                          |
 | You click **Disconnect**, or choose **Exit**                         | Lifted. Lockdown stays ticked, so the next connect puts it back                                                                      |
 | The machine shuts down or restarts while Hole is connected           | Stays in force, and is still there after the next boot                                                                               |
-| The proxy or the plugin process dies on its own                      | Lifted when the app next asks for the status, because Hole gives up and disconnects then                                             |
+| The Shadowsocks client or the plugin stops on its own                | Lifted when the app next asks for the status, because Hole gives up and disconnects then                                             |
 | You choose **Unblock Network** in the tray                           | Lifted, Lockdown is switched off, and Hole will not reconnect by itself at the next start. A connection that is running is not ended |
 | You untick **Lockdown**                                              | Lifted at once, while still connected                                                                                                |
 | You run `hole bridge unlock`                                         | Lifted, with the same effects as Unblock Network. It refuses while a bridge is running, and then **Unblock Network** is the way      |
 
 The block follows one model: it holds while Hole is *meant* to be connected, and lifts when it is not. A disconnect you
 asked for, and a connection Hole has given up on, both mean it is not, so the block does not trap a machine whose
-tunnel Hole has abandoned. Hole notices a proxy or plugin that died only when the app next asks the bridge for its
+tunnel Hole has abandoned. Hole notices a Shadowsocks client or plugin that stopped only when the app next asks the bridge for its
 status. With no app running, for instance after a boot-time connect with the tray gone, the block stays until one does.
+
+On macOS, a connection that restarts under the block has to look the server up again, and the block there lets through
+only TCP to the server's address. When the server is given by name the lookup can fail, the restart then fails, and the
+block stays until you choose **Unblock Network**.
 
 If you are left with a block and no way to lift it from the app, the recovery steps are in the Get started guide, under
 troubleshooting.

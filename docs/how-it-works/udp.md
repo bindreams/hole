@@ -15,7 +15,7 @@ fails to one that leaks.
 ```{mermaid}
 flowchart TD
     udp["A UDP flow"] --> dns{"UDP to port 53, and the DNS forwarder is on?"}
-    dns -- "yes" --> fwd["Answered by the DNS forwarder"]
+    dns -- "yes" --> fwd["Answered by the DNS forwarder, whatever the rules say"]
     dns -- "no" --> action{"What do the filter rules say?"}
     action -- "Block" --> d1["Dropped"]
     action -- "Bypass" --> v6{"IPv6 destination and no working IPv6 on the real network?"}

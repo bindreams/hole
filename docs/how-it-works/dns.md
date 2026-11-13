@@ -25,7 +25,7 @@ sequenceDiagram
     participant R as Your chosen resolver
     App->>OS: Look up example.com
     OS->>T: UDP to port 53 of a configured resolver address
-    T->>F: Intercept before any filter rule is read
+    T->>F: Intercept, whatever the filter rules say
     F->>R: Same question, over the tunnel (DoH by default)
     R-->>F: Answer
     F-->>T: Reply with the application's own transaction ID
@@ -35,8 +35,8 @@ sequenceDiagram
 
 Hole points the operating system's DNS at the resolver addresses in its settings. Public resolver addresses, such as the defaults, fall in the halves of
 the address space that [the routes](tun.md#two-routes-per-address-family) send into the TUN device, so the
-lookup arrives at the bridge. A UDP packet to port 53 is handed to the forwarder before any [filter](tun.md#from-packets-to-connections)
-rule is read. This holds for any destination, not only the configured resolvers, so an application that hard-codes its
+lookup arrives at the bridge. A UDP packet to port 53 always goes to the forwarder, whatever the [filter](tun.md#from-packets-to-connections) rules
+say. This holds for any destination, not only the configured resolvers, so an application that hard-codes its
 own resolver is answered by the forwarder too, and a rule that blocks that resolver does not stop the answer.
 
 The forwarder tries your resolvers in order and returns the first answer. Each question goes out over one of four
@@ -80,11 +80,10 @@ would be worse than one that said it could not connect.
 
 Before it opens the TUN device, installs any route or touches any DNS setting, the bridge sends one test lookup,
 `example.com`, through the forwarder and the proxy. If the lookup is not answered, the connection fails with an error
-that says which of three things happened: every attempt to open a connection into the tunnel failed outright, a
-connection was still being set up when the time ran out, or the tunnel opened and then nothing came back. The message
-does not pick a side where it cannot tell: a dead plugin and a server that cannot reach your resolver look the same
-from here. Because the check runs first, a dead tunnel never takes the
-machine's DNS with it.
+that says what the check saw, for instance that every attempt to open a connection into the tunnel failed outright, or
+that the tunnel opened and then nothing came back. The message does not pick a side where it cannot tell: a dead plugin
+and a server that cannot reach your resolver look the same from here. Because the check runs first, a dead tunnel never
+takes the machine's DNS with it.
 
 ## Settings
 

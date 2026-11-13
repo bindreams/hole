@@ -62,7 +62,9 @@ say `tls` uses plain WebSocket (the Shadowsocks payload inside it is still encry
 tls;host=example.com;path=/ws
 ```
 
-With TLS on, the connection is an HTTPS WebSocket connection to the name in `host`, which is what camouflages it.
+ex-ray connects to the address Hole looked up, not to a name. With TLS on, `host` is the server name it announces in the
+TLS handshake and the `Host` header of the WebSocket request, which is what makes the connection look like ordinary HTTPS
+to that site.
 
 ## galoshes
 
