@@ -54,6 +54,9 @@ VERSIONS_LINE = (
     "garter {garter_version}, ex-ray {exray_version}."
 )
 
+# A crate's own README; vendored trees under a crate are not ours to check.
+CRATE_README_RE = re.compile(r"crates/[^/]+/README\.md")
+
 # Only this project's own substitutions. A general `{{` match fails a correct
 # build: a page documenting `${{ github.ref }}` emits it verbatim.
 SUBSTITUTION_RE = re.compile(r"\{\{\s*(?:" + "|".join(SUBSTITUTIONS) + r")\s*\}\}")
@@ -308,13 +311,14 @@ def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
 def readme_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
     """Problems with the links into the published site in every README.
 
-    The root README and every tracked `README.md`, each reported by its own path.
+    The root README and each tracked `crates/<crate>/README.md` (not vendored
+    trees), each reported by its own path.
     `<page>.html` must have a tracked `docs/<page>.md` source; the bare site root
     maps to `docs/index.md`. Any other link under the site's base is a problem.
     Link destinations, plain text and raw HTML are read, once each; code, and the
     text of a link (which is not itself a link), are not.
     """
-    readmes = {"README.md"} | {path for path in tracked if path.endswith("/README.md")}
+    readmes = {"README.md"} | {path for path in tracked if CRATE_README_RE.fullmatch(path)}
     return [problem for readme in sorted(readmes) for problem in single_readme_problems(repo_root, tracked, readme)]
 
 
@@ -700,7 +704,9 @@ def test_readme_links_are_checked_in_every_tracked_readme_by_its_own_path(tmp_pa
     (tmp_path / "crates" / "foo" / "README.md").write_text(
         "ok\n[a](https://hole.readthedocs.io/en/latest/reference/gone.html)\n", encoding="utf-8"
     )
-    tracked = frozenset({"docs/index.md", "README.md", "crates/foo/README.md"})
+    (tmp_path / "crates" / "foo" / "third_party").mkdir()
+    (tmp_path / "crates" / "foo" / "third_party" / "README.md").write_text("```\nnever closed\n", encoding="utf-8")
+    tracked = frozenset({"docs/index.md", "README.md", "crates/foo/README.md", "crates/foo/third_party/README.md"})
 
     problems = readme_link_problems(tmp_path, tracked)
 

@@ -80,9 +80,20 @@ TUN
   one, so it sees the packets of every app. See [the TUN device and the routes](../how-it-works/tun.md) and
   [TUN/TAP](https://en.wikipedia.org/wiki/TUN/TAP).
 
+yamux
+  A stream multiplexing protocol: many independent streams over one connection. {term}`galoshes` uses it to carry every
+  TCP connection and UDP exchange of a client on one connection to the server. See
+  [the galoshes transport](../contributing/architecture/galoshes-transport.md) and
+  [the specification](https://github.com/hashicorp/yamux/blob/master/spec.md).
+
 VPN client
   An app that sends a machine's traffic through a server somebody else runs. Hole is a client of that kind, not a VPN
   service: it comes with no server.
+
+ULA
+  Unique local address: an IPv6 address from the private `fc00::/7` range (RFC 4193), the IPv6 counterpart of a
+  `192.168.x.x` address. Hole's tunnel uses one. See
+  [the TUN device](../contributing/architecture/tun-device.md#ipv6-in-the-tunnel).
 
 Unblock Network
   The tray action, shown while Hole is blocking traffic, that lifts the {term}`kill switch`'s block and turns Lockdown

@@ -6,10 +6,13 @@ is both the unprivileged Tauri GUI (no args) and the privileged bridge
 (`hole bridge run`, root/SYSTEM).
 
 This file is the agent-facing architecture map. Product and install live in
-[README.md](README.md); the full contributor reference — build, dev, test, and
-every rule below in detail — lives in [CONTRIBUTING.md](CONTRIBUTING.md) and, for
-build, development and testing, [docs/contributing/](docs/contributing/index.md). Read
-them before editing; the sections linked below are the authoritative source.
+[README.md](README.md); the contributor reference lives in
+[docs/contributing/](docs/contributing/index.md) (setup, build, development,
+testing, and the architecture under
+[docs/contributing/architecture/](docs/contributing/architecture/overview.md)).
+[CONTRIBUTING.md](CONTRIBUTING.md) holds the route and recovery rules, the process
+model and releases. Read them
+before editing; the sections linked below are the authoritative source.
 
 **IMPORTANT:** NEVER PIPE TESTS TO `tail`! ALWAYS SET A TIMEOUT FOR THE SHELL COMMAND! Tests are known to hang, you WILL get stuck and WILL not have information to debug why if you tail.
 
@@ -26,24 +29,25 @@ them before editing; the sections linked below are the authoritative source.
   TCP-only plugin are **dropped, not bypassed** (bypassing would leak outside the
   tunnel); enforced structurally in `HoleRouter::resolve_endpoint`. UDP/53 is
   diverted to the DNS forwarder before the cascade. →
-  [CONTRIBUTING.md#udp-policy](CONTRIBUTING.md#udp-policy)
+  [docs/contributing/architecture/datapath.md#udp-is-dropped-never-bypassed](docs/contributing/architecture/datapath.md#udp-is-dropped-never-bypassed)
 - **TUN naming.** The running TUN device's name has exactly one source of
   truth at runtime, `tun_engine::device::TunIdentity`: Windows names it the
   fixed constant `WINDOWS_TUN_ALIAS` (`"hole-tun"`), macOS's kernel assigns
-  it (`TunName::KernelAssigned`, a `utunN`) and every macOS consumer —
-  DNS apply, the lockdown TUN permit — reads it back rather than assuming
-  a literal. →
-  [CONTRIBUTING.md#tun-naming](CONTRIBUTING.md#tun-naming)
+  it (`TunName::KernelAssigned`, a `utunN`) and every macOS consumer that
+  needs the name — route install, the lockdown TUN permit — reads it back
+  rather than assuming a literal (the macOS DNS apply takes none). →
+  [docs/contributing/architecture/tun-device.md#the-device-name-has-one-source](docs/contributing/architecture/tun-device.md#the-device-name-has-one-source)
 - **IPv6 in the tunnel.** IPv6 is meant to traverse the tunnel: the `::/1` +
   `8000::/1` split pair captures it, and the TUN interface holds
   `TUN_SUBNET6` on the **OS interface** as well as in smoltcp, so a host with
   no global IPv6 still has a source address for those routes. The ULA's
   global ID is generated per RFC 4193, not `fd00::`. Windows waits for the
   interface's IPv6 half itself (`tun` waits only for the IPv4 one) and
-  creates the address `IpDadStatePreferred`; assignment is fatal on Windows,
-  warn-only on macOS, and `Dispatcher::ipv6_assigned()` is what route-install
-  fatality must read. →
-  [CONTRIBUTING.md#ipv6-in-the-tunnel](CONTRIBUTING.md#ipv6-in-the-tunnel)
+  creates the address `IpDadStatePreferred`; on Windows `Ipv6StackAbsent` only
+  warns and any other IP Helper failure is fatal, on macOS every failure
+  warns, and route-install fatality reads `gateway::tun_ipv6_available`, not
+  the assignment's outcome. →
+  [docs/contributing/architecture/tun-device.md#ipv6-in-the-tunnel](docs/contributing/architecture/tun-device.md#ipv6-in-the-tunnel)
 - **TCP accept refusal.** The accept verdict lands while the listener is still
   in `SynReceived` with its SYN-ACK paused, so a declined connection is refused
   with a pre-handshake RST instead of black-holing behind a SYN-ACK; the verdict
@@ -61,31 +65,30 @@ them before editing; the sections linked below are the authoritative source.
   connection carries a keep-alive plus a timeout, the sanctioned bound on a
   client that may never speak again — without it a stall in
   `SynReceived`/`FinWait2`/`CloseWait` holds its slot forever. →
-  [CONTRIBUTING.md#tcp-accept-refusal](CONTRIBUTING.md#tcp-accept-refusal)
+  [docs/contributing/architecture/tcp-admission.md](docs/contributing/architecture/tcp-admission.md)
 - **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; OS
-  resolution is diverted to the configured resolver IPs on the TUN interface
-  only, which route into it and are intercepted by the in-TUN
-  `LocalDnsEndpoint`; a start-time forwarder self-test gates the whole
-  connection. The apply mechanism itself is platform-specific — Windows sets
+  resolution is diverted to the configured resolver IPs, which route into
+  the TUN and are intercepted by the in-TUN `LocalDnsEndpoint`; a start-time
+  forwarder self-test gates the whole connection. The apply mechanism itself is platform-specific — Windows sets
   the adapter's resolvers directly; macOS's `networksetup` has no interface
   identifier, so it instead publishes a synthetic, session-scoped
   `SCDynamicStore` supplemental-resolver key (`tun_engine::dns_steer`) — both
   fail-fatal, enforced by the sealed `DnsPhase`/`LeakBearing`/`Cosmetic`
   split. →
-  [CONTRIBUTING.md#dns-forwarder](CONTRIBUTING.md#dns-forwarder)
+  [docs/contributing/architecture/dns-forwarder.md](docs/contributing/architecture/dns-forwarder.md)
 - **DNS-egress confinement (Windows).** Hole never writes DNS settings to an
   adapter it doesn't own; on Windows, egress on UDP+TCP port 53 is also
   confined to `hole-tun` by a WFP filter set in a **process-scoped dynamic**
   FWPM session — the opposite lifetime from the fail-closed covers below, and
   deliberately so: it needs no crash-recovery state because it dies with the
   bridge. →
-  [CONTRIBUTING.md#dns-forwarder](CONTRIBUTING.md#dns-forwarder)
+  [docs/contributing/architecture/dns-forwarder.md#how-the-operating-system-reaches-it](docs/contributing/architecture/dns-forwarder.md#how-the-operating-system-reaches-it)
 - **Listener selection invariants.** `build_ss_config` rejects
   `TunnelRequiresSocks5` (full + HTTP-only) / `NoListenersEnabled`
   (socks-only + none) / `DuplicateListenerPort` up-front; full mode with
   no listeners is the pure-VPN start (internal SOCKS5 data plane on an
   ephemeral port). →
-  [CONTRIBUTING.md#listener-selection-invariants](CONTRIBUTING.md#listener-selection-invariants)
+  [docs/contributing/architecture/datapath.md#the-listener-the-datapath-dials](docs/contributing/architecture/datapath.md#the-listener-the-datapath-dials)
 - **Bridge trait seam.** All OS-mutating bridge I/O routes through the `Proxy`,
   `Routing`, and `Dns` traits so tests can mock it. →
   [CONTRIBUTING.md#bridge-test-isolation-contract](CONTRIBUTING.md#bridge-test-isolation-contract)
@@ -99,7 +102,7 @@ them before editing; the sections linked below are the authoritative source.
   folder (`/Library/Application Support/Hole`) hold exactly those at every start, before it serves; the app
   bundle ships none. A layout stamp this release cannot read is never repaired over; plugins are run from that
   folder only once the start's repair left it holding what `hole` carries. →
-  [CONTRIBUTING.md#plugin-binaries-where-each-platform-gets-them](CONTRIBUTING.md#plugin-binaries-where-each-platform-gets-them)
+  [docs/contributing/architecture/plugin-binaries.md](docs/contributing/architecture/plugin-binaries.md)
 - **Proxy shutdown contract.** `stop()` returns only once the listener sockets
   are closed; the proxy owns its own runtime because upstream's teardown is
   three layers of bare `abort()`. →
@@ -139,13 +142,13 @@ them before editing; the sections linked below are the authoritative source.
   a cycle is fatal only when the transport tap counted no inbound read across a
   whole interval and deadline, so an un-upgraded peer's tag rejection reads as
   liveness and a busy tunnel is never probed at all. →
-  [CONTRIBUTING.md#yamux-transport-self-heal](CONTRIBUTING.md#yamux-transport-self-heal)
+  [docs/contributing/architecture/galoshes-transport.md#telling-that-the-transport-is-dead](docs/contributing/architecture/galoshes-transport.md#telling-that-the-transport-is-dead)
 - **galoshes mux default.** galoshes appends `mux=0` for its embedded ex-ray —
   its yamux already collapsed every stream onto one connection, so Mux.Cool is
   pure overhead. ex-ray is first-wins on duplicate SIP003 keys, so an operator's
   earlier `mux=` overrides it. `mux` also picks the server's dokodemo
   destination, so a `mux=0` client cannot reach a `mux=1` server. →
-  [CONTRIBUTING.md#galoshes-mux-default](CONTRIBUTING.md#galoshes-mux-default)
+  [docs/contributing/architecture/galoshes-transport.md#the-mux-default](docs/contributing/architecture/galoshes-transport.md#the-mux-default)
 - **Fail-closed covers.** The standing lockdown cover (the opt-in kill switch) outlives
   the bridge: the bridge **disarms-not-drops** it and the new bridge adopts it. Release
   decisions come from the persisted `Target` and the measured `CoverPresence`;
@@ -179,7 +182,7 @@ them before editing; the sections linked below are the authoritative source.
 
 - **UDP-proxy flows DROP, never bypass** — bypassing leaks the flow outside the
   encrypted tunnel.
-  [→](CONTRIBUTING.md#udp-policy)
+  [→](docs/contributing/architecture/datapath.md#udp-is-dropped-never-bypassed)
 - **Bridge OS I/O goes through the `Proxy`/`Routing`/`Dns` traits**, including
   `Drop` cleanup — never the raw free functions (clippy-enforced).
   [→](CONTRIBUTING.md#bridge-test-isolation-contract)
@@ -257,7 +260,10 @@ what is open before starting more.
   [CI](docs/contributing/ci.md) ·
   [commit messages](docs/contributing/commit-messages.md) ·
   [dev/admin CLI](docs/contributing/bridge-cli.md))
-- Architecture, releases → [CONTRIBUTING.md](CONTRIBUTING.md)
+- Architecture →
+  [docs/contributing/architecture/](docs/contributing/architecture/overview.md)
+- The route and recovery rules, the process model, releases →
+  [CONTRIBUTING.md](CONTRIBUTING.md)
   ([releases](CONTRIBUTING.md#releases))
 - Release ops (rollback, minisign key rotation) →
   [RELEASE-OPS.md](RELEASE-OPS.md)
