@@ -30,7 +30,7 @@ jobs:
   # select, in a fixed order, on one target dir and one sccache. Every lane step
   # carries `!cancelled()`, so one failing lane hides nothing, and its own
   # `timeout-minutes`, so a hang fails that step and the later lanes still run,
-  # instead of running into the job wall, which cancels them (#989). Every lane
+  # instead of running into the job wall, which cancels them. Every lane
   # gates the merge: no `continue-on-error`, and a rerun repeats the whole
   # platform job. The xtask audits that read this file (`ci_platform_coverage`,
   # `ci_timeouts`, `ci_nextest_parity`, `skuld_label_coverage`,
@@ -45,9 +45,9 @@ jobs:
   #     rewriting them afterwards makes the test lanes recompile `hole`, uncached
   #     and on macOS as root.
   #   - Windows: every user of loopback (compiles through sccache, tests, the
-  #     installer E2E) runs before the TUN lane, which corrupts NDIS loopback
-  #     (#200). Only the #999 proof step, the job-level no-compile check, and
-  #     uploads follow it.
+  #     installer E2E) runs before the TUN lane, which corrupts NDIS loopback.
+  #     Only the `hole-verify-executed` proof step, the job-level no-compile
+  #     check, and uploads follow it.
   #   - macOS: the TUN lane runs as root and leaves root-owned files in
   #     `target/`, so it is the last step that runs a toolchain.
   #
@@ -67,10 +67,11 @@ jobs:
   # (`no_leg_wall_is_below_the_walls_of_the_jobs_it_absorbed`).
   #
   # RELEASE PATH: a release call also runs the `release-*` steps, which the audit's
-  # ordinary-run model skips. Each wall is the ordinary wall plus the budgets of the
-  # release steps that run on the leg: the tag 5, the plugin stage 20 (it builds
-  # the garter CLI on a garter release), the upload 10, and on installer legs the installer stage 10 (35 on
-  # a leg without an installer, 45 with one). These budgets are estimates, not measured.
+  # ordinary-run model skips. Each wall is the ordinary wall plus the
+  # `timeout-minutes` of the release steps that run on the leg: `release-tag`,
+  # `release-stage-plugins` (it builds the garter CLI on a garter release),
+  # `release-upload`, and on a leg that ships an installer `release-stage-msi` or
+  # `release-stage-dmg`. These budgets are estimates, not measured.
   ci:
     name: Build, lint, test (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -205,10 +206,9 @@ jobs:
         run: cargo xtask prek portable
 
       # `scripts/*.py` keep their tests inline, and the filenames are
-      # hyphenated, so pytest's default `test_*.py` collection finds nothing —
-      # which is why sign-release.py's stale asset-count check reached a release
-      # unnoticed (#682). `python_files` collects every script rather than a
-      # hand-listed set, so a new script's tests run without touching CI.
+      # hyphenated, so pytest's default `test_*.py` collection finds nothing.
+      # `python_files` collects every script rather than a hand-listed set, so a
+      # new script's tests run without touching CI.
       - id: lint-release-scripts
         name: Test release scripts
         if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.portable-lint == true }}
@@ -283,8 +283,8 @@ jobs:
 
       # Archive lanes ===================================================================================================
       # The ex-Galoshes crates plus the workspace tooling crates (stepstool,
-      # dev-console, xtask, xtask-lib, payload-archive; #454), archived once and
-      # run by the three steps below. These run first, before anything writes
+      # dev-console, xtask, xtask-lib, payload-archive, util, file-lock), archived
+      # once and run by the three steps below. These run first, before anything writes
       # outside gitignored paths, so tooling's git/prek tests see a clean tree.
       # The mock-plugin fixture bin is ungated and always archived
       # (crates/garter/tests/common/mod.rs).
@@ -334,7 +334,7 @@ jobs:
       #   SKULD_LABELS=windows_console cargo nextest run -p dev-console \
       #     -E 'test(null_stdin_child_cannot_corrupt_console_mode)'
       #
-      # Budget 20: windows/arm64 ran 8m52s green, then 10m18s on an unchanged
+      # Budget: windows/arm64 ran 8m52s green, then 10m18s on an unchanged
       # test set, under a budget of 10.
       - id: test-tooling
         name: Test tooling
@@ -352,7 +352,7 @@ jobs:
 
       # Loopback users that precede the Hole build ======================================================================
 
-      # Plugin interop/e2e (crate `plugin-e2e`, #435): ex-ray<->stock interop on
+      # Plugin interop/e2e (crate `plugin-e2e`): ex-ray<->stock interop on
       # all 6 platforms (QUIC not(windows)) + galoshes server<->client
       # roundtrips (WS all platforms; WS-TLS/QUIC not(windows)). A fresh build,
       # not the archive lane: these spawn plugin BINARIES and need on-disk
@@ -399,7 +399,7 @@ jobs:
 
       # Installer assembly ==============================================================================================
       # Release builds; they re-run the sidecar cascade, so they precede
-      # `hole-build`. Budget 80 for both assembly steps, held equal by
+      # `hole-build`. Both assembly steps share one budget, held equal by
       # `ci_installer_assembly_steps_share_a_timeout_budget`; sized for a cold
       # sccache (GitHub evicts entries untouched for 7 days); the maxima are in
       # STEP-LEVEL BUDGETS below.
@@ -437,10 +437,10 @@ jobs:
         run: target\release\hole.exe version
 
       # DMG assembly + signature-consistency tests (`dmg-installer/`): catches an
-      # unsigned .app bundle that launches "damaged" under Gatekeeper quarantine
-      # (#364). One build+test via the run-cascade (builds hole-dmg once, then the
+      # unsigned .app bundle that launches "damaged" under Gatekeeper quarantine.
+      # One build+test via the run-cascade (builds hole-dmg once, then the
       # signing pytest); a separate `build hole-dmg` step would double-roll the
-      # flaky bundle_dmg.sh/hdiutil pipeline (#446).
+      # flaky bundle_dmg.sh/hdiutil pipeline.
       #
       # Local time, the zone `log show --start` reads, so the diagnostics below
       # span this step whatever its budget is.
@@ -539,10 +539,10 @@ jobs:
       # Compile test binaries via the orchestrator (resolves the full DAG:
       # ex-ray -> galoshes -> wintun -> hole -> hole-tests) but don't run them
       # yet. Nothing after this step rewrites the sidecars or builds in the debug
-      # profile, so the lanes below re-execute these binaries (see #200 for the
-      # NDIS-loopback corruption that motivates running TUN tests last).
+      # profile, so the lanes below re-execute these binaries (the TUN tests run
+      # last: they corrupt NDIS loopback on Windows).
       #
-      # Budget 70 (STEP-LEVEL BUDGETS below).
+      # Budget: see STEP-LEVEL BUDGETS below.
       - id: hole-build
         name: Build hole test binaries
         if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.hole == true }}
@@ -586,7 +586,7 @@ jobs:
       # `--record` writes the membership just verified for the proof step (below)
       # to read back after the lanes — see `verify` in
       # global_net_state_conformance.rs for why it isn't re-listed there
-      # instead. bindreams/hole#999.
+      # instead.
       - id: hole-verify-labels
         name: Verify global_net_state label matches the nextest.toml filter
         if: ${{ !cancelled() && steps.hole-build.outcome == 'success' }}
@@ -625,14 +625,14 @@ jobs:
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
       # feature set -> different fingerprint -> fresh build), whose build.rs
       # generates the Tauri context in production mode and fails on
-      # missing `ui/dist/`. See bindreams/hole#372. The
+      # missing `ui/dist/`. The
       # `--features tombstone/crash-dumps,tombstone/crash-child` + `package(tombstone)`
       # also mirror `hole-tests` so the crash-marker tests `build hole-tests`
-      # compiled actually run (matching feature set -> no rebuild). See #522.
+      # compiled actually run (matching feature set -> no rebuild).
       # The `ci_test_hole_steps_match_the_hole_tests_target` conformance test
       # holds every nextest step of the `hole-` lanes equal to that target's `run:`.
       #
-      # STEP-LEVEL BUDGETS (#989). A step that blows its own budget fails
+      # STEP-LEVEL BUDGETS. A step that blows its own budget fails
       # normally: the job runs on and the later lanes still report; when the
       # job WALL fires instead, the lanes after the hung step do not run.
       # Sized off per-step maxima over 200 runs (2026-09-23 -> 2026-10-17):
@@ -701,10 +701,10 @@ jobs:
       # service would share WFP, routes and the adapter with the TUN tests and confound their
       # verdicts. A failed lifecycle with a clean cleanup does not hide the TUN lane.
       #
-      # Last-resort kill: the harness bounds each phase itself (msiexec 3 min; gsudo self-test,
-      # dashboard E2E and each diagnostics dump 5 min), so a wedged phase fails by name and the
-      # fixture still uninstalls first. Those bounds sum to about 25 min; 75 leaves margin for the
-      # unbounded phases (tool provisioning, the build, process listing).
+      # Last-resort kill: the harness bounds each phase itself (msiexec, gsudo self-test,
+      # dashboard E2E and each diagnostics dump), so a wedged phase fails by name and the
+      # fixture still uninstalls first. This budget leaves margin over the sum of those bounds for
+      # the unbounded phases (tool provisioning, the build, process listing).
       - id: installer-tests
         name: Install, E2E and uninstall the MSI
         if: ${{ !cancelled() && steps.installer-build-msi.outcome == 'success' }}
@@ -755,8 +755,7 @@ jobs:
       # bridge.log (C:\ProgramData\hole\logs) has the only record of what the
       # HoleBridge SERVICE process itself was doing -- SCM start/stop/restart,
       # the liveness lock, IPC bind -- none of which appears in the MSI logs. On
-      # failure only: this repo has an unresolved uninstall-hang history (#790)
-      # this is meant to help close. Named apart from the test lane's
+      # failure only. Named apart from the test lane's
       # `bridge-logs-windows-amd64`: both run in one job and an artifact name
       # is unique per run.
       - id: installer-upload-bridge-logs
@@ -789,10 +788,8 @@ jobs:
         # `--no-fail-fast`: this lane serializes many independent real-OS-effect
         # tests behind one elevated token; one failure otherwise cancels the
         # rest of the run, hiding every verdict downstream of the first
-        # failure for a whole CI round (bindreams/hole#961 — 14 of 29 TUN
-        # tests cancelled by one failure, hiding five others for two rounds).
-        # Only changes how many tests run after a failure, never whether a
-        # passing run fails.
+        # failure for a whole CI round. Only changes how many tests run after
+        # a failure, never whether a passing run fails.
         run: >
           .github/scripts/fail-on-compile.sh
           cargo nextest run --no-default-features
@@ -808,7 +805,7 @@ jobs:
       # group/filter machinery mis-scheduling on Windows) would still read as
       # green. This diffs the membership that check recorded against the two
       # lanes' own-profile JUnit reports and fails on any member that never shows
-      # up as executed — bindreams/hole#999.
+      # up as executed.
       #
       # WINDOWS LEG ONLY, and the name says so: the darwin legs would need their
       # own pair of `non-tun`/`tun` profiles too, but their walls are the scarce
@@ -820,7 +817,7 @@ jobs:
       # pass" is yes, and a failed lane is its own, louder signal that leaves
       # partial reports. Naming the two outcomes (not the whole job) keeps an
       # unrelated lane's failure from hiding it. This is the one toolchain user
-      # after the TUN lane (#200): a set diff over two files and a recorded
+      # after the TUN lane: a set diff over two files and a recorded
       # listing, no network, no test execution, no timing.
       - id: hole-verify-executed
         name: "Verify every global_net_state test executed (windows leg, #999)"
@@ -836,7 +833,7 @@ jobs:
           --junit target/nextest/non-tun/junit.xml
           --junit target/nextest/tun/junit.xml
 
-      # macOS TUN lane runs UNDER ROOT: the lockdown real-engage test (#527)
+      # macOS TUN lane runs UNDER ROOT: the lockdown real-engage test
       # drives `pfctl -E`/`-f`, which require root. The runner's cargo/nextest
       # and the user-owned `target/` are reused via `sudo env PATH/HOME` (the
       # binaries are prebuilt above; nextest only re-executes them). macOS
@@ -901,7 +898,7 @@ jobs:
       # given rule actually applies to a given dependency — see
       # docs/contributing/testing.md ("The schemars pin") for why that's not verified here.
       #
-      # Runs on the Node 24 that `package.json` pins, which is what Renovate's
+      # Runs on the Node that `package.json` pins, which is what Renovate's
       # `engines` asks for.
       #
       # Named explicitly, with --no-global: naming a config file makes the

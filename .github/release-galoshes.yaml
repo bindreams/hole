@@ -9,15 +9,15 @@ initial_release: |
   decoupling rationale.
 
 include_paths:
-  # Note: crates/garter/** was removed from this list in #312. Garter
-  # changes belong in garter release notes; galoshes consumers wanting
-  # garter-library detail can read the garter release notes directly.
+  # crates/garter/** is not listed: garter changes belong in garter release
+  # notes; galoshes consumers wanting garter-library detail can read the
+  # garter release notes directly.
   - crates/galoshes/**
   - crates/ex-ray/**
   - .github/workflows/draft-release-galoshes.yaml
   - .github/workflows/publish-release-galoshes.yaml
   - .github/release-galoshes.yaml
-  # Workspace-engineering files affect every release track. See #312.
+  # Workspace-engineering files affect every release track.
   - xtask/**
   - xtask-lib/**
   - scripts/generate-release-notes.py

@@ -69,11 +69,11 @@ targets:
     #
     # `cargo xtask run hole` launches dev mode via the dev-console crate. The
     # cascade below builds the workspace; dev-console only supervises — it builds
-    # nothing (#564). `hole.run` re-runs the galoshes build with the dev-only
-    # crash-dumps opt-in, so release/--all builds stay minidump-free (#438).
+    # nothing. `hole.run` re-runs the galoshes build with the dev-only
+    # crash-dumps opt-in, so release/--all builds stay minidump-free.
     # dev-console runs unprivileged and elevates only the bridge — via sudo on
     # POSIX (prompts for your password), inheriting the elevated token on
-    # Windows (#452, #454).
+    # Windows.
     #
     # `--no-default-features` keeps Tauri's `cfg(dev) = true` so the webview
     # loads from the Vite dev server (`http://localhost:1420`) instead of
@@ -86,11 +86,11 @@ targets:
       - cargo build --workspace --no-default-features --features tombstone/crash-dumps
       - cargo xtask stage --profile debug --out-dir target/debug/dist
     run:
-      # Dev-only galoshes minidumps (#438): re-run the galoshes build with the
+      # Dev-only galoshes minidumps: re-run the galoshes build with the
       # crash-dumps opt-in here, in a run-only step, so `cargo xtask build --all`
       # and the release installers never link minidump-writer. WINDOWS ONLY —
-      # `xtask::galoshes::build_args` drops the feature off Windows, where there
-      # is no `.dmp` branch left to enable (#842) and the changed feature set
+      # `xtask::galoshes::build_args` drops the feature off Windows, which has
+      # no `.dmp` branch to enable, and the changed feature set
       # would buy a full galoshes + tombstone release rebuild for no behavioural
       # difference at all. On darwin this step re-runs the command the cascade
       # already ran, and cargo no-ops it.
@@ -98,7 +98,7 @@ targets:
           args: [cargo, xtask, galoshes]
           environment: { HOLE_CRASH_DUMPS: "1" }
       # Launch the cascade-built supervisor directly: dev-console builds nothing,
-      # so nothing can overwrite its own running exe (#564). `{exe}` → host suffix;
+      # so nothing can overwrite its own running exe. `{exe}` → host suffix;
       # the relative path resolves against the repo root (see run_step).
       - process: ["target/debug/dev-console{exe}"]
 
@@ -155,7 +155,8 @@ targets:
   hole-dmg-tests:
     # Pytest harness that asserts the produced .app's code signature is
     # internally consistent (sealed resources, no linker-signed-only Mach-Os,
-    # sidecar identifier rewritten). Guards against issue #364 regressing.
+    # sidecar identifier rewritten). Guards against an unsigned .app that
+    # Gatekeeper rejects as "damaged".
     #
     # Tests the single DMG of the release build, or the one `DMG_UNDER_TEST` names.
     depends: hole-dmg
@@ -210,9 +211,9 @@ targets:
     # has to be built ahead of the Rust build. For `hole-dmg`: `npx tauri
     # build` needs `node_modules/` populated (with `@tauri-apps/cli`)
     # before it can even start; the `npm ci` step here provides that.
-    # Tauri's own `beforeBuildCommand: "npm run build"` re-runs vite —
-    # ~10-15s waste — but we accept the redundancy to keep `npx tauri
-    # build` self-sufficient for ad-hoc dev use outside the orchestrator.
+    # Tauri's own `beforeBuildCommand: "npm run build"` re-runs vite, but
+    # we accept the redundancy to keep `npx tauri build` self-sufficient
+    # for ad-hoc dev use outside the orchestrator.
     #
     # `hole-msi` doesn't switch to `npx tauri build` because the WiX MSI
     # layout (custom-action install/uninstall, PATH munging, embedded
@@ -251,15 +252,14 @@ targets:
           + package(hole-test-observability)'
     # `--no-fail-fast`: the TUN lane runs many independent real-OS-effect
     # tests serialized behind a single elevated token; one failure otherwise
-    # cancels the rest of the run (14 of 29 once, cutting five DNS-confine
-    # verdicts before they ever executed — bindreams/hole#961), hiding
-    # everything downstream of the first failure for a whole CI round. This
-    # only changes how many tests run after a failure; it cannot turn a
-    # passing run into a failing one. NOT on `build:`: nextest rejects
+    # cancels the rest of the run, hiding everything downstream of the first
+    # failure for a whole CI round. This only changes how many tests run after
+    # a failure; it cannot turn a passing run into a failing one. NOT on
+    # `build:`: nextest rejects
     # `--no-fail-fast` alongside `--no-run` outright (it is a run-only flag,
     # same class as the ones `xtask::skuld_label_coverage::RUN_ONLY_FLAGS`
     # already had to strip for `nextest list`). `run:` legitimately differs
-    # from `build:` by exactly this flag now —
+    # from `build:` by exactly this flag —
     # `tests_targets_run_matches_build_minus_no_run` (xtask) checks
     # "run == build minus --no-run, plus RUN_ONLY_FLAGS", not plain equality.
     # `ci_test_hole_steps_match_the_hole_tests_target` (xtask) holds every
@@ -274,12 +274,12 @@ targets:
           + package(hole-test-observability)'
 
   plugin-e2e-tests:
-    # Plugin interop/e2e area (crate `plugin-e2e`, #435): ex-ray↔stock interop
+    # Plugin interop/e2e area (crate `plugin-e2e`): ex-ray↔stock interop
     # (all 6 platforms; QUIC `not(windows)`) + galoshes server↔client roundtrips
-    # (Linux-only, #197). These spawn plugin BINARIES, so they need on-disk
-    # artifacts: ex-ray + galoshes (via `cargo xtask deps` and the
-    # `depends: galoshes` chain) and the pinned stock v2ray-plugin (provisioned
-    # in `build:` below). Deliberately NOT on the archive lane — that lane ships
+    # (WS on all platforms; WS-TLS and QUIC `not(windows)`). These spawn plugin
+    # BINARIES, so they need on-disk artifacts: ex-ray + galoshes (via
+    # `cargo xtask deps` and the `depends: galoshes` chain) and the pinned stock
+    # v2ray-plugin (provisioned in `build:` below). Deliberately NOT on the archive lane — that lane ships
     # no on-disk binaries — so this target gets its own `test-plugin-e2e` CI step.
     #
     # `depends: galoshes` chains ex-ray → galoshes, so both are on disk before
@@ -352,17 +352,19 @@ targets:
       - cd crates/ex-ray && go test ./...
 
   ex-ray-tests:
-    # ex-ray's Go unit tests. Run-only: `go test` compiles + runs in one step,
-    # unlike the nextest `*-tests` targets' --no-run/run split. This is the only
-    # CI that EXERCISES Go tests — prek runs golangci-lint (govet) on the ex-ray
-    # wrapper but excludes third_party/v2ray-core and runs no tests at all. It
+    # ex-ray's Go tests, plus the ECH tests of the vendored packages.
+    # Run-only: `go test` compiles + runs in one step, unlike the nextest
+    # `*-tests` targets' --no-run/run split. prek runs golangci-lint (govet) on
+    # the ex-ray wrapper but excludes third_party/v2ray-core and runs no tests at
+    # all; this target and `ex-ray-unit-tests` are what EXERCISE Go tests. It
     # gives the ECH fail-closed gate CI teeth: ex-ray's buildTLSConfig (ech /
     # ech-doh flags, exit-23) plus the patched vendored packages that carry the
     # gate/refuse/round-trip + ECH-retry tests (tls incl. utls, quic, hysteria2,
-    # transportcommon). Scoped to the ECH-touching packages, not the whole vendored tree (upstream's full suite is slow).
-    # Gate logic is platform-independent (domainsocket is !windows); the matrix is wide so
-    # `cargo xtask run ex-ray-tests` works anywhere, though CI exercises only linux --
-    # the per-OS socket code is covered by `ex-ray-unit-tests` instead.
+    # transportcommon). Scoped to the ECH-touching packages, not the whole
+    # vendored tree (upstream's full suite is slow). Gate logic is
+    # platform-independent (domainsocket is !windows); the matrix is wide so
+    # `cargo xtask run ex-ray-tests` works anywhere, though CI exercises only
+    # linux -- the per-OS socket code is covered by `ex-ray-unit-tests` instead.
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     run:
@@ -385,7 +387,7 @@ targets:
     # clippy runs `hole`'s build.rs like a regular compile, which generates
     # the Tauri context and would fail on missing `ui/dist/` in production
     # mode. Linting the dev-mode codepaths is sufficient — the cfg(dev) gate
-    # only affects Tauri-internal URL resolution, not Hole-side code. See #372.
+    # only affects Tauri-internal URL resolution, not Hole-side code.
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     run: cargo clippy --workspace --all-targets --no-default-features --features garter/test-utils -- -D warnings
 

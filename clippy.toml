@@ -8,16 +8,16 @@ reason = "Must call sender.ready().await before send_request() (tower::Service c
 # for spawning tunnels and mutating host routing tables. Direct calls to
 # the underlying free functions / constructors bypass mock-based test
 # isolation (unit tests would shell out to real `netsh`, corrupting
-# loopback state on Windows CI runners — see #165). Legitimate callers
+# loopback state on Windows CI runners). Legitimate callers
 # suppress the lint with a per-site `#[allow]` + comment.
 
 [[disallowed-methods]]
 path = "tun_engine::routing::setup_routes"
-reason = "Route setup must go through `Routing::install`. Only `SystemRouting::install` in tun-engine may call this. See #165."
+reason = "Route setup must go through `Routing::install`. Only `SystemRouting::install` in tun-engine may call this."
 
 [[disallowed-methods]]
 path = "tun_engine::routing::teardown_routes"
-reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `SystemRoutes::drop` in tun-engine and `recover_routes` may call this. See #165."
+reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `SystemRoutes::drop` in tun-engine and `recover_routes` may call this."
 
 # System tools — spawn by absolute path --------------------------------------------------------------------------------
 #
@@ -129,11 +129,10 @@ allow-invalid = true  # only crates that depend on cosca (with its `tokio` featu
 # independent TCP/UDP excluded-port-range tables (Hyper-V / WSL / Docker
 # dynamic reservations); a port that passes a TCP probe can still fail
 # UDP bind with WSAEACCES. New sites must go through `bind_ephemeral`.
-# See bindreams/hole#285 and #300.
 
 [[disallowed-methods]]
 path = "util::port_alloc::free_port"
-reason = "Use `port_alloc::bind_ephemeral` instead — it folds the caller's bind into the same unbounded retry loop, eliminating the divorced-port-number TOCTOU window. Suppress with `#[allow(clippy::disallowed_methods)]` + comment when the port must be returned to the caller before the bind happens. The two sanctioned exceptions are `test_support::port_alloc::allocate_ephemeral_port` and `plugin_e2e::ports`. See bindreams/hole#285 and #300."
+reason = "Use `port_alloc::bind_ephemeral` instead — it folds the caller's bind into the same unbounded retry loop, eliminating the divorced-port-number TOCTOU window. Suppress with `#[allow(clippy::disallowed_methods)]` + comment when the port must be returned to the caller before the bind happens. The two sanctioned exceptions are `test_support::port_alloc::allocate_ephemeral_port` and `plugin_e2e::ports`."
 
 # tracing subscriber test invariant ------------------------------------------------------------------------------------
 #
@@ -143,34 +142,34 @@ reason = "Use `port_alloc::bind_ephemeral` instead — it folds the caller's bin
 # install a per-test subscriber as their assertion target must route
 # through `garter::tracing_test::set_default_in_current_thread`, which
 # checks the runtime flavor at install time and panics on multi-thread.
-# Sanctioned suppressions carry an inline `#[allow]`. See bindreams/hole#302.
+# Sanctioned suppressions carry an inline `#[allow]`.
 
 [[disallowed-methods]]
 path = "tracing::subscriber::set_default"
-reason = "Use `garter::tracing_test::set_default_in_current_thread` — it asserts the current tokio runtime is current-thread, where `set_default`'s thread-local guard remains effective for `tokio::spawn`'d tasks. See bindreams/hole#302."
+reason = "Use `garter::tracing_test::set_default_in_current_thread` — it asserts the current tokio runtime is current-thread, where `set_default`'s thread-local guard remains effective for `tokio::spawn`'d tasks."
 
 [[disallowed-methods]]
 path = "tracing_subscriber::util::SubscriberInitExt::set_default"
-reason = "Use `garter::tracing_test::set_default_in_current_thread` — it asserts the current tokio runtime is current-thread, where `set_default`'s thread-local guard remains effective for `tokio::spawn`'d tasks. See bindreams/hole#302."
+reason = "Use `garter::tracing_test::set_default_in_current_thread` — it asserts the current tokio runtime is current-thread, where `set_default`'s thread-local guard remains effective for `tokio::spawn`'d tasks."
 
 [[disallowed-methods]]
 path = "tracing::dispatcher::set_default"
-reason = "Use `garter::tracing_test::set_default_in_current_thread` — `tracing::subscriber::set_default` delegates to this lower-level function; disallowing the underlying form keeps the same thread-local-guard footgun out of reach for code that reaches under the abstraction. See bindreams/hole#302."
+reason = "Use `garter::tracing_test::set_default_in_current_thread` — `tracing::subscriber::set_default` delegates to this lower-level function; disallowing the underlying form keeps the same thread-local-guard footgun out of reach for code that reaches under the abstraction."
 
 # Test-time subscriber install — only hole-test-observability and the
 # production logging::init_multi / binary-main sites may install global
 # tracing subscribers via the `try_init` family. Direct callers in tests
-# trigger the #147 LogTracer perf regression that times out
+# trigger the LogTracer perf regression that times out
 # `server_test_tests` on Windows CI. Sanctioned sites carry a per-site
-# `#[allow]` with a citation. See bindreams/hole#301.
+# `#[allow]` with a citation.
 
 [[disallowed-methods]]
 path = "tracing_subscriber::util::SubscriberInitExt::init"
-reason = "Use hole_test_observability::register!() at lib.rs level for tests. Direct .init() calls trigger the #147 LogTracer perf trap (sets log::max_level=Trace and allocates a tracing Event for every log::*! from shadowsocks-service/tokio/mio). See bindreams/hole#301."
+reason = "Use hole_test_observability::register!() at lib.rs level for tests. Direct .init() calls trigger the LogTracer perf trap (sets log::max_level=Trace and allocates a tracing Event for every log::*! from shadowsocks-service/tokio/mio)."
 
 [[disallowed-methods]]
 path = "tracing_subscriber::util::SubscriberInitExt::try_init"
-reason = "Use hole_test_observability::register!() at lib.rs level for tests; the production caller in crates/common/src/logging.rs is sanctioned via #[allow]. See bindreams/hole#301."
+reason = "Use hole_test_observability::register!() at lib.rs level for tests; the production caller in crates/common/src/logging.rs is sanctioned via #[allow]."
 
 # `fmt::SubscriberBuilder::{init,try_init}` are the `tracing_subscriber::fmt().init()`
 # entry points; they forward to `SubscriberInitExt::try_init` internally, so the
@@ -181,11 +180,11 @@ reason = "Use hole_test_observability::register!() at lib.rs level for tests; th
 
 [[disallowed-methods]]
 path = "tracing_subscriber::fmt::SubscriberBuilder::init"
-reason = "Use hole_test_observability::register!() at lib.rs level for tests. Production main.rs callers in galoshes/garter-bin are sanctioned via #[allow]. See bindreams/hole#301."
+reason = "Use hole_test_observability::register!() at lib.rs level for tests. Production main.rs callers in galoshes/garter-bin are sanctioned via #[allow]."
 
 [[disallowed-methods]]
 path = "tracing_subscriber::fmt::SubscriberBuilder::try_init"
-reason = "Use hole_test_observability::register!() at lib.rs level for tests. See bindreams/hole#301."
+reason = "Use hole_test_observability::register!() at lib.rs level for tests."
 
 # Bridge Dns trait — Win32 native DNS FFI ------------------------------------------------------------------------------
 #
@@ -194,16 +193,16 @@ reason = "Use hole_test_observability::register!() at lib.rs level for tests. Se
 # `WinDnsBackend::Win32Real` impl, so unit tests can substitute
 # `MockBackend`. The bans below cover anything reaching the raw `windows`
 # crate paths directly; the `Win32Real` call sites in
-# `dns/system/windows.rs` carry a per-site `#[allow]`. See bindreams/hole#397.
+# `dns/system/windows.rs` carry a per-site `#[allow]`.
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::IpHelper::SetInterfaceDnsSettings"
-reason = "Must go through `WinDnsBackend::set_servers` / `restore` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
+reason = "Must go through `WinDnsBackend::set_servers` / `restore` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this."
 allow-invalid = true  # only `hole-bridge` has the `Win32_NetworkManagement_IpHelper` feature wired in; other workspace crates can't resolve the path.
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::IpHelper::GetInterfaceDnsSettings"
-reason = "Must go through `WinDnsBackend::get_settings` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
+reason = "Must go through `WinDnsBackend::get_settings` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this."
 allow-invalid = true
 
 # `DnsFlushResolverCache` is currently called via a local `#[link]`
@@ -215,7 +214,7 @@ allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::Dns::DnsFlushResolverCache"
-reason = "Must go through `WinDnsBackend::flush` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
+reason = "Must go through `WinDnsBackend::flush` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this."
 allow-invalid = true
 
 # Windows service control handler --------------------------------------------------------------------------------------
@@ -265,11 +264,10 @@ allow-invalid = true  # the `windows` crate is a Windows-only dependency; other 
 # their own root tokens carry a module-level `#![allow]`. The sanctioned
 # bridge-side production sites are enumerated in the `reason =` string
 # below; each carries a per-site `#[allow]` + comment citing this rule.
-# See bindreams/hole#397.
 
 [[disallowed-methods]]
 path = "tokio_util::sync::CancellationToken::new"
-reason = "In `crates/bridge/src/`, fresh tokens shadow the cooperative-cancellation chain rooted at `ipc.rs::handle_start`. Use the propagated `cancel: &CancellationToken` parameter (or `cancel.child_token()` for phase isolation). Sanctioned production sites: `ipc.rs::handle_start`, `dispatcher.rs::Dispatcher::new`, `proxy/plugin.rs::spawn_plugin_runner_at` (the chain's session-lifetime scope), `proxy_manager.rs::ProxyManager::start`, `server_test.rs`, and the three process/service entry points that root the shutdown chain (`foreground.rs::run_inner`, `platform/macos.rs`, `platform/windows.rs`). `reconcile_once` is NOT on this list: it takes the root token by reference — a token minted mid-call-graph is one nothing else holds, so nothing can cancel it. Test files use module-level `#![allow]`. See bindreams/hole#397."
+reason = "In `crates/bridge/src/`, fresh tokens shadow the cooperative-cancellation chain rooted at `ipc.rs::handle_start`. Use the propagated `cancel: &CancellationToken` parameter (or `cancel.child_token()` for phase isolation). Sanctioned production sites: `ipc.rs::handle_start`, `dispatcher.rs::Dispatcher::new`, `proxy/plugin.rs::spawn_plugin_runner_at` (the chain's session-lifetime scope), `proxy_manager.rs::ProxyManager::start`, `server_test.rs`, and the three process/service entry points that root the shutdown chain (`foreground.rs::run_inner`, `platform/macos.rs`, `platform/windows.rs`). `reconcile_once` is NOT on this list: it takes the root token by reference — a token minted mid-call-graph is one nothing else holds, so nothing can cancel it. Test files use module-level `#![allow]`."
 
 # macOS tray template flag ---------------------------------------------------------------------------------------------
 #
@@ -286,23 +284,22 @@ reason = "In `crates/bridge/src/`, fresh tokens shadow the cooperative-cancellat
 # path. `set_icon_as_template` (both layers) is the non-atomic sibling —
 # tauri's own docs call the `set_icon` + `set_icon_as_template` sequence
 # out for visible flicker, and `(false)` clears the live flag outright.
-# See bindreams/hole#469.
 
 [[disallowed-methods]]
 path = "tauri::tray::TrayIcon::set_icon"
-reason = "On macOS this resets the NSImage template flag, rendering the alpha-only tray icon solid black. Use `set_icon_with_as_template(icon, true)` — atomic on macOS, falls back to `set_icon` elsewhere. See bindreams/hole#469."
+reason = "On macOS this resets the NSImage template flag, rendering the alpha-only tray icon solid black. Use `set_icon_with_as_template(icon, true)` — atomic on macOS, falls back to `set_icon` elsewhere."
 
 [[disallowed-methods]]
 path = "tray_icon::TrayIcon::set_icon"
-reason = "Reached via `with_inner_tray_icon`; hardcodes icon_is_template=false on macOS (tray-icon 0.23.1). Use `tauri::tray::TrayIcon::set_icon_with_as_template(icon, true)`. See bindreams/hole#469."
+reason = "Reached via `with_inner_tray_icon`; hardcodes icon_is_template=false on macOS (tray-icon 0.23.1). Use `tauri::tray::TrayIcon::set_icon_with_as_template(icon, true)`."
 
 [[disallowed-methods]]
 path = "tauri::tray::TrayIcon::set_icon_as_template"
-reason = "Non-atomic: pairing with `set_icon` flickers (per tauri docs) and `(false)` clears the template flag live. Use `set_icon_with_as_template(icon, true)`. See bindreams/hole#469."
+reason = "Non-atomic: pairing with `set_icon` flickers (per tauri docs) and `(false)` clears the template flag live. Use `set_icon_with_as_template(icon, true)`."
 
 [[disallowed-methods]]
 path = "tray_icon::TrayIcon::set_icon_as_template"
-reason = "Reached via `with_inner_tray_icon`; same non-atomic footgun as the tauri-level form. Use `tauri::tray::TrayIcon::set_icon_with_as_template(icon, true)`. See bindreams/hole#469."
+reason = "Reached via `with_inner_tray_icon`; same non-atomic footgun as the tauri-level form. Use `tauri::tray::TrayIcon::set_icon_with_as_template(icon, true)`."
 
 # Tray menu rebuild ordering -------------------------------------------------------------------------------------------
 #
@@ -310,24 +307,24 @@ reason = "Reached via `with_inner_tray_icon`; same non-atomic footgun as the tau
 # dispatches the whole rebuild (state reads included) to the main thread.
 # A raw `set_menu` from a worker thread reads state early and commits the
 # menu later through the event-loop queue, so a stale menu can overwrite a
-# newer one — the bindreams/hole#473 desync. The sanctioned commit point
+# newer one. The sanctioned commit point
 # inside `rebuild_tray_menu` carries a per-site `#[allow]`.
 
 [[disallowed-methods]]
 path = "tauri::tray::TrayIcon::set_menu"
-reason = "Menu commits must go through `tray::rebuild_tray_menu` so rebuilds stay ordered on the main thread and cannot commit stale state. The sanctioned commit site inside `rebuild_tray_menu` carries a per-site `#[allow]`. See bindreams/hole#473."
+reason = "Menu commits must go through `tray::rebuild_tray_menu` so rebuilds stay ordered on the main thread and cannot commit stale state. The sanctioned commit site inside `rebuild_tray_menu` carries a per-site `#[allow]`."
 
 # Config persistence — enforce the ConfigStore seam --------------------------------------------------------------------
 #
 # `ConfigStore` (crates/common/src/config_store.rs) quarantines a corrupt
 # config.json at load and blocks saves for the session when quarantine
 # fails. A direct `AppConfig::save` bypasses the `save_blocked` gate and
-# can overwrite the very file #467 preserves. `ConfigStore::save` and the
+# can overwrite the very file the quarantine preserves. `ConfigStore::save` and the
 # `AppConfig::save` unit tests carry sanctioned `#[allow]`s.
 
 [[disallowed-methods]]
 path = "hole_common::config::AppConfig::save"
-reason = "Go through `ConfigStore::save` — direct saves bypass the #467 save_blocked gate and can destroy a quarantine-pending config.json. See bindreams/hole#467."
+reason = "Go through `ConfigStore::save` — direct saves bypass the `save_blocked` gate and can destroy a quarantine-pending config.json."
 
 # tun-engine fail-closed cover + DNS-egress confinement — WFP/FWPM native FFI ------------------------------------------
 #
@@ -335,87 +332,87 @@ reason = "Go through `ConfigStore::save` — direct saves bypass the #467 save_b
 # sanctioned sites: the fail-closed cover impl
 # (`crates/tun-engine/src/routing/failclosed/windows.rs`) and its recovery
 # sweep, and the DNS-egress confinement impl
-# (`crates/tun-engine/src/dns_confine/windows.rs`, #846). There are two, not
+# (`crates/tun-engine/src/dns_confine/windows.rs`). There are two, not
 # one, because they install objects with deliberately OPPOSITE lifetimes:
 # the fail-closed cover is persistent (survives an update-cutover restart —
 # the user's intent) and the confinement is a dynamic, process-scoped
 # session (dies with the bridge — anything else would be a DNS block the
-# user cannot escape, Rule #0). Collapsing them into one site would conflate
+# user cannot escape). Collapsing them into one site would conflate
 # those two lifetimes. Both call sites carry per-site
 # `#[allow(clippy::disallowed_methods)]`. Unit tests exercise only the pure
 # `build_cover_spec` / `dns_confine::spec::build_spec` data builders — never
-# the host firewall (the #165 isolation contract). `allow-invalid = true`
+# the host firewall (the isolation contract above). `allow-invalid = true`
 # because only tun-engine wires the WFP feature; other workspace crates
 # can't resolve the path (mirrors the Win32 DNS-FFI block).
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineOpen0"
-reason = "WFP must go through `routing::failclosed::engage`/`recover_cover` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846."
+reason = "WFP must go through `routing::failclosed::engage`/`recover_cover` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterAdd0"
-reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846."
+reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmProviderAdd0"
-reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846."
+reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmSubLayerAdd0"
-reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846."
+reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterDeleteByKey0"
-reason = "WFP teardown must go through `routing::failclosed` (Drop / recover_cover) — the confinement's dynamic session needs no by-key delete at all (closing the engine handle deletes everything in it), which is exactly why it has the opposite lifetime from the persistent cover. Only `failclosed/windows.rs` may call this. See bindreams/hole#468, #846."
+reason = "WFP teardown must go through `routing::failclosed` (Drop / recover_cover) — the confinement's dynamic session needs no by-key delete at all (closing the engine handle deletes everything in it), which is exactly why it has the opposite lifetime from the persistent cover. Only `failclosed/windows.rs` may call this."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmSubLayerDeleteByKey0"
-reason = "WFP teardown must go through `routing::failclosed` — the confinement's dynamic session needs no by-key delete at all (closing the engine handle deletes everything in it), which is exactly why it has the opposite lifetime from the persistent cover. Only `failclosed/windows.rs` may call this. See bindreams/hole#468, #846."
+reason = "WFP teardown must go through `routing::failclosed` — the confinement's dynamic session needs no by-key delete at all (closing the engine handle deletes everything in it), which is exactly why it has the opposite lifetime from the persistent cover. Only `failclosed/windows.rs` may call this."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmProviderDeleteByKey0"
-reason = "WFP teardown must go through `routing::failclosed` — the confinement's dynamic session needs no by-key delete at all (closing the engine handle deletes everything in it), which is exactly why it has the opposite lifetime from the persistent cover. Only `failclosed/windows.rs` may call this. See bindreams/hole#468, #846."
+reason = "WFP teardown must go through `routing::failclosed` — the confinement's dynamic session needs no by-key delete at all (closing the engine handle deletes everything in it), which is exactly why it has the opposite lifetime from the persistent cover. Only `failclosed/windows.rs` may call this."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineClose0"
-reason = "WFP must go through `routing::failclosed` or `dns_confine::DnsConfinement`'s Drop — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement, whose entire disengage IS this close call). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846."
+reason = "WFP must go through `routing::failclosed` or `dns_confine::DnsConfinement`'s Drop — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement, whose entire disengage IS this close call). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionBegin0"
-reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846."
+reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionCommit0"
-reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846."
+reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionAbort0"
-reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846."
+reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmGetAppIdFromFileName0"
-reason = "App-ID permit construction must go through `routing::failclosed` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See #527, #846."
+reason = "App-ID permit construction must go through `routing::failclosed` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFreeMemory0"
-reason = "App-ID blob free must go through `routing::failclosed` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See #527, #846."
+reason = "App-ID blob free must go through `routing::failclosed` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterGetByKey0"
-reason = "Lockdown cover presence probe must go through `routing::failclosed::lockdown_cover_presence`. Only `failclosed/windows.rs` may call FWPM. See #881."
+reason = "Lockdown cover presence probe must go through `routing::failclosed::lockdown_cover_presence`. Only `failclosed/windows.rs` may call FWPM."
 allow-invalid = true
 
 # The enumeration family is the ONLY read that can see a BOOT-TIME filter:
@@ -431,30 +428,30 @@ allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterCreateEnumHandle0"
-reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846, #1008."
+reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterEnum0"
-reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846, #1008."
+reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterDestroyEnumHandle0"
-reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846, #1008."
+reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmLayerCreateEnumHandle0"
-reason = "The layers the provider sweep reads boot-time views of must be listed through `routing::failclosed`'s `enum_layers`, not hardcoded. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#1008."
+reason = "The layers the provider sweep reads boot-time views of must be listed through `routing::failclosed`'s `enum_layers`, not hardcoded. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmLayerEnum0"
-reason = "The layers the provider sweep reads boot-time views of must be listed through `routing::failclosed`'s `enum_layers`, not hardcoded. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#1008."
+reason = "The layers the provider sweep reads boot-time views of must be listed through `routing::failclosed`'s `enum_layers`, not hardcoded. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmLayerDestroyEnumHandle0"
-reason = "The layers the provider sweep reads boot-time views of must be listed through `routing::failclosed`'s `enum_layers`, not hardcoded. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#1008."
+reason = "The layers the provider sweep reads boot-time views of must be listed through `routing::failclosed`'s `enum_layers`, not hardcoded. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true

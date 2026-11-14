@@ -1,7 +1,7 @@
 name: Draft Release (galoshes)
 
 # Thin caller for the shared draft-release reusable workflow.
-# See .github/workflows/reusable-draft-release.yaml and #325.
+# See .github/workflows/reusable-draft-release.yaml.
 
 on:
   workflow_dispatch:

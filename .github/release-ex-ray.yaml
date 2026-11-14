@@ -14,7 +14,7 @@ include_paths:
   - .github/workflows/reusable-draft-release.yaml
   - .github/workflows/publish-release-ex-ray.yaml
   - .github/release-ex-ray.yaml
-  # Workspace-engineering files affect every release track. See #312.
+  # Workspace-engineering files affect every release track.
   - xtask/**
   - xtask-lib/**
   - scripts/generate-release-notes.py
