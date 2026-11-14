@@ -668,8 +668,7 @@ fn self_test_failure_logs_the_typed_upstream_cause() {
 
 /// A walk gives EVERY resolver the full per-resolver bound and nothing
 /// shared: two hanging upstreams cost exactly `2 × TUNNEL_QUERY_TIMEOUT`, not
-/// a deadline divided between them (there is no deadline any more — no
-/// retry, so nothing to divide it across). Virtual time: the connector never
+/// a deadline divided between them. Virtual time: the connector never
 /// completes, so every `forward_one` budget expires via auto-advance and no
 /// wall-clock is consumed.
 #[skuld::test]
@@ -703,10 +702,8 @@ fn self_test_gives_every_hanging_resolver_the_full_bound() {
     match outcome {
         SelfTestOutcome::Failed { reason, attempts, .. } => {
             // Every connect stays outstanding until its budget fires, so the
-            // run is `TunnelSetupPending` — NOT `NoConnection`. This shape
-            // used to be reported as "the local proxy or its plugin is not
-            // accepting connections", a claim about a refusal that never
-            // happened. `NoConnection` is now reserved for connects that
+            // run is `TunnelSetupPending`, not `NoConnection`: the latter claims a
+            // refusal that never happened, and is reserved for connects that
             // failed outright, pinned by
             // `a_definite_connect_failure_is_still_reported_as_no_connection`.
             assert!(matches!(reason, SelfTestReason::TunnelSetupPending), "got {reason:?}");
@@ -722,12 +719,9 @@ fn noerror_reply() -> Vec<u8> {
     reply
 }
 
-/// **Load-bearing regression.** A transport that is alive but slow —
-/// 5s into establishing, well past the deleted 1500ms `PER_ATTEMPT` budget
-/// (the deleted 5s `OUTER_BUDGET` gave no extra margin at this point — it
-/// would have expired at the same 5s), but under the 10s
-/// `TUNNEL_QUERY_TIMEOUT` — must pass the gate rather than being refused as
-/// dead.
+/// **Load-bearing regression.** A transport that is alive but slow, still
+/// establishing well into the attempt yet inside `TUNNEL_QUERY_TIMEOUT`, must
+/// pass the gate rather than being refused as dead.
 #[skuld::test]
 fn a_slow_but_alive_transport_passes_the_gate() {
     // Current-thread runtime with `tokio::time::pause()`: the whole test runs
@@ -774,7 +768,7 @@ fn a_slow_but_alive_transport_passes_the_gate() {
         });
 }
 
-/// finding-11 guard at the gate: a hung primary must not strand the
+/// A hung primary must not strand the
 /// secondary. `HangThenAnswer` hangs `connect_tcp` for the primary and
 /// answers the secondary in-process, so the walk's own failover (not a
 /// retry) is what passes the gate.
@@ -1313,9 +1307,9 @@ async fn reset_endpoint_maps_to_network_blocked() {
 }
 
 /// Regression: a gate cancelled before its first attempt must still hit the
-/// single reporting match (both cancel return-sites set `outcome` and
-/// `break` rather than returning directly) — otherwise a cancelled gate is
-/// indistinguishable in `bridge.log` from one that never ran at all.
+/// single reporting match (the cancel arm sets `outcome` rather than
+/// returning directly), or a cancelled gate is indistinguishable in
+/// `bridge.log` from one that never ran at all.
 #[skuld::test]
 fn a_cancelled_gate_logs_and_reports_cancelled() {
     let writer = VecWriter::new();

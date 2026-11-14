@@ -137,12 +137,8 @@ fn classify_first_wins_on_duplicate_mode_key() {
 }
 #[skuld::test(name = "reachability_tests::malformed_options_probe_is_inconclusive")]
 async fn malformed_options_probe_is_inconclusive() {
-    // `classify_transport` rejects the malformed options before any connect
-    // is attempted, so the port is deliberately left closed (not backed by a
-    // live fixture): were a future regression to let a connection through
-    // anyway, this address would produce TcpRefused/TcpTimeout, not
-    // Inconclusive, and fail the assertion below rather than passing on an
-    // unused live server.
+    // `classify_transport` rejects the options before any connect, so the port is left closed on purpose: a
+    // regression that connected anyway would yield TcpRefused/TcpTimeout and fail the assertion.
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
     drop(l);
@@ -253,10 +249,9 @@ async fn tls_ws_reset_is_blocked() {
         ReachabilityVerdict::Blocked
     );
 }
-/// Every supported kernel RSTs a closed port. Windows bills the connecting
-/// socket for its own SYN-retransmission budget (~2.05 s) first, which
-/// `CONNECT_DEADLINE` clears — see `util::syn_budget`. Accepting `TcpTimeout`
-/// here as well would assert nothing about the classifier.
+/// Every supported kernel RSTs a closed port. Windows first bills the connecting socket for its own
+/// SYN-retransmission budget, which `CONNECT_DEADLINE` clears (see `util::syn_budget`). Accepting `TcpTimeout` here
+/// as well would assert nothing about the classifier.
 #[skuld::test(name = "reachability_tests::closed_port_is_refused")]
 async fn closed_port_is_refused() {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();

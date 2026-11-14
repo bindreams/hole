@@ -2,24 +2,17 @@
 //! confinement seam.
 //!
 //! This layer calls `SetInterfaceDnsSettings` / `GetInterfaceDnsSettings`
-//! / `DnsFlushResolverCache` directly via the `windows = "0.62"` crate
-//! rather than shelling out to `netsh`. Each `netsh` subprocess cost ~5–7
-//! s on Defender-active machines (four per start); the direct FFIs are
-//! ms-scale (total apply ~ 50 ms).
+//! / `DnsFlushResolverCache` directly through the `windows` crate rather
+//! than shelling out to `netsh`, whose subprocess start is slow on
+//! Defender-active machines.
 //!
 //! ## Two layers
 //!
-//! - [`WinDnsBackend`] — the **inner test seam** (per-platform, mirrors
-//!   the `Routing` precedent from
-//!   [bindreams/hole#165](https://github.com/bindreams/hole/issues/165)).
+//! - [`WinDnsBackend`] is the inner test seam, per platform like `Routing`.
 //!   Production goes through [`Win32Real`]; unit tests substitute
 //!   `MockBackend` via [`crate::dns::system::SystemDns::new_with_backend`].
-//!   The trait surface intentionally uses bridge types only (no
-//!   `windows::*` types) so the mock can be constructed without depending
-//!   on the Win32 crate. `get_settings` / `restore` / `restore_family` are
-//!   used ONLY by `crate::dns::recovery`'s upgrade sweep now — the bridge
-//!   itself no longer captures or blind-restores (bindreams/hole#846);
-//!   `set_servers` / `flush` are still the live `Dns::apply` path.
+//!   The trait surface uses bridge types only (no `windows::*` types) so
+//!   the mock does not depend on the Win32 crate.
 //!
 //! - [`DnsConfiner`] — the same seam, one layer up, for
 //!   `tun_engine::dns_confine::engage`: production goes through
@@ -85,7 +78,7 @@ use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
 pub trait WinDnsBackend: Send + Sync + 'static {
     /// Capture the v4 + v6 DNS state of `alias`. Returns `Ok(None)` when
     /// the adapter does not exist; returns `Err` only on unexpected Win32
-    /// failures. Used only by the upgrade sweep now.
+    /// failures. Used only by the upgrade sweep.
     fn get_settings(&self, alias: &str) -> io::Result<Option<DnsPriorAdapter>>;
 
     /// Set the DNS resolvers on the adapter identified by `luid`,
@@ -93,17 +86,15 @@ pub trait WinDnsBackend: Send + Sync + 'static {
     /// entries in `servers`. A family with no entries is left untouched
     /// (never cleared — clearing would revert it to DHCP and leak).
     ///
-    /// Takes the LUID, not an alias: the caller (`Dns::apply`) already
-    /// holds the LUID of the concrete adapter this process opened
-    /// (`TunIdentity::luid`), and resolving a GUID from that LUID directly
-    /// (`ConvertInterfaceLuidToGuid`) never re-resolves the *name* Hole
-    /// requested — which, unlike the LUID, could belong to a different
-    /// adapter than the one this process holds (bindreams/hole#936).
+    /// Takes the LUID, not an alias: the caller (`Dns::apply`) holds the
+    /// LUID of the adapter this process opened (`TunIdentity::luid`), and
+    /// resolving the GUID from it directly never re-resolves the name Hole
+    /// requested, which a concurrent bridge's adapter can also answer to.
     fn set_servers(&self, luid: u64, servers: &[IpAddr]) -> io::Result<()>;
 
     /// Restore BOTH families of the captured prior DNS state for `adapter`.
-    /// Used only by the upgrade sweep now, and only when both families'
-    /// evidence supports a restore.
+    /// No production caller: the upgrade sweep restores per family through
+    /// [`Self::restore_family`].
     fn restore(&self, adapter: &DnsPriorAdapter) -> io::Result<()>;
 
     /// Restore ONE family only, leaving the other untouched. Used by the
@@ -158,13 +149,10 @@ impl WinDnsBackend for Win32Real {
     fn set_servers(&self, luid: u64, servers: &[IpAddr]) -> io::Result<()> {
         let started = Instant::now();
         let guid = luid_to_guid(luid)?;
-        // Advertise per family. Set a family ONLY when `servers` carries at
-        // least one address of that family: setting a family to an empty list
-        // clears it and lets Windows revert to the DHCP-assigned resolver (an
-        // on-link router = a DNS leak outside the tunnel). A family with no
-        // configured resolver is left untouched and its captured prior is
-        // replayed on restore. `set_one`'s `ip.is_ipv6() == ipv6` filter
-        // selects the matching family.
+        // Set a family only when `servers` carries an address of that family:
+        // an empty list clears it and lets Windows revert to the DHCP-assigned
+        // resolver (an on-link router, a DNS leak outside the tunnel). A family
+        // with no configured resolver is left untouched.
         let v4: Vec<IpAddr> = servers.iter().copied().filter(|ip| ip.is_ipv4()).collect();
         let v6: Vec<IpAddr> = servers.iter().copied().filter(|ip| ip.is_ipv6()).collect();
         if !v4.is_empty() {
@@ -322,19 +310,18 @@ fn luid_to_guid(luid: u64) -> io::Result<GUID> {
 /// The `Version` stamped into every `DNS_INTERFACE_SETTINGS` this module
 /// hands to the OS. **Must be `VERSION1`.** windows-rs models all three DNS
 /// FFIs (`GetInterfaceDnsSettings` / `SetInterfaceDnsSettings` /
-/// `FreeInterfaceDnsSettings`) as taking the V1 `DNS_INTERFACE_SETTINGS`
-/// (64 bytes), and Windows sizes the buffer it reads/writes **solely** from
-/// this field — there is no length parameter. Stamping any higher version
-/// makes the OS access the larger `DNS_INTERFACE_SETTINGS3` (112-byte)
-/// layout off the end of our V1 stack allocation: the 48-byte out-of-bounds
-/// FFI access of bindreams/hole#437.
+/// `FreeInterfaceDnsSettings`) as taking the V1 `DNS_INTERFACE_SETTINGS`,
+/// and Windows sizes the buffer it reads/writes solely from this field;
+/// there is no length parameter. Stamping a higher version makes the OS
+/// access the larger `DNS_INTERFACE_SETTINGS3` layout off the end of our V1
+/// stack allocation, an out-of-bounds FFI access.
 const SETTINGS_VERSION: u32 = DNS_INTERFACE_SETTINGS_VERSION1;
 
 /// Compile-time pin of the *premise* behind [`SETTINGS_VERSION`]: the V1
 /// `DNS_INTERFACE_SETTINGS` (the type the DNS FFIs accept) is strictly
 /// smaller than `DNS_INTERFACE_SETTINGS3`. Because `Version` is the only
 /// size signal, that size gap is exactly why stamping a version above V1
-/// over-reads/over-writes our V1 allocation (#437). This fails the build if
+/// over-reads/over-writes our V1 allocation. This fails the build if
 /// a windows-rs bump ever makes the layouts equal; it does NOT guard the
 /// stamped value — the `empty_settings_always_stamps_version1` test does.
 const _: () = assert!(std::mem::size_of::<DNS_INTERFACE_SETTINGS>() < std::mem::size_of::<DNS_INTERFACE_SETTINGS3>());
@@ -381,15 +368,13 @@ fn get_one(guid: GUID, ipv6: bool) -> io::Result<DnsPrior> {
     let mut settings = empty_settings(ipv6);
     // SAFETY: `settings` is an owned V1 `DNS_INTERFACE_SETTINGS` whose
     // address is valid for the call. `empty_settings` stamps
-    // `SETTINGS_VERSION` (V1), matching the 64-byte buffer we allocate, so
-    // the OS reads/writes exactly those 64 bytes (a higher version would
-    // write the larger V3 layout off the end — bindreams/hole#437). The OS
-    // writes a fresh `NameServer` string we must free via
-    // `FreeInterfaceDnsSettings`.
-    // The `disallowed_methods` ban on `GetInterfaceDnsSettings` exists
-    // so that nothing outside `Win32Real` reaches around the
-    // `WinDnsBackend` test seam (bindreams/hole#397). This module IS
-    // the sanctioned caller.
+    // `SETTINGS_VERSION` (V1), matching the buffer we allocate, so the OS
+    // reads/writes only that layout (a higher version would write the larger
+    // V3 layout off the end). The OS writes a fresh `NameServer` string we
+    // must free via `FreeInterfaceDnsSettings`.
+    // The `disallowed_methods` ban on `GetInterfaceDnsSettings` keeps
+    // callers from reaching around the `WinDnsBackend` test seam; this
+    // module is the sanctioned caller.
     #[allow(clippy::disallowed_methods)]
     let rc: WIN32_ERROR = unsafe { GetInterfaceDnsSettings(guid, &mut settings) };
     if rc != ERROR_SUCCESS {
@@ -412,7 +397,7 @@ fn get_one(guid: GUID, ipv6: bool) -> io::Result<DnsPrior> {
             }
         }
     };
-    // SAFETY: `settings` is the same 64-byte V1 buffer, populated by the V1
+    // SAFETY: `settings` is the same V1 buffer, populated by the V1
     // `GetInterfaceDnsSettings` call above; the OS returns a V1-layout
     // struct, so `FreeInterfaceDnsSettings` (also V1) frees the PWSTRs that
     // call allocated and its walk stays inside our allocation.
@@ -446,9 +431,9 @@ fn set_one(guid: GUID, ipv6: bool, prior: &DnsPrior) -> io::Result<()> {
     settings.NameServer = PWSTR(wide.as_mut_ptr());
     // SAFETY: `settings` and `wide` outlive the FFI call. `empty_settings`
     // stamps `SETTINGS_VERSION` (V1); the OS reads `Version` to size the
-    // buffer it interprets, so passing V1 — matching the 64-byte V1
-    // allocation — makes it read exactly those 64 bytes (a higher version
-    // would over-read into the larger V3 layout — bindreams/hole#437).
+    // buffer it interprets, so passing V1, matching our V1 allocation, makes
+    // it read only that layout (a higher version would over-read into the
+    // larger V3 layout).
     // Sanctioned `disallowed_methods` site — see `get_one` for the
     // rationale; the rule exists to keep the FFI inside `Win32Real`.
     #[allow(clippy::disallowed_methods)]

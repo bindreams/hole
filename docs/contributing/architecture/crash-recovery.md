@@ -62,7 +62,19 @@ so it has no recovery state: it ends with the process. A sweep still undoes an o
 resolvers. For each recorded adapter, and each address family on it separately, `recover_dns_config` restores the prior
 setting only if the *live* setting still equals what that build advertised. A family someone else has changed since is
 left alone. `bridge-dns.json` is evaluated once: it is deleted if every family settled, and otherwise renamed to
-`bridge-dns.superseded.json`, a name the bridge never reads again.
+`bridge-dns.superseded.json`, a name the bridge never reads again. The rename never replaces an existing superseded
+file: if that name is taken (a second crash, a reinstall, a rollback), the older file keeps it and the newer one is
+archived under a numbered name that nothing reads. A superseded file exists because an earlier restore did not fully
+succeed, so the newer file's recorded priors may already be Hole's own dead resolver addresses; the older file is closer
+to the user's original DNS.
+
+The sweep assumes one bridge reads `bridge-dns.json` at a time, and the single-instance guarantee behind that is not
+airtight, so a second reader should be harmless. Two readers cannot write conflicting values, because every write is the
+recorded prior, and each reader ends by deleting or superseding the file and treats a file the other already moved as
+done. The gate itself is check-then-act: a family's live setting is read and compared, then the prior is written, and
+the OS DNS APIs offer no compare-and-set. A change by DHCP, the user or another VPN that lands between the read and the
+write is overwritten with the recorded prior, and a second concurrent reader widens that window. This is a known gap
+(bindreams/hole#1321).
 
 A confinement held by a bridge that is alive but unreachable has no file-based release. It ends only with its owning
 process, and the escape below stops that process.

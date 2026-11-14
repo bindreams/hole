@@ -1,17 +1,14 @@
 //! Connection-level domain sniffer.
 //!
-//! When the dispatcher accepts a new TCP connection it peeks the first
-//! ≤ 2 KiB of payload and asks the sniffer to extract a destination domain.
-//! The sniffer tries TLS SNI first (covers ~all HTTPS/DoH/DoT/SMTPS/IMAPS),
-//! then HTTP Host header (covers plaintext HTTP). If neither matches, the
+//! When the dispatcher accepts a new TCP connection it peeks the start of the
+//! payload and asks the sniffer to extract a destination domain. The sniffer
+//! tries TLS SNI first, then the HTTP Host header. If neither matches, the
 //! connection falls through to IP-only matching.
 //!
-//! This is hole's primary name-recovery mechanism. QUIC/UDP and
-//! non-TLS/non-HTTP TCP are IP-only as a documented trade-off.
+//! This is the only name-recovery mechanism: QUIC/UDP and non-TLS, non-HTTP
+//! TCP are matched on IP only.
 //!
-//! Both submodules are pure functions over a `&[u8]` buffer. Tests
-//! exercise them with static fixtures of real ClientHellos and HTTP
-//! requests.
+//! Both submodules are pure functions over a `&[u8]` buffer.
 
 pub mod http_host;
 pub mod tls_sni;

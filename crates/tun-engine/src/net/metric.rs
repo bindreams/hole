@@ -7,9 +7,11 @@
 //! never surfaces. Here absence is a returned value,
 //! [`MetricOutcome::NoInterfaceRow`], which the caller logs at `warn!`.
 //!
-//! That removes the silent part of the failure, not the race: the IPv6
-//! interface row may not exist yet when this runs, so the IPv6 outcome is
-//! timing-dependent, and no test asserts the row is present. See
+//! The IPv6 row's presence is ordered by `Device::build`, which waits for the
+//! interface's IPv6 half before the caller sets the metric. A
+//! `NoInterfaceRow` for [`Family::V6`] therefore follows from the device
+//! having reported `Assigned::Ipv6StackAbsent` (the wait's expiry is contested
+//! in bindreams/hole#1301). No test asserts the row is present. See
 //! `docs/contributing/architecture/tun-device.md`.
 
 use std::io;
