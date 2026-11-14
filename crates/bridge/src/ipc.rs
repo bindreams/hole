@@ -1606,8 +1606,11 @@ pub(crate) fn write_installer_user_sid(dir: &Path, sid: &str) -> std::io::Result
 /// Windows: detects error code 1379) and `group::add_user_to_group`
 /// is idempotent (macOS: `dseditgroup -o edit -a` is naturally
 /// idempotent; Windows: detects error code 1378). The SID file write
-/// unconditionally replaces the file. An end-to-end test would need elevation
-/// (to call `dseditgroup` / `net localgroup`).
+/// unconditionally replaces the file. No test asserts its effects (the group
+/// membership, the SID file's creation by this call). It does run end to end in
+/// the installer lanes (the MSI's `bridge install` custom action, and `hole bridge
+/// install` in the macOS DMG install test), but those check that the service is
+/// registered and that the bridge answers, not the group or the SID file.
 pub fn prepare_ipc_access() -> std::io::Result<()> {
     crate::group::create_group()?;
     let user = crate::group::installing_username()?;

@@ -141,7 +141,7 @@ fn unlock_successful_disengage_flips_intent_off() {
 #[skuld::test]
 fn unlock_hands_back_what_the_disengage_could_not_prove() {
     // `unlock_with` must hand back the disengage's verdict, not `()`. It writes the
-    // kill-switch intent OFF right after the disengage, so no later engage re-arms
+    // kill-switch intent OFF once the disengage returns, so no later engage re-arms
     // or re-deletes a boot-time key (the pre-delete runs only from
     // `engage_lockdown`, which an off intent prevents). This is the last moment the
     // qualification can reach anybody, which is why `hole bridge unlock` prints it.

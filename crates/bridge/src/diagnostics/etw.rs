@@ -7,8 +7,9 @@
 //!
 //! Volume is deliberately unbounded, to diagnose hard network issues on customer
 //! machines: connection-level events at `info`, anomalies (retransmit at or above
-//! [`RETRANSMIT_WARN_THRESHOLD`], connection-request timeout, abort) at `warn`,
-//! and the per-packet NDIS firehose not subscribed at all.
+//! [`RETRANSMIT_WARN_THRESHOLD`], connection-request timeout, abort) at `warn`.
+//! No NDIS packet-capture provider is subscribed, and the high-volume per-packet
+//! TCPIP events are dropped in userspace ([`HIGH_VOLUME_TCPIP_EVENTS`]).
 //!
 //! # Architecture
 //!
@@ -88,8 +89,9 @@
 //!
 //! # Provider GUIDs, keywords and severity
 //!
-//! [`TCPIP_PROVIDER`], [`WFP_PROVIDER`] and [`AFD_PROVIDER`] hold the GUIDs and
-//! per-provider keyword masks. Only TCPIP events get event-id-aware severity;
+//! [`TCPIP_PROVIDER`], [`WFP_PROVIDER`] and [`AFD_PROVIDER`] hold the GUID
+//! strings; the keyword masks are [`TCPIP_KEYWORDS`], [`WFP_KEYWORDS`] and
+//! [`AFD_KEYWORDS`]. Only TCPIP events get event-id-aware severity;
 //! AFD and WFP events are emitted at DEBUG via [`Emission::Unknown`]. The
 //! providers recycle small event IDs (AFD `1002`/`1004` collide with TCPIP
 //! `TCB_CONNECT_REQUESTED`/`TCB_SYN_SEND`), so [`dispatch`] gates on the provider

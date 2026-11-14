@@ -5,7 +5,7 @@
 //! every process, so a test reads off what an elevated administrator and
 //! LocalSystem can open and read. Every failure is printed with its Win32 code,
 //! the kind the production code classifies it as, and what each `Basis` table
-//! row does about it, so the per-failure table is read off a run.
+//! row does about it, so the per-failure table is read off a run (probe P5).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -62,7 +62,7 @@ fn measure(service: &str) -> String {
     let sid = ServiceSid::of(service);
     writeln!(report, "service SID: {sid}").unwrap();
     // The OS answers only while the service is registered and not marked for
-    // deletion; printed to cross-check the derivation, never used.
+    // deletion; printed to cross-check the derivation (P4), never used.
     match ServiceSid::os_lookup(service) {
         Ok(from_os) => writeln!(
             report,

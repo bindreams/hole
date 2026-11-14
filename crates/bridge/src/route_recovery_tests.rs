@@ -95,11 +95,11 @@ async fn recover_and_record_on_a_clean_host_leaves_the_claim_false() {
 
 /// Structural guard, not a proof: it asserts `routing::recover_routes(` appears
 /// exactly once in non-test bridge sources, and that the one call is in
-/// `route_recovery.rs`. Three entry points (`foreground`, `platform::windows`,
-/// `platform::macos`) must reach it through `route_recovery.rs`, which records
-/// its verdict. The escape's visibility depends on that verdict being
-/// recorded, so a fourth ungated caller would be a silent regression rather
-/// than a duplication.
+/// `route_recovery.rs`. The three entry points (`foreground`,
+/// `platform::windows`, `platform::macos`) must reach it through
+/// `route_recovery.rs`, which records its verdict. The escape's visibility
+/// depends on that verdict being recorded, so a second direct caller would be a
+/// silent regression rather than a duplication.
 ///
 /// Two evasions it does NOT catch, both by construction: a rename of
 /// `recover_routes`, and a call routed through an alias or a re-export under a

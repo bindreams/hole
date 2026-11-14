@@ -31,7 +31,9 @@ use util::port_alloc::{self, Protocols};
 ///
 /// Callers must declare the right `protocols` set: a TCP-only probe
 /// followed by a TCP+UDP bind invites the Windows independent
-/// excluded-port-range race that `bind_ephemeral` exists to prevent. For SOCKS5
+/// excluded-port-range race: `util::port_alloc` verifies a port against every
+/// transport in `protocols` (the check `free_port` shares with
+/// `bind_ephemeral`), and only those. For SOCKS5
 /// listener ports use `Protocols::TCP | Protocols::UDP` (the bridge
 /// SOCKS5 listener is structurally `Mode::TcpAndUdp`); for HTTP CONNECT
 /// listener ports use `Protocols::TCP`.
