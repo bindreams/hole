@@ -93,7 +93,7 @@ fn unticking_the_switch_releases_the_block_mid_session() {
     assert_eq!(
         cover_step(Intent::Off, CoverPresence::Live, &target),
         CoverStep::Release,
-        "Q4: unticking the switch releases immediately rather than waiting for stop"
+        "unticking the switch releases immediately rather than waiting for stop"
     );
 }
 
@@ -119,10 +119,10 @@ fn cover_step_is_exhaustive_over_presence() {
     use CoverStep::{Engage, Hold, Release};
 
     // The expected answers are DATA, not recomputed from the same match arms
-    // `cover_step` uses. A mirror-match version of this test verified the test
-    // file against itself: an edit to a `cover_step` arm, mechanically copied
-    // here to make the test pass again, shipped green. Disagreeing with a row
-    // below means arguing about the policy, which is the point.
+    // `cover_step` uses: a mirror-match would verify the test file against
+    // itself, and an edited `cover_step` arm mechanically copied here would keep
+    // it green. Disagreeing with a row below means arguing about the policy,
+    // which is the point.
 
     // Target::Off — the engaged block follows the target, so intent never
     // enters. One row per presence.
@@ -240,7 +240,7 @@ fn tunnel_step_holds_with_no_session_and_an_off_target() {
 
 #[skuld::test]
 fn tunnel_step_never_stops_a_session_on_an_unreadable_target() {
-    // R4: Unreadable authorises neither connect nor disconnect. A corrupt
+    // Unreadable authorises neither connect nor disconnect. A corrupt
     // read while a session is live must not tear it down.
     assert_eq!(tunnel_step(true, &Target::Unreadable), TunnelStep::Hold);
     assert_eq!(tunnel_step(false, &Target::Unreadable), TunnelStep::Hold);
@@ -416,7 +416,7 @@ fn reconcile_once_honours_an_always_connect_startup_preference_with_a_candidate(
         // Nothing persisted (a fresh install, or a prior explicit stop)...
         target_records::save(dir.path(), &Target::Off, None).unwrap();
         // ...but the GUI pushed AlwaysConnect with the last-connected config
-        // as the candidate to substitute (R8/Task 4's `candidate`).
+        // as the candidate to substitute.
         target_records::save_startup_preference(
             dir.path(),
             &target::StartupPreference {
@@ -449,26 +449,21 @@ fn reconcile_once_honours_an_always_connect_startup_preference_with_a_candidate(
 // Sanctioned release call sites =======================================================================================
 //
 // `release_all_covers()` is unconditional and knows nothing about cover
-// state (see the module doc). The plan's own aspiration is a single caller
-// in `reconciler.rs`, but that is not achievable without an on-demand/
-// event-driven reconcile invocation (tracked separately, not scoped to any
-// task's file list): `handle_unblock`'s own doc is explicit that its direct
-// call is deliberate — it must work while a wedged teardown holds
+// state. A single caller in `reconciler.rs` is not achievable without an
+// event-driven reconcile invocation: `handle_unblock`'s direct call is
+// deliberate, since it must work while a wedged teardown holds
 // `state.proxy.lock()`, so it cannot route through the reconciler/manager at
-// all. So this guards the WEAKER, achievable property instead: every real
-// caller is one of the five independently-reasoned-about sites below, each
-// with its own doc explaining why it releases directly rather than through
-// the others. A sixth, undocumented caller is exactly the kind of divergent,
-// re-introduced `ReleaseWarrant`-style release path this stage exists to
-// prevent. Same walk pattern as `proxy_manager_tests.rs`'s
+// all. So this guards the weaker property instead: every real caller is one of
+// the independently-reasoned-about sites below, each with its own doc
+// explaining why it releases directly rather than through the others. An
+// undocumented extra caller would be a divergent release path. Same walk
+// pattern as `proxy_manager_tests.rs`'s
 // `no_bridge_source_derives_cover_state_from_a_session`.
 //
 // The pattern matches the free function `failclosed::release_all` as well as
-// the `Routing` trait method that wraps it. Matching only the trait method
-// left a hole a whole release path walked through: `cutover::release_covers`
-// calls the free function directly (it has no `Routing` handle — there is no
-// bridge), and the guard stayed silent while the sanctioned set was reported
-// as unchanged (#1003).
+// the `Routing` trait method that wraps it: `cutover::release_covers` calls the
+// free function directly (it has no `Routing` handle, since there is no
+// bridge), so matching only the trait method would leave it invisible.
 
 /// Regex for a Rust function declaration, used to attribute a call site to the
 /// function that lexically encloses it. A backwards line walk is a heuristic —
@@ -516,9 +511,8 @@ fn cover_release_pattern() -> regex::Regex {
     regex::Regex::new(r"\brelease_all(?:_covers)?\s*\(").expect("cover-release regex must compile")
 }
 
-/// An undocumented sixth caller of the cover release would mean a new release
-/// path was added outside the five reasoned-about sites — the exact kind of
-/// divergent teardown route this stage collapses cover-release onto.
+/// An undocumented extra caller of the cover release would mean a new release
+/// path was added outside the reasoned-about sites: a divergent teardown route.
 #[skuld::test]
 fn cover_release_has_the_known_sanctioned_caller_set() {
     let pattern = cover_release_pattern();
@@ -537,7 +531,7 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
         ("reconciler.rs", "reconcile_once"),       // boot-time reconciliation.
         // The uninstaller's escape: no bridge, so no `Routing` handle and no
         // reconciler to route through, and it is the LAST thing that can clear
-        // a persistent WFP filter before the binary is deleted (#1003). Its
+        // a persistent WFP filter before the binary is deleted. Its
         // own liveness refusal is what keeps it from desyncing a live posture.
         ("cutover.rs", "release_covers"),
     ];
@@ -635,11 +629,9 @@ fn the_sanctioned_caller_guard_survives_line_shifts() {
     assert_eq!(before[0].0, "beta", "call site attributed to the wrong function");
 }
 
-/// The hole the guard shipped with: it matched `release_all_covers(` only, so
-/// a caller that reached past the trait to `failclosed::release_all` was
-/// invisible to it — and the first such caller (`cutover::release_covers`)
-/// landed while the sanctioned set was still reported as unchanged. Pinning the
-/// pattern against both forms is what makes an injected stray caller fail
+/// The pattern must match both forms: a caller that reaches past the trait to
+/// `failclosed::release_all` (as `cutover::release_covers` does) must be visible
+/// to the guard. Pinning both is what makes an injected stray caller fail
 /// `cover_release_has_the_known_sanctioned_caller_set` rather than pass it.
 #[skuld::test]
 fn the_cover_release_pattern_catches_the_free_function_too() {
@@ -829,13 +821,11 @@ fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
     })
 }
 
-/// Four separate bugs in this one change had the same shape: a contract
-/// stated in prose at a definition site, violated at a call site far away.
-/// `SessionEvent`'s own doc says "do not collapse any two variants onto their
-/// shared consequence"; the transient-cover match did exactly that, and
-/// `stop_with`'s death-reason branch re-derived a per-variant policy of its
-/// own. The fix is that per-variant policy lives ON the type — one exhaustive
-/// match per question — and nowhere else.
+/// A contract stated in prose at a definition site is violated at a call site
+/// far away. `SessionEvent`'s own doc says "do not collapse any two variants
+/// onto their shared consequence", and a call site that re-derives a
+/// per-variant policy of its own does exactly that. So per-variant policy
+/// lives ON the type — one exhaustive match per question — and nowhere else.
 ///
 /// Constructing a variant (`stop_with(SessionEvent::Blipped)`) is fine and
 /// deliberately not matched here: a caller naming its own cause is the API
@@ -963,8 +953,8 @@ fn cover_presence_is_never_compared_against_a_variant() {
     let scan_root = workspace.clone();
     // The type definitions, plus the platform modules that PRODUCE the probe
     // (they classify their own raw OS result; the invariant binds consumers).
-    // Path-qualified: bare `macos.rs`/`windows.rs` exempted fourteen unrelated
-    // files, including `crates/bridge/src/platform/macos.rs`.
+    // Path-qualified: a bare `macos.rs`/`windows.rs` would exempt every unrelated
+    // file of that name, including `crates/bridge/src/platform/macos.rs`.
     let sanctioned = [
         "crates/tun-engine/src/routing.rs",
         "crates/common/src/protocol.rs",

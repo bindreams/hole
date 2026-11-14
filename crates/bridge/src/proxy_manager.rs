@@ -27,9 +27,9 @@
 // the cooperative-cancel path returns `Err(Cancelled)` before reaching the
 // commit.
 //
-// There are deliberately no getters for `proxy` or `routing` — test access
-// to mock state happens via `Arc` clones captured before the mock is
-// handed to `new`. A getter would recreate an encapsulation smell.
+// The manager exposes no getter for `proxy`. `routing` is lent only as the shared handle
+// [`ProxyManager::routing_handle`], which the Unblock escape needs; a test reaches mock
+// state through `Arc` clones captured before the mock is handed to `new`.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -60,12 +60,9 @@ use crate::dns::system::{Dns, DnsError, SystemDns};
 use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals};
 use tun_engine::RoutingError;
 use util::versioned_file::StoreError;
-// `WINDOWS_TUN_ALIAS` only stands in for a real `TunIdentity` on the
-// `#[cfg(test)]` synthetic path below — the production path threads the
-// identity `Engine::build`/`Dispatcher::identity()` actually opened. Names no
-// OS object either way, so borrowing the Windows-only alias constant here
-// (rather than a fresh literal) is inert on every platform this test code
-// compiles for.
+// `WINDOWS_TUN_ALIAS` stands in for a real `TunIdentity` on the `#[cfg(test)]` synthetic
+// path only; production threads the identity `Dispatcher::identity()` opened. It names no
+// OS object here, so it is inert on every platform this test code compiles for.
 #[cfg(test)]
 use crate::proxy::config::WINDOWS_TUN_ALIAS;
 
@@ -85,8 +82,7 @@ pub enum LockdownOffError {
 /// YAML-shaped logging via `dump!`.
 ///
 /// There is no field an address can occupy. `server` is the entry's opaque
-/// token; the shape questions this repo's actual diagnoses turned on (#248,
-/// #541, #655, #770, #694) are answered by `server_kind` / `server_family` /
+/// token; the address's shape is answered by `server_kind` / `server_family` /
 /// `server_scope` instead. `server_family` and `server_scope` are `None`
 /// only where no address was resolved.
 #[derive(DeriveDump)]
@@ -216,7 +212,7 @@ pub struct TrafficMetrics {
 // ProxyManager ========================================================================================================
 
 /// The one reason an out-of-band death is reported to the GUI. A `&'static str`
-/// so the status/toast surface is path-free by construction (#470): unlike the
+/// so the status/toast surface is path-free by construction: unlike the
 /// operation-error `last_error`, which can carry a filesystem path or hostname
 /// from a failed start, this can never embed PII.
 pub const DEATH_REASON: &str = "proxy task exited unexpectedly";
@@ -244,7 +240,7 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// The out-of-band death reason surfaced to the GUI status/toast, distinct
     /// from `last_error` (which keeps the rich, possibly-PII operation detail
     /// for diagnostics and the click-path start-error surface). Set only by
-    /// `check_health`; cleared on every start attempt and on stop (#470).
+    /// `check_health`; cleared on every start attempt and on stop.
     death_reason: Option<&'static str>,
     /// Last successfully-started config. Used by `reload` to detect
     /// filter-only changes (hot-swap path vs full restart).
@@ -256,10 +252,10 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// "Startup recovery found a standing cover live this run" — see
     /// [`Self::set_standing_cover_adopted`] for the full contract.
     ///
-    /// The LIVE-COVER half only. The armed half — "the user wants the kill
-    /// switch" — is `bridge-lockdown.json`, written by `promote_adopted_claim`
-    /// once a start honours this claim with a real `install_lockdown`. Holding
-    /// both facts here is what let a plain disconnect disarm the switch.
+    /// The LIVE-COVER half only. The armed half, "the user wants the kill
+    /// switch", is `bridge-lockdown.json`, written by `promote_adopted_claim`
+    /// once a start honours this claim with a real `install_lockdown`. The two
+    /// facts are kept apart so a plain disconnect cannot disarm the switch.
     adopted_standing_cover: bool,
     /// The count of Unblocks the tray has committed, shared with `IpcState::unblock_generation` (see
     /// [`Self::unblock_generation_handle`]). The transient cover section compares it under the cover lock against
@@ -303,15 +299,12 @@ struct BlockedStart<C> {
 // Posture =============================================================================================================
 
 /// Who owns `ProxyManager`'s per-cycle state right now: nobody, a pending
-/// covered start, or a live session. Collapses what were two independently
-/// mutable `Option` fields (`running`, `blocked`) into one, so a session and
-/// a pending start both holding covers stops being representable.
+/// covered start, or a live session.
 enum Posture<P: Proxy, R: Routing, D: Dns> {
     Idle,
     PendingStart(BlockedStart<R::Cover>),
-    // Boxed: `RunningState` (283+ bytes, dwarfing `PendingStart`'s ~75) would
-    // otherwise size every `Posture` — including the common `Idle` case — to
-    // its largest variant.
+    // Boxed: `RunningState` dwarfs `PendingStart`, and would otherwise size every
+    // `Posture`, including the common `Idle`, to its largest variant.
     Session(Box<RunningState<P, R, D>>),
 }
 
@@ -506,7 +499,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// Test seam: shift `started_at` backwards by `by`. Lets uptime
     /// tests assert "after N seconds elapsed" without sleeping or
     /// injecting a clock abstraction. No-op if not currently running.
-    /// See bindreams/hole#383.
     #[cfg(test)]
     pub fn shift_started_at_for_test(&mut self, by: std::time::Duration) {
         if let Some(r) = self.posture.session_mut() {
@@ -598,21 +590,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     }
 
     /// The out-of-band death reason for the GUI status/toast (path-free by
-    /// type), or None if the proxy did not die unexpectedly (#470).
+    /// type), or None if the proxy did not die unexpectedly.
     pub fn death_reason(&self) -> Option<&'static str> {
         self.death_reason
     }
 
-    /// Delegation for `handle_diagnostics`: expose the routing provider's
-    /// destination-independent default-route query without leaking the
-    /// provider itself. This is NOT an encapsulation-breaking getter — it's
-    /// a single capability intentionally surfaced for the diagnostics
-    /// handler so tests can exercise the mock routing's gateway stub instead
-    /// of hitting the host OS.
+    /// The routing provider's destination-independent default-route query, for
+    /// `handle_diagnostics`. A single capability rather than the provider, so a
+    /// test can answer it from the mock routing's gateway stub.
     ///
     /// `Routing::default_route`, not `default_gateway`: diagnostics runs
     /// with no session, so there is no `server_ip` a server-scoped probe
-    /// could even be given (see `Routing::default_gateway`'s doc).
+    /// could be given (see `Routing::default_gateway`'s doc).
     pub fn default_route(&self) -> Result<GatewayInfo, ProxyError> {
         self.routing.default_route().map_err(Into::into)
     }
@@ -639,11 +628,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// What the OS says about a standing lockdown cover on the host right
     /// now — an OS probe (`Routing::lockdown_cover_presence`), not a
     /// recollection of what this process engaged. Distinct from the
-    /// persisted intent (`lockdown_enabled`). Replaces the old
-    /// `lockdown_active() -> bool`, which answered the *host* question with
-    /// a *process-ownership* answer — structurally `false` whenever nothing
-    /// is running even while an adopted cover blocks every packet
-    /// (bindreams/hole#825).
+    /// persisted intent (`lockdown_enabled`), and true of an adopted cover while
+    /// nothing is running.
     pub fn cover_presence(&self) -> CoverPresence {
         self.routing.lockdown_cover_presence()
     }
@@ -696,9 +682,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// armed: the intent's `reads_armed` fold, OR this run adopted a standing
     /// cover it has not released.
     ///
-    /// The `|| adopted` disjunct is what keeps the Unblock item on the menu
-    /// when the intent file is gone and the repair write itself failed — the
-    /// escape must not depend on the file this change made stickier.
+    /// The `|| adopted` disjunct keeps the Unblock item on the menu when the
+    /// intent file is gone and its repair write failed: the escape must not
+    /// depend on that file.
     ///
     /// An explicit recorded `Off` wins over the claim outright: the claim is
     /// only ever cleared by in-process paths, so an out-of-process writer
@@ -747,23 +733,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     }
 
     /// Turn the kill-switch intent off, releasing the cover UNCONDITIONALLY.
-    /// Reads no session posture — Q4 ("unblock IS unticking") means a live
-    /// session's cover is released too.
+    /// Reads no session posture: a live session's cover is released too.
     ///
-    /// There is deliberately no presence check in front of the release. This
-    /// once consulted `cover_step` and skipped the call on a confirmed
-    /// `Absent`, which is check-then-act on an operation documented
-    /// idempotent — and at an EXPLICIT user disarm a stale `Absent` is the one
-    /// wrong answer that matters: it reports success while the host stays
-    /// blocked. A redundant release costs nothing; a skipped one strands the
-    /// user. `handle_unblock` shares this rule, which is what removed the
-    /// discrepancy the two bespoke `must_release` expressions used to carry.
+    /// There is deliberately no presence check in front of the release: it is
+    /// idempotent, and at an explicit user disarm a stale `Absent` would report
+    /// success while the host stays blocked. A redundant release costs nothing;
+    /// a skipped one strands the user. `handle_unblock` follows the same rule.
     ///
     /// Release-then-persist ordering is load-bearing: the tray offers this
     /// escape while the intent is on, so flipping the intent off after a
     /// FAILED release would delete the user's only retry affordance while
-    /// the host is still held closed. The intent moves only after the clear
-    /// confirms (or after this decided no clear was owed).
+    /// the host is still held closed. The intent moves only after the release
+    /// confirms.
     ///
     /// "Confirms" is bounded by what a delete-by-key can observe, and on
     /// Windows that is narrower for a `FWPM_FILTER_FLAG_BOOTTIME` key than for
@@ -786,10 +767,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             held.cover.release(&lock);
         }
 
-        // Unconditional: `release_all_covers` is documented idempotent, so
-        // gating it on a presence probe is a check-then-act guard on an
-        // operation that needs none — and at an explicit disarm a stale
-        // `Absent` is the one wrong answer that matters.
         self.routing
             .release_all_covers(&lock)
             .map_err(LockdownOffError::Release)?;
@@ -799,10 +776,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // of the process.
         self.set_standing_cover_adopted(false);
 
-        // Only now move the intent. Either the covers are already gone and
-        // the host is open, or `cover_step` said none needed releasing; a
-        // persist failure here means only the SETTING did not save, which
-        // the caller must be able to say distinctly from a failed release.
+        // Only now move the intent. A failure here means only the SETTING did
+        // not save, which the caller must be able to say distinctly from a failed
+        // release.
         lockdown_state::set_enabled(&lock, false, self.routing.owner()).map_err(LockdownOffError::IntentNotSaved)
     }
 
@@ -1011,8 +987,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // Covered retry after the user enabled lockdown mid-blocked-state:
                 // release the held cover. Unless an adopted standing cover already holds the host, it is uncovered
                 // from here until the standing cover engages after the plugin chain and `routing.install`; a start
-                // that fails first never engages it, so the window lasts as long as the starts fail (open:
-                // bindreams/hole#1206).
+                // that fails first never engages it, so the window lasts as long as the starts fail
+                // (open, bindreams/hole#1206).
                 if self.release_held_cover() {
                     warn!(
                         "covered retry with lockdown newly enabled: releasing the held cover; unless an adopted standing \
@@ -1194,8 +1170,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .filter(|b| b.host == host && b.resolver_permit != ech_resolver_permit)
             .map(|b| (b.resolver_permit, b.pin));
         if repair_fallback.is_some() {
-            // On macOS the release reloads `/etc/pf.conf`, so the host is open until the re-engage below
-            // (re-engaging over the live cover instead: open, bindreams/hole#758).
+            // On macOS the release reloads `/etc/pf.conf`, so the host is open until the re-engage below. Re-engaging
+            // over the live cover instead is open, bindreams/hole#758.
             if let Some(held) = self.posture.take_pending() {
                 held.cover.release(&lock);
             }
@@ -1328,33 +1304,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// release `stop` runs, before returning the error. A failed start drops its standing cover, no exception.
     /// The teardown observes no cancel token, so a cancel that arrives during it cannot cut it short.
     ///
-    /// **Cooperative cancellation.** Each long-running phase of `acquire` observes the supplied `cancel` token and
-    /// returns `Err(ProxyError::Cancelled)` cooperatively:
-    /// - **Phase 1 (plugin chain)**: the token is threaded into `start_plugin_chain`, which derives child tokens
-    ///   for each attempt and races readiness against cancel.
-    /// - **Phase 2 (proxy.start)**: `tokio::select!` around `proxy.start(ss_config)`. Drop-on-cancel is sound:
-    ///   Proxy implementations own no async cleanup obligations on an in-flight start.
-    /// - **Phase 3 (build_local_dns)**: builds the in-TUN endpoint + forwarder synchronously; the outer
-    ///   `tokio::select!` against cancel re-emits Cancelled canonically.
-    /// - **Phase 4 (forwarder self-test)**: the token is threaded into `run_forwarder_self_test`, which races its
-    ///   one walk against cancel in a `biased` `select!` and drops the in-flight walk on cancel.
-    /// - **Phase 5 (Dispatcher::new)**: the token is threaded in, and the device build runs on `spawn_blocking`
-    ///   raced against it. The build waits for the TUN interface's IPv6 half, and on a covered start a Cancel the
-    ///   phase could not observe would extend the window during which the host is fail-closed. On cancel the
-    ///   blocking task finishes and drops its own `Device`; nothing is future-drop-cancelled.
-    /// - **Phase 6 (routing.install)**: sync; cancel observed at the phase boundary only. The netsh/route
-    ///   shell-outs are uninterruptible from our process.
-    /// - **Phase 7 (dns.apply)**: the token is threaded into [`Dns::apply`], which observes cancel between
-    ///   per-adapter FFIs. A cancel mid-apply restores any partially-applied adapters inline before
-    ///   `DnsError::Cancelled` propagates as `ProxyError::Cancelled`. The `DnsApplied` guard exists only on the
-    ///   `Ok` path, so its drop bomb is never armed on an `Err`.
-    ///
-    /// CRITICAL ORDERING: the routing provider is responsible for
-    /// persisting the recovery state BEFORE mutating routes. A panic
-    /// or SIGKILL between `setup_routes` and `SystemRoutes`
-    /// construction would otherwise leak routes with no on-disk record,
-    /// defeating crash recovery on next startup. See
-    /// [`tun_engine::routing::SystemRouting::install`] for the invariant.
+    /// Each long-running phase observes `cancel`; [`Self::acquire`] says how, and which phases are checked only at
+    /// their boundary.
     // DI params (the proxy/routing/dns seams + config + cancel + the
     // test-querier seam); bundling into a struct adds more noise than the warning.
     #[allow(clippy::too_many_arguments)]
@@ -1423,6 +1374,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
     /// The phases of a start, each acquisition recorded in `session` the moment it exists, the proxy included. A
     /// `?` anywhere here leaves what was acquired in the session for [`Session::teardown`].
+    ///
+    /// Each long-running phase observes the supplied `cancel` token and returns `Err(ProxyError::Cancelled)`
+    /// cooperatively. Two phases differ:
+    /// - **Phase 2 (proxy.start)** is dropped, not awaited, on cancel. That is sound because a `Proxy` owns no async
+    ///   cleanup obligation on an in-flight start.
+    /// - **Phase 6 (routing.install)** is synchronous and checked at its boundary only: the netsh/route shell-outs
+    ///   cannot be interrupted from this process. The recovery-state-before-mutation ordering is
+    ///   [`tun_engine::routing::SystemRouting::install`]'s contract.
+    ///
+    /// Phase 5 (`Dispatcher::new`) is raced on `spawn_blocking` because its device build waits for the TUN
+    /// interface's IPv6 half, and on a covered start a cancel it could not observe would extend the fail-closed
+    /// window; on cancel the blocking task finishes and drops its own `Device`.
     // DI params (the proxy/routing/dns seams + config + cancel + the
     // test-querier seam); bundling into a struct adds more noise than the warning.
     #[allow(clippy::too_many_arguments)]
@@ -1495,7 +1458,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Build shadowsocks config. When a plugin chain is running,
         // point ss-service at the chain's local port.
         //
-        // Pure-VPN starts (Full mode, no user-facing listeners, #459)
+        // Pure-VPN starts (Full mode, no user-facing listeners)
         // cannot build the config yet — the internal SOCKS5 port is
         // allocated by bind_ephemeral in phase 2 — so run the same
         // typed validation now to keep rejects fast and typed, before
@@ -1579,36 +1542,19 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Compile filter rules.
         let ruleset = crate::filter::rules::RuleSet::from_user_rules(&config.filters);
 
-        // CRITICAL ORDERING:
-        //
-        //   0. (above) plugin_chain spawn  — plugin subprocess is alive
-        //      from this point. NOT a system-state mutation (the session
-        //      teardown reaps it) but the user sees the plugin process briefly.
-        //   1. proxy.start  — binds local SS listener
-        //   2. build_local_dns  — builds the in-TUN LocalDnsEndpoint +
-        //      forwarder (Err on degenerate dns.enabled + empty servers)
-        //   3. GATE: run_forwarder_self_test  — Err here means the plugin
-        //      chain cannot reach upstream. The session's teardown releases
-        //      the proxy + plugin chain. NO system state
-        //      (routes / system DNS / TUN adapter) is mutated.
-        //   4. Dispatcher::new  — only NOW does LocalDnsEndpoint become
-        //      reachable through the cascade
-        //   5. routing.install  — TUN routes go live; OS DNS to the
-        //      advertised resolver IPs starts routing into the TUN
-        //   6. Dns::apply  — OS adapter DNS pointed at the resolver IPs
-        //
-        // Reordering steps 3..=6 re-introduces a dead-tunnel DNS hijack
-        // with the GUI reporting "Running". The
-        // start_blocks_on_forwarder_self_test_failure test catches the
-        // most likely regression (asserting routing.install was NOT
-        // called when the gate fails).
+        // CRITICAL ORDERING (phases 3..=7 below): the forwarder self-test gate (4) runs before any
+        // system state (routes, system DNS, TUN adapter) is mutated, so a failing gate leaves nothing to
+        // undo beyond the proxy and plugin chain the session teardown releases. Reordering
+        // re-introduces a dead-tunnel DNS hijack with the GUI reporting "Running".
+        // `start_blocks_on_forwarder_self_test_failure` pins that `routing.install` is not called when
+        // the gate fails.
 
         // Phase 2 (Full mode): start the SS SOCKS5 proxy, racing the
         // start future against cancel.
         //
         // The TUN data plane rides the user-facing SOCKS5 listener when
-        // it is enabled. On a pure-VPN start (no user-facing listeners,
-        // #459) the internal SOCKS5 instance binds an ephemeral loopback
+        // it is enabled. On a pure-VPN start (no user-facing listeners)
+        // the internal SOCKS5 instance binds an ephemeral loopback
         // port instead, so nothing is bound on the user-configured
         // ports. TCP+UDP: the SOCKS5 instance is always TcpAndUdp.
         let socks5_port = if let Some(ss_config) = ss_config {
@@ -1700,7 +1646,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // On Err, the session's teardown stops the proxy and the plugin chain.
         // System state is untouched. `run_forwarder_self_test`
         // observes cancel cooperatively: its one walk races cancel in a
-        // biased `select!`, checked before every poll of the walk (#397).
+        // biased `select!`, checked before every poll of the walk.
         if let Some(fwd) = forwarder.as_ref() {
             // Race an out-of-band reachability probe against the self-test so it
             // adds NO latency. Skip it under an active fail-closed cover — this
@@ -1839,20 +1785,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             let _ = local_dns_endpoint;
         }
 
-        // The identity of the TUN device this start opened — the LUID and
-        // alias of the concrete OS object, never a name lookup. Threaded to
-        // `Dns::apply` below.
+        // The identity of the TUN device this start opened: the concrete OS object, never a name
+        // lookup (a name can resolve to someone else's adapter). Threaded to `routing.install`, `Dns::apply`
+        // and the standing lockdown cover (`install_standing_cover`, which hands it to `install_lockdown`).
         //
-        // Under `#[cfg(test)]` the dispatcher is stubbed out (creating a
-        // real TUN needs elevation), so no `hole-tun` exists on a clean
-        // machine — a synthetic identity stands in instead. This is what
-        // makes Phase 7 reachable and observable from a unit test on any
-        // machine, not just one with a leftover `hole-tun`. The
-        // alternative — resolving the alias via a raw OS call here instead
-        // of threading the identity through — would be wrong on both
-        // safety grounds (a name lookup can resolve to someone else's
-        // adapter) and testability grounds (nothing to substitute in a
-        // unit test).
+        // Under `#[cfg(test)]` the dispatcher is stubbed out (creating a real TUN needs elevation),
+        // so a synthetic identity stands in.
         #[cfg(not(test))]
         let tun_identity = session
             .dispatcher
@@ -1863,11 +1801,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         #[cfg(test)]
         let tun_identity = tun_engine::TunIdentity::synthetic(0xFEED, WINDOWS_TUN_ALIAS);
 
-        // The TUN's IPv6 verdict, read here because `Engine::build` has
-        // already consumed the device by now. `Ipv6StackAbsent` is the second
-        // operand of the route-install fatality rule: the IPv6 route adds are
-        // non-fatal when the upstream has no IPv6 OR the TUN interface has no
-        // IPv6 half.
+        // The TUN's IPv6 verdict, read from the dispatcher because `Engine::build` has consumed the
+        // device. Logged only. The probe of the TUN's own name decides whether the route runner stops at a
+        // failed IPv6 split, but `SystemRouting::install` fails the start on any missing planned route, an
+        // IPv6 split included (open, bindreams/hole#1299).
         let tun_ipv6 = session.dispatcher.as_ref().and_then(|d| d.ipv6_assigned());
 
         // Phase 6: cancel checkpoint before routing.install (sync; mid-
@@ -1894,9 +1831,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // the permit names the file that ran.
         let app_ids = lockdown_app_ids(session.plugin_chain());
 
-        // Standing lockdown cover (#527). Engaged only when intent is on; when
-        // off this whole block is a no-op and the start is byte-identical to
-        // today. Engaged AFTER routing.install (TUN exists => LUID resolvable)
+        // Standing lockdown cover. Engaged only when intent is on; when off this block
+        // is a no-op. Engaged AFTER routing.install (TUN exists => LUID resolvable)
         // and BEFORE Dns::apply, so the line is held the moment routes go live.
         // FAIL-FATAL: an engage error under intent-on aborts the start and the
         // session's teardown releases the routes — the opposite of the transient
@@ -1916,12 +1852,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // unconfigured family is left untouched), so a mixed or v6 resolver
         // list is carried end-to-end on both platforms.
         //
-        // FAIL-FATAL on both error shapes: after #846 removed the
-        // upstream-adapter rewrite, the WFP confinement (Windows) is the
-        // ONLY thing standing between OS DNS and the LAN resolver — a
-        // degraded-but-running session here would be a silent leak on a
-        // session the UI reports as connected. `Cancelled` and every other
-        // `DnsError` fail the start and the session's teardown releases what it holds.
+        // FAIL-FATAL on every error shape: Hole writes no DNS settings to an adapter it does not own,
+        // so the WFP confinement (Windows) is the ONLY thing standing between OS DNS and the LAN
+        // resolver; a degraded-but-running session here would be a silent leak on a session the UI
+        // reports as connected. `Cancelled` and every other `DnsError` fail the start and the
+        // session's teardown releases what it holds.
         if forwarder.is_some() {
             let advertise_ips: Vec<IpAddr> = config.dns.servers.clone();
             session.dns = match dns
@@ -1948,19 +1883,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         self.stop_with(SessionEvent::UserStopped).await
     }
 
-    /// Stop the proxy in response to `event`. The standing lockdown cover's
-    /// fate is no longer read off `event` directly — it comes from
+    /// Stop the proxy in response to `event`. The standing lockdown cover's fate comes from
     /// [`teardown_cover_disposition`], decided against the *persisted* [`Target`](crate::target::Target) `event`
-    /// moves it to (see [`persist_session_event`](Self::persist_session_event)).
+    /// moves it to (see [`persist_session_event`](Self::persist_session_event)), not from `event` itself.
     /// Routes/DNS/proxy/plugin tear down identically regardless of `event`.
     ///
-    /// One exhaustive match over the posture taken from `self`, replacing it
-    /// with `Idle` up front: `Idle` is a no-op; `PendingStart` decides the
-    /// held transient cover's fate directly from `event` (this is the
-    /// bounded-window failclosed cover, a wholly separate mechanism from the
-    /// standing one `teardown_cover_disposition` governs — see
-    /// `apply_cover_disposition`); `Session`
-    /// runs the full teardown below.
+    /// The posture is replaced with `Idle` up front. `Idle` is a no-op; `PendingStart` decides the held
+    /// transient cover's fate directly from `event` (a separate mechanism from the standing cover, which
+    /// `teardown_cover_disposition` governs); `Session` runs the full teardown.
     pub async fn stop_with(&mut self, event: SessionEvent) -> Result<(), ProxyError> {
         self.stop_with_progress(event, |_| {}).await
     }
@@ -2014,11 +1944,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     crate::diagnostics::ndis::log_snapshot("post-teardown");
                 }
 
-                // Clear any error from a previous failed start (#142) — except
-                // on a GaveUp teardown: `check_health` just set last_error/
-                // death_reason to explain why THIS session ended (#470), and
-                // clearing them here would erase that explanation before the
-                // GUI/toast ever reads it.
+                // Clear any error from a previous failed start, except on a GaveUp teardown:
+                // `check_health` just set last_error/death_reason to explain why THIS session
+                // ended, and clearing them here would erase that explanation before the GUI/toast
+                // reads it.
                 if !event.preserves_death_reason() {
                     self.last_error = None;
                     self.death_reason = None;
@@ -2080,8 +2009,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // confirmable path FIRST — the same one the `Nobody` arm of
                 // `turn_lockdown_off` uses — and clear the live-cover half of
                 // the claim only on a CONFIRMED open host: a false clear here
-                // is Rule #0 territory, the Unblock item disappearing exactly
-                // when it is still needed.
+                // makes the Unblock item disappear exactly when it is still needed.
                 match self.routing.release_all_covers(lock) {
                     Ok(()) => self.set_standing_cover_adopted(false),
                     Err(e) => tracing::warn!(
@@ -2150,10 +2078,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             && active.proxy_socks5 == config.proxy_socks5
             && active.proxy_http == config.proxy_http
             && active.local_port_http == config.local_port_http
-            // #388: toggling diagnostic_plugin_tap wraps/unwraps the
-            // plugin chain in TapPlugin, which is fixed at chain
-            // construction. Hot-swap can't rebuild the chain — force
-            // full stop + start so the new tap state takes effect.
+            // Toggling diagnostic_plugin_tap wraps/unwraps the plugin chain in TapPlugin, which is
+            // fixed at chain construction. Hot-swap can't rebuild the chain, so it forces a full
+            // stop + start.
             && active.diagnostic_plugin_tap == config.diagnostic_plugin_tap;
 
         if structural_same {
@@ -2168,14 +2095,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             info!("filter rules hot-swapped");
             Ok(())
         } else {
-            // Slow path: full stop + start. Not a real disconnect — a
-            // hot-swap-incapable config edit — so the target must not move
-            // to `Off`. `Blipped`'s "reconciliation working, not a decision
-            // to disconnect" semantics fit; `cover_step`'s `Connected`+`On`+
-            // `Live` arm then holds the standing cover live across the gap,
-            // rather than the old code's unconditional disengage-then-
-            // re-engage (which briefly opened the host on every structural
-            // reload).
+            // Slow path: full stop + start. A hot-swap-incapable config edit is not a disconnect, so
+            // the target must not move to `Off`: `Blipped` is the event for that, and `cover_step`'s
+            // `Connected`+`On`+`Live` arm then holds the standing cover across the gap.
             self.stop_with(SessionEvent::Blipped).await?;
             self.start(config).await
         }
@@ -2205,7 +2127,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             return None;
         }
         self.last_error = Some(DEATH_REASON.into());
-        // Path-free death reason for the GUI status/toast (#470).
+        // Path-free death reason for the GUI status/toast.
         self.death_reason = Some(DEATH_REASON);
         Some(SessionEvent::GaveUp)
     }
@@ -2365,7 +2287,7 @@ mod proxy_manager_e2e_tests;
 #[path = "proxy_manager_live_tun_permit_e2e_tests.rs"]
 mod proxy_manager_live_tun_permit_e2e_tests;
 
-// a real Full-mode start's three OS-visible effects (utun,
+// A real Full-mode start's three OS-visible effects (utun,
 // split routes, derived DNS config) and their clean removal, judged only by
 // reading the OS back — never our own return values. macOS-only (the file is
 // `#![cfg(target_os = "macos")]`); the module is still registered

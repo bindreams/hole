@@ -3,12 +3,9 @@
 //! Every other Full-mode e2e in this crate (`proxy_manager_e2e_tests.rs`'s
 //! `mod tun`, `proxy_manager_live_tun_permit_e2e_tests.rs`) is driven through
 //! `BridgeRequest::Start`/`Stop` and then judges the session by dialing
-//! sockets — never by asking the OS what it actually installed. Before this
-//! file, no test on ANY platform asked: after a real Full-mode start, does
-//! the OS's own interface list, routing table, and resolver configuration
-//! actually show what Hole claims to have done? On macOS that question was
-//! previously unanswerable at all — `TUN_DEVICE_NAME` didn't exist as
-//! something `Dispatcher::new` could open, and `SystemDns::apply` was a silent no-op.
+//! sockets — never by asking the OS what it actually installed. This file asks: after a real
+//! Full-mode start, do the OS's own interface list, routing table, and resolver configuration
+//! show what Hole claims to have done?
 //!
 //! Every fact this test asserts is read from the OS — `ifconfig -l`,
 //! `netstat -rn -f inet`, `scutil --dns` — never from a `BridgeResponse`

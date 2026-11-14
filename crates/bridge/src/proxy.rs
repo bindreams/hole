@@ -12,7 +12,7 @@
 // generic over the `Proxy` trait so unit tests can substitute a mock that
 // returns inert running handles. A helper that bypasses the trait cannot
 // be intercepted by the mock and will exercise real production code from
-// unit tests, breaking test isolation. See the bindreams/hole#165 incident.
+// unit tests, breaking test isolation. See docs/contributing/architecture/test-isolation.md.
 //
 // Module layout:
 //
