@@ -82,8 +82,7 @@ fn socks_only_config(server: SocketAddr, local_port: u16) -> shadowsocks_service
 }
 
 /// Build a `SocksOnly` config with one HTTP CONNECT listener on
-/// `local_port_http` and no SOCKS5 listener — the literal shape of the
-/// reported repro (toggling the HTTP listener on a live session).
+/// `local_port_http` and no SOCKS5 listener: the shape of a live session whose HTTP listener is toggled on.
 fn http_only_config(server: SocketAddr, local_port_http: u16) -> shadowsocks_service::config::Config {
     let entry = ServerEntry {
         id: "shadowsocks-shutdown-test".into(),
@@ -216,10 +215,10 @@ fn stop_then_start_reuses_the_same_ports() {
     });
 }
 
-/// The reported repro's literal shape: the HTTP CONNECT listener,
-/// not the SOCKS5 one. Every other test in this file exercises SOCKS5;
-/// nothing else here would catch a regression specific to the HTTP local
-/// instance's teardown path.
+/// Stop-then-start on one port for the HTTP CONNECT listener, not the SOCKS5
+/// one: what toggling the HTTP listener on a live session does. Every other
+/// test in this file exercises SOCKS5; nothing else here would catch a
+/// regression specific to the HTTP local instance's teardown path.
 #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn stop_then_start_reuses_the_same_http_listener_port() {
     current_thread_runtime().block_on(async {
@@ -245,9 +244,10 @@ fn stop_then_start_reuses_the_same_http_listener_port() {
 /// which holds an `Arc` clone of the inbound SOCKS5 UDP listener inside a
 /// per-association task whose handle never leaves `UdpAssociationManager`.
 ///
-/// Layer 2 alone already holds the port, so a leak here is indistinguishable
-/// from `stop_releases_the_listener_ports` failing. This is the only test that
-/// would catch a regression to a layer-2-only teardown.
+/// With no association, layer 3 holds nothing, so `stop_releases_the_listener_ports`
+/// passes on a teardown that reaches layer 2 but not layer 3; this is the only
+/// test that catches that regression. A leak at layer 2 itself fails both
+/// tests, so a failure here alone points at layer 3.
 #[skuld::test]
 fn stop_releases_the_udp_port_with_a_live_association(#[fixture(ssserver_none)] ss: &SsServerHandle) {
     current_thread_runtime().block_on(async {

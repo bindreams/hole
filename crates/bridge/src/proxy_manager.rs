@@ -988,7 +988,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // Covered retry after the user enabled lockdown mid-blocked-state:
                 // release the held cover. Unless an adopted standing cover already holds the host, it is uncovered
                 // from here until the standing cover engages after the plugin chain and `routing.install`; a start
-                // that fails first never engages it, so the window lasts as long as the starts fail.
+                // that fails first never engages it, so the window lasts as long as the starts fail
+                // (open, bindreams/hole#1206).
                 if self.release_held_cover() {
                     warn!(
                         "covered retry with lockdown newly enabled: releasing the held cover; unless an adopted standing \
@@ -1170,7 +1171,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .filter(|b| b.host == host && b.resolver_permit != ech_resolver_permit)
             .map(|b| (b.resolver_permit, b.pin));
         if repair_fallback.is_some() {
-            // On macOS the release reloads `/etc/pf.conf`, so the host is open until the re-engage below.
+            // On macOS the release reloads `/etc/pf.conf`, so the host is open until the re-engage below. Re-engaging
+            // over the live cover instead is open, bindreams/hole#758.
             if let Some(held) = self.posture.take_pending() {
                 held.cover.release(&lock);
             }
@@ -1303,7 +1305,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// release `stop` runs, before returning the error. A failed start drops its standing cover, no exception.
     /// The teardown observes no cancel token, so a cancel that arrives during it cannot cut it short.
     ///
-    /// Every phase observes `cancel` (see [`Self::acquire`] for how each one does).
+    /// Each long-running phase observes `cancel`; [`Self::acquire`] says how, and which phases are checked only at
+    /// their boundary.
     // DI params (the proxy/routing/dns seams + config + cancel + the
     // test-querier seam); bundling into a struct adds more noise than the warning.
     #[allow(clippy::too_many_arguments)]
@@ -1802,8 +1805,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
 
         // The identity of the TUN device this start opened: the concrete OS object, never a name
-        // lookup (a name can resolve to someone else's adapter). Threaded to `routing.install` and
-        // `Dns::apply`.
+        // lookup (a name can resolve to someone else's adapter). Threaded to `routing.install`, `Dns::apply`
+        // and the standing lockdown cover (`install_standing_cover`, which hands it to `install_lockdown`).
         //
         // Under `#[cfg(test)]` the dispatcher is stubbed out (creating a real TUN needs elevation),
         // so a synthetic identity stands in. That makes phase 7 reachable from a unit test on any

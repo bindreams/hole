@@ -826,7 +826,8 @@ fn windows_state_dir_and_files_are_not_readable_by_users() {
 
 /// The on-disk shapes are the same ladder as [`Target`]'s, and unlike
 /// `Target` they *do* derive `Serialize` — so a `dump!` on one renders the
-/// serde tree and never reaches `ProxyConfig::dump`.
+/// serde tree and never reaches `ProxyConfig::dump`. They are private to the
+/// module, but visibility does not make a secret safe.
 ///
 /// Drives this through `dump!`, not a direct `.dump()` call: a direct call
 /// only proves the hand-written `Dump` impl itself redacts, not that the

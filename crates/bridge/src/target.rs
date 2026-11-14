@@ -73,7 +73,9 @@ enum PersistedTarget {
 
 /// [`Target`]'s `Dump` impl below exists because `Target` has no `Serialize`
 /// to fall through to. These two do: a `dump!` on either would render the serde
-/// tree and never reach `ProxyConfig::dump`, so each has its own impl.
+/// tree and never reach `ProxyConfig::dump`, so each has its own impl. They are
+/// private to this module, but visibility does not make a secret safe: a later
+/// `pub` or a `dump!` inside the module would leak the config.
 ///
 /// Destructured rather than field-accessed, here and in
 /// [`StartupPreferenceFile`]'s impl below: a new field fails compilation

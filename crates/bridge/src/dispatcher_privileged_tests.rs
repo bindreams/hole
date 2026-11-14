@@ -17,8 +17,8 @@
 //! - `dispatcher_opens_tun_names_the_interface_it_opened`: resolves `identity().alias()` back to
 //!   a live OS interface through [`tun_engine::gateway::interface_index_by_name`] (the same
 //!   Windows `ConvertInterfaceAliasToLuid`+`ConvertInterfaceLuidToIndex` / macOS `if_nametoindex`
-//!   lookup production route-install already trusts, reused rather than reimplemented against
-//!   raw platform FFI) and, on macOS, checks that the resolved name has the kernel-assigned
+//!   lookup production route-install already trusts, `pub` so this test reuses it rather than
+//!   reimplementing it against raw platform FFI) and, on macOS, checks that the resolved name has the kernel-assigned
 //!   `utunN` shape, rather than the `WINDOWS_TUN_ALIAS` constant, which is meaningless off
 //!   Windows.
 //!

@@ -452,12 +452,11 @@ impl Routing for MockRouting {
             return Err(RoutingError::RouteSetup("mock install failure".into()));
         }
 
-        // Mirror the INTENDED per-command fatality (`SetupCommand::fatal`): the IPv4 splits and the
-        // server bypass are always fatal, and the IPv6 splits are tolerated where the TUN has no
-        // IPv6 binding. So a narrowed `installed` is returned as `Ok` when only the v6 splits are
-        // missing, the shape `routed_families` exists to report. The real `SystemRouting::install`
-        // does not yet carry that tolerance through to the start (route-failure-policy.md), so this
-        // mock is more tolerant than the real install on that one input.
+        // Mirror the real install's all-or-nothing contract for the IPv4 splits and the server bypass.
+        // The IPv6 splits are tolerated here (a narrowed `installed` returns `Ok`, the shape
+        // `routed_families` reports), but the real `SystemRouting::install` fails the start on any
+        // narrowing, a v6 split included (open, bindreams/hole#1299; route-failure-policy.md). So
+        // the mock diverges from the real install on every v6 narrowing.
         let missing_fatal = planned
             .iter()
             .any(|id| !installed.contains(id) && !matches!(id, RouteId::SplitV6Low | RouteId::SplitV6High));
@@ -1005,7 +1004,8 @@ fn start_reaches_dns_apply_when_the_forwarder_answers() {
 /// Call-site wiring only, not a naming guard. Under `#[cfg(test)]`, `start_inner` builds its
 /// `TunIdentity` from `TunIdentity::synthetic(0xFEED, WINDOWS_TUN_ALIAS)` rather than the real
 /// device-discovery path, so this test cannot catch a regression in macOS's kernel-assigned
-/// naming; only the privileged macOS full-tunnel test can. What it pins: `Routing::install`,
+/// naming; the guard for that is `dispatcher_privileged_tests.rs::dispatcher_opens_tun_names_the_interface_it_opened`.
+/// What it pins: `Routing::install`,
 /// `Routing::install_lockdown`, and `Dns::apply` are all handed the SAME `TunIdentity`'s alias
 /// from one Full-mode start with the standing lockdown engaged. The three signatures take
 /// `&TunIdentity`, so passing three DIFFERENT names is a compile error rather than a runtime
@@ -2819,7 +2819,9 @@ fn route_failure_clears_stale_state_file() {
 /// prefixes) must fail the whole `start` closed, not return a degraded
 /// tunnel: `SystemRouting::install` treats a narrowed `installed` as a hard error and rolls
 /// back, because a user who believes traffic is captured when some of it is not is worse off than
-/// one told Hole failed to connect. `MockRouting::failing_routes` mirrors that contract.
+/// one told Hole failed to connect. `MockRouting::failing_routes` mirrors that contract for the
+/// IPv4 splits and the server bypass only; it tolerates a missing v6 split where the real install
+/// fails (see the mock's `install`).
 #[skuld::test]
 fn partial_route_failure_fails_closed_and_clears_state() {
     rt().block_on(async {

@@ -384,8 +384,8 @@ fn e2e_start_rejects_full_mode_without_socks5(
 // bounds the TCP case. The TCP transit proof lives in
 // `proxy_manager_e2e_tests.rs::tun::e2e_*_full_tunnel_captures_unowned_destination`.
 //
-// OPEN GAP, not closed by this test: in-TUN UDP transit has no coverage anywhere in this suite. Building the oracle
-// needs something that answers a datagram from inside the TUN, which the TCP
+// OPEN GAP, tracked in bindreams/hole#922, not closed by this test: in-TUN UDP transit has no coverage anywhere in
+// this suite. Building the oracle needs something that answers a datagram from inside the TUN, which the TCP
 // oracle gets for free from the handshake. Do not read this test as covering
 // it, and do not delete this note without landing that oracle.
 //
