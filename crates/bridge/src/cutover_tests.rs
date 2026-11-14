@@ -1093,6 +1093,13 @@ fn a_report_with_every_key_class_is_worded_exactly_as_released() {
             None,
         ),
         observation(
+            "b-view",
+            KeyLifetime::BootTime,
+            KeyOutcome::Failed,
+            KeyRole::Enumeration,
+            None,
+        ),
+        observation(
             "other-key",
             KeyLifetime::BootTime,
             KeyOutcome::NotFound,
@@ -1138,7 +1145,7 @@ fn a_report_with_every_key_class_is_worded_exactly_as_released() {
          host can make. Reinstalling this release, {RUNNING_VERSION}, or later (a build can delete a boot-time \
          key only if its own list names it) and running `hole bridge release-covers` elevated puts back the \
          only tool that addresses these keys. \
-         Also, the sweep could not enumerate a-view, so a filter another build left there was not looked for. \
+         Also, the sweep could not enumerate a-view, b-view, so a filter another build left there was not looked for. \
          Running `hole bridge release-covers` elevated again repeats the sweep \
          (reinstall this release, {RUNNING_VERSION}, or later first if `hole` is gone)."
     );

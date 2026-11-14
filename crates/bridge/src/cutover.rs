@@ -329,8 +329,8 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// `hole.exe` still exists on an uninstalling host this message IS the
 /// qualification.
 ///
-/// It reads [`Clearance::leftover_keys`], not [`Clearance::unproven_keys`]: the
-/// twins go unproven on every boot where no bridge engaged, so the unproven set
+/// Leftover boot-time filters are gated by [`Clearance::leftover_keys`], not
+/// reported off [`Clearance::unproven_keys`]: the twins go unproven on every boot where no bridge engaged, so the unproven set
 /// would fire on essentially every Windows uninstall and carry no information.
 /// `leftover_keys` reports when EITHER the standing cover's `PERSISTENT` siblings
 /// in this sweep (`failclosed::KeyRole`) or the persisted
@@ -339,11 +339,11 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// the record is lost with a wiped `state_dir`; silence requires losing both.
 ///
 /// It does NOT assert that a cover is present, since an unproven key is equally
-/// consistent with never having been installed. Three key classes are worded apart.
-/// Two pass the `leftover_keys` gate: leftover boot-time filters and views that
-/// could not be enumerated. A filter the OS refused to delete does not:
-/// [`Clearance::refused_strangers`] reads the unproven set directly, so no sibling
-/// or witness evidence can suppress it.
+/// consistent with never having been installed. Three key classes are worded
+/// apart, and only the filters are gated: a view that could not be enumerated is
+/// always reported, and a filter the OS refused to delete is read off the unproven
+/// set ([`Clearance::refused_strangers`]), so no sibling or witness evidence can
+/// suppress either.
 ///
 /// `running_version` is the build making the report, and the remedy names it: a
 /// key that answered not-found is not live, so no enumeration sees it and only a
@@ -366,8 +366,7 @@ pub fn release_clearance_report(clearance: &Clearance, running_version: &str) ->
 /// Each names its label (it carries the filter's GUID), and its code when the OS gave one. The line always ends in
 /// an operator remedy: a refusal may be transient, so a later sweep may succeed; failing that, an external tool,
 /// since `netsh wfp` has no delete verb. It names no build, so it takes no `running_version`. A refusal does not fail
-/// any sweep and is worded apart from [`boot_time_filters_line`]: the filter is known to exist, and repeating the
-/// sweep that just failed is no remedy.
+/// any sweep and is worded apart from [`boot_time_filters_line`] because the filter is known to exist.
 fn refused_strangers_line(clearance: &Clearance) -> Option<String> {
     let refusals: Vec<String> = clearance
         .refused_strangers()
