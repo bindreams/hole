@@ -1,8 +1,9 @@
 //! Built-in DNS forwarder — carries DNS over the shadowsocks tunnel so
 //! clients paired with TCP-only plugins (v2ray-plugin) can still resolve.
 //!
-//! The architecture is in `docs/contributing/architecture/dns-forwarder.md` and
-//! `docs/contributing/architecture/datapath.md`.
+//! The architecture is in `docs/contributing/architecture/dns-forwarder.md`,
+//! `docs/contributing/architecture/datapath.md` and, for what a crash leaves
+//! behind, `docs/contributing/architecture/crash-recovery.md`.
 
 pub mod bootstrap;
 pub mod connector;

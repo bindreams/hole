@@ -117,4 +117,11 @@ from the app, and the process shutdown token that boot passes to `reconcile_once
   - [TCP accept refusal](tcp-admission.md): admitting, refusing and retiring TCP connections.
   - [The DNS forwarder](dns-forwarder.md): carrying DNS over the tunnel, and the check before a connection starts.
 - Plugins: [where the plugin binaries come from](plugin-binaries.md) and [the galoshes transport](galoshes-transport.md).
-- The route and recovery rules and the process model are in {src}`CONTRIBUTING.md`, under *Architecture*.
+- Routes: [what a failed route command does](route-failure-policy.md), and [which routes Hole may delete](route-ownership.md).
+- State and recovery: [crash recovery](crash-recovery.md) of what a killed bridge left behind, [config
+  recovery](config-recovery.md) for the app's own file, and [native crashes](native-crashes.md).
+- Privilege: [folders a user may own](privileged-folders.md), [the file lock and state files](file-lock.md), [system
+  tools](system-tools.md) and [the update cutover](update-cutover.md).
+- Windows service: [stop reporting](windows-service-stop.md). Test infrastructure: [spawn contention and
+  ports](contention-and-ports.md).
+- The process model is still in {src}`CONTRIBUTING.md`, under *Architecture*.

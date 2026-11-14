@@ -27,7 +27,7 @@
 //!   every NT version; any other kind of reparse point is refused.
 //!
 //! A link is followed under the ownership-transition rule (see `trail` and
-//! CONTRIBUTING.md, "Privileged code in folders a user may own"): the walk never
+//! `docs/contributing/architecture/privileged-folders.md`): the walk never
 //! moves from a folder an unprivileged user owns into one somebody else owns.
 //! Links the system owns (unix: root; Windows: SYSTEM, Administrators,
 //! TrustedInstaller) stay trusted, which keeps macOS's `/var`, `/tmp` and `/etc`

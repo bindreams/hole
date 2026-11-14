@@ -95,6 +95,15 @@ ULA
   `192.168.x.x` address. Hole's tunnel uses one. See
   [the TUN device](../contributing/architecture/tun-device.md#ipv6-in-the-tunnel).
 
+crash marker
+  A small file that Hole's crash handler writes when the process dies of a native fault, such as a segmentation fault. The
+  next start reports it in the log and deletes it. See [native crashes](../contributing/architecture/native-crashes.md).
+
+state directory
+  The folder where the {term}`bridge` keeps its records across a restart: the routes it installed, the plugin processes it
+  started and the {term}`kill switch`'s intent. The next start reads them to clean up after a crash. See
+  [crash recovery](../contributing/architecture/crash-recovery.md).
+
 Unblock Network
   The tray action, shown while Hole is blocking traffic, that lifts the {term}`kill switch`'s block and turns Lockdown
   off, so Hole will not reconnect by itself at the next start. It does not end a running connection.
