@@ -167,10 +167,12 @@ pub(crate) fn escape_sip003(s: &str) -> String {
 /// If the path came from a `config=` value `value_was_mangled_by_unescaping`
 /// flagged (an unescaped literal backslash silently dropped) and the load then
 /// fails with ANY IO-layer error, the error names the escaping as the cause and
-/// offers two corrected spellings, rather than a bare IO error that gives no
-/// hint the real cause was SIP003 escaping. The check is on any IO error, not
-/// only `NotFound`: a dropped backslash can also collapse the path into a
-/// protected location (`PermissionDenied`).
+/// offers corrected spellings, rather than a bare IO error that gives no
+/// hint the real cause was SIP003 escaping. Windows offers two (the doubled
+/// backslashes and the forward-slash form); other platforms offer the doubled
+/// one only. The check is on any IO error, not only `NotFound`: a dropped
+/// backslash can also collapse the path into a protected location
+/// (`PermissionDenied`).
 ///
 /// A path with no `mangled_from` never gets this text. Neither does a
 /// YAML-parse failure on a path that DID resolve to a real file: `yaml_serde`

@@ -1332,9 +1332,13 @@ pub fn parse_udp_timeout(plugin_options: Option<&str>) -> Result<Duration> {
     Ok(selected.unwrap_or(DEFAULT_UDP_TIMEOUT))
 }
 
-/// The yamux hop of the galoshes chain: multiplexes TCP connections and UDP associations over one transport
-/// connection to the remote end. A server instance accepts the transport; a client instance dials it and reconnects
-/// when it dies. Serves TCP and UDP at its listener.
+/// The yamux hop of the galoshes chain: carries TCP connections and UDP associations as substreams of a yamux
+/// transport connection, and reports both transports.
+///
+/// - A client instance binds `local` for TCP and for UDP, serves both there, and relays them over one transport
+///   connection that it dials to `remote` and redials when it dies.
+/// - A server instance binds only a TCP listener on `local`, accepts any number of transport connections there, and
+///   relays each substream, TCP or UDP, to `remote`.
 pub struct YamuxPlugin {
     config: yamux::Config,
     is_server: bool,
@@ -1382,8 +1386,8 @@ impl garter::ChainPlugin for YamuxPlugin {
     ) -> garter::Result<()> {
         // Readiness comes from the bind point itself, over the same channel the
         // tests use: `run_server`/`run_client` send their bound address once
-        // their listeners are up, and a YAMUX plugin serves both TCP and UDP
-        // there. A listener that does not come up sends its typed `StartError`
+        // their listeners are up, and a YAMUX plugin reports both TCP and UDP.
+        // A listener that does not come up sends its typed `StartError`
         // instead: a lost bind is a `BindConflict`, so the chain restarts an
         // intermediate hop on a fresh port and the caller retries a public one.
         // `run` joins the task that forwards it, so `ready` holds it by the

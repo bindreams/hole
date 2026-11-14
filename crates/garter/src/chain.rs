@@ -21,8 +21,7 @@ use crate::tap::INNER_STOP_BOUND;
 /// rather than aborted mid-take-down. The headroom makes that member's own warning come first.
 ///
 /// [`TapPlugin`]: crate::TapPlugin
-pub(crate) const DEFAULT_DRAIN_TIMEOUT: Duration =
-    Duration::from_secs(INNER_STOP_BOUND.as_secs() + TAKEDOWN_TAIL.as_secs());
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(INNER_STOP_BOUND.as_secs() + TAKEDOWN_TAIL.as_secs());
 
 /// Whole-chain readiness reported via [`ChainRunner::on_ready`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,7 +196,7 @@ impl ChainRunner {
     /// was already captured, in which case that error takes precedence, and a start
     /// failure ([`Error::StartFailed`](crate::Error::StartFailed)) outranks both.
     ///
-    /// The default is `DEFAULT_DRAIN_TIMEOUT`. It must outlast the longest
+    /// The default is [`DEFAULT_DRAIN_TIMEOUT`]. It must outlast the longest
     /// take-down a plugin may need after a shutdown: a `BinaryPlugin` gives its
     /// child a grace period to exit and a bound to close its output, and a
     /// `TapPlugin` waits for that plus headroom for its inner, so a plugin that
@@ -269,8 +268,9 @@ impl ChainRunner {
     /// picks for it just before it starts.
     ///
     /// A hop that reports a bind conflict on its intermediate port is stopped and run again on a fresh port, without
-    /// a cap and without disturbing the hops already running; only a shutdown ends that. A conflict on the public port
-    /// is the caller's and is reported.
+    /// a cap and without disturbing the hops already running; only a shutdown ends that. Whatever address the conflict
+    /// names counts, not only the hop's own port: a [`TapPlugin`](crate::TapPlugin) reports its inner's. A conflict on
+    /// the public port is the caller's and is reported.
     ///
     /// Any other start failure (a hop's reported failure, or a hop that ends before it is ready) ends the chain: every
     /// plugin is cancelled, with or without an [`on_ready`](ChainRunner::on_ready) callback, and `run` returns

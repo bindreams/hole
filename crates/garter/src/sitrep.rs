@@ -10,10 +10,15 @@
 //! in this crate's source tree; this module is its reference implementation.
 //!
 //! Readiness has two tiers. Tier 1 is a plugin that speaks sitrep, so the
-//! `hello` handshake and typed events decide readiness. Tier 2 is the
-//! fallback for a plugin that does not (or whose protocol MAJOR the consumer
-//! does not know): readiness is a TCP connect probe on the plugin's listener
-//! and carries no typed failure. See [`ProtocolSupport`].
+//! `hello` handshake and typed events decide readiness. Tier 2 is a TCP
+//! connect probe on the plugin's listener, which carries no typed failure.
+//! [`ReadinessMode`](crate::ReadinessMode) chooses between them: `Probe` always
+//! uses tier 2, and `Auto` starts the probe and stands it down on a supported
+//! `hello`, so tier 2 is its fallback for a plugin that sends none. `ExpectSitrep`
+//! has no such fallback: a plugin that never sends `hello` fails (it closes
+//! stdout) or never readies (it stays silent). A `hello` whose protocol MAJOR
+//! the consumer does not know falls back to tier 2 in `ExpectSitrep` and `Auto`
+//! alike. See [`ProtocolSupport`].
 
 /// The protocol version this consumer SPEAKS. Bump the MAJOR only for breaking
 /// envelope/semantics changes; MINOR is additive (old consumers ignore new

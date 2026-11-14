@@ -36,10 +36,10 @@
 //!    one. A typed failure the inner reports (`BindConflict` when another
 //!    process took the internal port, `Fatal`) becomes the tap's own, so the
 //!    caller sees the same retryable or terminal class. When the tap is an
-//!    intermediate hop, the chain restarts it on that `BindConflict` (whatever
-//!    address it names, not only the tap's own), and the re-run's step 1 picks a
-//!    fresh inner port. The wait is bounded by `INNER_READY_TIMEOUT`, which
-//!    covers an inner that drops its readiness sender but keeps running.
+//!    intermediate hop, the chain re-runs it on that `BindConflict` (see
+//!    [`ChainRunner::run`](crate::ChainRunner::run)), and the re-run's step 1
+//!    picks a fresh inner port. The wait is bounded by [`INNER_READY_TIMEOUT`],
+//!    which covers an inner that drops its readiness sender but keeps running.
 //! 4. Bind the tap's public listener on `local` (only after step 3, so the
 //!    public bind happens only once the data plane is actually wired
 //!    through), then report the tap's OWN readiness on the `ready` channel
@@ -66,11 +66,9 @@
 //! inner's token (a child of `shutdown`) and waits for the inner task, so the
 //! output the inner is still relaying is drained first.
 //!
-//! The chain is still starting, so no `drain_timeout` runs. The wait has a
-//! bound of its own, `INNER_STOP_BOUND`: the whole take-down of a
-//! `BinaryPlugin` inner plus headroom, which an inner that honours its token
-//! never reaches. On expiry the tap warns, naming the plugin, and aborts the
-//! inner.
+//! The wait is bounded by [`INNER_STOP_BOUND`], which an inner that honours its
+//! token never reaches. On expiry the tap warns, naming the plugin, and aborts
+//! the inner.
 //!
 //! How the inner ended is logged (an exit status at debug, a panic at warn) and
 //! otherwise dropped: the failure reported is the tap's, unless the inner
@@ -82,7 +80,10 @@
 //! already made, its one readiness message.
 //!
 //! A start failure the tap has reported is also its `run` error, so a runner
-//! with no `on_ready` sees the chain fail.
+//! with no `on_ready` sees the chain fail. That error is an
+//! [`Error::Chain`](crate::Error::Chain) naming the tap. The one exception is an
+//! inner that ended before it was ready: the tap returns what the inner returned,
+//! and an [`Error::Chain`](crate::Error::Chain) when that was `Ok`.
 
 use std::future::Future;
 use std::io;
@@ -111,13 +112,18 @@ use crate::sitrep::{PluginReady, StartError, Transports};
 static NEXT_TAP_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Failure bound on an inner plugin that may never report readiness: past it the
-/// tap stops the inner and reports a `Fatal` start failure.
-const INNER_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// tap stops the inner and reports the typed failure the inner delivered while
+/// being stopped (e.g. `BindConflict`), else a `Fatal` start failure.
+pub const INNER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Failure bound on the wait for the inner to return after the tap cancelled its token to report a failed start. An
 /// inner must return once its token fires, so this expires only on an inner that does not: the tap then warns and
-/// aborts it. It outlasts a [`BinaryPlugin`](crate::BinaryPlugin) inner's own take-down, so that one is never cut off.
-pub(crate) const INNER_STOP_BOUND: Duration =
+/// aborts it. The chain is still starting, so no [`drain_timeout`](crate::ChainRunner::drain_timeout) runs to end the
+/// wait.
+///
+/// It is the whole take-down of a [`BinaryPlugin`](crate::BinaryPlugin) inner (its root's grace period to exit, then
+/// the bound on its output closing) plus headroom, so that inner is never cut off.
+pub const INNER_STOP_BOUND: Duration =
     Duration::from_secs(crate::binary::TAKEDOWN_BOUND.as_secs() + crate::binary::TAKEDOWN_TAIL.as_secs());
 
 /// Decorator that wraps any [`ChainPlugin`] in a counting loopback hop.
@@ -302,7 +308,6 @@ impl ChainPlugin for TapPlugin {
         //    task itself so an early plugin failure doesn't leave us blocked.
         //    `biased`: a report already delivered outranks the exit that
         //    follows it.
-        // INNER_READY_TIMEOUT is a failure bound on an inner that may never ready, surfaced to the caller.
         let ready_deadline = tokio::time::Instant::now() + INNER_READY_TIMEOUT;
         let reported = tokio::select! {
             biased;
@@ -420,10 +425,7 @@ impl ChainPlugin for TapPlugin {
         //    plugin's lifetime.
         let mut connections: JoinSet<()> = JoinSet::new();
         loop {
-            // Use boolean state to drive control flow because tokio::select!
-            // arms cannot embed `break`/`return` cleanly across multi-arm
-            // match blocks (parser disambiguation gets unhappy). We set
-            // intent here, drop out of select, then act.
+            /// What ended one pass of the `select!` below, acted on after it.
             enum Step {
                 Continue,
                 Break,
@@ -497,8 +499,8 @@ async fn accept_next(
 /// relaying reaches the log before the caller hears of the failure.
 ///
 /// The wait is bounded by [`INNER_STOP_BOUND`], a failure bound on external code: an inner must return once
-/// its token fires, and one that does not is warned about by name and aborted. The chain is still starting, so
-/// no `drain_timeout` runs to end it. The failure being reported is the tap's; how the inner ended is only logged.
+/// its token fires, and one that does not is warned about by name and aborted. The failure being reported is the
+/// tap's; how the inner ended is only logged.
 async fn stop_inner(
     plugin_name: &str,
     inner_stop: &CancellationToken,

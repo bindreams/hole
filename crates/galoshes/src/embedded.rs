@@ -14,8 +14,12 @@ pub struct EmbeddedBinary {
     pub sha256: [u8; 32],
 }
 
-/// An extracted binary whose hash matched, held open: an open descriptor on Unix, on Windows a handle that denies
-/// writes and deletes. Dropping it releases the hold.
+/// An extracted binary that is held open: an open descriptor on Unix, on Windows a handle that denies writes and
+/// deletes. Dropping it releases the hold.
+///
+/// The SHA-256 is taken over a read of the path, and the held handle is a second open of the same path, so the held
+/// file is not proven to be the hashed one. Only on Linux does the held descriptor decide what runs (see
+/// [`exec_path`](Self::exec_path)); elsewhere the path runs. Tracked in bindreams/hole#1334.
 pub struct VerifiedBinary {
     fs_path: PathBuf,
     exec_path: PathBuf,

@@ -312,11 +312,12 @@ impl ChainPlugin for BinaryPlugin {
         // galoshes inside the bridge's chain) joins this tree instead of creating
         // one Unix pgids could escape from.
         //
-        // Only ONE marker name is recognised, so an ancestor and a descendant
-        // must agree on it. A galoshes binary and the garter inside it are built
-        // from one commit and always agree; a separately-released `garter-bin`
-        // driving a separately-released `galoshes` can skew, and mixed pre-1.0
-        // binaries are not supported.
+        // Only ONE marker name is recognised, so the outer garter (Hole's bridge,
+        // `garter-bin`, or any embedder) and galoshes' inner garter must agree on
+        // it. Pairing the garter crate at one version with a galoshes built on
+        // another can mismatch the marker. The nested garter then does not see
+        // this tree's marker and makes its own process group, which the kill of
+        // this tree does not reach. Mixed pre-1.0 binaries are not supported.
         cmd.contain();
         cmd.nesting(cosca::containment::Nesting::Mark);
         let mut child = cmd.spawn().map_err(|e| {
