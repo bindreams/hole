@@ -214,9 +214,9 @@ impl SocketStack {
                     // sides readable and equal — if either this SYN's ISN or
                     // the ISN its owner was admitted with could not be read
                     // off the wire, falling back to `Duplicate` means a
-                    // parsing gap on either side can
-                    // never mint a spurious connection, nor tear down a live
-                    // one on its own harmless retransmit.
+                    // parsing gap on either side can never mint a spurious
+                    // connection, nor tear down a live one on its own
+                    // harmless retransmit.
                     let is_retransmit = match (observed_isn, owners_isn) {
                         (Some(a), Some(b)) => a == b,
                         _ => true,

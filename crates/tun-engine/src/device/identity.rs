@@ -17,9 +17,14 @@
 //!   "the GUID is not ours" are different facts, and only the second may refuse
 //!   on ownership grounds.
 //!
-//! Nothing is verified after the create. The probe does not retry, so a probe
-//! that raced the alias lookup reads as [`Incumbent::None`] and an existing
-//! adapter is adopted unverified: a missed check, never a refusal.
+//! Nothing is verified after the create, and there is no startup sweep of
+//! adapters: a post-create GUID check would judge the create path too, turning
+//! one Windows GUID-assignment quirk into a permanent refusal to connect, and a
+//! sweep would rest on the false belief that only one bridge runs.
+//!
+//! The probe does not retry, so a probe that raced the alias lookup reads as
+//! [`Incumbent::None`] and an existing adapter is adopted unverified: a missed
+//! check, never a refusal.
 //!
 //! Do not probe with `wintun_bindings::Adapter::open` (its `Drop` closes the
 //! adapter, which would destroy a live sibling bridge's) or `Adapter::get_guid`

@@ -57,8 +57,8 @@ pub enum DnsConfineError {
 /// Map a raw Win32 status at `stage` to the matching [`DnsConfineError`]
 /// variant. The FFI call sites route through this so the mapping is testable
 /// without making FWPM fail. A `Stage::AddFilter` / `Stage::Commit` failure
-/// classifies as `AddFilter`, never `EngineOpen`.
-/// seam exists to catch.
+/// classifies as `AddFilter`, never `EngineOpen`: mis-mapping the stage is the
+/// bug this seam exists to catch.
 pub(crate) fn classify(stage: Stage, rc: u32) -> DnsConfineError {
     let io = std::io::Error::from_raw_os_error(rc as i32);
     match stage {

@@ -44,6 +44,11 @@ leftover) and `Foreign` (refuse with `DeviceError::ForeignAdapter`, having writt
 an error, never `Foreign`: "cannot read the GUID" and "the GUID is not ours" are different facts, and only the second
 may refuse on ownership grounds.
 
+Nothing is verified after the create, and nothing sweeps adapters at startup. A post-create GUID check would judge the
+create path as well as the incumbent, so a single Windows GUID-assignment quirk would become a permanent refusal to
+connect. A startup sweep of leftover adapters would rest on the belief that only one bridge runs on the machine, which
+is false.
+
 The probe does not retry. The alias lookup can transiently answer "not found" on a live machine, and a retry would need
 a chosen delay. The cost is bounded and in the safe direction: a raced probe reads as `None`, so an existing adapter is
 adopted without the check. Do not probe with `wintun_bindings::Adapter::open`: its `Drop` closes the adapter, which would

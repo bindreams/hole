@@ -3032,7 +3032,9 @@ mod windows_bypass_teardown_scoping {
         );
     }
 
-    /// A record migrated from schema 1/2/3 never persisted a gateway — the
+    /// A record migrated from schema 1 or 2 never persisted a gateway. The code
+    /// that installs and tears down a live session always has one, so `None`
+    /// reaches teardown only when recovery replays such a leftover record; the
     /// delete must still be attempted (the old unscoped shape, a disclosed
     /// residual), not silently skipped.
     #[skuld::test]

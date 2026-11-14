@@ -389,11 +389,10 @@ fn dns_confine_global_net_state_is_sensitive_to_the_interface_it_names() {
     drop(dev_b);
 }
 
-/// Dropping the guard must fully
-/// release the confinement — a dynamic session's filters vanish with the
-/// engine handle, with no by-key sweep and nothing left to strand a user.
-/// Proven at the wire, after the guard is dropped: `send_to`'s `Ok` alone
-/// cannot attest that DNS is unblocked again.
+/// Dropping the guard must fully release the confinement: a dynamic session's
+/// filters vanish with the engine handle, with no by-key sweep and nothing left
+/// to strand a user. Proven at the wire, after the guard is dropped:
+/// `send_to`'s `Ok` alone cannot attest that DNS is unblocked again.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_filters_die_with_the_session() {
     let dev = open_device("dns-confine-test-tun-f", "10.255.245.1", "255.255.255.0");
@@ -467,8 +466,9 @@ fn dns_confine_global_net_state_permits_the_server_on_port_53() {
 /// Ship gate for the adapter-GUID identity. The vendor header calls the
 /// `RequestedGUID` API "completely undocumented, and so there could be
 /// minor interesting complications with its usage" (`wintun.h`), and
-/// `wintun-bindings` ships a live GUID-mismatch handler. Creates a real adapter through the PRODUCTION path
-/// (`Device::build`, which requests `HOLE_ADAPTER_GUID`), drops it, then
+/// `wintun-bindings` ships a live GUID-mismatch handler. Creates a real adapter
+/// through the PRODUCTION path (`Device::build`, which requests
+/// `HOLE_ADAPTER_GUID`), drops it, then
 /// re-opens by NAME (not by handle) and reads the GUID back via
 /// `probe_incumbent` — the exact ADOPT-path read `Device::build` itself
 /// performs on its next start. If this fails, the ownership gate is

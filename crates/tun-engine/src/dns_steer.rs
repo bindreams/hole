@@ -27,7 +27,6 @@
 //! thread's acknowledgement of the removal. `Drop` is the best-effort
 //! crash/unwind fallback and can only warn on a genuine OS failure, never
 //! propagate one.
-//!
 
 #[cfg(target_os = "macos")]
 #[path = "dns_steer/macos.rs"]

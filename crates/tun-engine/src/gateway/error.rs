@@ -8,30 +8,15 @@
 //! `#[error(...)]` below is a bare literal with no payload interpolation, which
 //! makes that structural rather than a habit.
 //!
-//! `source()` carries the diagnostic cause and call sites log it as an error value
-//! (the chain renders `Display` only, so payload held solely in
-//! `Debug` — `HopDetail`, `interface_index` — is not in the chain: the site
-//! that builds the error logs it). Three of the four
-//! sentences point the user at `bridge.log`, so the cause must travel with the
-//! error; the wrappers (`RoutingError::Gateway`, `ProxyError::Gateway`) hold the
-//! typed error, so the chain survives them.
-
-use std::net::IpAddr;
+//! `source()` carries the diagnostic cause and call sites log it as an error
+//! value (the chain renders `Display` only, so payload held solely in `Debug`,
+//! such as `interface_index`, is not in the chain: the site that builds the
+//! error logs it). Two of the three sentences point the user at `bridge.log`,
+//! so the cause must travel with the error; the wrappers
+//! (`RoutingError::Gateway`, `ProxyError::Gateway`) hold the typed error, so the
+//! chain survives them.
 
 use thiserror::Error;
-
-/// The upstream route a failure is about. `Debug`-only by design: this is
-/// exactly the material that must not reach a toast. Never given a `Display`
-/// impl — that would make leaking it a one-character mistake.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HopDetail {
-    /// OS interface alias (Windows connection name, e.g. `Wi-Fi`).
-    pub interface_alias: String,
-    /// OS interface index.
-    pub interface_index: u32,
-    /// Next hop the route named. Unspecified means the route is on-link.
-    pub next_hop: IpAddr,
-}
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -42,21 +27,6 @@ pub enum GatewayError {
          can build the tunnel."
     )]
     NoDefaultRoute,
-
-    /// Currently unconstructed: an on-link default route classifies as
-    /// [`crate::gateway::NextHop::OnLink`] on Windows and as `NoDefaultRoute` on
-    /// macOS (see `crate::gateway::reject_macos_on_link`).
-    ///
-    /// The copy names two causes and picks neither. On-link is equally the
-    /// signature of another VPN's tunnel adapter and of a point-to-point
-    /// physical link (cellular/WWAN, PPPoE), and telling them apart would take
-    /// an `IfType` allowlist, a heuristic.
-    #[error(
-        "Your default network route has no gateway Hole can route around, so the tunnel cannot \
-         be built. This happens when another VPN is handling your traffic, and on point-to-point \
-         links such as some mobile and PPP connections. See bridge.log for the adapter involved."
-    )]
-    NoUsableGateway { detail: HopDetail },
 
     /// The route lookup itself failed — distinct from it answering "no route".
     /// `code` is the raw OS status, kept for `bridge.log` so a status this

@@ -95,9 +95,8 @@ pub const BLOCK_WEIGHT: u8 = 0;
 
 /// Build the DNS-egress confinement: permit UDP+TCP/53 on `tun_luid` and on
 /// loopback, permit the Shadowsocks server on any port, block UDP+TCP/53
-/// everywhere else. Pure: no FFI;
-/// `windows::engage` submits it in one transaction inside a dynamic
-/// (process-scoped) FWPM session.
+/// everywhere else. Pure: no FFI; `windows::engage` submits it in one
+/// transaction inside a dynamic (process-scoped) FWPM session.
 pub fn build_spec(tun_luid: u64, server_ip: IpAddr) -> ConfineSpec {
     let mut filters = Vec::with_capacity(13);
 

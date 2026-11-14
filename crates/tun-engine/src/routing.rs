@@ -368,10 +368,10 @@ fn route_confirmed_absent(output: &std::process::Output) -> bool {
 /// beyond the exit code, and unlike macOS, a non-zero exit does NOT
 /// unambiguously mean "already gone": `netsh ... delete route` on an absent
 /// route and on a route requiring elevation both exit 1 with no distinguishing
-/// text (verified empirically). Only exit 0 (a
-/// definite, successful delete) confirms the route gone; a non-zero exit
-/// conservatively keeps it recorded rather than risk silently dropping a
-/// route that is still there — a disclosed residual.
+/// text (verified empirically). Only exit 0 (a definite, successful delete)
+/// confirms the route gone; a non-zero exit conservatively keeps it recorded
+/// rather than risk silently dropping a route that is still there — a
+/// disclosed residual.
 #[cfg(not(target_os = "macos"))]
 fn route_confirmed_absent(output: &std::process::Output) -> bool {
     output.status.success()
@@ -1629,11 +1629,11 @@ pub trait Routing: Send + Sync {
     /// The trust argument and its residuals are in
     /// docs/contributing/architecture/kill-switch.md#the-transient-cover.
     ///
-    /// The cover survives a process crash (Windows: persistent WFP filters keyed by fixed
-    /// GUID; macOS: pf enable token persisted to `bridge-failclosed.json`) and is
-    /// swept by [`recover_routes`] on the next start. Does NOT permit the TUN
-    /// interface — the block-until-connected connect gate holds it only until the
-    /// tunnel comes up.
+    /// The cover survives a process crash (Windows: persistent WFP filters
+    /// keyed by fixed GUID; macOS: pf enable token persisted to
+    /// `bridge-failclosed.json`) and is swept by [`recover_routes`] on the next
+    /// start. Does NOT permit the TUN interface — the block-until-connected
+    /// connect gate holds it only until the tunnel comes up.
     fn install_failclosed_cover(
         &self,
         lock: &failclosed::CoverLock,
@@ -1668,9 +1668,13 @@ pub trait Routing: Send + Sync {
     /// method (no default) so every `Routing` implementation, including every
     /// test mock, commits to one.
     ///
-    /// Drops [`failclosed::Clearance`], the operator message, because every
-    /// caller is in-process and `hole bridge unlock` stays reachable. The
-    /// evidence it carries is persisted by `release_all` itself (see
+    /// Drops [`failclosed::Clearance`], the operator message, and this is the
+    /// ONE site allowed to: every caller is in-process (the tray's Unblock,
+    /// `turn_lockdown_off`, session teardown), so `hole.exe` stays on disk and
+    /// `hole bridge unlock` stays reachable. A caller about to remove the binary
+    /// must not use this method: `cutover::release_covers` calls the free
+    /// [`failclosed::release_all`] and reads the clearance. The evidence the
+    /// clearance carries is persisted by `release_all` itself (see
     /// docs/contributing/architecture/kill-switch-uninstall.md). A filter whose
     /// delete the OS refused fails none of these callers; it reaches only the
     /// bridge log, through the warning the provider sweep writes.
@@ -2019,9 +2023,9 @@ impl SystemRouting {
         // another process holds that prefix) is popped from `installed` by
         // `setup_routes`, so setup_result can be `Ok` with `installed` a
         // strict subset of what was planned. A degraded tunnel is worse than
-        // no tunnel: the user believes traffic is captured when
-        // some of it is not. Roll back and fail closed rather than return a
-        // partial connect as success.
+        // no tunnel: the user believes traffic is captured when some of it is
+        // not. Roll back and fail closed rather than return a partial connect
+        // as success.
         let planned = planned_routes(server_ip);
         if installed.len() != planned.len() {
             let missing: Vec<RouteId> = planned.iter().copied().filter(|id| !installed.contains(id)).collect();

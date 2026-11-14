@@ -41,8 +41,11 @@ fn build_remove_adapter_script(tun_name: &str) -> String {
     )
 }
 
-/// Remove every adapter whose name starts with `tun_name`. Failures are logged,
-/// never returned: the caller is already tearing down.
+/// Remove every adapter whose name starts with `tun_name`: the script globs
+/// `'<tun_name>*'`, so `hole-tun` also matches `hole-tun 2` and any other
+/// adapter that merely shares the prefix, including a sibling bridge's
+/// (bindreams/hole#1314). Failures are logged, never returned: the caller is
+/// already tearing down.
 #[cfg(target_os = "windows")]
 pub fn remove_adapter(tun_name: &str) {
     use tracing::{debug, warn};

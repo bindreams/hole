@@ -13,7 +13,7 @@ pub mod error;
 #[path = "gateway/windows.rs"]
 mod platform;
 
-pub use error::{GatewayError, HopDetail};
+pub use error::GatewayError;
 
 /// The raw upstream-route lookup. Public so the privileged integration test can
 /// drive it against a real wintun adapter, which is the only proof that this
@@ -182,9 +182,6 @@ pub fn upstream_route(_dest: IpAddr) -> Result<GatewayInfo, GatewayError> {
 /// bypass — see `reject_macos_on_link`) rejects it itself, after this
 /// classification, rather than this shared function guessing on the caller's
 /// behalf.
-///
-/// Neither refusal below constructs a `HopDetail`; on those two branches the
-/// `warn!` is the only thing that carries the hop.
 pub(crate) fn classify_hop(hop: Option<RouteHop>, ipv6_available: bool) -> Result<GatewayInfo, GatewayError> {
     let Some(hop) = hop else {
         warn!("no default route: nothing routes off this host");
@@ -226,8 +223,7 @@ pub(crate) fn classify_hop(hop: Option<RouteHop>, ipv6_available: bool) -> Resul
 /// macOS has no interface-scoped IPv4 bypass form (`routing.rs`'s Windows IPv4
 /// bypass builder does; the macOS one does not), so an on-link default route is
 /// a refusal there even though [`classify_hop`] accepts it. The error is
-/// `NoDefaultRoute` rather than `NoUsableGateway`, whose message describes
-/// a condition Windows supports.
+/// `NoDefaultRoute`.
 ///
 /// Pure and platform-independent so it is testable without macOS; the platform
 /// gate is at its one call site, not in this function.

@@ -469,8 +469,9 @@ fn a_client_rst_after_the_synack_reverts_the_socket_to_listen() {
     assert!(stack.socket(handle).remote_endpoint().is_none());
 }
 
-/// A reverted socket must not outrank the re-armed listener and swallow the
-/// next client's SYN, which no accept path could see.
+/// Pins the hazard `SocketStack::settle_packet` avoids: at the `SocketStack`
+/// level a socket that reverted to `Listen` outranks the re-armed listener in
+/// slot order and swallows the next client's SYN, which no accept path can see.
 #[skuld::test]
 fn a_reverted_socket_would_hijack_a_later_syn() {
     let mut stack = stack();
@@ -544,9 +545,10 @@ fn retiring_a_timewait_socket_would_hold_it_but_removing_does_not() {
     assert!(!dropped.sockets.iter().any(|(h, _)| h == handle));
 }
 
-/// A FIN that also carries data
-/// stays unacknowledged past the poll that ingests it, because arming the
-/// delayed-ACK timer happens before the ingress ACK check ever runs.
+/// Pins that the ACK covering a data-carrying FIN's payload and the FIN itself
+/// leaves on the poll that ingests them. With a delayed-ACK timer, smoltcp arms
+/// it before the ingress ACK check runs, so the ACK would stay unsent past that
+/// poll and the socket could be removed first.
 #[skuld::test]
 fn a_fin_carrying_data_is_acknowledged_before_the_socket_can_be_removed() {
     let isn = 1000u32;

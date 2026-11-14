@@ -10,7 +10,9 @@
 //! persistent covers, because a lockdown cover outliving the bridge is the
 //! user's intent while a DNS block outliving the bridge is pure harm.
 //!
-//! `#[cfg]`-free facade, mirroring `routing::failclosed`'s shape.
+//! The facade is not `#[cfg]`-free for callers: [`spec`] is exported on every
+//! target, but `engage`, `DnsConfineError` and `DnsConfinement` exist on Windows
+//! only.
 
 pub mod spec;
 
