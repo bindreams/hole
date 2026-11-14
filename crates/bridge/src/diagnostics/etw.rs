@@ -263,7 +263,7 @@ impl Drop for EtwGuard {
     fn drop(&mut self) {
         // Stop the periodic timer thread FIRST and join it, so no live-phase
         // query can still be in flight when the stop-phase query and
-        // `stop_session` below run — see [`EtwGuard`]'s "Drop's added wait".
+        // `stop_session` below run — see `EtwGuard`'s "Drop's added wait".
         drop(self.stats_tx.take());
         if let Some(stats_thread) = self.stats_thread.take() {
             if let Err(e) = stats_thread.join() {
@@ -301,7 +301,7 @@ impl Drop for EtwGuard {
             } else {
                 // `stop_session` returned `false` -- see its doc for what
                 // that guarantees and doesn't. Abandoning here is not free:
-                // it forfeits the drain-on-drop guarantee ([`EtwGuard`]'s
+                // it forfeits the drain-on-drop guarantee (`EtwGuard`'s
                 // "Drain on Drop") for whatever the processing thread still
                 // has queued, and that loss is accepted only because a join
                 // with no remaining exit condition would hang shutdown
@@ -328,8 +328,8 @@ impl EtwGuard {
     /// STOP issued after it failed, in which case the processing thread
     /// will still return on its own; `false` cannot distinguish that from a
     /// session genuinely still live, so a caller must not join the
-    /// processing thread on the strength of this return value alone ([`EtwGuard`]'s
-    /// [Drain on Drop](EtwGuard#drain-on-drop)).
+    /// processing thread on the strength of this return value alone
+    /// ([Drain on Drop](EtwGuard#drain-on-drop)).
     ///
     /// Why a by-name STOP is needed, and why it is the third close+STOP attempt
     /// rather than the second: [Drain on Drop](EtwGuard#drain-on-drop).

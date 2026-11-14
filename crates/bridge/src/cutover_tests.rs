@@ -1093,11 +1093,25 @@ fn a_report_with_every_key_class_is_worded_exactly_as_released() {
             None,
         ),
         observation(
+            "other-key",
+            KeyLifetime::BootTime,
+            KeyOutcome::NotFound,
+            KeyRole::Plain,
+            None,
+        ),
+        observation(
             "a-stranger",
             KeyLifetime::BootTime,
             KeyOutcome::Failed,
             KeyRole::Unlisted,
             Some(5),
+        ),
+        observation(
+            "b-stranger",
+            KeyLifetime::BootTime,
+            KeyOutcome::Failed,
+            KeyRole::Unlisted,
+            None,
         ),
     ];
     let report = release_clearance_report(
@@ -1107,8 +1121,14 @@ fn a_report_with_every_key_class_is_worded_exactly_as_released() {
     .expect("reported");
 
     let expected = format!(
-        "covers released, but the OS refused to delete a-stranger (code 0x00000005). {REFUSED_STRANGER_REMEDY} \
-         Also, 1 boot-time filter key(s) could not be proven empty: twin-key. \
+        "covers released, but the OS refused to delete a-stranger (code 0x00000005); \
+         the OS refused to delete b-stranger. \
+         Boot-time filters are live only between kernel start and Base Filtering Engine \
+         start, so they block nothing now, but one that survives can block egress early in the next boot. A refusal may \
+         be transient: after a reboot, or on a later `hole bridge unlock`, the sweep may delete what it refused. Failing \
+         that, remove each by its key with an elevated tool that calls `FwpmFilterDeleteByKey0` (`netsh wfp` has no \
+         delete verb). \
+         Also, 2 boot-time filter key(s) could not be proven empty: twin-key, other-key. \
          A boot-time filter is live only between kernel start and Base Filtering Engine start, \
          so a delete-by-key finds nothing on any later boot whether or not a policy record \
          survives behind it. To check after this uninstall, run `netsh wfp show boottimepolicy` \

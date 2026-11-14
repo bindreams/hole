@@ -339,25 +339,51 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// the record is lost with a wiped `state_dir`; silence requires losing both.
 ///
 /// It does NOT assert that a cover is present, since an unproven key is equally
-/// consistent with never having been installed. Each key class that passes the
-/// gate is worded apart: `refused_strangers_line`, `boot_time_filters_line`
-/// and `unenumerated_views_line`.
+/// consistent with never having been installed. Three key classes are worded apart.
+/// Two pass the `leftover_keys` gate: [`boot_time_filters_line`] and
+/// [`unenumerated_views_line`]. A filter the OS refused to delete does not:
+/// [`refused_strangers_line`] reads [`Clearance::refused_strangers`], which reads the
+/// unproven set directly, so no sibling or witness evidence can suppress it.
 ///
 /// `running_version` is the build making the report, and the remedy names it: a
 /// key that answered not-found is not live, so no enumeration sees it and only a
 /// build whose list names the key can address it. The running build's list names
 /// every key it installs, so a key a later release adds needs no edit here.
+#[allow(rustdoc::private_intra_doc_links)]
 pub fn release_clearance_report(clearance: &Clearance, running_version: &str) -> Option<String> {
     let mut parts = Vec::new();
-    if let Some(refused) = refused_strangers_line(clearance) {
-        parts.push(format!("{refused}. {REFUSED_STRANGER_REMEDY}"));
-    }
+    parts.extend(refused_strangers_line(clearance));
     parts.extend(boot_time_filters_line(clearance, running_version));
     parts.extend(unenumerated_views_line(clearance, running_version));
     if parts.is_empty() {
         return None;
     }
     Some(format!("covers released, but {}", parts.join(" Also, ")))
+}
+
+/// The line for the filters the OS refused to delete ([`Clearance::refused_strangers`]), or `None` when there are
+/// none.
+///
+/// Each names its label (it carries the filter's GUID), and its code when the OS gave one. The line always ends in
+/// an operator remedy: a refusal may be transient, so a later sweep may succeed; failing that, an external tool,
+/// since `netsh wfp` has no delete verb. It names no build, so it takes no `running_version`. A refusal does not fail
+/// any sweep and is worded apart from [`boot_time_filters_line`]: the filter is known to exist, and repeating the
+/// sweep that just failed is no remedy.
+fn refused_strangers_line(clearance: &Clearance) -> Option<String> {
+    let refusals: Vec<String> = clearance
+        .refused_strangers()
+        .map(|(label, code)| match code {
+            Some(code) => format!("the OS refused to delete {label} (code 0x{code:08x})"),
+            None => format!("the OS refused to delete {label}"),
+        })
+        .collect();
+    if refusals.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}. Boot-time filters are live only between kernel start and Base Filtering Engine          start, so they block nothing now, but one that survives can block egress early in the next boot. A refusal may          be transient: after a reboot, or on a later `hole bridge unlock`, the sweep may delete what it refused. Failing          that, remove each by its key with an elevated tool that calls `FwpmFilterDeleteByKey0` (`netsh wfp` has no          delete verb).",
+        refusals.join("; "),
+    ))
 }
 
 /// The line for the leftover filter keys ([`Clearance::leftover_filters`]), or `None` when there are none.
@@ -408,30 +434,6 @@ fn unenumerated_views_line(clearance: &Clearance, running_version: &str) -> Opti
          (reinstall this release, {running_version}, or later first if `hole` is gone).",
         views.join(", "),
     ))
-}
-
-/// What the operator can do about filters the OS refused to delete: a refusal may be transient, so the sweep may
-/// succeed later; failing that, an external tool, since `netsh wfp` has no delete verb.
-const REFUSED_STRANGER_REMEDY: &str = "Boot-time filters are live only between kernel start and Base Filtering Engine \
-     start, so they block nothing now, but one that survives can block egress early in the next boot. A refusal may \
-     be transient: after a reboot, or on a later `hole bridge unlock`, the sweep may delete what it refused. Failing \
-     that, remove each by its key with an elevated tool that calls `FwpmFilterDeleteByKey0` (`netsh wfp` has no \
-     delete verb).";
-
-/// One line naming each filter under Hole's provider that no key list names and the OS refused to delete, with the
-/// code it answered when it did, or `None` when there is none.
-fn refused_strangers_line(clearance: &Clearance) -> Option<String> {
-    let lines: Vec<String> = clearance
-        .refused_strangers()
-        .map(|(label, code)| match code {
-            Some(code) => format!("the OS refused to delete {label} (code 0x{code:08x})"),
-            None => format!("the OS refused to delete {label}"),
-        })
-        .collect();
-    if lines.is_empty() {
-        return None;
-    }
-    Some(lines.join("; "))
 }
 
 /// Every state dir OTHER than the service's that a bridge on this host could be
