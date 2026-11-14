@@ -1,6 +1,7 @@
-// Route ALL v2ray-core logs to stderr so stdout carries ONLY sitrep events.
-// The init() runs before main() and before core.New(), so the Console
-// HandlerCreator override is in place before app/log.New reads the map.
+// Routes all v2ray-core logs to stderr, so stdout carries only sitrep events.
+// init runs before main and before core.New, so the Console HandlerCreator
+// override is in place before app/log.New reads the registered creators.
+
 package main
 
 import (
@@ -9,9 +10,8 @@ import (
 	clog "github.com/v2fly/v2ray-core/v5/common/log"
 )
 
-// stderrConsoleCreator is the HandlerCreator registered for LogType_Console.
-// It is extracted as a named function so unit tests can call it directly and
-// assert it returns a non-nil Handler without touching global state.
+// stderrConsoleCreator is the HandlerCreator registered for LogType_Console. It is
+// a named function so tests can call it directly.
 func stderrConsoleCreator(_ vlog.LogType, _ vlog.HandlerCreatorOptions) (clog.Handler, error) {
 	return clog.NewLogger(clog.CreateStderrLogWriter()), nil
 }

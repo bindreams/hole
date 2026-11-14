@@ -12,14 +12,14 @@ import (
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 )
 
-// Registered once for the whole binary through the real production entry point,
-// so the flag-to-live-controller path main() runs is covered rather than
-// re-implemented here. At this point flag defaults are assigned, so this
-// registers keepAliveDialerController({15,15,3}) -- exactly testParams().
+// TestMain registers the keepalive controller once for the whole binary, through
+// the real production entry point, so the flag-to-controller path main runs is
+// covered rather than re-implemented. With the flag defaults it registers
+// exactly testParams().
 //
 // Once per binary is required: internet.RegisterDialerController appends to a
 // process-global slice with no removal, so registering inside a test would leak
-// into every later test and would double under -count=2.
+// into every later test and double under -count=2.
 func TestMain(m *testing.M) {
 	common.Must(registerTCPKeepAlive())
 	os.Exit(m.Run())

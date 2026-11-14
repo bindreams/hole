@@ -3,6 +3,7 @@ package main
 import (
 	gotls "crypto/tls"
 	"crypto/x509"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -36,22 +37,17 @@ import (
 	"github.com/v2fly/v2ray-core/v5/transport/internet/websocket"
 )
 
-// muxDefault, tcpKeepAliveDefault, and fwmarkDefault are these three flags'
-// registered defaults, named so the values aren't repeated as magic
-// numbers at the flag registration and (for mux) in doc comments elsewhere
-// that reference "the default".
+// muxDefault, tcpKeepAliveDefault and fwmarkDefault are the registered defaults of
+// the mux, tcp-keepalive and fwmark flags.
 const (
 	muxDefault          = 1
 	tcpKeepAliveDefault = 15
 	fwmarkDefault       = 0
 )
 
-// allowedEchModes is the single source of truth for the `ech` option's
-// vocabulary, referenced both by parseOptsIntoFlags' parse-time validation
-// (main.go, reachable from SS_PLUGIN_OPTIONS) and by buildTLSConfig's own
-// switch below (reachable from a raw `-ech=` CLI flag, which bypasses
-// parseOptsIntoFlags entirely) -- keeping one list means a future mode
-// addition can't update one check and silently miss the other.
+// allowedEchModes lists the values of the `ech` option. parseOptsIntoFlags
+// (options from SS_PLUGIN_OPTIONS) and generateConfig (which also sees a raw
+// `-ech=` flag) both validate against it.
 var allowedEchModes = []string{"auto", "always", "never"}
 
 var (
@@ -68,7 +64,7 @@ var (
 	certRaw      = flag.String("certRaw", "", "Raw TLS certificate content. Intended only for Android.")
 	key          = flag.String("key", "", "(server) Path to TLS key file. Default: ~/.acme.sh/{host}/{host}.key")
 	mode         = flag.String("mode", "websocket", "Transport mode: websocket, quic (enforced tls).")
-	mux          = flag.Int("mux", muxDefault, "Concurrent multiplexed connections (websocket client mode only).")
+	mux          = flag.Int("mux", muxDefault, "Concurrent multiplexed connections (websocket mode only); 0 disables Mux.Cool. Client and server must agree on whether it is on.")
 	server       = flag.Bool("server", false, "Run in server mode")
 	logLevel     = flag.String("loglevel", "", "loglevel for v2ray: debug, info, warning (default), error, none.")
 	version      = flag.Bool("version", false, "Show current version of ex-ray")
@@ -78,13 +74,11 @@ var (
 	tcpKeepAlive = flag.Int("tcp-keepalive", tcpKeepAliveDefault, "Seconds an idle outbound connection waits before TCP keepalive probes start. Three probes at the same spacing follow, so a black-holed idle connection is dropped after about four times this value. 0 disables keepalive entirely, including Go's own default.")
 )
 
-// redactedError wraps cause for errors.Is/errors.As chaining while keeping
-// Error() text limited to msg -- used where cause's own Error() text may
-// embed operator-supplied content (e.g. a cert/key path built from
-// SS_PLUGIN_OPTIONS) that must never reach the sitrep. v2ray-core's own
-// Error.Base() couples Unwrap() to an Error() that unconditionally appends
-// the wrapped error's text, so it cannot express "chainable but redacted"
-// -- this type can.
+// redactedError wraps cause so errors.Is and errors.As see through to it, while
+// Error() returns only msg. It is for errors whose cause text may embed
+// operator-supplied content (such as a cert or key path from SS_PLUGIN_OPTIONS)
+// that must not reach the sitrep. v2ray-core's Error.Base cannot do this: its
+// Error() always appends the wrapped error's text.
 type redactedError struct {
 	msg   string
 	cause error
@@ -93,13 +87,10 @@ type redactedError struct {
 func (e *redactedError) Error() string { return e.msg }
 func (e *redactedError) Unwrap() error { return e.cause }
 
-// homeDir resolves the operator's home directory, used only to build the
-// default ~/.acme.sh cert/key paths when the server-mode operator gave
-// neither. Returns an error rather than exiting directly, so a failure here
-// reaches main() through the same buildTLSConfig -> generateConfig ->
-// buildV2Ray -> failFatal path as every other config-class error in this
-// file -- a `fatal` sitrep with exit 23, not a bare stderr line and exit 1
-// that breaks the sitrep's hello-then-exactly-one-terminal-event contract.
+// homeDir returns the current user's home directory, for the default
+// ~/.acme.sh cert and key paths. It returns an error instead of exiting so the
+// failure reaches main as a `fatal` sitrep (exit 23), keeping the sitrep's
+// hello-then-exactly-one-terminal-event contract.
 func homeDir() (string, error) {
 	usr, err := user.Current()
 	if err != nil {
@@ -108,6 +99,9 @@ func homeDir() (string, error) {
 	return usr.HomeDir, nil
 }
 
+// readCertificate returns the PEM certificate named by *cert, else the one in
+// *certRaw (the body without the BEGIN/END lines, which it adds). One of the
+// two must be non-empty.
 func readCertificate() ([]byte, error) {
 	if *cert != "" {
 		return filesystem.ReadFile(*cert)
@@ -121,12 +115,9 @@ func readCertificate() ([]byte, error) {
 	panic("thou shalt not reach hear")
 }
 
-// logConfig builds the v2ray-core log config for the operator-chosen
-// level. An unrecognized value is fatal rather than silently resolving to
-// the Warning default -- the empty string ("" -- no loglevel option given)
-// and the explicit "warning" spelling are the two ways to ask for that
-// default; anything else that doesn't match a known level is an error, not
-// a guess.
+// logConfig builds the v2ray-core log config for logLevel (debug, info,
+// warning, error or none, case-insensitive). Empty means the default,
+// warning. Any other value is an error, never a silent fallback to the default.
 func logConfig(logLevel string) (*vlog.Config, error) {
 	config := &vlog.Config{
 		Error:  &vlog.LogSpecification{Type: vlog.LogType_Console, Level: clog.Severity_Warning},
@@ -150,60 +141,40 @@ func logConfig(logLevel string) (*vlog.Config, error) {
 	return config, nil
 }
 
-func parseLocalAddr(localAddr string) []string {
-	return strings.Split(localAddr, "|")
-}
-
-// canonicalLocalAddr validates s as a single IP literal and returns
-// v2ray-core's own canonical string form for it -- the single source of
-// truth both main()'s pre-bind guard and generateConfig's own
-// self-validation route through, and the exact address v2ray-core will
-// actually bind. This matters because net.ParseAddress folds some inputs
-// that don't look identical to what it returns: an IPv4-mapped IPv6
-// literal ("::ffff:127.0.0.1") is valid per net.ParseIP (main.go would
-// otherwise accept it) but v2ray-core's own IPAddress folds it into plain
-// IPv4 ("127.0.0.1") before binding -- reporting the raw, unfolded string
-// as the sitrep's `ready.listen` would disagree with what was actually
-// bound. ok is false when s is not a single IP literal (a `|`-joined
-// multi-address list, or a hostname net.ParseAddress resolves to the
-// domain family).
-func canonicalLocalAddr(s string) (canonical string, ok bool) {
-	addrs := parseLocalAddr(s)
-	if len(addrs) != 1 {
-		return "", false
+// listenAddr returns the address and port the inbound binds, from *localAddr and
+// *localPort, and what `ready` reports as `listen`. It refuses port 0
+// (v2ray-core cannot report an OS-assigned port) and anything but exactly one IP
+// literal (`ready` carries one address). The address is v2ray-core's canonical
+// form, so "::ffff:127.0.0.1" returns as 127.0.0.1, and the port is the parsed
+// number, so "01984" returns as 1984. Errors name the option, never the value;
+// main reports their text as the `fatal` detail.
+func listenAddr() (net.Address, net.Port, error) {
+	port, err := net.PortFromString(*localPort)
+	if err != nil {
+		return nil, 0, errors.New("invalid localPort: not a valid port")
 	}
-	addr := net.ParseAddress(addrs[0])
+	if port == 0 {
+		return nil, 0, errors.New("invalid localPort: port-0 OS-assignment is not supported (v2ray-core does not expose the bound port)")
+	}
+	if strings.Contains(*localAddr, "|") {
+		return nil, 0, errors.New("invalid localAddr: a single listen address is required (the ready sitrep cannot report more than one)")
+	}
+	addr := net.ParseAddress(*localAddr)
 	if !addr.Family().IsIP() {
-		return "", false
+		return nil, 0, errors.New("invalid localAddr: must be an IP literal")
 	}
-	return addr.IP().String(), true
+	return addr, port, nil
 }
 
-// validPort parses and range-checks a SIP003 port string, the single
-// source of truth both main()'s early port-0 guard and generateConfig's
-// own localPort/remotePort validation route through -- two independently
-// written parsers is exactly the kind of drift that can silently
-// reintroduce a port-0/mis-report bug: strconv.Atoi alone accepts syntax
-// (e.g. a leading "+") that net.PortFromString (built on
-// strconv.ParseUint) rejects.
-func validPort(s string) (net.Port, error) {
-	return net.PortFromString(s)
-}
-
-// uint32Opt converts an operator-supplied integer option to uint32, rejecting
-// out-of-range values loudly instead of letting them silently wrap. The bound
-// guard wrapping the conversion is gosec G115's recognized mitigation, so the
-// cast needs no //nolint. The error propagates through generateConfig ->
-// buildV2Ray -> main's emitFatal + os.Exit(23), the same config-error path
-// (exit 23) as an invalid remotePort (main.go).
+// uint32Opt converts an integer option to uint32, returning an error that
+// names the option if v is out of range instead of letting it wrap. The bound
+// guard is what gosec G115 recognizes, so the conversion needs no //nolint.
 func uint32Opt(name string, v int) (uint32, error) {
 	if v >= 0 && v <= math.MaxUint32 {
 		return uint32(v), nil
 	}
-	// v2ray-core's newError concatenates its arguments with no separator
-	// (serial.Concat), so this must be one pre-formatted string, not
-	// comma-separated fragments -- "invalid", name, "(..." would run
-	// together as "invalidmux(...".
+	// newError joins its arguments with no separator, so this is one pre-formatted
+	// string.
 	return 0, newError(fmt.Sprintf("invalid %s (expected 0..4294967295)", name))
 }
 
@@ -233,10 +204,11 @@ func tcpKeepAliveParams() (keepAliveParams, error) {
 	return keepAliveParams{IdleSeconds: idle, IntervalSeconds: idle, Probes: keepAliveProbeCount}, nil
 }
 
-// registerTCPKeepAlive must run exactly once, before core.New: it mutates
-// process-global state, and generateConfig deliberately does not call it
-// because RegisterDialerController appends and the tests call generateConfig
-// repeatedly.
+// registerTCPKeepAlive installs the dialer controller that applies the
+// tcp-keepalive option to outbound sockets. It must run exactly once, before
+// core.New: it mutates process-global state, and generateConfig deliberately
+// does not call it because RegisterDialerController appends and the tests call
+// generateConfig repeatedly.
 //
 // Server mode is skipped: ex-ray's outbound there dials loopback to ss-server,
 // and a listener is unreachable from a dialer controller anyway.
@@ -255,14 +227,17 @@ func registerTCPKeepAlive() error {
 	return internet.RegisterDialerController(ctl)
 }
 
-// buildTLSConfig assembles the v2ray tls.Config: SNI stays *host, ECH is armed
-// by Ech_DOHserver (ech != "never" with a non-empty ech-doh), and ech=always
-// also sets RequireEch so v2ray aborts the dial rather than leak a cleartext SNI
-// when the ECH config can't be obtained.
+// buildTLSConfig assembles the v2ray tls.Config. SNI stays *host. ECH is armed by
+// Ech_DOHserver (ech is not "never" and ech-doh is set), and ech=always also sets
+// RequireEch so v2ray aborts the dial rather than leak a cleartext SNI when no
+// ECH config can be obtained.
 //
-// ech=always with an empty ech-doh is a configuration error (mirrors main.go's
-// exit-23 contract): "always" promises fail-closed ECH, impossible without a
-// DoH source.
+// ech=always with an empty ech-doh is a configuration error: "always" promises
+// fail-closed ECH, impossible without a DoH source.
+//
+// Server mode reads the certificate and key (defaulting to ~/.acme.sh/{host}/).
+// A client reads a certificate only to pin it as the trusted CA. Both are
+// checked to parse. Read errors carry no path (see redactedError).
 func buildTLSConfig() (*tls.Config, error) {
 	tlsConfig := &tls.Config{ServerName: *host}
 
@@ -295,12 +270,9 @@ func buildTLSConfig() (*tls.Config, error) {
 			logWarn("failed to read key file:", err)
 			return nil, &redactedError{msg: "failed to read key file", cause: err}
 		}
-		// A readable but unparseable cert/key pair is otherwise never
-		// caught before ready: v2ray-core's own BuildCertificates logs
-		// "ignoring invalid X509 key pair" at Warning and silently drops
-		// it, leaving zero certificates configured rather than failing to
-		// start. gotls.X509KeyPair is the same parse the TLS stack itself
-		// performs, so anything it accepts, v2ray-core would too.
+		// v2ray-core drops an unparseable pair with only a warning, leaving no
+		// certificate configured, so check it here. X509KeyPair is the parse the TLS
+		// stack itself performs.
 		if _, err := gotls.X509KeyPair(certificate.Certificate, certificate.Key); err != nil {
 			logWarn("cert and key are not a valid X509 key pair:", err)
 			return nil, &redactedError{msg: "cert and key are not a valid X509 key pair", cause: err}
@@ -314,42 +286,24 @@ func buildTLSConfig() (*tls.Config, error) {
 			logWarn("failed to read cert:", err)
 			return nil, &redactedError{msg: "failed to read cert", cause: err}
 		}
-		// Client-side pinned CA: an unparseable PEM is otherwise never
-		// caught before ready either -- v2ray-core's GetTLSConfig only
-		// logs AppendCertsFromPEM's failure and leaves RootCAs nil, which
-		// silently falls back to the system root pool instead of the
-		// operator's pinned CA.
+		// v2ray-core's GetTLSConfig only logs a PEM that fails to parse and then falls
+		// back to the system root pool instead of the pinned CA, so check it here.
 		if !x509.NewCertPool().AppendCertsFromPEM(certificate.Certificate) {
 			logWarn("cert is not a valid PEM certificate")
 			return nil, newError("cert is not a valid PEM certificate")
 		}
 		tlsConfig.Certificate = []*tls.Certificate{&certificate}
-		// Windows only: without this, the pinned CA above is silently
-		// never applied at all there. config_windows.go's getCertPool
-		// returns (nil, nil) unconditionally unless DisableSystemRoot is
-		// set, leaving RootCAs nil and verification falling back to the
-		// machine's system root pool -- any CA trusted by the OS
-		// (including one an attacker or an MDM profile installed) would
-		// then satisfy verification instead of only the operator's pin.
-		// Scoped to Windows deliberately: on every other platform,
-		// config_other.go already APPENDS the supplied cert to a copy of
-		// the system pool without this flag, which is the existing,
-		// working, non-buggy behavior -- setting DisableSystemRoot there
-		// too would additionally stop trusting the system pool, a
-		// separate security-posture change (stricter pinning vs. "pin
-		// plus system roots") this fix doesn't make unilaterally.
+		// Windows only: config_windows.go's getCertPool returns a nil pool unless
+		// DisableSystemRoot is set, so without this the pin is ignored and any
+		// OS-trusted CA satisfies verification. Other platforms append the cert to the
+		// system pool (config_other.go) and keep trusting the system roots.
 		if runtime.GOOS == "windows" {
 			tlsConfig.DisableSystemRoot = true
 		}
 	}
 
-	// Unreachable from main(): generateConfig already runs this identical
-	// check before ever calling buildTLSConfig, so on the real
-	// (main()-driven) call path *echMode is always already valid here.
-	// Kept as buildTLSConfig's own guard because it IS independently
-	// reachable -- this func is called directly (bypassing generateConfig
-	// entirely) by its own tests, e.g. TestBuildTLSConfigEch's "invalid
-	// mode" case.
+	// generateConfig runs this check too; it is repeated because tests call
+	// buildTLSConfig directly.
 	if !slices.Contains(allowedEchModes, *echMode) {
 		return nil, newError(fmt.Sprintf("invalid ech mode (expected one of %s)", strings.Join(allowedEchModes, ", ")))
 	}
@@ -366,19 +320,17 @@ func buildTLSConfig() (*tls.Config, error) {
 			return nil, newError("ech=always requires ech-doh to be set; refusing to start without a DoH source for fail-closed ECH")
 		}
 	default:
-		// Unreachable given the slices.Contains guard above: every value in
-		// allowedEchModes must have a case here, or a future entry added to
-		// the list without a matching case would silently apply no ECH
-		// config at all instead of failing loudly -- exactly the class of
-		// bug this file otherwise fails loud on.
+		// Unreachable given the guard above: a mode added to allowedEchModes without
+		// a case here must fail loudly, not apply no ECH config.
 		panic(fmt.Sprintf("unreachable: echMode %q passed the allowedEchModes guard but has no switch case", *echMode))
 	}
 
 	return tlsConfig, nil
 }
 
+// defaultFingerprint is the uTLS fingerprint a client websocket dial mimics.
 // chrome_auto tracks the newest Chrome the vendored uTLS knows and is
-// ECH-capable, so SNI concealment composes with the mimicked fingerprint.
+// ECH-capable, so SNI concealment composes with it.
 const defaultFingerprint = "chrome_auto"
 
 // securitySettings returns the stream's security proto message. A client
@@ -396,78 +348,44 @@ func securitySettings(tlsConfig *tls.Config) proto.Message {
 	return tlsConfig
 }
 
+// generateConfig builds the v2ray-core config from the flags. Client mode
+// listens on localAddr:localPort as plain TCP and sends the traffic to
+// remoteAddr:remotePort over the websocket or quic transport; server mode
+// listens on localAddr:localPort over that transport and forwards to
+// remoteAddr:remotePort.
+//
+// It rejects invalid options itself, whatever main has already checked, because
+// tests call it directly. With tls on it calls buildTLSConfig, which refuses
+// ech=always with an empty ech-doh; the form of ech-doh is checked by
+// parseURLOption. Error text never contains an option value.
 func generateConfig() (*core.Config, error) {
-	// Both the syntax check and the ==0 case below are unreachable from
-	// main(): main() already validates *localPort with this same validPort,
-	// rejecting a parse failure and port-0 separately, before ever calling
-	// buildV2Ray/generateConfig. Kept here as generateConfig's own guard
-	// because it IS independently reachable -- this func's own unit tests
-	// call it directly, bypassing main() entirely.
-	lport, err := validPort(*localPort)
+	listenHost, listenPort, err := listenAddr()
 	if err != nil {
-		return nil, newError("invalid localPort: not a valid port")
+		return nil, err
 	}
-	// A localPort=0 parses as in-range (validPort allows 0..65535) but
-	// would bind an OS-assigned ephemeral port that v2ray-core exposes
-	// through no public API -- the same silent mis-report class
-	// remotePort's own ==0 guard below closes, and the one main()'s
-	// pre-bind check exists to prevent on the real call path.
-	if lport == 0 {
-		return nil, newError("invalid localPort: must not be 0")
-	}
-	// localAddr must be a single IP literal, via the same canonicalLocalAddr
-	// main()'s pre-bind guard uses. Unreachable from the real
-	// main()-driven call path, since main() already rejects a
-	// multi-address or non-IP *localAddr before ever calling
-	// generateConfig, but kept here too because this func is
-	// independently reachable, bypassing main() entirely, from this
-	// file's own unit tests -- without it, those callers could build a
-	// Config whose Listen address is net.ParseAddress of an unparsed
-	// "a|b" string instead of failing loudly.
-	if _, ok := canonicalLocalAddr(*localAddr); !ok {
-		return nil, newError("invalid localAddr: must be a single IP literal")
-	}
-	rport, err := validPort(*remotePort)
+	rport, err := net.PortFromString(*remotePort)
 	if err != nil {
 		return nil, newError("invalid remotePort: not a valid port")
 	}
-	// remotePort==0 parses as in-range (validPort allows 0..65535) but the
-	// vendored freedom outbound only applies its destination-port override
-	// `if server.Port != 0` -- a remotePort=0 silently drops the override
-	// entirely, falling back to dokodemo's unset (zero) port, and nothing
-	// downstream rejects a zero Destination.Port. Reject it explicitly,
-	// the same way localPort's port-0 is rejected in main().
+	// freedom applies its destination-port override only `if server.Port != 0`, so
+	// port 0 would silently forward to a zero port.
 	if rport == 0 {
 		return nil, newError("invalid remotePort: must not be 0")
 	}
-	// An empty (or whitespace-only -- ParseAddress trims) remoteAddr
-	// parses as a zero-length domain address that core.New/Start both
-	// accept without complaint -- ex-ray binds and reports ready, then
-	// every dial to the upstream fails. Checked on the PARSED address's
-	// Domain(), not the raw string, so a value ParseAddress trims to
-	// empty can't slip past a raw-string comparison.
-	//
-	// The unspecified IP address (0.0.0.0 or ::) is a failure one level
-	// down, though the two families fail differently: freedom's own
-	// isValidAddress (third_party/v2ray-core/proxy/freedom/freedom.go)
-	// only compares against net.AnyIP (0.0.0.0), so a 0.0.0.0 override is
-	// silently discarded and traffic redirects to dokodemo's
-	// net.LocalHostIP fallback -- a wrong destination that succeeds
-	// rather than failing every dial. :: has no such fallback: isValidAddress
-	// doesn't recognize it as unspecified, so the override IS applied
-	// verbatim and every dial goes to "[::]:port" and fails outright.
-	// Both are rejected here regardless of which failure mode applies.
-	// domainAddress.IP() panics, so this is checked only when the family
-	// is actually IP.
+	// An empty or whitespace-only remoteAddr parses as an empty domain that
+	// core.New accepts, after which every dial to the upstream fails. The
+	// unspecified address is also rejected: freedom discards a 0.0.0.0 override and
+	// falls back to dokodemo's localhost destination (a wrong destination that
+	// succeeds), and for :: every dial fails. The check reads the parsed address,
+	// so a value ParseAddress trims to empty is caught, and calls IP() only on an
+	// IP family because a domain address panics.
 	remoteAddress := net.ParseAddress(*remoteAddr)
 	family := remoteAddress.Family()
 	if (family.IsDomain() && remoteAddress.Domain() == "") || (family.IsIP() && remoteAddress.IP().IsUnspecified()) {
 		return nil, newError("invalid remoteAddr: must not be empty or the unspecified address")
 	}
-	// Validate operator-supplied numeric options up-front, before the
-	// server/client split, so out-of-range mux/fwmark are rejected identically
-	// in both modes. This also makes the guard dominate both cast sites below,
-	// so gosec G115 clears with no cast remaining at those sites.
+	// Validated before the server/client split so both modes reject the same
+	// values; this also dominates the casts below for gosec G115.
 	muxU32, err := uint32Opt("mux", *mux)
 	if err != nil {
 		return nil, err
@@ -507,41 +425,23 @@ func generateConfig() (*core.Config, error) {
 		return nil, newError("unsupported mode (expected websocket or quic)")
 	}
 
-	// ech is validated here (not earlier): quic sets *tlsEnabled = true as
-	// a side effect of the mode switch just above, and this check must
-	// see that. Not only inside buildTLSConfig (which runs only when
-	// *tlsEnabled below) either: a valid-vocabulary ech=always without
-	// tls set would otherwise silently apply nothing -- the operator
-	// asked for fail-closed SNI concealment and gets a fully plaintext
-	// transport instead, with no diagnostic. "auto"/"never" make no such
-	// promise -- opportunistic ECH with no TLS at all is simply a no-op,
-	// not a broken guarantee, so only "always" is checked here.
+	// Checked after the mode switch, because quic sets *tlsEnabled. ech=always
+	// without tls would otherwise apply nothing and silently give a plaintext
+	// transport; auto and never make no such promise, so only always is checked.
 	if !slices.Contains(allowedEchModes, *echMode) {
 		return nil, newError(fmt.Sprintf("invalid ech mode (expected one of %s)", strings.Join(allowedEchModes, ", ")))
 	}
 	if *echMode == "always" && !*tlsEnabled {
 		return nil, newError("ech=always requires tls to be enabled")
 	}
-	// A non-empty cert/certRaw/key without tls set is never read, never
-	// validated, and never applied -- buildTLSConfig only runs `if
-	// *tlsEnabled` below, so ex-ray silently builds a plaintext transport
-	// and reports ready while the operator believes they configured a
-	// pinned CA (client) or a server certificate. Same class of gap as
-	// ech=always above, just for the cert material instead of the ECH
-	// promise.
+	// Without tls, buildTLSConfig does not run, so a cert, certRaw or key would be
+	// silently ignored and ex-ray would report ready on a plaintext transport.
 	if !*tlsEnabled && (*cert != "" || *certRaw != "" || *key != "") {
 		return nil, newError("cert/certRaw/key require tls to be enabled")
 	}
-	// A client-mode `key` value (key is read only inside buildTLSConfig's
-	// `if *server` branch) is deliberately NOT rejected here, unlike the
-	// tls-unset case above: real client-side plugin_opts strings in this
-	// monorepo already carry a harmless, unused `key=<path>` alongside
-	// `cert=<path>` (crates/bridge/src/test_support/skuld_fixtures.rs
-	// builds its ws_tls/quic client fixtures this way, reusing the same
-	// cert+key pair the server-mode builder uses), so rejecting it would
-	// break real, working configs rather than close a silent-misconfig
-	// gap -- a client `key` is genuinely inert, not a broken promise like
-	// an unapplied `cert`/`certRaw` pin.
+	// A client-mode `key` is not rejected, unlike a cert without tls: it is read
+	// only in server mode, and real client options carry an unused `key=<path>`
+	// beside `cert=<path>`.
 
 	streamConfig := internet.StreamConfig{
 		ProtocolName: *mode,
@@ -606,16 +506,12 @@ func generateConfig() (*core.Config, error) {
 			// dokodemo is not aware of mux connections by itself.
 			proxyAddress = net.ParseAddress("v1.mux.cool")
 		}
-		// Exactly one inbound: main()'s localAddr guard already rejects
-		// any *localAddr that parseLocalAddr would split into more than
-		// one address (the sitrep's `ready` event can only report one
-		// `listen`, so a multi-address bind could never be honestly
-		// reported as ready in the first place -- see main.go).
+		// Exactly one inbound: listenAddr refuses a `|`-joined list.
 		return &core.Config{
 			Inbound: []*core.InboundHandlerConfig{{
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortRange:      net.SinglePortRange(lport),
-					Listen:         net.NewIPOrDomain(net.ParseAddress(*localAddr)),
+					PortRange:      net.SinglePortRange(listenPort),
+					Listen:         net.NewIPOrDomain(listenHost),
 					StreamSettings: &streamConfig,
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
@@ -637,8 +533,8 @@ func generateConfig() (*core.Config, error) {
 	return &core.Config{
 		Inbound: []*core.InboundHandlerConfig{{
 			ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-				PortRange: net.SinglePortRange(lport),
-				Listen:    net.NewIPOrDomain(net.ParseAddress(*localAddr)),
+				PortRange: net.SinglePortRange(listenPort),
+				Listen:    net.NewIPOrDomain(listenHost),
 			}),
 			ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
 				Address:  net.NewIPOrDomain(net.LocalHostIP),

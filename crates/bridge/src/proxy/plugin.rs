@@ -153,8 +153,8 @@ struct ChainTask {
 
 impl ChainTask {
     /// Cancel the chain, abort its task and wait until the runner is gone. The plugins get no grace period: garter's
-    /// own drain would hold a cancelled start, and a stop, for its whole drain bound. The abort drops each plugin's task,
-    /// possibly after this returns; a plugin's child goes when its task is dropped.
+    /// own drain would hold a cancelled start, and a stop, until `garter::chain::DEFAULT_DRAIN_TIMEOUT` expires. The
+    /// abort drops each plugin's task, possibly after this returns; a plugin's child goes when its task is dropped.
     async fn end(mut self) {
         self.cancel.cancel();
         self.handle.abort();
@@ -751,45 +751,47 @@ fn ex_ray_fatal_config_error(
     {
         return Some("tcp-keepalive");
     }
-    // main.go validPort (`net.PortFromString`, nonzero) for `localPort`; under `server` the `remotePort` key is
-    // cross-assigned here, but both share this rule.
+    // main.go's cross-assign: under `*server` the `localX` and `remoteX` KEYS swap flags, so which key reaches
+    // listenAddr (the listener) and which reaches generateConfig (the upstream) swaps too. The checks run in
+    // ex-ray's order: listenAddr (port, then address), then generateConfig (port, then address), so the key
+    // returned is the one ex-ray fails on first.
+    let (listen_port_key, listen_addr_key, upstream_port_key, upstream_addr_key) = if server_present {
+        ("remotePort", "remoteAddr", "localPort", "localAddr")
+    } else {
+        ("localPort", "localAddr", "remotePort", "remoteAddr")
+    };
+    // config.go listenAddr: `net.PortFromString`, nonzero.
     if segments
         .iter()
-        .find(|s| s.key == "localPort")
+        .find(|s| s.key == listen_port_key)
         .is_some_and(|s| !matches!(ex_ray_parses_as_uint32(ex_ray_flag_value(s)), Some(p) if p != 0 && p <= 65535))
     {
-        return Some("localPort");
+        return Some(listen_port_key);
     }
-    // main.go's cross-assign: under `*server` the `remoteAddr` KEY feeds `*localAddr`, so the two address keys swap
-    // rules. (The port pair shares one rule, so it needs no swap.) `localAddr` rule: canonicalLocalAddr.
-    let (local_addr_key, remote_addr_key) = if server_present {
-        ("remoteAddr", "localAddr")
-    } else {
-        ("localAddr", "remoteAddr")
-    };
+    // config.go listenAddr: one IP literal.
     if segments
         .iter()
-        .find(|s| s.key == local_addr_key)
+        .find(|s| s.key == listen_addr_key)
         .is_some_and(|s| ex_ray_local_addr_is_invalid(ex_ray_flag_value(s)))
     {
-        return Some(local_addr_key);
+        return Some(listen_addr_key);
     }
 
-    // generateConfig: `remotePort`, same rule as `localPort`.
+    // generateConfig: the upstream port, same rule as the listen port.
     if segments
         .iter()
-        .find(|s| s.key == "remotePort")
+        .find(|s| s.key == upstream_port_key)
         .is_some_and(|s| !matches!(ex_ray_parses_as_uint32(ex_ray_flag_value(s)), Some(p) if p != 0 && p <= 65535))
     {
-        return Some("remotePort");
+        return Some(upstream_port_key);
     }
-    // generateConfig: `remoteAddr` must not normalize to an empty domain or an unspecified IP.
+    // generateConfig: the upstream address must not normalize to an empty domain or an unspecified IP.
     if segments
         .iter()
-        .find(|s| s.key == remote_addr_key)
+        .find(|s| s.key == upstream_addr_key)
         .is_some_and(|s| ex_ray_remote_addr_is_invalid(ex_ray_flag_value(s)))
     {
-        return Some(remote_addr_key);
+        return Some(upstream_addr_key);
     }
     // generateConfig: `mux`, `fwmark` range check (uint32Opt).
     for key in ["mux", "fwmark"] {
@@ -1012,13 +1014,13 @@ fn v2ray_core_parses_as_a_domain(value: &str) -> bool {
 
 /// Whether `value` parses as a v2ray-core IP-family address once normalized
 /// as [`v2ray_core_normalize`] — used by [`ex_ray_fatal_config_error`] for
-/// `localAddr`'s `canonicalLocalAddr` check, which requires an IP literal.
+/// `localAddr`'s `listenAddr` check, which requires an IP literal.
 fn v2ray_core_parses_as_an_ip(value: &str) -> bool {
     v2ray_core_normalize(value).parse::<std::net::IpAddr>().is_ok()
 }
 
-/// Whether ex-ray's `canonicalLocalAddr` (config.go, reachable from main()'s
-/// pre-bind guard) would reject `value` for `localAddr`: not exactly one
+/// Whether ex-ray's `listenAddr` (config.go, called from main() before the
+/// bind) would reject `value` for `localAddr`: not exactly one
 /// (`|`-free) address, or not an IP literal once normalized.
 fn ex_ray_local_addr_is_invalid(value: &str) -> bool {
     value.contains('|') || !v2ray_core_parses_as_an_ip(value)
@@ -2060,7 +2062,7 @@ mod inject_tests {
         );
     }
 
-    // `remotePort` routes through the SAME `validPort` as `localPort`
+    // `remotePort` parses with the SAME `net.PortFromString` as `localPort`
     // (config.go), so it shares localPort's tighter 65535 ceiling and its
     // `0` rejection, not a bare `strconv.ParseUint(_, 10, 32)` with no
     // upper bound beyond u32::MAX and no zero check.
@@ -2081,7 +2083,7 @@ mod inject_tests {
     }
 
     // Non-canonical-zero coverage: `"00"` is valid `strconv.ParseUint`
-    // syntax (parses to `0`), so it is caught by `validPort`'s `== 0`
+    // syntax (parses to `0`), so it is caught by `listenAddr`'s `== 0`
     // rejection, not by a parse failure — a check that only compared
     // against the LITERAL string `"0"` would miss it.
     #[skuld::test]
@@ -2120,7 +2122,7 @@ mod inject_tests {
         assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("path"));
     }
 
-    // `localAddr` (main.go's cross-assign + `canonicalLocalAddr`) must be a
+    // `localAddr` (main.go's cross-assign + `listenAddr`) must be a
     // single IP literal — a domain or a `|`-joined multi-address list is
     // fatal.
     #[skuld::test]
@@ -2140,6 +2142,20 @@ mod inject_tests {
         assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("localAddr"));
     }
 
+    // The spellings config_test.go's listenAddr table pins: `ParseAddress` trims a padded address and
+    // `PortFromString` accepts a leading zero but neither a sign nor padding.
+    #[skuld::test]
+    fn local_addr_and_port_spellings_follow_what_listen_addr_accepts() {
+        let fatal = |opts: &str| {
+            let segments = garter::split_plugin_options(opts).unwrap();
+            ex_ray_fatal_config_error(&segments, None)
+        };
+        assert_eq!(fatal("host=cdn.example;localAddr= 127.0.0.1"), None);
+        assert_eq!(fatal("host=cdn.example;localPort=01984"), None);
+        assert_eq!(fatal("host=cdn.example;localPort=+1984"), Some("localPort"));
+        assert_eq!(fatal("host=cdn.example;localPort= 1984"), Some("localPort"));
+    }
+
     // Under `server`, main.go cross-assigns a `localAddr` OPTION to
     // `*remoteAddr` and a `remoteAddr` OPTION to `*localAddr` — so the
     // single-IP-literal rule (`localAddr`'s own) must be checked against the
@@ -2151,7 +2167,7 @@ mod inject_tests {
     fn server_mode_swaps_which_key_the_address_rules_apply_to() {
         let e = pinned("https://9.9.9.9/dns-query");
         // Over-permit repro: under `server`, the `remoteAddr` OPTION lands
-        // in `*localAddr`, so this domain value fails `canonicalLocalAddr`
+        // in `*localAddr`, so this domain value fails `listenAddr`
         // and the whole process exits 23 — never reachable.
         let segments = garter::split_plugin_options("server;tls;host=cdn.example;remoteAddr=cdn.example").unwrap();
         assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("remoteAddr"));
@@ -2169,6 +2185,43 @@ mod inject_tests {
         // reachability) may fetch.
         let segments = garter::split_plugin_options("server;tls;host=cdn.example;localAddr=cdn.example").unwrap();
         assert_eq!(ex_ray_fatal_config_error(&segments, None), None);
+    }
+
+    // When several keys are faulty, the key that is logged is the one ex-ray
+    // fails on first: `listenAddr` (port, then address), then `generateConfig`
+    // (remote port, then remote address). Under `server` each KEY swaps with its
+    // partner, so the order of KEYS swaps too.
+    #[skuld::test]
+    fn the_first_fault_ex_ray_reaches_names_the_key() {
+        let first = |opts: &str| {
+            let segments = garter::split_plugin_options(opts).unwrap();
+            ex_ray_fatal_config_error(&segments, None)
+        };
+        // Client: listenAddr checks localPort before localAddr, both before remotePort.
+        assert_eq!(
+            first("host=cdn.example;localAddr=cdn.example;localPort=0;remotePort=0"),
+            Some("localPort")
+        );
+        assert_eq!(
+            first("host=cdn.example;localAddr=cdn.example;remotePort=0"),
+            Some("localAddr")
+        );
+        // Server: the listener is fed by remotePort and remoteAddr, so those two keys come first,
+        // port before address, and both before the keys that feed the upstream.
+        assert_eq!(
+            first("server;host=cdn.example;remotePort=0;remoteAddr=cdn.example;localPort=0"),
+            Some("remotePort")
+        );
+        assert_eq!(
+            first("server;host=cdn.example;remoteAddr=cdn.example;localPort=0"),
+            Some("remoteAddr")
+        );
+        // Then generateConfig: the upstream port before the upstream address.
+        assert_eq!(
+            first("server;host=cdn.example;localPort=0;localAddr=0.0.0.0"),
+            Some("localPort")
+        );
+        assert_eq!(first("server;host=cdn.example;localAddr=0.0.0.0"), Some("localAddr"));
     }
 
     // `remoteAddr` (`generateConfig`) must not be an empty domain or the
@@ -2561,7 +2614,7 @@ mod inject_tests {
             assert_eq!(
                 effective_ech_doh(bundled("ex-ray"), Some(opts), Some(&e)),
                 EffectiveEchDoh::None,
-                "opts={opts:?}: ex-ray cannot honor port-0/empty OS-assignment (main.go) — exits before dialing"
+                "opts={opts:?}: ex-ray cannot honor port-0/empty OS-assignment (config.go listenAddr) — exits before dialing"
             );
         }
     }
@@ -2836,7 +2889,7 @@ mod inject_tests {
 
         // The numeric bounds `ex_ray_fatal_config_error` hardcodes for
         // mux/fwmark (`uint32Opt`), tcp-keepalive (`keepAliveMaxSeconds`),
-        // and localPort/remotePort (`validPort`) — same drift risk, same
+        // and localPort/remotePort (`net.PortFromString`) — same drift risk, same
         // pin. Pinned on the COMPARISON itself, not `uint32Opt`'s error
         // message: the message is free to change for reasons that have
         // nothing to do with the bound it protects (e.g. to stop a
@@ -2854,20 +2907,30 @@ mod inject_tests {
              config.go's `keepAliveMaxSeconds` — update the range to the vendored source"
         );
         assert!(
-            source.contains("rport, err := validPort(*remotePort)"),
-            "ex_ray_fatal_config_error's remotePort ceiling (65535, shared with localPort) no \
-             longer matches config.go — remotePort must still route through the same `validPort` \
-             as localPort, not a bare `strconv.ParseUint`"
+            source.contains("rport, err := net.PortFromString(*remotePort)"),
+            "ex_ray_fatal_config_error's remotePort ceiling (65535) no longer matches config.go — \
+             generateConfig must still parse remotePort with `net.PortFromString`, not a bare \
+             `strconv.ParseUint`"
+        );
+        assert!(
+            source.contains("port, err := net.PortFromString(*localPort)"),
+            "ex_ray_fatal_config_error's localPort parse no longer matches config.go's `listenAddr` — \
+             it must still use `net.PortFromString`, whose ceiling and syntax the mirror copies"
+        );
+        assert!(
+            source.contains("if port == 0 {"),
+            "ex_ray_fatal_config_error's localPort nonzero check no longer matches config.go's \
+             `listenAddr` — update the mirror to the vendored source"
+        );
+        assert!(
+            source.contains("if !addr.Family().IsIP() {"),
+            "ex_ray_fatal_config_error's localAddr IP-literal check no longer matches config.go's \
+             `listenAddr` — update ex_ray_local_addr_is_invalid to the vendored source"
         );
         assert!(
             source.contains("family.IsIP() && remoteAddress.IP().IsUnspecified()"),
             "ex_ray_fatal_config_error's remoteAddr unspecified-IP check no longer matches \
              config.go — update ex_ray_remote_addr_is_invalid to the vendored source"
-        );
-        assert!(
-            source.contains("func canonicalLocalAddr"),
-            "ex_ray_fatal_config_error's localAddr IP-literal check no longer matches config.go's \
-             `canonicalLocalAddr` — update ex_ray_local_addr_is_invalid to the vendored source"
         );
         assert!(
             source.contains("if *echMode == \"always\" && !*tlsEnabled {"),
