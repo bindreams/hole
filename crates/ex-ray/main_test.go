@@ -16,16 +16,12 @@ import (
 	"time"
 )
 
-// TestListenerNetwork verifies the inbound-transport decision that drives the
-// sitrep `transports` value (and mirrors the transport v2ray-core binds). Only
-// server+quic binds a UDP listener (the quic inbound faces the remote client);
-// every other combination — client mode (plain TCP dokodemo inbound) and
-// server+websocket — is TCP. An unknown mode resolves to "tcp" here and is
-// rejected later by generateConfig's switch default, before emitReady. See
-// bindreams/hole#421.
+// TestListenerNetwork pins the inbound-transport decision behind the sitrep
+// `transports` value: only server+quic is UDP, every other combination is TCP,
+// and an unknown mode resolves to "tcp" (generateConfig rejects it before
+// emitReady).
 func TestListenerNetwork(t *testing.T) {
-	// Do NOT t.Parallel() this (or its subtests): it mutates the package-global
-	// *server/*mode flag pointers, which are shared across the whole test binary.
+	// Not parallel: it mutates the package-global *server and *mode flags.
 	origServer, origMode := *server, *mode
 	t.Cleanup(func() { *server, *mode = origServer, origMode })
 
@@ -53,15 +49,11 @@ func TestListenerNetwork(t *testing.T) {
 }
 
 // reserveTCPPortWithFreeUDP returns a held TCP listener whose port is also
-// confirmed bindable for UDP, so the TCP bind-conflict pin test cannot flake
-// on a Windows independent-excluded-port-range mismatch
-// (TCP and UDP maintain separate Hyper-V/WSL/Docker reservation tables — the
-// exact race hole_common::port_alloc::bind_ephemeral exists to absorb on the
-// Rust side). It binds TCP on an OS-assigned port, verifies the same port binds
-// for UDP, then releases only the UDP socket — leaving TCP held and the UDP
-// space proven free. Unbounded retry on a per-port TCP/UDP mismatch (no
-// arbitrary cap; the OS ephemeral allocator is the natural termination, same as
-// port_alloc).
+// bindable for UDP, so the TCP bind-conflict test cannot fail on a Windows
+// excluded-port-range mismatch (TCP and UDP keep separate Hyper-V/WSL/Docker
+// reservation tables). It binds TCP on an OS-assigned port, checks the same port
+// binds for UDP, then releases the UDP socket. It retries on a per-port mismatch
+// with no cap; the OS ephemeral allocator ends the loop.
 func reserveTCPPortWithFreeUDP(t *testing.T) (net.Listener, string) {
 	t.Helper()
 	for {
@@ -82,32 +74,18 @@ func reserveTCPPortWithFreeUDP(t *testing.T) (net.Listener, string) {
 	}
 }
 
-// exRayHelperProcessEnv gates TestMainHelperProcess: only the child spawned
-// by runExRaySubprocess actually calls the real main() entry point. Under a
-// plain `go test` run (this env var unset) it returns immediately and does
-// nothing.
+// exRayHelperProcessEnv gates TestMainHelperProcess: only the child spawned by
+// runExRaySubprocess calls the real main. Under a plain `go test` run it is unset
+// and the helper returns immediately.
 const exRayHelperProcessEnv = "EXRAY_TEST_HELPER_PROCESS"
 
 // TestMainHelperProcess is not a test of its own. runExRaySubprocess re-execs
-// the already-compiled test binary with -test.run pinned to this name and
-// exRayHelperProcessEnv set, so the real main() -- including its os.Exit
-// calls -- runs as a genuine child process the parent test observes end to
-// end (stdout sitrep stream + real exit code), without mocking either. This
-// is the standard library's own TestHelperProcess pattern (see os/exec's
-// tests).
+// the compiled test binary with -test.run pinned to this name and
+// exRayHelperProcessEnv set, so the real main, os.Exit calls included, runs as a
+// child process whose sitrep stream and exit code the parent observes. It is the
+// standard library's TestHelperProcess pattern (see os/exec's tests).
 //
-// keepalive_wiring_test.go's TestMain runs registerTCPKeepAlive() once
-// before any test in this binary, including in the re-exec'd child --
-// main() then calls it again on paths that reach it (client mode, no
-// registerTCPKeepAlive error). Both calls append to a process-global slice
-// in the vendored internet package (that file's own comment: "no
-// removal"), but the child is a separate OS process from the one running
-// this test, so nothing about that duplication crosses the process
-// boundary back into the parent test binary's state; and within the child,
-// two structurally-identical controller registrations produce the same
-// dial-time keepalive settings twice, not a functional difference. Fatal
-// cases never reach it at all (main.go exits before registerTCPKeepAlive's
-// own call site).
+// The child registers the keepalive controller twice, which is harmless.
 func TestMainHelperProcess(_ *testing.T) {
 	if os.Getenv(exRayHelperProcessEnv) != "1" {
 		return
@@ -116,31 +94,22 @@ func TestMainHelperProcess(_ *testing.T) {
 }
 
 // runExRaySubprocessTimeout bounds how long a child ex-ray process may run
-// before emitting its terminal sitrep event. This is the sanctioned
-// exception to synchronizing via time: it bounds an external child
-// process's exit (something that genuinely might never happen -- a wedge
-// anywhere between hello and the terminal event), and the duration is a
-// failure bound surfaced to a human ("the child produced no terminal
-// sitrep within 30s"), not a synchronization device between two pieces of
-// code this repo controls.
+// before emitting its terminal sitrep event. It is the failure bound surfaced to
+// a human ("the child produced no terminal sitrep"), not a synchronization
+// device: the child is an external process that may never emit one.
 const runExRaySubprocessTimeout = 30 * time.Second
 
-// runExRaySubprocess re-execs the test binary as a fresh ex-ray process with
-// env set, and returns the parsed hello event, the parsed terminal sitrep
-// event (whichever of ready/bind_conflict/fatal follows hello), and the
-// exit code.
+// runExRaySubprocess re-execs the test binary as a fresh ex-ray process with env
+// set, and returns the parsed hello event, the parsed terminal sitrep event
+// (whichever of ready, bind_conflict or fatal follows hello), and the exit code.
 //
-// sitrep.go guarantees exactly one of ready/bind_conflict/fatal follows
-// hello before the plugin serves or exits (crates/garter/SITREP.md's "Event
-// ordering" section), so reading exactly two lines is the primary
-// rendezvous -- not a poll, a real completion signal. The bounded context is
-// the backstop for a child that wedges before ever emitting its terminal
-// event -- e.g. a silently swallowed parse error that lets ex-ray bind
-// successfully and block forever on <-osSignals -- so the test fails with a clear message instead
-// of hanging until go test's own package timeout kills everything with no
-// indication of which subtest hung. A genuine "ready" terminal event is
-// killed immediately after being observed, since main() then only exits on
-// SIGINT/SIGTERM.
+// Exactly one terminal event follows hello (crates/garter/SITREP.md, "Event
+// ordering"), so reading two lines is the rendezvous. The timeout context is the
+// backstop for a child that wedges before emitting one, such as a swallowed
+// parse error that lets ex-ray bind and block on <-osSignals: the test fails with
+// a message instead of waiting for go test's package timeout. After a `ready`
+// the child is killed, since main then exits only on SIGINT or SIGTERM, and the
+// exit code is -1.
 func runExRaySubprocess(t *testing.T, env map[string]string) (hello, terminal map[string]any, exitCode int) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), runExRaySubprocessTimeout)
@@ -218,13 +187,9 @@ func runExRaySubprocess(t *testing.T, env map[string]string) (hello, terminal ma
 	return hello, terminal, exitErr.ExitCode()
 }
 
-// freeTCPPort returns a port that was free at the moment of the call, for
-// the one test below that needs ex-ray to actually bind successfully. The
-// listen-then-close-then-reuse pattern is the standard Go idiom for finding
-// a free port; the caller (TestReadySitrepReachesParentOnValidOptions)
-// handles the resulting check-then-act race the same way this file's
-// existing reserveTCPPortWithFreeUDP handles its own: retry on a genuine
-// conflict rather than fail the test on an infrastructure race.
+// freeTCPPort returns a port that was free at the moment of the call, for the
+// tests that need ex-ray to bind successfully. Another process may take it before
+// the child binds; callers retry on a bind_conflict with address-in-use.
 func freeTCPPort(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -261,30 +226,22 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 		{"invalid_cert_raw_not_pem", "tls;host=example.com;certRaw=not-a-real-certificate", false},
 		{"invalid_host_empty", "host=;path=/", false},
 		{"invalid_cert_material_without_tls", "certRaw=some-cert-content;host=example.com;path=/", false},
-		// strconv.Atoi("00") parses to the integer 0, same as "0" -- a raw
-		// string compare against the literal "0" alone would have missed
-		// it, binding an OS-assigned ephemeral port while ready.listen
-		// still reported the literal "00" spelling.
+		// "00" is port 0 to net.PortFromString. A raw compare against "0" would miss
+		// it, and ex-ray would bind an OS-assigned port while ready.listen reported "00".
 		{"invalid_local_port_non_canonical_zero", "localPort=00", false},
 		{"malformed_options_never_echo_secret", `certRaw=SUPERSECRETVALUE;;path=/`, true},
-		// The generateConfig/buildTLSConfig no-echo behavior for localPort/
-		// remotePort/mode, driven through the REAL pipeline
-		// (parsePluginOptions -> parseOptsIntoFlags -> buildV2Ray ->
-		// generateConfig/buildTLSConfig -> emitFatal), not just via
-		// directly-stuffed flag globals the way the sibling unit tests do
-		// it -- proves the backslash-absorption exploit those unit tests
-		// assume is real actually reaches these sites end to end.
+		// No-echo for localPort, remotePort and mode through the whole pipeline
+		// (parsePluginOptions, parseOptsIntoFlags, buildV2Ray, emitFatal), not just
+		// with flag globals set directly as the unit tests do: it shows that a
+		// backslash-absorbed secret reaches these sites end to end.
 		{"invalid_localPort_never_echo_secret", `localPort=1\;certRaw=SUPERSECRETVALUE`, true},
 		{"invalid_remotePort_never_echo_secret", `remotePort=1\;certRaw=SUPERSECRETVALUE`, true},
 		{"invalid_mode_never_echo_secret", `mode=abc\;certRaw=SUPERSECRETVALUE`, true},
-		// ech is validated by parseEnumOption inside parseOptsIntoFlags
-		// itself, so this case never reaches buildTLSConfig's own ech-mode
-		// branch at all -- it end-to-end-proves parseEnumOption's no-echo
-		// behavior (already unit-tested directly), not buildTLSConfig's.
+		// parseEnumOption rejects the ech value inside parseOptsIntoFlags, so this
+		// case covers its no-echo behavior, not buildTLSConfig's ech branch.
 		{"invalid_ech_mode_never_echo_secret", `tls;host=example.com;ech=abc\;certRaw=SUPERSECRETVALUE`, true},
-		// tls and loglevel go through the same real pipeline: tls=false
-		// must be fatal, not a silent TLS-enable, and must never echo an
-		// absorbed secret; same for an unrecognized loglevel.
+		// tls and loglevel: an unrecognized value is fatal and never echoes an
+		// absorbed secret.
 		{"invalid_tls_bool_never_echo_secret", `tls=abc\;certRaw=SUPERSECRETVALUE`, true},
 		{"invalid_loglevel_never_echo_secret", `loglevel=abc\;certRaw=SUPERSECRETVALUE`, true},
 	}
@@ -320,14 +277,11 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 	}
 }
 
-// cert points at a nonexistent path carrying an absorbed secret; the
-// underlying os.PathError text would otherwise embed it. This needs its
-// own env (not the shared table's SS_REMOTE_HOST=chain.example.net):
-// server mode cross-assigns the remoteAddr option (== SS_REMOTE_HOST)
-// into *localAddr, and a non-IP-literal *localAddr is itself fatal
-// (main()'s IP-literal guard) before ever reaching buildTLSConfig -- an
-// IP-literal SS_REMOTE_HOST is required for the flow to actually reach
-// the cert read this case means to exercise.
+// cert points at a nonexistent path carrying an absorbed secret, which the
+// os.PathError text would otherwise embed. It needs its own env: in server mode
+// SS_REMOTE_HOST becomes *localAddr, and a non-IP *localAddr is fatal before
+// buildTLSConfig, so SS_REMOTE_HOST must be an IP literal for the flow to reach
+// the cert read.
 func TestInvalidCertPathSitrepNeverEchoesSecret(t *testing.T) {
 	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
 		"SS_REMOTE_HOST":    "10.9.8.7",
@@ -354,17 +308,10 @@ func TestInvalidCertPathSitrepNeverEchoesSecret(t *testing.T) {
 	}
 }
 
-// localAddr must be an IP literal -- "nosuchhost.invalid" (and any other
-// non-IP spelling) is fatal before the process ever attempts to bind, via
-// a static message that structurally cannot echo the absorbed secret
-// (main()'s canonicalLocalAddr guard never interpolates the rejected
-// value at all, unlike the sites elsewhere in this file that do and must
-// be checked for it explicitly).
-//
-// No test drives Start()'s generic (non-bind-conflict) fatal branch
-// directly -- main()'s port/localAddr/remoteAddr guards already reject
-// every value that could reach it. It's still provably safe: the message
-// is a fixed string literal with no interpolated value at all (main.go).
+// A non-IP localAddr such as "nosuchhost.invalid" is fatal before the process
+// tries to bind, with a message that never interpolates the rejected value
+// (listenAddr). The generic Start-failure `fatal` is a fixed
+// string too; no test drives that branch.
 func TestInvalidLocalAddrSitrepNeverEchoesValue(t *testing.T) {
 	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
 		"SS_REMOTE_HOST":    "chain.example.net",
@@ -391,17 +338,11 @@ func TestInvalidLocalAddrSitrepNeverEchoesValue(t *testing.T) {
 	}
 }
 
-// A `|`-separated multi-address localAddr (parseLocalAddr's own grammar,
-// inherited from upstream v2ray-plugin's server-mode multi-listen) is
-// fatal: the sitrep's `ready` event carries exactly one `listen` address
-// (SITREP.md), so ex-ray cannot honestly report a `|`-joined value there
-// -- main()'s guard rejects it before generateConfig ever runs, so
-// generateConfig itself only ever builds a single server-mode inbound.
-// Server mode is used here because parseLocalAddr's `|` grammar is a
-// server-only concept; a client invocation only ever treats *localAddr as
-// one address. In server mode parseOptsIntoFlags cross-assigns a
-// `remoteAddr` option (not `localAddr`) into *localAddr -- see
-// parseOptsIntoFlags' own doc comment.
+// A `|`-separated multi-address localAddr (the grammar of upstream
+// v2ray-plugin's server-mode multi-listen) is fatal: `ready` carries one
+// `listen` address, so listenAddr rejects it in main before buildV2Ray. Server mode
+// is used because the `|` grammar is server-only, and there the `remoteAddr`
+// option, not `localAddr`, becomes *localAddr (see parseOptsIntoFlags).
 func TestMultiAddressLocalAddrSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
 		"SS_REMOTE_HOST":    "10.9.8.7",
@@ -425,10 +366,8 @@ func TestMultiAddressLocalAddrSitrepReachesParentAndProcessExitsNonZero(t *testi
 	}
 }
 
-// A partial SS_* chain-handoff env (here, SS_REMOTE_PORT missing) must be
-// fatal through the real process boundary, not a stderr warning next to a
-// `ready` sitrep -- the whole reason main() proceeds only past a nil
-// parseOptsIntoFlags error.
+// A partial SS_* chain-handoff env (here, SS_REMOTE_PORT blank) must be a `fatal`
+// sitrep through the real process boundary, not a stderr warning beside `ready`.
 func TestPartialSSEnvSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
 		"SS_REMOTE_HOST":    "chain.example.net",
@@ -452,14 +391,10 @@ func TestPartialSSEnvSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 	}
 }
 
-// A malformed port must be fatal when it comes from the SS_*-env chain-
-// handoff itself (SS_REMOTE_PORT), not only when it's an SS_PLUGIN_OPTIONS
-// override -- generateConfig's net.PortFromString is the only gate on
-// *remotePort regardless of which of those two sources set it, so a
-// regression that special-cased validation to the options-override path
-// would pass every case in TestFatalSitrepReachesParentAndProcessExitsNonZero
-// (which never varies SS_REMOTE_PORT/SS_LOCAL_PORT themselves) while
-// leaving this, the original chain-handoff path, unvalidated again.
+// A malformed port must be fatal when it comes from the SS_* chain handoff
+// (SS_REMOTE_PORT), not only from an SS_PLUGIN_OPTIONS override.
+// TestFatalSitrepReachesParentAndProcessExitsNonZero never varies SS_REMOTE_PORT or
+// SS_LOCAL_PORT, so it would not catch validation limited to the options path.
 func TestInvalidSSEnvPortSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
 		"SS_REMOTE_HOST":    "chain.example.net",
@@ -495,24 +430,15 @@ func isAddrInUse(errno int) bool {
 	return errno == int(syscall.EADDRINUSE)
 }
 
-// The control: a valid options string must still reach ready and bind on
-// the SS_LOCAL_*-derived address. The fatal-path cases above only prove
-// real per-input behavior if this control exists: a helper that always
-// reported `fatal` would still pass every fatal-path case, but fails here.
+// The control: a valid options string must reach ready and bind on the
+// SS_LOCAL_*-derived address. Without it, a helper that always reported `fatal`
+// would pass every fatal-path case above.
 func TestReadySitrepReachesParentOnValidOptions(t *testing.T) {
-	// freeTCPPort's port can lose a race to another process before the
-	// child binds it. classifyBindError (bind_error.go) reports every OS
-	// listen failure as bind_conflict regardless of errno, so retrying on
-	// the event name alone would also retry -- forever -- on a genuine,
-	// deterministic failure (e.g. no permission to bind loopback in a
-	// sandboxed CI runner), reintroducing exactly the unbounded-hang risk
-	// runExRaySubprocessTimeout exists to catch one level down, where that
-	// per-child timeout can't see a parent-level infinite retry. Retry only
-	// on the specific errno the race can actually produce (address already
-	// in use); anything else is a real environment failure this test
-	// should report, not paper over. Unbounded on that one errno, matching
-	// this file's existing reserveTCPPortWithFreeUDP: the OS ephemeral
-	// allocator is the natural termination.
+	// freeTCPPort's port can be taken before the child binds it. classifyBindError
+	// reports every listen failure as bind_conflict whatever the errno, so retrying
+	// on the event alone would loop forever on a deterministic failure (such as a
+	// sandbox that forbids binding loopback). Retry only on address-in-use, the
+	// errno the race produces, and fail on any other.
 	for {
 		port := freeTCPPort(t)
 		hello, terminal, _ := runExRaySubprocess(t, map[string]string{
@@ -543,13 +469,10 @@ func TestReadySitrepReachesParentOnValidOptions(t *testing.T) {
 	}
 }
 
-// An IPv4-mapped IPv6 literal ("::ffff:127.0.0.1") is a valid IP per
-// net.ParseIP -- main()'s guard accepts it -- but v2ray-core's own
-// address type folds it into plain IPv4 before binding
-// (third_party/v2ray-core/common/net/address.go's IPAddress). ready.listen
-// must report the address v2ray-core actually bound (the folded IPv4
-// form), not the raw, unfolded literal, or a host reading the sitrep
-// cannot tell where ex-ray is really listening.
+// An IPv4-mapped IPv6 literal ("::ffff:127.0.0.1") passes listenAddr, but
+// v2ray-core folds it to plain IPv4 before binding (IPAddress in
+// third_party/v2ray-core/common/net/address.go). ready.listen must report the
+// folded form v2ray-core bound, or a host cannot tell where ex-ray listens.
 func TestReadySitrepReportsCanonicalFormOfV4MappedV6LocalAddr(t *testing.T) {
 	for {
 		port := freeTCPPort(t)
@@ -578,5 +501,84 @@ func TestReadySitrepReportsCanonicalFormOfV4MappedV6LocalAddr(t *testing.T) {
 			t.Errorf("listen = %v, want the folded IPv4 form %q, not the raw IPv4-mapped-IPv6 literal", terminal["listen"], wantListen)
 		}
 		return
+	}
+}
+
+// A leading-zero localPort ("0" + the port) is the same port to v2ray-core, so
+// ready.listen must report the canonical decimal form, not the spelling the
+// operator wrote: a host compares it against the endpoint it dials.
+func TestReadySitrepReportsCanonicalFormOfLeadingZeroLocalPort(t *testing.T) {
+	for {
+		port := freeTCPPort(t)
+		hello, terminal, _ := runExRaySubprocess(t, map[string]string{
+			"SS_REMOTE_HOST":    "example.com",
+			"SS_REMOTE_PORT":    "443",
+			"SS_LOCAL_HOST":     "127.0.0.1",
+			"SS_LOCAL_PORT":     "0" + port,
+			"SS_PLUGIN_OPTIONS": "host=example.com;path=/",
+		})
+		if terminal["event"] == "bind_conflict" {
+			errno, _ := terminal["errno"].(float64)
+			if isAddrInUse(int(errno)) {
+				continue
+			}
+			t.Fatalf("bind_conflict with errno %v, want the address-in-use code to retry, anything else is a real failure; terminal: %v", terminal["errno"], terminal)
+		}
+		if hello["event"] != "hello" {
+			t.Errorf("first sitrep line event = %v, want %q", hello["event"], "hello")
+		}
+		if terminal["event"] != "ready" {
+			t.Fatalf("terminal sitrep event = %v, want %q", terminal["event"], "ready")
+		}
+		wantListen := "127.0.0.1:" + port
+		if terminal["listen"] != wantListen {
+			t.Errorf("listen = %v, want the canonical port %q, not the leading-zero spelling", terminal["listen"], wantListen)
+		}
+		return
+	}
+}
+
+// The operator-facing `fatal` detail for a refused listen address keeps its
+// reason: port 0 is refused because v2ray-core cannot report the bound port, and
+// a `|` list because `ready` carries one address. The value is never echoed.
+func TestListenAddrFatalDetailKeepsTheReason(t *testing.T) {
+	cases := []struct {
+		name, options, want string
+	}{
+		{
+			"port_zero",
+			"localPort=0;host=example.com;path=/",
+			"invalid localPort: port-0 OS-assignment is not supported (v2ray-core does not expose the bound port)",
+		},
+		{
+			"address_list",
+			"server;remoteAddr=127.0.0.1|127.0.0.2;host=example.com;path=/",
+			"invalid localAddr: a single listen address is required (the ready sitrep cannot report more than one)",
+		},
+		{
+			"hostname",
+			"localAddr=nosuchhost.invalid;host=example.com;path=/",
+			"invalid localAddr: must be an IP literal",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, terminal, exitCode := runExRaySubprocess(t, map[string]string{
+				"SS_REMOTE_HOST":    "10.9.8.7",
+				"SS_REMOTE_PORT":    "9443",
+				"SS_LOCAL_HOST":     "10.1.2.3",
+				"SS_LOCAL_PORT":     "45999",
+				"SS_PLUGIN_OPTIONS": tc.options,
+			})
+			if terminal["event"] != "fatal" {
+				t.Fatalf("terminal sitrep event = %v, want %q", terminal["event"], "fatal")
+			}
+			if detail, _ := terminal["detail"].(string); detail != tc.want {
+				t.Errorf("fatal detail = %q, want %q", detail, tc.want)
+			}
+			if exitCode != 23 {
+				t.Errorf("exit code = %d, want 23", exitCode)
+			}
+		})
 	}
 }

@@ -2,6 +2,8 @@ package main
 
 import "golang.org/x/sys/unix"
 
+// setTCPKeepAlive enables SO_KEEPALIVE on the socket fd and sets the idle,
+// interval and probe-count options from p.
 func setTCPKeepAlive(fd uintptr, p keepAliveParams) error {
 	s := int(fd)
 	if err := unix.SetsockoptInt(s, unix.SOL_SOCKET, unix.SO_KEEPALIVE, 1); err != nil {

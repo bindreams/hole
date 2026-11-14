@@ -24,14 +24,15 @@ func (args Args) Get(key string) (value string, ok bool) {
 	return vals[0], true
 }
 
-// Append value to the list of values for key.
+// Add appends value to the list of values for key.
 func (args Args) Add(key, value string) {
 	args[key] = append(args[key], value)
 }
 
-// Return the index of the next unescaped byte in s that is in the term set, or
-// else the length of the string if no terminators appear. Additionally return
-// the unescaped string up to the returned index.
+// indexUnescaped returns the index of the next unescaped byte in s that is in
+// the term set, or the length of s if there is none, together with the
+// unescaped text before that index. A backslash escapes the byte after it, any
+// byte; one that ends s is an error.
 func indexUnescaped(s string, term []byte) (int, string, error) {
 	var i int
 	unesc := make([]byte, 0)
@@ -53,9 +54,11 @@ func indexUnescaped(s string, term []byte) (int, string, error) {
 	return i, string(unesc), nil
 }
 
-// parseEnv validates SS_PLUGIN_OPTIONS and, if present, the SS_*
-// chain-handoff vars -- a partial SS_* set is fatal (see below); the
-// standalone/fully-complete cases are not.
+// parseEnv returns the options in SS_PLUGIN_OPTIONS, plus remoteAddr, remotePort,
+// localAddr and localPort taken from SS_REMOTE_HOST, SS_REMOTE_PORT,
+// SS_LOCAL_HOST and SS_LOCAL_PORT. The four SS_* variables are all set (the
+// plugin is chained) or all unset (standalone); a partial or blank set is an
+// error. The errors name variables, never option values.
 func parseEnv() (opts Args, err error) {
 	otherOpts, err := parsePluginOptions(os.Getenv("SS_PLUGIN_OPTIONS"))
 	if err != nil {
@@ -67,19 +70,14 @@ func parseEnv() (opts Args, err error) {
 		opts[k] = v
 	}
 
-	// LookupEnv, not Getenv: Getenv can't tell an unset var from one
-	// exported empty, and that distinction drives the partial-vs-absent
-	// check below.
+	// LookupEnv, not Getenv: the check below must tell an unset var from an empty one.
 	ssRemoteHost, remoteHostSet := os.LookupEnv("SS_REMOTE_HOST")
 	ssRemotePort, remotePortSet := os.LookupEnv("SS_REMOTE_PORT")
 	ssLocalHost, localHostSet := os.LookupEnv("SS_LOCAL_HOST")
 	ssLocalPort, localPortSet := os.LookupEnv("SS_LOCAL_PORT")
 
-	// unset and empty are reported separately: a var that is exported but
-	// blank is a materially different operator mistake (e.g. an empty-
-	// string default in a wrapping script) than one never mentioned at
-	// all, and conflating them into a single "some but not all are set"
-	// message is actively misleading when every var IS set, just to "".
+	// Unset and empty are reported separately, since "some are unset" would be
+	// misleading when every var is set but blank.
 	vars := [...]struct {
 		name string
 		val  string
@@ -111,8 +109,6 @@ func parseEnv() (opts Args, err error) {
 		if len(empty) > 0 {
 			detail = append(detail, fmt.Sprintf("set but empty: %s", strings.Join(empty, ", ")))
 		}
-		// Env var names only -- never operator/secret content, safe to
-		// name directly.
 		return nil, fmt.Errorf("SS_* chain-handoff env is incomplete (%s)", strings.Join(detail, "; "))
 	}
 
@@ -123,8 +119,12 @@ func parseEnv() (opts Args, err error) {
 	return opts, nil
 }
 
-// parsePluginOptions parses a SS_PLUGIN_OPTIONS k=v;k=v string (';', '=', '\\'
-// are backslash-escaped). Example: secret=nou;cache=/tmp/cache;secret=yes
+// parsePluginOptions parses a SIP003 SS_PLUGIN_OPTIONS string of `key=value`
+// segments separated by `;`, for example `secret=nou;cache=/tmp/cache;secret=yes`.
+// A backslash escapes the next byte. A repeated key keeps every value in order
+// (Args.Get returns the first). A key with no `=` is a bare key and its value is
+// "1". A segment with an empty key, or a string ending in an unpaired
+// backslash, is an error; the error never contains option content.
 func parsePluginOptions(s string) (opts Args, err error) {
 	opts = make(Args)
 	if len(s) == 0 {
@@ -144,7 +144,6 @@ func parsePluginOptions(s string) (opts Args, err error) {
 		}
 		if len(key) == 0 {
 			// No segment content in the message: a value can carry a secret.
-			// Mirrors crates/garter/src/sip003.rs's MalformedOptions::EmptyKey.
 			err = fmt.Errorf("plugin options segment %d has no key", segmentIndex)
 			return
 		}

@@ -6,22 +6,17 @@ import (
 	vlog "github.com/v2fly/v2ray-core/v5/app/log"
 )
 
-// TestStderrConsoleCreatorReturnsHandler verifies that stderrConsoleCreator
-// produces a non-nil Handler. This exercises the function that init() wires
-// as the Console HandlerCreator, confirming the wiring is structurally sound.
+// TestStderrConsoleCreatorReturnsHandler checks that stderrConsoleCreator, which
+// init installs as the Console HandlerCreator, yields a usable Handler. That is
+// the structural guarantee that v2ray-core log output reaches stderr and not fd 1.
 //
-// This is the structural guarantee that v2ray-core log output reaches
-// stderr and NOT fd 1: init() installs stderrConsoleCreator as the Console
-// HandlerCreator, so the only thing this test must confirm is that the
-// creator yields a usable handler. The plugin-e2e interop test
-// (plugin-e2e/tests/interop.rs) additionally exercises the live path — it parses
-// ex-ray's `ready` sitrep off stdout for a successful round-trip — but note
-// it does NOT assert stdout is *exclusively* sitrep (garter's ExpectSitrep
-// reader tolerates stray non-JSON stdout lines as log passthrough). Reliable
-// fd-level "stdout is sitrep-only" capture inside a Go unit test is not
-// practical here because v2ray's generalLogger is asynchronous (channel +
-// goroutine), so any pipe-read without internal sync would be inherently
-// racy; the byte-identical sitrep marshal is unit-tested in sitrep_test.go.
+// A fd-level check that stdout is sitrep-only is not practical in a Go unit test:
+// v2ray's generalLogger writes asynchronously (a channel and a goroutine), so
+// reading the pipe would be racy. The plugin-e2e interop test
+// (crates/plugin-e2e/tests/interop.rs) covers the live path, but it does not
+// assert that stdout is exclusively sitrep, because garter's ExpectSitrep reader
+// tolerates stray non-JSON stdout lines. The sitrep bytes are tested in
+// sitrep_test.go.
 func TestStderrConsoleCreatorReturnsHandler(t *testing.T) {
 	handler, err := stderrConsoleCreator(vlog.LogType_Console, vlog.HandlerCreatorOptions{})
 	if err != nil {

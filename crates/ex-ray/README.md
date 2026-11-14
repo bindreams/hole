@@ -54,12 +54,11 @@ else it and v2ray-core log goes to standard error.
 ECH keeps the real server name out of the cleartext TLS handshake. It needs TLS (`tls`, or `mode=quic`, which turns it
 on), and two options control it:
 
-- `ech-doh=<DoH URL>` is where ex-ray fetches the server's ECH config. With no value (the `ech-doh` flag's default in
-  [`config.go`](config.go)) ECH is off. Hole supplies its own when it starts ex-ray; see ECH and DoH below.
-- `ech=auto|always|never` is the policy; the `ech` flag in [`config.go`](config.go) holds the default. `auto` uses ECH
-  when a config can be fetched and otherwise connects with the name in the clear. `always` never sends the name in the
-  clear: a dial that cannot get a config fails, and ex-ray refuses to start without TLS or without `ech-doh`. `never`
-  leaves ECH off.
+- `ech-doh=<DoH URL>` is where ex-ray fetches the server's ECH config. With no value (the default) ECH is off. Hole
+  supplies its own when it starts ex-ray; see ECH and DoH below.
+- `ech=auto|always|never` is the policy; the default is `auto`. `auto` uses ECH when a config can be fetched and
+  otherwise connects with the name in the clear. `always` never sends the name in the clear: a dial that cannot get a
+  config fails, and ex-ray refuses to start without TLS or without `ech-doh`. `never` leaves ECH off.
 
 When a server has rotated its ECH key, the client's old config is rejected and the rejection carries the new ones. ex-ray
 retries once with them and refreshes its cached copy.
@@ -71,10 +70,10 @@ retries once with them and refreshes its cached copy.
 A connection to the server that a network silently black-holes stays open and idle, and nothing errors. ex-ray tightens
 the keepalive of the socket it opens to the server, so the kernel gives up on a dead connection sooner.
 
-`tcp-keepalive=<seconds>` is the idle time before probing starts; its default is `tcpKeepAliveDefault` in
-[`config.go`](config.go). `keepAliveProbeCount` probes then follow, each spaced by that same idle time.
-`tcp-keepalive=0` turns keepalive off on that connection, including Go's own default keepalive, which is a full opt-out
-and not a return to the old behaviour.
+`tcp-keepalive=<seconds>` is the idle time before probing starts (default 15). Three probes then follow, each spaced by
+the same idle time, so a dead idle connection is dropped after about four times this value. `tcp-keepalive=0` turns
+keepalive off on that connection, including Go's own default keepalive, which is a full opt-out and not a return to the
+old behaviour.
 
 It applies to the client's TCP connection to the server whatever `mux` says. It does nothing in `mode=quic`, which
 runs over UDP, or in server mode. A connection stalled with unacknowledged data is governed by the TCP retransmit timer

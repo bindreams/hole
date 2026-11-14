@@ -1,9 +1,9 @@
 version: "2"
 
 linters:
-  # `standard` = errcheck, govet, ineffassign, staticcheck, unused.
-  # govet subsumes the old `go vet` hook; ineffassign is already in the set
-  # (do NOT also list it under `enable`).
+  # `standard` = errcheck, govet, ineffassign, staticcheck, unused. govet covers
+  # `go vet`, and ineffassign is already in the set, so do not list it under
+  # `enable`.
   default: standard
   enable:
     - revive

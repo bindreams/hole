@@ -2,11 +2,12 @@ package main
 
 import "log"
 
-// logInit is a no-op retained as a call hook in main(); the actual log
-// routing to stderr is configured in logsink.go's init().
+// logInit does nothing. Log routing to stderr is set up in logsink.go's init().
 func logInit() {
 }
 
+// logFatal, logWarn and logInfo write to stderr through the standard logger.
+// logFatal only logs; the caller exits.
 func logFatal(v ...interface{}) {
 	log.Println(v...)
 }
