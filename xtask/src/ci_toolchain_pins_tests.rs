@@ -26,8 +26,9 @@ fn bare_go_version_is_flagged() {
     assert!(found[0].why.contains("go-version-file"), "{found:?}");
 }
 
-/// A `go-version-file` other than the pinned `go.mod` is flagged: only `go.mod`
-/// carries the `toolchain` directive.
+/// A `go-version-file` is accepted only if it is exactly `GO_VERSION_FILE`; any
+/// other path is flagged, including another `go.mod` that has a `toolchain` line
+/// (the vendored `v2ray-core` one) and a version file such as `.go-version`.
 #[skuld::test]
 fn setup_go_pointing_at_another_file_is_flagged() {
     let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/setup-go@v7\n        with:\n          go-version-file: .go-version\n";

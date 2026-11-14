@@ -37,9 +37,9 @@
 //! The expectation is likewise NOT re-derived here. Guard 2's step lists the
 //! group's live membership before the test steps run and records it
 //! ([`write_expectation`]); guard 3 reads it back ([`read_expectation`]).
-//! Re-listing after the run would cost a second `cargo nextest list` on the leg
-//! closest to its job wall, and would add a second, unverified derivation of the
-//! very set guard 2 pins.
+//! Re-listing after the run would cost a second `cargo nextest list` (64 s to
+//! 3 m 30 s measured on the windows leg, which runs closest to its job wall) and
+//! would add a second, unverified derivation of the very set guard 2 pins.
 //!
 //! [`junit_executed_tests`] reads nextest's JUnit report
 //! (`.config/nextest.toml`'s `[profile.default.junit]`) for the tests that

@@ -11,8 +11,9 @@
 //! notices upstream moving before Renovate proposes the impossible bump.
 //!
 //! The Renovate `allowedVersions` rule is best-effort noise suppression, and this
-//! module does not check that Renovate applies it. `.github/renovate.json` is still
-//! schema-validated by the `renovate-config` CI step.
+//! module does not check that Renovate applies it; `docs/contributing/testing.md`
+//! ("The schemars pin") says why. `.github/renovate.json` is still schema-validated
+//! by the `renovate-config` CI step.
 //!
 //! [`PINNED_SERIES`] is the canonical copy of the fact. `crates/common/Cargo.toml`'s
 //! `schemars = "0.8"` is checked against it ([`check_local_pin`]), and so is the

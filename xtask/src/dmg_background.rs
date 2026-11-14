@@ -96,7 +96,8 @@ pub fn render_typst(
 
     // Propagate a real compile error first (full detail) so it isn't masked by the
     // warnings check when both occur; then treat ANY warning as a hard error (typst
-    // emits none for SFNS.ttf — verified).
+    // 0.15.1 emits none for SFNS.ttf — verified on that version; a typst bump must
+    // re-check).
     let doc = compiled.output.map_err(|e| anyhow!("typst compile failed: {e:?}"))?;
     if !compiled.warnings.is_empty() {
         let msgs = compiled

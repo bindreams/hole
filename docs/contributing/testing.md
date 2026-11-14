@@ -113,7 +113,10 @@ Cargo and Renovate cannot see it coming. Several semver-incompatible `schemars` 
 (`serde_with` declares more than one as optional features), so a bump resolves cleanly and fails only at compile time.
 `.github/renovate.json` carries an `allowedVersions` rule that suppresses the proposal. It is best-effort: if it is
 malformed or shadowed, the worst case is a reopened Renovate PR that `E0603` refuses, never a broken build. Beyond the
-`renovate-config` CI step's schema validation, nothing checks that Renovate applies it.
+`renovate-config` CI step's schema validation, nothing checks that Renovate applies it. A check once did: a hand-rolled
+model of Renovate's rule resolution (which selectors reach `schemars`, name matching, negation, merging of nested
+rules). It diverged from Renovate's real behaviour in three review rounds running, an arms race of machinery that needed
+guarding as much as the rule it guarded, so it was removed.
 
 What the check ({src}`xtask/src/schemars_pin.rs`) guards is the upstream fact that `typify` still requires 0.8. A pin is
 correct only while that holds, and left as a comment it would outlive the fact silently: a suppressed update produces
