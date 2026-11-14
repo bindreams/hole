@@ -10,8 +10,8 @@ This file is the agent-facing architecture map. Product and install live in
 [docs/contributing/](docs/contributing/index.md) (setup, build, development,
 testing, and the architecture under
 [docs/contributing/architecture/](docs/contributing/architecture/overview.md)).
-[CONTRIBUTING.md](CONTRIBUTING.md) holds the route and recovery rules, the process
-model and releases. Read them
+[CONTRIBUTING.md](CONTRIBUTING.md) holds releases, icons and the emergency network
+reset. Read them
 before editing; the sections linked below are the authoritative source.
 
 **IMPORTANT:** NEVER PIPE TESTS TO `tail`! ALWAYS SET A TIMEOUT FOR THE SHELL COMMAND! Tests are known to hang, you WILL get stuck and WILL not have information to debug why if you tail.
@@ -24,7 +24,7 @@ before editing; the sections linked below are the authoritative source.
   [docs/contributing/architecture/overview.md](docs/contributing/architecture/overview.md)
 - **Single-instance GUI.** Single-instance via `tauri-plugin-single-instance`
   (`com.hole.app`); CLI subcommands bypass the lock. →
-  [CONTRIBUTING.md#single-instance-enforcement](CONTRIBUTING.md#single-instance-enforcement)
+  [docs/contributing/architecture/app-process.md#one-instance-per-session](docs/contributing/architecture/app-process.md#one-instance-per-session)
 - **UDP-drop policy.** Hole is a VPN: UDP flows that resolve to `Proxy` on a
   TCP-only plugin are **dropped, not bypassed** (bypassing would leak outside the
   tunnel); enforced structurally in `HoleRouter::resolve_endpoint`. UDP/53 is
@@ -91,7 +91,7 @@ before editing; the sections linked below are the authoritative source.
   [docs/contributing/architecture/datapath.md#the-listener-the-datapath-dials](docs/contributing/architecture/datapath.md#the-listener-the-datapath-dials)
 - **Bridge trait seam.** All OS-mutating bridge I/O routes through the `Proxy`,
   `Routing`, and `Dns` traits so tests can mock it. →
-  [CONTRIBUTING.md#bridge-test-isolation-contract](CONTRIBUTING.md#bridge-test-isolation-contract)
+  [docs/contributing/architecture/test-isolation.md](docs/contributing/architecture/test-isolation.md)
 - **Datapath test seams.** The router seam splits the drop path off `Endpoint`
   so the cascade's consequence is assertable without an engine; the datapath
   seam generifies `Engine`/`Driver` over their packet I/O so the TUN loop is
@@ -106,12 +106,12 @@ before editing; the sections linked below are the authoritative source.
 - **Proxy shutdown contract.** `stop()` returns only once the listener sockets
   are closed; the proxy owns its own runtime because upstream's teardown is
   three layers of bare `abort()`. →
-  [CONTRIBUTING.md#proxy-shutdown-contract](CONTRIBUTING.md#proxy-shutdown-contract)
+  [docs/contributing/architecture/proxy-shutdown.md](docs/contributing/architecture/proxy-shutdown.md)
 - **Cooperative-cancel model.** Cancellation propagates via tokens from the IPC
   `handle_start` handler; no future-drop cancellation. The engine driver
   observes the token at every await, so the dispatcher's join of it carries no
   bound. →
-  [CONTRIBUTING.md#bridge-cancellation-contract](CONTRIBUTING.md#bridge-cancellation-contract)
+  [docs/contributing/architecture/cancellation.md](docs/contributing/architecture/cancellation.md)
 - **Native-crash observability.** The `tombstone` crate writes a signal-safe
   crash marker; the next start of the same kind sweeps it. On macOS
   `on_crash` terminates the process instead of returning — see crash.rs's
@@ -161,11 +161,10 @@ before editing; the sections linked below are the authoritative source.
   `RedactingWriter` under the **one** log-file writer (plus the three console
   writers) provides coverage, because the default filter is a global `info` and
   the set of crates that can write an address is not enumerable; a `Display`-less
-  `ServerAddress` newtype provides prevention. Arming is last-wins, so the
-  crash-recovery `<server:recovered>` token joins to the session token on the
-  next connect. The password has a matching `Display`-less `Password` newtype
-  and its own asymmetric limits. →
-  [CONTRIBUTING.md#server-address-redaction](CONTRIBUTING.md#server-address-redaction)
+  `ServerAddress` newtype provides prevention. Arming is last-wins, so a re-arm
+  joins the old token to the new one in a collected bundle. The password has a
+  matching `Display`-less `Password` newtype and its own asymmetric limits. →
+  [docs/contributing/architecture/redaction.md](docs/contributing/architecture/redaction.md)
 - **File lock.** Cross-process file locks use `file_lock::Exclusive`, which
   never re-permissions a file it did not create or the expected owner does not
   already own (it replaces a leftover, refuses a symlink or other non-regular
@@ -177,7 +176,7 @@ before editing; the sections linked below are the authoritative source.
   [docs/contributing/architecture/file-lock.md](docs/contributing/architecture/file-lock.md)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay
   tee, `HOLE_BRIDGE_LOG` directives, and the plugin tap. →
-  [CONTRIBUTING.md#logging--diagnostics](CONTRIBUTING.md#logging--diagnostics)
+  [docs/contributing/architecture/logging.md](docs/contributing/architecture/logging.md)
 
 ## Invariants you must not break
 
@@ -186,10 +185,10 @@ before editing; the sections linked below are the authoritative source.
   [→](docs/contributing/architecture/datapath.md#udp-is-dropped-never-bypassed)
 - **Bridge OS I/O goes through the `Proxy`/`Routing`/`Dns` traits**, including
   `Drop` cleanup — never the raw free functions (clippy-enforced).
-  [→](CONTRIBUTING.md#bridge-test-isolation-contract)
+  [→](docs/contributing/architecture/test-isolation.md)
 - **Cooperative cancel tokens only** — no fresh `CancellationToken::new()` in
   `crates/bridge/src/` (clippy-enforced).
-  [→](CONTRIBUTING.md#bridge-cancellation-contract)
+  [→](docs/contributing/architecture/cancellation.md#one-cancel-mechanism-tokens)
 - **Delete only recorded routes** — a route whose install failed belongs to
   whoever holds it now; deleting it takes down another VPN's tunnel.
   [→](docs/contributing/architecture/route-ownership.md)
@@ -206,7 +205,7 @@ before editing; the sections linked below are the authoritative source.
 - **PII redaction** — errors carrying filesystem paths or other PII must be
   redacted before reaching any log, toast, or bundle; a path's detail still
   lands in `gui.log`, but the server address never does.
-  [→](CONTRIBUTING.md#logging--diagnostics)
+  [→](docs/contributing/architecture/logging.md#what-reaches-a-toast)
 - **Per-variant policy lives on the type, never at a call site** — a decision
   keyed to an enum variant belongs in ONE exhaustive match on that type
   (`SessionEvent::preserves_death_reason`, `CoverPresence::is_present`,
@@ -239,7 +238,7 @@ before editing; the sections linked below are the authoritative source.
   `ServerAddress` or `Password` (compiler-enforced), `.expose()` is the only
   exit from either, and every `Serialize` type transitively holding one needs
   its own `Dump` impl.
-  [→](CONTRIBUTING.md#server-address-redaction)
+  [→](docs/contributing/architecture/redaction.md#prevention-by-type)
 
 ## macOS CI is the scarce resource
 
@@ -263,7 +262,7 @@ what is open before starting more.
   [dev/admin CLI](docs/contributing/bridge-cli.md))
 - Architecture →
   [docs/contributing/architecture/](docs/contributing/architecture/overview.md)
-- The route and recovery rules, the process model, releases →
+- Releases, icons, emergency network reset →
   [CONTRIBUTING.md](CONTRIBUTING.md)
   ([releases](CONTRIBUTING.md#releases))
 - Release ops (rollback, minisign key rotation) →

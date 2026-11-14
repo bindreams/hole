@@ -79,7 +79,8 @@ The field order of `Session` is the release order:
    cover back still in force, after the routes are gone, and the caller releases it or lets go of it, so the cover's
    persistent filters can outlive the routes.
 
-A teardown never observes a cancel token: a cancelled start still runs it to the end.
+A teardown never observes a cancel token: a cancelled start still runs it to the end ([cancellation and
+teardown](cancellation.md#every-exit-of-a-start-ends-in-one-teardown)).
 
 ## The trait seams
 
@@ -92,20 +93,14 @@ them:
 | `Routing` | {src}`crates/tun-engine/src/routing.rs` | The route table and the kill-switch covers                                  |
 | `Dns`     | {src}`crates/bridge/src/dns/system.rs`  | Pointing the operating system's resolvers at the TUN device, and undoing it |
 
-The reason is test isolation. A unit test that reached the real `netsh`, `route` or `pfctl` would change the machine it
-runs on, so tests substitute a mock whose guard type counts its drops. {src}`clippy.toml` keeps the seam closed: route
-setup and teardown (`setup_routes`, `teardown_routes`) are disallowed methods outside `SystemRouting`, and so are the
-Windows DNS-settings calls and the FWPM calls outside their sanctioned modules. Crash recovery of routes is the free
-function `recover_routes`, which the bridge calls directly and not through the trait.
+The reason is test isolation: a unit test that reached the real `netsh`, `route` or `pfctl` would change the machine it
+runs on, so tests substitute a mock. [The seams](test-isolation.md) is the full contract and says what keeps it closed.
 
 Resource guards are RAII: a `Routing::Installed` removes its routes on drop and a `Routing::Cover` removes its block on
 drop, with the one exception that a cover can be *disarmed*, which leaves the block in force while the process lets go
 of it (see [the kill switch](kill-switch.md)).
 
-Cancellation is cooperative: a start carries a token and checks it, and nothing cancels a start by dropping its future.
-Creating a token in `crates/bridge/src/` is a disallowed method in {src}`clippy.toml`, with a short list of sanctioned
-sites that each carry an `#[allow]`: the roots, such as `handle_start` in {src}`crates/bridge/src/ipc.rs` for a start
-from the app, and the process shutdown token that boot passes to `reconcile_once`, which connects with a child of it.
+Cancellation is cooperative; see [cancellation and teardown](cancellation.md).
 
 ## Where to read next
 
@@ -124,4 +119,8 @@ from the app, and the process shutdown token that boot passes to `reconcile_once
   tools](system-tools.md) and [the update cutover](update-cutover.md).
 - Windows service: [stop reporting](windows-service-stop.md). Test infrastructure: [spawn contention and
   ports](contention-and-ports.md).
-- The process model is still in {src}`CONTRIBUTING.md`, under *Architecture*.
+- The app and the rules that cross the process boundary:
+  - [The app process](app-process.md): single instance, the tray menu, and the app and bridge version handoff.
+  - [The seams](test-isolation.md): the `Proxy`, `Routing` and `Dns` traits, in full.
+  - [Cancellation and teardown](cancellation.md) and [the proxy shutdown contract](proxy-shutdown.md).
+- Logs: [logging and diagnostics](logging.md), and [server-address redaction](redaction.md).
