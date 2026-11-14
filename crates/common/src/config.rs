@@ -217,7 +217,7 @@ pub struct AppConfig {
     /// land in `bridge.log`. Off by default — adds a loopback round-trip
     /// per byte, inappropriate at browser-traffic scale. Enable when
     /// reproducing a "tunnel returns nothing" failure (e.g. a plugin
-    /// outbound that silently hangs). See CLAUDE.md "Plugin tap" section.
+    /// outbound that silently hangs). See `docs/contributing/architecture/logging.md`.
     ///
     /// **Reaches service mode**: this flag travels via `ProxyConfig`
     /// in the IPC `BridgeRequest::Start` payload, unlike the

@@ -25,10 +25,9 @@
 //   (Ctrl+S, pipe consumer hung) MUST NOT block the bridge or the panic
 //   hook.
 // - **File appender** is `.lossy(false)` — the teardown burst MUST land
-//   on disk for diagnostics. Hang risk is bounded by the
-//   `buffered_lines_limit` default (128k events) and by the fact that
-//   real disk wedges are user-visible (a stop that takes >2s is reported
-//   to the IPC caller).
+//   on disk for diagnostics. A wedged disk blocks every thread that logs,
+//   with no limit, once the `buffered_lines_limit` default (128k events)
+//   is full; the buffer only delays that.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -735,8 +734,8 @@ pub fn init_dual(
     // Remove-NetAdapter — emitted in tens of ms) must never be silently
     // truncated, or `bridge.log` loses the diagnostic for a teardown that
     // broke the user's network. Trade-off: a wedged disk (full filesystem,
-    // OneDrive sync stall, AV scan) back-pressures the tracing producer,
-    // bounded by `buffered_lines_limit` (default 128k events).
+    // OneDrive sync stall, AV scan) blocks every thread that logs, with no
+    // limit, once `buffered_lines_limit` (default 128k events) is full.
     //
     // The STDERR non-blocking writer keeps `lossy(true)`: a wedged
     // terminal (Ctrl+S on a console session) MUST NOT block the bridge.
