@@ -47,7 +47,11 @@ so the error names every failure:
 1. **Stop the bridge.** It is gated on nothing. Whether a bridge runs and whether a registration record names it are
    independent facts, and the covers are held by the live process, not by the record. Gating the stop on the record made an
    uninstall a dead end: `DeleteService` on a live service *succeeds* by marking the row for deletion, after which the
-   record reads as absent, every retry skipped the teardown, and the liveness lock refused the release for ever.
+   record reads as absent, every retry skipped the teardown, and the liveness lock refused the release for ever. On both
+   platforms the stop is the act followed by a classification of what it left behind, never a probe before it and never the
+   act's exit code: the job can leave the service manager between a probe and the act (a concurrent uninstall, an operator's
+   own stop, the daemon exiting), and `launchctl bootout` of a label launchd does not have exits with neither 0 nor the
+   "no such service" status. Only an answer taken after the act is about the world the act left.
 1. **Deregister the service**, only after a *confirmed* stop and only when something is registered. An unconfirmed stop
    leaves the registration alone, because it is the only handle a later attempt has.
 1. **Release the covers**, unconditionally unless `--keep-covers` is passed. It is never gated on registration and never
@@ -161,6 +165,14 @@ exhaustive match (`RepairStep::of`):
 - **It is a registry value and not a file** because the GUI must read it unprivileged and the state directory's DACL admits
   SYSTEM and Administrators only. A service key grants Users read and nothing else, so the GUI reads it and no user can
   forge it. It dies with the service.
+- **Whether the stamped process runs is read from the process where it can be opened.** The writer may be SYSTEM (the cutover
+  child, an installer's custom action) and the GUI is an unprivileged user, and `OpenProcess` is refused for every SYSTEM
+  process there (measured: `ERROR_ACCESS_DENIED` for `services.exe` and `svchost.exe`, even for
+  `PROCESS_QUERY_LIMITED_INFORMATION`). A process that can be opened is running when its object is not signalled, which is an
+  edge at exit. The system process list (`NtQuerySystemInformation`) kept an exited process listed, with a thread left, while a
+  reader held a handle to it, so it decides only for a process that cannot be opened. For that case it was measured as a
+  standard user holding no handle, right after a SYSTEM process stopped: about 6,500 rounds on the privileged CI runner (probe at
+  `50d133c91`, CI run 41817171754) never listed the exited process with a thread left (`Stamp::is_running`).
 - **It never blocks.** A record that cannot be read counts as present, and none of an uninstall, an install, a cutover or a
   connect is blocked by it: a record that could block them is the lockout this design removes.
 - **An administrator's Disable survives every path that is not an explicit enable**: the retirement's restore, the update

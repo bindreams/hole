@@ -58,7 +58,7 @@ impl<T: Settle> Registration<T> {
 impl<T: Settle> Drop for Registration<T> {
     fn drop(&mut self) {
         if self.get().is_settled() {
-            // SAFETY: `ptr` is the leaked `Box` from `new`, reclaimed at most once,
+            // SAFETY: `ptr` is the leaked `Box` from `new_with`, reclaimed at most once,
             // and settled means nothing else can reach it.
             drop(unsafe { Box::from_raw(self.ptr.as_ptr()) });
         } else {

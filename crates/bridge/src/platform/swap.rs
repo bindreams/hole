@@ -5,7 +5,7 @@
 //!
 //! The plan is pure (cfg-free, table-tested on any host); the real FFI
 //! (`renamex_np`, the `getattrlist VOL_CAP_INT_RENAME_SWAP` volume probe, and
-//! `execute_swap`) is gated to macOS behind the #165 isolation contract.
+//! `execute_swap`) is gated to macOS.
 
 use std::path::{Path, PathBuf};
 
@@ -115,7 +115,7 @@ pub trait SwapOps {
 /// both keep the swap all-or-nothing by deferring the destructive delete until the
 /// whole set commits, so any failure rolls back to the prior consistent set. The
 /// drivers differ in primitive (`renamex_np` exchange here vs rename-away/move-in
-/// retaining `.old-<ver>` there) and so are not yet unified.
+/// retaining `.old-<ver>` there).
 ///
 /// ROLLBACK PRECONDITION: a `PlainRename` image has no recoverable inverse (its
 /// pre-swap dest was overwritten by the new bytes), so `reswap` is a no-op for
