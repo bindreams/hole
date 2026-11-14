@@ -37,16 +37,12 @@ pub enum PinSource {
     ResolverDeselected,
 }
 
-/// The port implied by [`doh_url_for_ip`]'s bare `https://` scheme (RFC
-/// 9110's default port for `https`, since the URL never carries an explicit
-/// one) — the ONE port ex-ray's ECH-config fetch can ever dial for a URL this
-/// module builds. `doh_url_for_ip_ports_to_the_https_default` pins this with
-/// an executable assertion against the URL crate's own scheme-default table,
-/// not just prose. `tun-engine`'s fail-closed cover mirrors this value as
-/// `RESOLVER_PERMIT_PORT` (`crates/tun-engine/src/routing/failclosed.rs`) —
-/// a separate declaration, not an import: `tun-engine` sits BELOW
-/// `hole-bridge` in the crate dependency graph, so it cannot import from
-/// here.
+/// The port implied by [`doh_url_for_ip`]'s bare `https://` scheme (the
+/// default for `https`): the only port ex-ray's ECH-config fetch can dial for
+/// a URL this module builds. `doh_url_for_ip_ports_to_the_https_default` pins
+/// it against the URL crate's scheme-default table. `tun-engine`'s fail-closed
+/// cover mirrors it as `RESOLVER_PERMIT_PORT`, a separate declaration because
+/// `tun-engine` sits below `hole-bridge` in the dependency graph.
 pub const DOH_PORT: u16 = 443;
 
 /// DoH endpoint URL that pins the resolver by IP: `https://<ip>/dns-query`,
@@ -78,18 +74,13 @@ pub fn authority_is_a_name(url: &str) -> bool {
 /// in the log, and only [`PinSource::Answered`] outranks a value the config
 /// already carries whose authority is not a name (see [`authority_is_a_name`]).
 ///
-/// `resolver` is the exact address `url` names — Hole constructed `url` from
-/// it (`doh_url_for_ip`), never a guess. The fail-closed cover permits
-/// exactly this address regardless of `source`: it always comes from the
-/// user's OWN configured `dns.servers`, so permitting it is config-authorship
-/// trust, not a claim that THIS attempt personally dialed it — `Answered`
-/// and `SecureBootstrapFailed` did (`resolve_via_doh_with` dials every configured
-/// resolver even on total failure); `NoQueryNeeded` dialed nothing at all
-/// (a literal-IP server short-circuits before the loop), and
-/// `ResolverDeselected`'s fallback may name an address only a PRIOR resolve
-/// dialed, or never dialed this bridge process at all. See
-/// `Routing::install_failclosed_cover`'s doc for why config-authorship alone
-/// is judged sufficient.
+/// `resolver` is the exact address `url` names: Hole built `url` from it
+/// (`doh_url_for_ip`). The fail-closed cover permits exactly this address
+/// whatever `source` is, because it always comes from the user's own
+/// `dns.servers`: that is trust in the config's authorship, not a claim that
+/// this attempt dialed it (`NoQueryNeeded` dialed nothing, and
+/// `ResolverDeselected`'s fallback may never have been dialed by this
+/// process). See `Routing::install_failclosed_cover` for why that suffices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EchDoh {
     pub url: String,
@@ -99,10 +90,10 @@ pub struct EchDoh {
 
 impl EchDoh {
     /// Whether a resolver demonstrated it serves DoH from this host. Used
-    /// ONLY to break a tie against an operator's own `ech-doh` already in
-    /// `plugin_opts` (`crate::proxy::plugin::hole_ech_doh_outranks`) — NOT to
+    /// only to break a tie against an operator's own `ech-doh` already in
+    /// `plugin_opts` (`crate::proxy::plugin::hole_ech_doh_outranks`), never to
     /// gate the fail-closed cover's permit, which reads `resolver` directly
-    /// regardless of pin state (see `EchDoh`'s doc).
+    /// (see [`EchDoh`]).
     pub fn is_pinned(&self) -> bool {
         self.source.verified_ip().is_some()
     }

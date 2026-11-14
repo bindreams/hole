@@ -1,56 +1,40 @@
 //! System DNS apply + confine.
 //!
 //! The bridge advertises the configured resolver IPs on `hole-tun` (the
-//! adapter it created, per `tun_engine::device::identity`) and confines DNS
-//! egress to that adapter via `tun_engine::dns_confine` on Windows (see
-//! that module's doc for the WFP mechanism and its process-scoped
-//! lifetime). It writes DNS to no other adapter — `crate::dns_state` and
-//! `crate::dns::recovery` cover the one place a write to another adapter is
-//! still correct: undoing an older build's own upstream-adapter rewrite
-//! after a crash, gated on live evidence and evaluated at most once per
-//! file.
+//! adapter it created, per `tun_engine::device::identity`) and, on Windows,
+//! confines DNS egress to that adapter via `tun_engine::dns_confine`. On
+//! macOS it publishes a supplemental resolver at a synthetic, session-scoped
+//! `SCDynamicStore` key via `tun_engine::dns_steer`. Both mechanisms are
+//! process-scoped and die with the bridge, so neither needs crash-recovery
+//! state. DNS is written to no other adapter; `crate::dns_state` and
+//! `crate::dns::recovery` cover the one exception, undoing an older build's
+//! upstream-adapter rewrite after a crash.
 //!
-//! ## Windows: fail-fatal
+//! ## Fail-fatal
 //!
-//! the confinement is the ONLY thing standing
-//! between OS DNS and the LAN resolver. `apply` is fail-fatal on Windows:
-//! if the confinement cannot engage, or the resolver IPs cannot be set on
-//! `hole-tun`, the whole start aborts rather than leaving a session the UI
-//! reports as connected with a silent DNS leak.
+//! On both platforms `apply` aborts the start if the confinement or steering
+//! cannot engage, or the resolver IPs cannot be set: the confinement (Windows)
+//! and the steering key (macOS) are the only things standing between OS DNS and
+//! the LAN resolver, so a session that reports connected without them leaks DNS.
 //!
-//! ## macOS: fail-fatal
+//! ## macOS address families
 //!
-//! `apply_macos` no longer shells out to `networksetup` with an interface
-//! name — that identifier type is a *service* name, so passing it was a
-//! guaranteed no-op. It now publishes a
-//! supplemental resolver at a synthetic, session-scoped `SCDynamicStore` key
-//! via `tun_engine::dns_steer` — the macOS analogue of the Windows
-//! confinement above: a process-scoped mechanism that needs no
-//! crash-recovery state because it dies with the bridge, including on
-//! `SIGKILL` (see that module's doc for the mechanism and its D3
-//! session-lifetime argument). A failure to engage it is fatal, for the
-//! identical reason the Windows confinement is: there is no longer a
-//! degraded "advisory" mode a session can silently fall back to.
-//!
-//! Unlike Windows, the steering key covers the whole machine rather than one
-//! adapter, so `tun`'s alias plays no role in reaching it — see
-//! `apply_macos`'s own doc. `advertise_ips` is filtered to the address
-//! families the tunnel is actually carrying (`RoutedFamilies`, read once
-//! from the routes that landed — never from the TUN's own IPv6 read-back or
-//! the upstream gateway's IPv6 availability, both of which answer a
-//! different question). An
-//! empty filtered list is refused rather than silently advertising nothing.
+//! `advertise_ips` is filtered to the families the tunnel carries
+//! ([`RoutedFamilies`]); an empty filtered list is refused rather than
+//! advertising nothing. The steering key covers the whole machine, so the
+//! TUN's alias plays no part in reaching it (see `apply_macos`).
 //!
 //! ## Cancellation
 //!
-//! `apply` checks `cancel` before engaging the confinement/steering and
-//! again afterward — Windows, before setting resolvers; macOS, immediately
-//! after the engage call returns. A cancel fired after the engage drops it
-//! (Windows: the dynamic WFP session tears down with the guard; macOS:
-//! `withdraw` is called explicitly, best-effort — see `apply_macos`) before
-//! returning `DnsError::Cancelled` — there is nothing to inline-restore any
-//! more, since nothing but `hole-tun` (Windows) or the synthetic steering
-//! key (macOS) is ever touched.
+//! `apply` checks `cancel` before engaging the confinement/steering and again
+//! after: on Windows before setting resolvers, on macOS right after the engage
+//! returns. A cancel after the engage drops it (Windows: the dynamic WFP
+//! session ends with the guard; macOS: `withdraw`, best-effort) and returns
+//! [`DnsError::Cancelled`]. Nothing is restored, since only `hole-tun` or the
+//! steering key was ever touched.
+//!
+//! The mechanisms are described in
+//! `docs/contributing/architecture/dns-forwarder.md#how-the-operating-system-reaches-it`.
 
 use std::io;
 use std::net::IpAddr;
@@ -75,34 +59,29 @@ use phase::LeakBearing;
 /// Production goes through [`SystemDns`] (platform-specific); tests
 /// substitute a mock via [`crate::proxy_manager::ProxyManager::new_with_dns`].
 ///
-/// **Why a trait, not free functions.** Direct callers of the
-/// platform-free-function surface outside the `SystemDns` impl are
-/// rejected by workspace `clippy.toml` `disallowed_methods`, mirroring the
-/// `setup_routes` / `teardown_routes` enforcement at
-/// [tun_engine::routing](../../../tun_engine/routing.rs). The motivation
-/// is identical to #165: a helper that bypasses the trait cannot be
-/// intercepted by the mock and will exercise real production code from
-/// unit tests, with catastrophic consequences for test reliability and
-/// CI health. See bindreams/hole#397.
+/// Callers outside the `SystemDns` impl may not call the platform free
+/// functions: the workspace `clippy.toml` `disallowed_methods` rejects them,
+/// as it does for the routing free functions. A helper that bypasses the
+/// trait cannot be intercepted by the mock and would run real OS code from
+/// unit tests (`docs/contributing/architecture/test-isolation.md`).
 pub trait Dns: Send + Sync + 'static {
     /// RAII guard returned by [`apply`](Self::apply). Owns the confinement
-    /// (Windows) and the DebugDropBomb.
+    /// (Windows) or steering key (macOS) and the `DebugDropBomb`.
     ///
-    /// **Two teardown paths**:
+    /// Two teardown paths:
     ///
-    /// - Preferred: call [`DnsApplied::shutdown`] (async) before drop.
-    ///   This is what `ProxyManager::stop` does.
-    /// - Fallback: Drop. Synchronous, used only on crash / panic
-    ///   unwind. The `DebugDropBomb` safeguard inside the production
-    ///   guard panics in debug builds if shutdown wasn't awaited, so
-    ///   missed-shutdown bugs are caught at first test run.
+    /// - Preferred: call [`DnsApplied::shutdown`] (async) before drop, as
+    ///   `ProxyManager::stop` does.
+    /// - Fallback: `Drop`, synchronous, for crash or panic unwind. The
+    ///   `DebugDropBomb` panics in debug builds if shutdown wasn't awaited,
+    ///   so a missed shutdown fails the first test run.
     type Applied: DnsApplied;
 
     /// Confine DNS egress to `tun` and point the OS at `advertise_ips` (the
     /// configured upstream resolver IPs) on `tun` only. `server_ip` is the
-    /// confinement's own server permit — the tunnel's own handshake must
-    /// stay reachable even when the server runs on port 53 — see
-    /// `tun_engine::dns_confine::build_spec`.
+    /// confinement's server permit: the tunnel's own handshake must stay
+    /// reachable even when the server runs on port 53 (see
+    /// `tun_engine::dns_confine::build_spec`).
     ///
     /// On Windows, `set_servers` splits `advertise_ips` per address family
     /// and sets the v4 and v6 families separately; a family with no
@@ -110,8 +89,8 @@ pub trait Dns: Send + Sync + 'static {
     /// the mixed list (filtered by `routed` — see the module doc) at a
     /// synthetic supplemental-resolver key. OS UDP/53 to these IPs routes
     /// into `hole-tun` and is intercepted by the in-TUN `LocalDnsEndpoint`;
-    /// OS TCP/53 falls through the proxy cascade to the real resolver over
-    /// the tunnel.
+    /// OS TCP/53 takes the ordinary filter cascade to the real resolver, so
+    /// the user's rule for that address decides its path.
     ///
     /// `routed` is the address families the tunnel is actually carrying —
     /// see [`RoutedFamilies`]. Windows ignores it (the WFP confinement
@@ -134,22 +113,21 @@ pub trait Dns: Send + Sync + 'static {
 
 /// Which address families the tunnel is actually carrying, at the moment
 /// [`Dns::apply`] runs. Read once from the routes `Routing::install` just
-/// installed (ground truth) — never re-derived from the TUN's own IPv6
-/// read-back or the upstream gateway's IPv6 availability, both of which
-/// answer a different question . Windows ignores this: the WFP DNS-egress confinement blocks
-/// off-tunnel DNS egress regardless of family, so there is nothing this
-/// filter would add there.
+/// installed, never re-derived from the TUN's own IPv6 read-back or the
+/// upstream gateway's IPv6 availability, which answer a different question.
+/// Windows ignores it: the WFP confinement blocks off-tunnel DNS egress
+/// regardless of family.
 ///
-/// Defined in `tun-engine` (not here) and re-exported: `hole-bridge` depends
-/// on `tun-engine`, not the reverse, and `Routing::Installed`'s
-/// `routed_families()` — the only producer of this value — lives on that
-/// crate's `RoutesInstalled` trait .
+/// Defined in `tun-engine` and re-exported, since `hole-bridge` depends on
+/// `tun-engine` and the only producer, `RoutesInstalled::routed_families`,
+/// lives there.
 pub use tun_engine::routing::RoutedFamilies;
 
 /// RAII guard returned by [`Dns::apply`]. See [`Dns::Applied`] for the
 /// shutdown contract.
 pub trait DnsApplied: Send + 'static {
-    /// Release the confinement (Windows) and flush the OS resolver cache.
+    /// Release the confinement (Windows) or withdraw the steering key
+    /// (macOS), and flush the OS resolver cache.
     /// Async so the platform I/O can use `tokio::task::spawn_blocking` and
     /// never stall the runtime worker. Idempotent: calling twice is a
     /// no-op the second time.
@@ -159,23 +137,21 @@ pub trait DnsApplied: Send + 'static {
 /// Errors returned from [`Dns::apply`].
 #[derive(Debug, thiserror::Error)]
 pub enum DnsError {
-    /// The cancel token fired between the confinement engage and the
-    /// resolver-IP set. The confinement (if it had engaged) has already
-    /// been dropped before this variant is returned.
+    /// The cancel token fired during `apply`. Whatever had engaged (the
+    /// confinement or steering key) has already been released.
     #[error("DNS apply cancelled")]
     Cancelled,
 
-    /// Setting the resolver IPs on `hole-tun` failed. Fatal on Windows
-    /// (see the module doc); non-fatal (`warn!` + continue) on macOS.
+    /// Setting the resolver IPs on `hole-tun` failed (Windows), the steering
+    /// key could not be published, or no advertised resolver's address
+    /// family is routed (macOS). Always fatal (see the module doc).
     #[error("DNS apply failed: {0}")]
     Io(#[from] io::Error),
 
     /// The DNS-egress confinement could not be engaged (Windows only).
-    /// Always fatal — a confinement that failed to engage is not a
-    /// degraded session, it is an unprotected one. `#[from]` (not just
-    /// `#[source]`) so `phase::run`'s generic `E: Into<DnsError>` bound
-    /// carries this variant through unchanged instead of collapsing it
-    /// into `DnsError::Io` — see `phase.rs`'s doc.
+    /// Always fatal. `#[from]` (not just `#[source]`) so `phase::run`'s
+    /// `E: Into<DnsError>` bound carries this variant through unchanged
+    /// instead of collapsing it into `DnsError::Io` (see `phase.rs`).
     #[cfg(target_os = "windows")]
     #[error("could not confine DNS to the tunnel: {0}")]
     Confine(#[from] tun_engine::dns_confine::DnsConfineError),
@@ -203,8 +179,7 @@ pub struct SystemDns {
     /// [`Self::new_with_backend`].
     #[cfg(target_os = "windows")]
     confiner: Arc<dyn windows::DnsConfiner>,
-    /// macOS `networksetup` backend, used only for `flush` now (see the
-    /// module doc). Production: [`macos::Networksetup`]; tests: substitute
+    /// macOS `networksetup` backend, used only for `flush`. Production: [`macos::Networksetup`]; tests: substitute
     /// via [`Self::new_with_mac_backend`].
     #[cfg(target_os = "macos")]
     backend: Arc<dyn macos::MacDnsBackend>,
@@ -335,12 +310,9 @@ async fn apply_windows(
         return Err(DnsError::Cancelled);
     }
 
-    // Confine DNS egress to hole-tun BEFORE advertising a resolver on it —
-    // fail-fatal (see module doc): a confinement that failed to engage is
-    // not a degraded session, it is an unprotected one. `LeakBearing` so
-    // `phase::run` propagates the error (and preserves the
-    // `DnsError::Confine` variant, not a collapsed `DnsError::Io` — see
-    // `phase.rs`'s doc) instead of swallowing it.
+    // Confine DNS egress to hole-tun before advertising a resolver on it.
+    // `LeakBearing`: `phase::run` propagates the error, keeping the
+    // `DnsError::Confine` variant (see `phase.rs`).
     let confiner = Arc::clone(confiner);
     let luid = tun.luid();
     let confinement = phase::run::<LeakBearing, _, _>("confine", move || confiner.engage(luid, server_ip))
@@ -354,23 +326,11 @@ async fn apply_windows(
         return Err(DnsError::Cancelled);
     }
 
-    // The LUID of the device this process actually opened — never a name
-    // lookup. An alias, by contrast, is the name Hole REQUESTED
-    // (`TunIdentity::alias`), not a value read back from the opened device —
-    // true on this Windows-only function's platform (`WINDOWS_TUN_ALIAS` is
-    // requested and never read back; see `crate::dispatcher::Dispatcher::new`),
-    // though NOT of `TunIdentity::alias` in general: on macOS, where this
-    // function never runs, the alias IS a value read back from the opened
-    // device (bindreams/hole#850's `TunName::KernelAssigned`). A concurrent
-    // bridge's adapter can answer to that same requested name
-    // (bindreams/hole#936), so resolving a GUID from the alias instead of
-    // the LUID could target the wrong adapter.
-    //
-    // Fail-fatal (see module doc): after #846 there is exactly one target,
-    // so "continuing" has nowhere to continue to — confinement-up plus
-    // resolvers-never-set is a total DNS blackout on a session the UI
-    // reports as connected. `LeakBearing` for the same reason as the
-    // confinement engage above.
+    // Address the adapter by the LUID of the device this process opened, never by
+    // alias: on Windows the alias is the name Hole requested and never read
+    // back, and a concurrent bridge's adapter can answer to it. With the
+    // confinement up and no resolvers set, DNS is blacked out on a session the UI
+    // reports as connected, so this step is `LeakBearing` too.
     let b = Arc::clone(backend);
     let ips = advertise_ips.clone();
     phase::run::<LeakBearing, _, _>("set-servers", move || b.set_servers(luid, &ips)).await?;
@@ -416,9 +376,8 @@ async fn apply_macos(
         return Err(DnsError::Cancelled);
     }
 
-    // D4 narrow filter (see the module doc and `RoutedFamilies`'s doc):
-    // only advertise a resolver whose address family actually has a live
-    // split route. An empty result is refused rather than silently
+    // Advertise only resolvers whose address family has a live split route
+    // (see `RoutedFamilies`). An empty result is refused rather than silently
     // publishing nothing.
     let filtered: Vec<IpAddr> = advertise_ips
         .into_iter()
@@ -430,10 +389,8 @@ async fn apply_macos(
         )));
     }
 
-    // Publish the supplemental resolver key — fail-fatal (see module doc):
-    // this key is the ONLY thing steering OS DNS on macOS, so a failure to
-    // engage it is not a degraded session, it is an unprotected one.
-    // `LeakBearing` so `phase::run` propagates the error.
+    // Publish the supplemental resolver key. `LeakBearing`: it is the only
+    // thing steering OS DNS on macOS, so `phase::run` propagates a failure.
     let s = Arc::clone(steerer);
     let servers = filtered;
     let steering = phase::run::<LeakBearing, _, _>("dns-steer-engage", move || s.engage(&servers))
@@ -475,8 +432,7 @@ async fn apply_macos(
 /// test run. Release builds fall through to a best-effort sync fallback.
 #[must_use = "SystemDnsApplied owns async cleanup; call .shutdown().await before drop"]
 pub struct SystemDnsApplied {
-    /// Win32 backend, used only for `flush` now (nothing to restore — see
-    /// the module doc).
+    /// Win32 backend, used only for `flush` (nothing is restored).
     #[cfg(target_os = "windows")]
     backend: Arc<dyn windows::WinDnsBackend>,
     /// The engaged confinement. `None` only if `shutdown` already took it,
@@ -501,10 +457,9 @@ pub struct SystemDnsApplied {
     /// the fallback dead code in release. The `shutdown_completed` flag
     /// below is the load-bearing release-mode signal.
     bomb: drop_bomb::DebugDropBomb,
-    /// `true` after `DnsApplied::shutdown` has completed. Set regardless
-    /// of build profile. `Drop` checks this (not `bomb.is_defused()`) to
-    /// decide whether to run the sync-fallback flush. See
-    /// bindreams/hole#397.
+    /// `true` after `DnsApplied::shutdown` has completed, in every build
+    /// profile. `Drop` checks this (not `bomb.is_defused()`) to decide
+    /// whether to run the sync-fallback flush.
     shutdown_completed: bool,
 }
 
@@ -535,20 +490,16 @@ impl DnsApplied for SystemDnsApplied {
 
         #[cfg(target_os = "windows")]
         {
-            // Dropping the confinement here IS the disengage — see
-            // `tun_engine::dns_confine`'s module doc. No adapter restore:
-            // nothing but `hole-tun` was ever touched, and it is about to
-            // be torn down by the routes/dispatcher teardown that follows
-            // this in `ProxyManager::stop_with`.
+            // Dropping the confinement is the whole disengage (see
+            // `tun_engine::dns_confine`). No adapter restore: only `hole-tun`
+            // was touched, and the teardown that follows removes it.
             self.confinement.take();
         }
 
         #[cfg(target_os = "macos")]
         if let Some(steering) = self.steering.take() {
-            // Best-effort (`Cosmetic`): a failed withdraw must not fail a
-            // stop, but is logged (with the key) by
-            // `RealSteeringHandle::withdraw` — the whole point of making it
-            // confirmable rather than silent.
+            // `Cosmetic`: a failed withdraw must not fail a stop;
+            // `RealSteeringHandle::withdraw` logs it with the key.
             let _ = phase::run::<Cosmetic, _, _>("dns-steer-withdraw", move || steering.withdraw()).await;
         }
 

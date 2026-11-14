@@ -4,10 +4,9 @@ use super::{run, Cosmetic, LeakBearing};
 use crate::dns::system::DnsError;
 
 /// A [`LeakBearing`] failure is a DNS leak — it must propagate, never be
-/// swallowed. The production regression this guards: `apply_macos` today
-/// (pre-Task-3) writes `if let Err(e) = res { warn!(…) }` for exactly this
-/// shape of call; under `LeakBearing` that idiom cannot compile-and-pass
-/// this test, because `run` itself performs the propagation.
+/// swallowed. The regression this guards is an ad-hoc `if let Err(e) = res {
+/// warn!(…) }` on a leak-bearing call; under `LeakBearing`, `run` itself
+/// performs the propagation.
 #[skuld::test]
 async fn leak_bearing_propagates_the_backend_error() {
     let result: Result<Option<()>, DnsError> =
@@ -60,7 +59,7 @@ async fn both_phases_return_the_success_value() {
 /// The guard against collapsing a backend's own error variant into
 /// `DnsError::Io`: a closure returning `DnsConfineError` must yield
 /// `DnsError::Confine`, which is exactly the variant
-/// `proxy_manager.rs:1805-1810` matches on to decide the start aborted on
+/// `proxy_manager.rs` matches on to decide the start aborted on
 /// confinement specifically (as opposed to any other DNS-apply failure).
 /// Windows-only: `DnsConfineError` and `DnsError::Confine` exist only on
 /// that platform.

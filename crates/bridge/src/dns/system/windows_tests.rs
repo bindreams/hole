@@ -24,10 +24,9 @@ use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
 
 // MockBackend =========================================================================================================
 
-/// Test-only [`WinDnsBackend`]. Counts calls per method. `apply` now has
-/// exactly one target (`hole-tun`), so there is no second call for a cancel
-/// test to race against on the backend side any more — that race moved to
-/// [`MockConfiner::engage`], which still has a window before it (see
+/// Test-only [`WinDnsBackend`]. Counts calls per method. `apply` has one
+/// target (`hole-tun`), so a cancel test races against
+/// [`MockConfiner::engage`], not the backend (see
 /// `dns_apply_cancelled_drops_the_confinement`).
 struct MockBackend {
     get_calls: AtomicUsize,
@@ -291,9 +290,10 @@ async fn system_dns_applied_drop_panics_in_debug_if_shutdown_not_awaited() {
     drop(applied);
 }
 
-/// `shutdown` must release the confinement — the Rule #0 guarantee,
-/// pinned at this layer (the live proof that dropping it actually reopens
-/// DNS lives in the elevated `dns_confine_global_net_state_filters_die_with_the_session`).
+/// `shutdown` must release the confinement: one that outlived the session
+/// would leave the user without DNS. Pinned at this layer; the live proof
+/// that dropping it reopens DNS is the elevated
+/// `dns_confine_global_net_state_filters_die_with_the_session`.
 #[skuld::test]
 async fn shutdown_releases_the_confinement() {
     let backend = MockBackend::new();
@@ -510,13 +510,12 @@ async fn dns_apply_captures_nothing() {
     applied.shutdown().await;
 }
 
-// empty_settings contract (regression: bindreams/hole#437) ============================================================
+// empty_settings contract =============================================================================================
 //
-// CONTRACT PINS, not OOB detectors. The original 48-byte out-of-bounds FFI
-// access is NOT observable from a unit test: `MockBackend` substitutes at
-// the `WinDnsBackend` level — ABOVE `empty_settings` and the real Win32 FFI
-// — so no unit test reaches the corrupting path. These pin the constructor's
-// contract (the layer that carried the bug); the
+// Contract pins, not out-of-bounds detectors. An out-of-bounds FFI access is
+// not observable from a unit test: `MockBackend` substitutes at the
+// `WinDnsBackend` level, above `empty_settings` and the real Win32 FFI, so no
+// unit test reaches that path. These pin the constructor's contract; the
 // `const _: () = assert!(size_of::<V1>() < size_of::<V3>())` guard in
 // windows.rs is the compile-time companion.
 
@@ -526,9 +525,9 @@ use windows::Win32::NetworkManagement::IpHelper::{
 
 #[skuld::test]
 fn empty_settings_always_stamps_version1() {
-    // #437: stamping VERSION3 onto the 64-byte V1 allocation was the OOB.
-    // windows-rs models all three DNS FFIs as taking the V1 struct, so V1
-    // is the only version that matches the buffer we allocate.
+    // Stamping VERSION3 onto a V1 allocation makes the OS access out of bounds.
+    // windows-rs models all three DNS FFIs as taking the V1 struct, so V1 is
+    // the only version that matches the buffer we allocate.
     assert_eq!(super::empty_settings(false).Version, DNS_INTERFACE_SETTINGS_VERSION1);
     assert_eq!(super::empty_settings(true).Version, DNS_INTERFACE_SETTINGS_VERSION1);
 }

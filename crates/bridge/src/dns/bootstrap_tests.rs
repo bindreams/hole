@@ -427,9 +427,8 @@ async fn resolve_reports_no_answer_when_no_resolvers_are_configured() {
 #[skuld::test]
 async fn bootstrap_error_display_never_leaks_the_hostname() {
     // The PII contract: `ProxyError::DohBootstrap` renders this verbatim into a
-    // toast, so no variant may name the host it was resolving. All seven —
-    // including the two reached through a SUCCESSFUL round trip, which are the
-    // newest surface and the easiest to enrich with reply detail later.
+    // toast, so no variant may name the host it was resolving. This covers
+    // every variant, including the two reached through a successful round trip.
     let resolver: IpAddr = "1.1.1.1".parse().unwrap();
     let host = "secret-proxy.example";
     let mut empty = Message::new(0, MessageType::Response, OpCode::Query);
@@ -461,10 +460,10 @@ async fn bootstrap_error_display_never_leaks_the_hostname() {
         assert!(!text.contains("1.1.1.1"), "{err:?} Display leaked the resolver: {text}");
     }
 
-    // InvalidName is the seventh variant and the one built directly FROM the
-    // untrusted hostname, so it is the likeliest to acquire the offending name
-    // in a later edit. It short-circuits before any querier runs, hence the
-    // separate drive: a 64-octet label is not a valid DNS name.
+    // InvalidName is built directly from the untrusted hostname, so it is the
+    // variant likeliest to carry the offending name. It short-circuits before
+    // any querier runs, hence the separate drive: a 64-octet label is not a
+    // valid DNS name.
     let bad = "a".repeat(64);
     let err = resolve_via_doh_with(&bad, &cfg(vec![resolver], false), stub(HashMap::new()))
         .await
@@ -590,8 +589,8 @@ async fn a_malformed_reply_logs_even_when_a_later_resolver_rescues_the_resolve()
 #[skuld::test]
 async fn resolve_returns_ipv6_when_only_aaaa_answers() {
     // No A record from any resolver; an AAAA answer must be returned (the v6
-    // branch is correct, not dodged). The wiring task verifies the bracket-safe
-    // handoff of this exact result.
+    // branch is correct, not dodged). `handoff_host` brackets the result for the
+    // plugin chain.
     let resolver: IpAddr = "1.1.1.1".parse().unwrap();
     let v6 = Ipv6Addr::new(0x2606, 0x2800, 0x220, 1, 0x248, 0x1893, 0x25c8, 0x1946);
     let mut answers = HashMap::new();

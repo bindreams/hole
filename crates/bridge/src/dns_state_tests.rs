@@ -114,9 +114,8 @@ fn load_wrong_version_returns_none() {
 
 #[skuld::test]
 fn a_v1_record_with_the_obsolete_chosen_loopback_key_still_loads() {
-    // DnsState dropped `deny_unknown_fields` so a v1 file's obsolete
-    // `chosen_loopback` key (and any future stray top-level key) is
-    // ignored rather than failing recovery.
+    // `DnsState` has no `deny_unknown_fields`: a v1 file's obsolete `chosen_loopback` key (or any stray top-level
+    // key) is ignored rather than failing recovery.
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
         "version": 1,
@@ -252,10 +251,10 @@ fn write_then_load_roundtrip_ipv6_advertised() {
     assert_eq!(loaded, state);
 }
 
-/// A record this release cannot read: newer, corrupt, and one whose read fails (a directory at the name).
 /// What a record is called and how it is planted in a folder.
 type Planting = (&'static str, fn(&std::path::Path));
 
+/// The records this release cannot read: newer, corrupt, and one whose read fails (a directory at the name).
 fn plant_unreadable_records() -> [Planting; 3] {
     [
         ("newer", |dir| {

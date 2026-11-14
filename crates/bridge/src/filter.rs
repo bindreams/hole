@@ -4,7 +4,7 @@
 //!
 //! Module exposes the data types ([`ConnInfo`], [`Decision`], [`RuleSet`])
 //! and the decision function [`decide`]. The runtime dispatcher lives in
-//! [`crate::hole_router`]: for TCP it peeks the first ≤ 2 KiB of payload
+//! [`crate::hole_router`]: for TCP it peeks the start of the payload
 //! via [`sniffer::peek`] to recover TLS SNI / HTTP Host before calling
 //! `decide`; for UDP the dispatcher matches on IP only.
 

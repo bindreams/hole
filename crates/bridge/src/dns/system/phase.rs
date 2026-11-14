@@ -4,15 +4,12 @@
 //! Mirrors `tun_engine::routing`'s sealed `Phase`/`FatalPhase`/
 //! `BestEffortPhase` split (`crates/tun-engine/src/routing.rs`): there, a
 //! route command cannot be run by the wrong runner because the runner is
-//! generic over a sealed trait. Before this module, `dns/system.rs` had no
-//! such split — `if let Err(e) = res { warn!(…) }` was writable, and was
-//! written, on the macOS apply path, where it means a
-//! silent DNS leak rather than a cosmetic miss.
+//! generic over a sealed trait. Here, an ad-hoc `if let Err(e) = res {
+//! warn!(…) }` on a leak-bearing step would be a silent DNS leak.
 //!
 //! [`run`] is the *only* place either apply function may consume a backend
-//! `Result`. Writing warn-and-continue for a leak-bearing operation now
-//! requires choosing [`Cosmetic`] at the call site — a visible, reviewable
-//! act instead of an idiom.
+//! `Result`. Warn-and-continue for a leak-bearing operation requires
+//! choosing [`Cosmetic`] at the call site, a visible, reviewable act.
 
 use std::io;
 
@@ -36,8 +33,8 @@ pub(crate) trait DnsPhase: sealed::Sealed {
 /// UI reports a connected, protected session. Must propagate.
 pub(crate) enum LeakBearing {}
 
-/// A failure here has no leak consequence — today, only the best-effort
-/// resolver-cache flush after resolvers are already set correctly.
+/// A failure here has no leak consequence: the resolver-cache flush, and the
+/// macOS steering withdraw on cancel or shutdown.
 pub(crate) enum Cosmetic {}
 
 impl sealed::Sealed for LeakBearing {}
@@ -62,9 +59,8 @@ const _: () = assert!(<Cosmetic as DnsPhase>::BEST_EFFORT);
 /// Owns the `spawn_blocking` hop and the `JoinError` mapping — a panic or a
 /// cancelled blocking task is always an anomaly, regardless of `P`, so it
 /// always maps to `DnsError::Io` and always propagates. No apply site
-/// spawns its own blocking task any more; this is the single place that
-/// does, mirroring how `exec_one` is the single spawner in
-/// `tun_engine::routing`.
+/// spawns its own blocking task; this is the single place that does,
+/// mirroring `exec_one` in `tun_engine::routing`.
 ///
 /// `E: Into<DnsError>` — generic over the backend's own error type, not
 /// hardcoded to `io::Error`, so a call whose backend returns

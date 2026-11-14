@@ -3,10 +3,9 @@
 //!
 //! Both production served slots dial for real: `Socks5Endpoint` connects
 //! to the SOCKS5 server and `InterfaceEndpoint` binds a raw socket to an
-//! interface index. A test may therefore never let a flow reach one, and
-//! before this double there was no way to observe which mechanism the
-//! cascade picked, or — the assertion that matters for the UDP-drop
-//! privacy invariant — that the bypass slot was reached by nothing.
+//! interface index. A test may therefore never let a flow reach one. This
+//! double makes observable which mechanism the cascade picked and, for the
+//! UDP-drop privacy invariant, that the bypass slot was reached by nothing.
 
 use std::io;
 use std::net::SocketAddr;

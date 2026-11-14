@@ -79,7 +79,7 @@ impl BootstrapError {
 }
 
 /// Map one round-trip failure onto the reported bootstrap error. Total, with no
-/// escape hatch: the seam's type admits exactly these six causes.
+/// escape hatch: the match covers every [`UpstreamCause`].
 fn classify(cause: UpstreamCause) -> BootstrapError {
     match cause {
         UpstreamCause::CertificateRejected => BootstrapError::CertificateRejected,
@@ -417,10 +417,9 @@ async fn resolve_via_doh_with(
     // failure report the DoH finding, not the OS one — the DoH failure is the
     // one the user can act on.
     //
-    // This WARN is the ONLY record of the finding on this path: the fallback can
-    // succeed, and a successful start shows the user nothing. Spell out the
-    // consequence rather than flagging it — a reader of this line is the entire
-    // audience for it.
+    // This WARN is the only record of the finding on this path: the fallback can
+    // succeed, and a successful start shows the user nothing, so it spells out
+    // the consequence.
     tracing::warn!(
         error = &failure as &dyn std::error::Error,
         resolvers = dns.servers.len(),

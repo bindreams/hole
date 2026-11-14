@@ -7,15 +7,12 @@
 //! systemd-resolved stub) so they never hit the UDP-drop privacy invariant.
 //!
 //! The endpoint owns an `Arc<DnsForwarder>` and runs each incoming UDP
-//! datagram through `forward()` directly — no OS-loopback hop. That's the
-//! point: the flow arrived via the TUN, we resolve in-process, and we write
-//! the reply back into the same flow.
+//! datagram through `forward()` directly, with no OS-loopback hop: the reply
+//! is written back into the same flow.
 //!
-//! TCP is not served: DNS-over-TCP to external IPs bypasses this endpoint
-//! — those flows take the normal proxy cascade. Serving TCP here would
-//! complicate the router's cascade semantics (port 53 TCP isn't
-//! necessarily DNS — it could be zone-transfer AXFR or any service
-//! running on port 53) with no known user benefit.
+//! TCP is not served: TCP/53 to an external IP takes the normal proxy
+//! cascade, since port 53 TCP is not necessarily DNS (zone transfers, any
+//! service on that port).
 
 use std::io;
 use std::net::SocketAddr;
@@ -40,8 +37,8 @@ impl LocalDnsEndpoint {
 #[async_trait]
 impl Endpoint for LocalDnsEndpoint {
     async fn serve_tcp(&self, _flow: &mut TcpFlow, _dst: SocketAddr) -> io::Result<()> {
-        // TCP/53 is not intercepted here. If the router routes TCP to this
-        // endpoint, that's a cascade bug — debug_assert + drop silently.
+        // TCP/53 is not intercepted here; a TCP flow routed to this endpoint is a cascade bug. Asserted in debug,
+        // dropped silently in release.
         debug_assert!(
             false,
             "LocalDnsEndpoint::serve_tcp called; router cascade misconfigured"

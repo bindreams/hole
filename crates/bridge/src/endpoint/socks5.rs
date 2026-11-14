@@ -1,9 +1,8 @@
 //! `Socks5Endpoint` — carries flows through a SOCKS5 server.
 //!
 //! L4 mechanism (speaks SOCKS5 over L3 TCP) satisfying the L3 [`Endpoint`]
-//! contract. The SOCKS5 server's address is a full [`SocketAddr`]; today
-//! hole always points it at `127.0.0.1:<ss_local_port>` but the type is
-//! not loopback-constrained.
+//! contract. The SOCKS5 server's address is a full [`SocketAddr`], not
+//! constrained to loopback; hole points it at `127.0.0.1:<ss_local_port>`.
 
 use std::io;
 use std::net::SocketAddr;

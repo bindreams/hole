@@ -55,7 +55,10 @@ differs.
    the opposite lifetime from [the kill-switch cover](kill-switch-windows.md#the-filter-set), on purpose; the reason is
    there.
 1. **Set servers.** The resolver addresses are set on the adapter, IPv4 and IPv6 separately, each family from its own
-   configured resolvers. A family with none is left untouched, never cleared.
+   configured resolvers. A family with none is left untouched, never cleared: clearing it would revert it to the
+   DHCP-assigned resolver, an on-link router outside the tunnel. The adapter is addressed by the LUID of the device this
+   process opened, never by alias: the alias is the name Hole requested, and a concurrent bridge's adapter can answer to
+   it.
 
 `Dispatcher::new` also gives `hole-tun` the lowest interface metric (`TUNNEL_INTERFACE_METRIC`) so Windows prefers the
 resolver Hole advertises over a physical adapter's. Only port 53 is confined: DNS over TLS on port 853 is not.
