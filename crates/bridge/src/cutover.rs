@@ -213,10 +213,12 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 /// Disengage a standing lockdown cover and clear the persisted intent, with no
 /// running bridge required.
 ///
-/// The escape hatch must disengage or FAIL LOUD: it records the target off,
-/// disengages, and flips the intent off only after a confirmed success. A swallowed failure (e.g. run
-/// unprivileged) would leave the cover engaged, egress still blocked, while the
-/// intent reads "off".
+/// The escape hatch must disengage or FAIL LOUD. In order, it records the target
+/// off, disengages, clears the auto-connect candidate and records the intent
+/// off; the first failure returns. A failed disengage therefore leaves the
+/// target off, the cover engaged and the intent on. A swallowed failure (e.g.
+/// run unprivileged) would instead leave the cover engaged, egress still
+/// blocked, while the intent reads "off".
 ///
 /// Refuses against a live bridge instance: a running bridge reconciles the target
 /// itself, and the state files' own locks are in-process only, so racing it from
@@ -226,10 +228,8 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 ///
 /// **`Ok` is qualified, and the caller must surface it.** The returned
 /// [`Clearance`] is what the disengage could not prove (on Windows, the two
-/// boot-time twins on any boot where no bridge engaged). Here that matters most:
-/// the intent is written off after the disengage, so no engage re-arms or
-/// re-deletes those keys until Lockdown is turned on again. `hole bridge unlock`
-/// prints [`release_clearance_report`] for that reason.
+/// boot-time twins on any boot where no bridge engaged). `hole bridge unlock`
+/// prints it with [`release_clearance_report`].
 pub fn unlock() -> std::io::Result<Clearance> {
     let state_dir = service_state_dir();
     unlock_with(&state_dir, |lock| {
@@ -272,11 +272,8 @@ fn unlock_with(
         .map_err(|e| std::io::Error::other(format!("could not clear the auto-connect candidate: {e}")))?;
     tun_engine::routing::failclosed::lockdown_state::set_enabled(&lock, false, None)
         .map_err(|e| std::io::Error::other(format!("could not record the lockdown intent off: {e}")))?;
-    // On success the clearance is handed back, never dropped: the intent is now
-    // off, so nothing after this will pre-delete a boot-time key or look at one
-    // again until Lockdown is turned on (see [`unlock`]). If the candidate or
-    // the intent write fails, the clearance is lost with the error:
-    // bindreams/hole#1325.
+    // On success the clearance is handed back, never dropped. If the candidate
+    // or the intent write fails, it is lost with the error: bindreams/hole#1325.
     Ok(clearance)
 }
 
@@ -286,9 +283,10 @@ fn unlock_with(
 /// Wider than [`unlock`], which disengages only the standing cover. Like
 /// [`unlock`] it REFUSES against a live bridge instance, so no in-process posture
 /// is left claiming a cover that no longer exists (`release_covers_with` names
-/// which state dirs it probes). `bridge uninstall` stops the service before it
-/// calls this; a bridge it does not stop, such as a foreground `hole bridge
-/// run`, makes the call refuse.
+/// which state dirs it probes). Any running bridge, the service or a foreground
+/// `hole bridge run`, makes the call refuse, so a caller stops the service
+/// first: the MSI runs `bridge uninstall --keep-covers` before its separate
+/// `bridge release-covers` action.
 ///
 /// Only the target write and the release itself abort the call: the MSI runs it
 /// `Return="check"`, and failing on the trailing bookkeeping would roll back an
