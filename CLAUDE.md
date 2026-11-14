@@ -172,7 +172,7 @@ before editing; the sections linked below are the authoritative source.
   file), because the state directory may belong to the interactive user. For the
   same reason the directory is opened once through handles, a link followed only
   under the ownership-transition rule (`util::dir::Dir`), and the lock and the
-  state-file writers listed in the section below go through that handle, never
+  state-file writers listed on the linked page go through that handle, never
   back through the path. →
   [docs/contributing/architecture/file-lock.md](docs/contributing/architecture/file-lock.md)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay

@@ -315,9 +315,8 @@ const _: () = assert!(<BestEffortPhase as Phase>::BEST_EFFORT);
 // Success oracle ======================================================================================================
 //
 // route(8) exits 0 unconditionally even on a routing-socket failure; the
-// only reliable signal is the stderr text `rtmsg()` prints. See docs/contributing/architecture/route-ownership.md for
-// what that rests on. Windows' `route.exe`/
-// `netsh` exit non-zero on failure, so no parsing is needed there.
+// only reliable signal is the stderr text `rtmsg()` prints. Windows' `route.exe`/`netsh` exit non-zero on failure, so
+// no parsing is needed there.
 
 /// True if macOS `route(8)`'s own text confirms the mutation went through —
 /// used by [`exec_one`] to decide whether a route actually went into the
@@ -377,7 +376,7 @@ fn route_confirmed_absent(output: &std::process::Output) -> bool {
 /// elevation both exit 1 with no distinguishing text. Only exit 0 (a
 /// definite, successful delete) confirms the route gone; a non-zero exit
 /// conservatively keeps it recorded rather than risk silently dropping a
-/// route that is still there — a disclosed residual, see docs/contributing/architecture/route-ownership.md.
+/// route that is still there — a disclosed residual.
 #[cfg(not(target_os = "macos"))]
 fn route_confirmed_absent(output: &std::process::Output) -> bool {
     output.status.success()
@@ -490,7 +489,7 @@ fn run_command<P: Phase>(mut command: Command, cmd: String, phase: P) -> Result<
 // Execute (checkpointed) ==============================================================================================
 //
 // Both loops below persist `installed`/`still_installed` after EVERY command,
-// not once per phase or once per install — see docs/contributing/architecture/route-ownership.md. The
+// not once per phase or once per install. The
 // on-disk record is therefore never a prediction (superset or otherwise): at
 // any instant, including mid-loop, it names exactly what the accumulator in
 // memory names, so a crash or a later command's spawn failure narrows the
@@ -521,7 +520,7 @@ fn run_command<P: Phase>(mut command: Command, cmd: String, phase: P) -> Result<
 /// never confirmed must not be rolled back as if it had. The ON-DISK
 /// checkpoint from just before the failed command is deliberately NOT
 /// corrected to match — it still names the speculative id, which is the safe
-/// superset-of-one this design accepts (see docs/contributing/architecture/route-ownership.md).
+/// superset-of-one this design accepts.
 pub(crate) fn setup_routes<R>(
     tun_name: &str,
     server_ip: IpAddr,
@@ -700,8 +699,7 @@ where
 /// argv is a function of `tun_name` alone, not a group's full identity, so
 /// two distinct groups (e.g. carrying different `server_ip`s from different
 /// sessions) can legitimately name the identical command; issuing it twice
-/// would re-delete whatever claimed the freed prefix in the interim (see
-/// docs/contributing/architecture/route-ownership.md), so each distinct split argv runs
+/// would re-delete whatever claimed the freed prefix in the interim, so each distinct split argv runs
 /// at most once here and its confirmation narrows every group that named it.
 /// The bypass loop below gets the identical treatment: on macOS the bypass
 /// delete embeds only `server_ip` — not `tun_name`, `interface_name`, or a
@@ -804,7 +802,6 @@ where
 /// [`state::coalesce`] before anything is swept, so a leftover sharing
 /// identity with an already-carried-forward group merges into it instead of
 /// growing the list, and an unplannable-only group never reaches the runner.
-/// See docs/contributing/architecture/route-ownership.md.
 ///
 /// Fails with [`RoutingError::StateUnreadable`], before anything is swept or
 /// written, over a record that cannot be read: an install over it would leave
@@ -2029,7 +2026,7 @@ impl SystemRouting {
     /// 2. runs teardown narrowed to exactly the [`RouteId`]s the per-command
     ///    checkpointing confirmed installed (`rollback_and_record`), never the
     ///    full planned set — deleting a route this run never confirmed going in
-    ///    is never safe, see docs/contributing/architecture/route-ownership.md;
+    ///    is never safe;
     /// 3. clears the persisted route-state file ONLY once nothing remains
     ///    unconfirmed — a command whose fate is genuinely unknown (a spawn
     ///    failure, or teardown itself not confirming a delete) stays recorded
@@ -2054,8 +2051,7 @@ impl SystemRouting {
         // AND after every route command, so `persisted.installed` — and the
         // on-disk file it writes — is never a prediction. At any instant it
         // names exactly what `installed` below names, so a crash narrows the
-        // leak window to at most the single command in flight. See
-        // docs/contributing/architecture/route-ownership.md. Built BEFORE the sweep below
+        // leak window to at most the single command in flight. Built BEFORE the sweep below
         // (not after) so the sweep can layer carried-forward debt into
         // `persisted.stale` instead of this install's own first checkpoint
         // racing it for the same on-disk slot.
@@ -2186,7 +2182,7 @@ pub struct SystemRoutes {
     server_ip: IpAddr,
     interface_name: String,
     /// The gateway this session's own routes were installed under — scopes
-    /// the Windows IPv4 bypass delete (see docs/contributing/architecture/route-ownership.md).
+    /// the Windows IPv4 bypass delete.
     original_gateway: IpAddr,
     /// The IPv4 bypass route's form — see [`state::RouteForm`].
     route_form: state::RouteForm,
@@ -2391,7 +2387,7 @@ fn platform_setup_commands(
             // On-link has no gateway to name, so the route names the interface; only
             // `netsh interface ip` can do that, unlike the gateway form's `route add`.
             // `store=active`: netsh defaults to `persistent`, which would outlive the
-            // session and uninstall; see docs/contributing/architecture/route-ownership.md.
+            // session and uninstall.
             (IpAddr::V4(_), NextHop::OnLink) => (
                 SystemTool::Netsh,
                 vec![
@@ -2494,8 +2490,7 @@ fn platform_split_teardown_commands(tun_name: &str) -> Vec<RouteCommand> {
 /// delete with. [`state::RouteForm::Via`] keeps `original_gateway`, when
 /// known, appended as the `route delete` gateway operand — `route.exe`'s own
 /// help confirms DELETE accepts (and does not require) a gateway argument,
-/// and unlike macOS, that argument DOES scope which entry is deleted (see
-/// docs/contributing/architecture/route-ownership.md). `None` (a record migrated from
+/// and unlike macOS, that argument DOES scope which entry is deleted. `None` (a record migrated from
 /// schema 1 or 2, which never persisted a gateway) falls back to the old
 /// unscoped delete — a disclosed residual, not a silent skip.
 #[cfg(target_os = "windows")]
@@ -2656,8 +2651,7 @@ fn platform_setup_commands(
 
 /// The macOS deletes name no interface, unlike their `add` counterparts:
 /// `-interface`/`-ifscope` are settled-and-rejected qualifiers (see
-/// [`RouteId`]'s doc and docs/contributing/architecture/route-ownership.md for
-/// why). Selectivity comes from [`RouteId`] provenance instead.
+/// [`RouteId`]'s doc for why). Selectivity comes from [`RouteId`] provenance instead.
 #[cfg(target_os = "macos")]
 fn platform_split_teardown_commands(_tun_name: &str) -> Vec<RouteCommand> {
     vec![
@@ -2688,8 +2682,7 @@ fn platform_split_teardown_commands(_tun_name: &str) -> Vec<RouteCommand> {
 /// The uplink outlives the tunnel, but it can still be renamed away — a
 /// Wi-Fi-to-Ethernet switch between connect and stop — and `route(8)` would
 /// abort on the stale name rather than delete the bypass. `original_gateway`
-/// is likewise unused: macOS `route delete` never reads the gateway (see
-/// docs/contributing/architecture/route-ownership.md), so it cannot scope anything here
+/// is likewise unused: macOS `route delete` never reads the gateway, so it cannot scope anything here
 /// — unlike the Windows counterpart. `route_form` is always
 /// [`state::RouteForm::Via`] here: macOS has no interface-scoped IPv4 bypass
 /// form, so `reject_macos_on_link` refuses on-link before `install` is ever

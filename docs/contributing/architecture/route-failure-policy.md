@@ -46,18 +46,20 @@ fails stays recorded, is under [what counts as gone](route-ownership.md#what-cou
 
 Within the fatal phase, one field decides: `SetupCommand::fatal`. The IPv4 splits and the server bypass are always fatal.
 The two IPv6 splits (`::/1` and `8000::/1`) are fatal only when the TUN device has an IPv6 binding, which
-`gateway::tun_ipv6_available` probes by the TUN's own name once the OS has created it.
+`gateway::tun_ipv6_available` probes by the TUN's own name once the OS has created it. The probe is of the TUN, not of the
+upstream interface that `GatewayInfo::ipv6_available` measures, because the TUN's name is what those commands carry.
 
-Where a host has no IPv6 on the TUN (a `DisabledComponents` setting, or an EDR policy that unbinds IPv6 from new
-adapters), adding an IPv6 route to it can fail outright, and a host with no IPv6 stack has no IPv6 traffic to leak. The
-two commands are still *issued*, and only their failure is tolerated: a bound TUN accepts the route whatever the upstream
-connectivity, so only a genuinely unbound TUN makes the add itself fail. The probe is of the TUN, not of the upstream
-interface that `GatewayInfo::ipv6_available` measures, because the TUN's name is what those commands carry.
+The intent: where a host has no IPv6 on the TUN (a `DisabledComponents` setting, or an EDR policy that unbinds IPv6 from
+new adapters), the two IPv6 commands may fail outright, a host with no IPv6 stack has no IPv6 traffic to leak, and so the
+start should go on without them.
 
-The tolerance ends at `run_setup_commands`. A tolerated command is dropped from the confirmed set, and `install_with`
-then compares that set with `planned_routes`, which always lists both IPv6 splits. So on an unbound TUN the install still
-fails ([a failed install](#a-failed-install)): the per-command flag decides whether the runner stops, not whether the
-start succeeds. The unit tests cover the flag in `run_setup_commands` only, and none runs `install_with` over it.
+```{warning}
+Today the tolerance does not reach the start. The flag stops at `run_setup_commands`: it drops a tolerated command from the confirmed set and carries on. `install_with`
+then compares that set with `planned_routes`, which always lists both IPv6 splits, so on an unbound TUN the install
+still fails ([a failed install](#a-failed-install)). The per-command flag decides whether the runner stops, not whether
+the start succeeds. The unit tests cover the flag in `run_setup_commands` only; none runs `install_with` over it.
+Tracked in [#1299](https://github.com/bindreams/hole/issues/1299).
+```
 
 ## A failed install
 

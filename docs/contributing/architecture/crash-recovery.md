@@ -57,12 +57,12 @@ reap runs at bridge start, in session teardown, and in the test harness's teardo
 
 ### DNS
 
-The bridge no longer writes `bridge-dns.json`. On Windows, DNS egress is confined to the TUN adapter by a firewall filter
-set held in a process-scoped, dynamic session, so it has no recovery state: it ends with the process. What remains is a
-sweep that undoes an older build's rewrite of another adapter's resolvers. For each recorded adapter, and each address
-family on it separately, `recover_dns_config` restores the prior setting only if the *live* setting still equals what that
-build advertised. A family someone else has changed since is left alone. The file is evaluated once: it is deleted if every
-family settled, and otherwise renamed to `bridge-dns.superseded.json`, a name the bridge never reads again.
+On Windows, DNS egress is confined to the TUN adapter by a firewall filter set held in a process-scoped, dynamic session,
+so it has no recovery state: it ends with the process. A sweep still undoes an older build's rewrite of another adapter's
+resolvers. For each recorded adapter, and each address family on it separately, `recover_dns_config` restores the prior
+setting only if the *live* setting still equals what that build advertised. A family someone else has changed since is
+left alone. `bridge-dns.json` is evaluated once: it is deleted if every family settled, and otherwise renamed to
+`bridge-dns.superseded.json`, a name the bridge never reads again.
 
 A confinement held by a bridge that is alive but unreachable has no file-based release. It ends only with its owning
 process, and the escape below stops that process.

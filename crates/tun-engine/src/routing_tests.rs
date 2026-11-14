@@ -1294,7 +1294,7 @@ fn recover_with_loopback_server_skips_bypass() {
 // Deliberate design choice, preserved across the #907 merge: teardown/recovery
 // has no error channel, so a command that fails to SPAWN means its route may
 // still be installed — it must stay recorded for the next start to retry,
-// never silently discarded. See docs/contributing/architecture/route-ownership.md.
+// never silently discarded.
 
 #[skuld::test]
 fn recover_keeps_state_file_when_every_command_fails_to_spawn() {
@@ -2121,8 +2121,7 @@ fn recover_returns_its_decision() {
 // macOS teardown names no interface ===================================================================================
 //
 // Named for what is checked: the macOS delete argv carries no interface
-// operand — no qualifier can be correct here, see [`RouteId`]'s doc and
-// docs/contributing/architecture/route-ownership.md. These assertions cannot show a
+// operand — no qualifier can be correct here, see [`RouteId`]'s doc. These assertions cannot show a
 // delete is SCOPED — nothing at this layer can, since the argv never reaches
 // route(8) here — only that it carries no such operand; selectivity is
 // asserted where it actually lives, in the provenance tests below.
@@ -2986,7 +2985,7 @@ fn install_rollback_clears_the_file_when_a_checkpoint_write_failure_leaves_nothi
 //
 // `route.exe`'s own help confirms DELETE's gateway operand is optional but
 // accepted; when supplied it scopes which entry is deleted — unlike macOS,
-// where the gateway is never read (see docs/contributing/architecture/route-ownership.md). An unscoped delete can take
+// where the gateway is never read. An unscoped delete can take
 // out a co-resident VPN's route to
 // the same destination.
 
@@ -3429,7 +3428,7 @@ fn install_sweep_drops_an_unplannable_stale_group() {
 /// `server_ip` are not coalesced by identity — yet a split-route delete
 /// command depends only on `tun_name`, so both groups would otherwise
 /// re-issue the identical delete. The second occurrence would remove
-/// whatever claimed the freed prefix in between (see docs/contributing/architecture/route-ownership.md).
+/// whatever claimed the freed prefix in between.
 #[skuld::test]
 fn recovery_never_issues_the_same_split_delete_twice_across_groups() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3545,7 +3544,7 @@ fn recovery_never_issues_the_same_macos_split_delete_twice_across_different_tun_
 /// `state::coalesce` does not merge them — `tun_name` is part of a group's
 /// identity. Without dedup, recovery would re-issue the bypass delete once
 /// per group: the second occurrence removes whatever a third party claimed
-/// after the first delete freed the host route (see docs/contributing/architecture/route-ownership.md). The one
+/// after the first delete freed the host route. The one
 /// confirmed delete must also narrow BOTH
 /// groups — its argv is shared, so its outcome applies to both.
 #[cfg(target_os = "macos")]

@@ -230,8 +230,7 @@ struct MacosGatewayRoute {
 
 /// True if macOS `route(8)`'s own text confirms the mutation went through.
 /// `route(8)` exits 0 unconditionally even on a routing-socket failure; the
-/// only reliable signal is the stderr text `rtmsg()` prints — see
-/// docs/contributing/architecture/route-ownership.md for what that rests on.
+/// only reliable signal is the stderr text `rtmsg()` prints.
 fn macos_route_command_succeeded(out: &std::process::Output) -> bool {
     out.status.success() && !String::from_utf8_lossy(&out.stderr).contains("writing to routing socket")
 }
