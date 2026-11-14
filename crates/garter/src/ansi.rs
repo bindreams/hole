@@ -1,11 +1,11 @@
 //! Strips ANSI SGR (Select Graphic Rendition - color/style) escape
 //! sequences from plugin log lines before they reach a display sink
-//! (`LogSink` / `tracing`). Never applied ahead of a parser - see
-//! `crates/garter/src/binary.rs`'s sitrep reader for why: a well-formed
+//! (`LogSink` / `tracing`). Never applied ahead of a parser: a well-formed
 //! sitrep line can never contain a raw ESC byte, so stripping ahead of
 //! `sitrep::parse_event` buys nothing for valid input and can turn
-//! malformed input (illegal per RFC 8259, correctly rejected today) into
-//! syntactically valid JSON with corrupted content.
+//! malformed input (illegal per RFC 8259, correctly rejected) into
+//! syntactically valid JSON with corrupted content. The sitrep reader in
+//! `binary.rs` parses the original line and strips only its display copy.
 //!
 //! Deliberately narrower than a general CSI stripper: matching only the
 //! `m`-terminated SGR form (what `tracing-subscriber`'s `fmt` layer
@@ -25,10 +25,9 @@ use regex::Regex;
 
 // Parameter bytes cover the full ECMA-48 CSI parameter range 0x30-0x3F
 // (digits, `;`, and `:` — the last for colon-separated sub-parameters, the
-// standard truecolor form `ESC [ 38:2:R:G:Bm`), not just `[0-9;]`: the
-// terminator `m` is what removes the ambiguity (see module doc), so
-// widening the parameter class costs nothing and covers a real SGR shape
-// this narrower set was missing.
+// standard truecolor form `ESC [ 38:2:R:G:Bm`), not just `[0-9;]`. The
+// terminator `m` is what removes the ambiguity (see module doc), so the
+// wider parameter class costs nothing.
 static SGR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;:]*m").expect("valid regex"));
 
 /// Remove every complete SGR escape sequence from `line`; anything that is

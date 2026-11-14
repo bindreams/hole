@@ -1013,7 +1013,7 @@ async fn a_member_that_fails_in_the_abort_window_is_recorded() {
 // record_exit structured-field tests ==================================================================================
 
 /// `record_exit` must emit a structured `exit_code` field on a `PluginExit`
-/// error so the mid-run death is machine-parseable in bridge.log.
+/// error so the mid-run death is machine-parseable in the log.
 ///
 /// The test asserts the FIELD NAME `exit_code` appears in the rendered output
 /// (not just via the error string that incidentally contains the code).

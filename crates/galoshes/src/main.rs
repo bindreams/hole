@@ -20,10 +20,10 @@ async fn main() -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Sanctioned production caller of `fmt::SubscriberBuilder::init`;
-    // banned in tests via clippy.toml `disallowed_methods`. See #301.
+    // banned in tests via clippy.toml `disallowed_methods`.
     //
     // Logs go to STDERR: galoshes' process STDOUT is reserved for the
-    // sitrep event stream (newline-delimited JSON) that the bridge reads.
+    // sitrep event stream (newline-delimited JSON) that its host reads.
     // The `tracing_subscriber::fmt` default writer is `io::stdout`, which
     // would interleave human logs into the JSON stream and corrupt it.
     #[allow(clippy::disallowed_methods)]
@@ -39,17 +39,13 @@ async fn main() -> anyhow::Result<()> {
         protocol: SITREP_PROTOCOL.to_string(),
     });
 
-    // Native-crash observability (bindreams/hole#438). galoshes does NOT
-    // route through hole_common::logging (it owns its own subscriber above),
-    // so it attaches + sweeps directly. Placed AFTER the Hello emit: Hello
-    // must be stdout line 1 (the bridge reads it), and runtime_dir() is
-    // fallible — it must not precede Hello. Markers are pid-keyed and sweep
-    // reports the PREVIOUS run, so ordering after Hello is correct. The
-    // marker/.dmp land in galoshes' per-user runtime dir
-    // (%LOCALAPPDATA%/galoshes etc.) — the bridge sweeps its OWN log dir, so
-    // galoshes markers are reported on the NEXT galoshes start, not by the
-    // bridge. Best-effort: a dir-resolution failure here must not block
-    // plugin startup, so attach/sweep are skipped on Err.
+    // Native-crash observability. galoshes owns its own subscriber above, so it
+    // attaches the crash marker and sweeps the previous run's directly. After
+    // the Hello emit, because Hello must be stdout line 1 and `runtime_dir()` is
+    // fallible. The marker and `.dmp` land in galoshes' per-user runtime dir, and
+    // sweep reports the PREVIOUS run's, so a crash is reported on the NEXT
+    // galoshes start. Best-effort: a dir-resolution failure must not block
+    // plugin startup, so attach and sweep are skipped on Err.
     if let Ok(crash_dir) = galoshes::embedded::runtime_dir() {
         tombstone::sweep(&crash_dir);
         tombstone::attach("galoshes", &crash_dir);
@@ -75,9 +71,8 @@ async fn main() -> anyhow::Result<()> {
 
     let verified = ex_ray_binary.prepare()?;
 
-    // The same defect would also fail `parse_udp_timeout`/`ex_ray_options`
-    // below, but they can never reach that branch through this binary; both
-    // stay fallible for their own callers and unit tests.
+    // A malformed options string fails here, so `parse_udp_timeout` and
+    // `ex_ray_options` below never see one through this binary.
     let mode = Mode::from_plugin_options(env.plugin_options.as_deref())?;
     // Parse the galoshes-specific client UDP NAT idle-eviction timeout from the
     // shared options string before any I/O so a misconfiguration fails loudly
@@ -90,18 +85,18 @@ async fn main() -> anyhow::Result<()> {
     let ex_ray_plugin =
         BinaryPlugin::new(verified.exec_path(), Some(&ex_ray_options)).readiness(ReadinessMode::ExpectSitrep);
 
-    // Bridge-facing readiness: galoshes' OWN ChainRunner folds the
+    // Host-facing readiness: galoshes' OWN ChainRunner folds the
     // per-plugin readiness of [yamux, ex-ray] and fires this channel with
     // the chain-level outcome. We map that to a PROCESS-stdout sitrep event
     // (overriding the inner-chain transport intersection with galoshes'
-    // true TCP|UDP capability — see `sitrep_out`) so the bridge sees a
+    // true TCP|UDP capability — see `sitrep_out`) so the host sees a
     // structured `ready`/`bind_conflict`/`fatal` on galoshes' stdout.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<ChainReady, StartError>>();
 
     // The emitter must run concurrently with `runner.run`: the plugins
     // only start (and report ready) once `run` is driving them, so we
     // cannot await `ready_rx` before calling `run`. On channel drop
-    // (RecvError) we emit nothing — galoshes will exit and the bridge sees
+    // (RecvError) we emit nothing — galoshes will exit and the host sees
     // stdout EOF, which is the backstop.
     let emitter = tokio::spawn(async move {
         if let Ok(outcome) = ready_rx.await {

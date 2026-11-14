@@ -154,6 +154,8 @@ impl Default for ChainRunner {
 }
 
 impl ChainRunner {
+    /// An empty runner: client mode, no `on_ready` or cancel token, and the default
+    /// [`drain_timeout`](Self::drain_timeout).
     pub fn new() -> Self {
         Self {
             plugins: Vec::new(),
@@ -195,13 +197,13 @@ impl ChainRunner {
     /// was already captured, in which case that error takes precedence, and a start
     /// failure ([`Error::StartFailed`](crate::Error::StartFailed)) outranks both.
     ///
-    /// The default is 12 seconds. It must outlast the longest take-down a
-    /// plugin may need after a shutdown: a `BinaryPlugin` gives its child 5
-    /// seconds to exit and 5 to close its output, and a `TapPlugin` waits for
-    /// that plus a second for its inner, so a plugin that needs all of those
-    /// is waited for, not aborted mid-take-down. The default is that wait plus
-    /// a second. A smaller value cuts such a plugin off mid-take-down, and its
-    /// last output is lost.
+    /// The default is `DEFAULT_DRAIN_TIMEOUT`. It must outlast the longest
+    /// take-down a plugin may need after a shutdown: a `BinaryPlugin` gives its
+    /// child a grace period to exit and a bound to close its output, and a
+    /// `TapPlugin` waits for that plus headroom for its inner, so a plugin that
+    /// needs all of those is waited for, not aborted mid-take-down. The default
+    /// is that wait plus headroom. A smaller value cuts such a plugin off
+    /// mid-take-down, and its last output is lost.
     ///
     /// It is also the bound on the wait that precedes the caller's release
     /// (see [`ChainRunner::on_ready`]): a start failure is delivered, or the
@@ -291,8 +293,8 @@ impl ChainRunner {
         // Shared shutdown token. ChainRunner owns its own shutdown scope —
         // the external `cancel_token` builder option is wired into this
         // token below so cancel propagation flows in either direction.
+        // The chain's shutdown root, distinct from any caller's cancel scope.
         #[allow(clippy::disallowed_methods)]
-        // Garter's chain-shutdown root: distinct from any caller cancel scope. See hole's clippy.toml CancellationToken::new rule.
         let shutdown = CancellationToken::new();
         shutdown::SignalOwner::of(self.external_cancel.as_ref()).register(&shutdown);
 
@@ -706,7 +708,7 @@ pub(crate) fn record_exit(
     }
 }
 
-/// Poll a TCP address with exponential backoff (10ms doubling to 1s) until it
+/// Poll a TCP address with exponential backoff until it
 /// accepts a connection. Returns `None` if shutdown fires before the address is
 /// ready.
 ///

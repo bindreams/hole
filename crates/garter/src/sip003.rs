@@ -4,14 +4,21 @@ use std::net::{IpAddr, SocketAddr};
 /// Parsed SIP003u environment variables.
 #[derive(Debug, Clone)]
 pub struct PluginEnv {
+    /// `SS_LOCAL_HOST`.
     pub local_host: IpAddr,
+    /// `SS_LOCAL_PORT`.
     pub local_port: u16,
+    /// `SS_REMOTE_HOST`: an IP address or a hostname, resolved when the chain runs.
     pub remote_host: String,
+    /// `SS_REMOTE_PORT`.
     pub remote_port: u16,
+    /// `SS_PLUGIN_OPTIONS`, `None` when unset.
     pub plugin_options: Option<String>,
 }
 
 impl PluginEnv {
+    /// Reads the SIP003 variables from the process environment. `SS_PLUGIN_OPTIONS` is optional; any other variable
+    /// that is unset, not Unicode or unparseable is an [`Error::Env`].
     pub fn from_env() -> crate::Result<Self> {
         Ok(Self {
             local_host: read_env_parsed("SS_LOCAL_HOST")?,
@@ -22,6 +29,7 @@ impl PluginEnv {
         })
     }
 
+    /// `local_host` and `local_port` as one address.
     pub fn local_addr(&self) -> SocketAddr {
         SocketAddr::new(self.local_host, self.local_port)
     }
@@ -115,9 +123,8 @@ pub struct OptionSegment<'a> {
     /// (`tls`) and an explicit empty one (`tls=`) — the two are otherwise
     /// indistinguishable here. A caller that must tell them apart reads
     /// [`has_value`](Self::has_value): ex-ray's own options parser does, and
-    /// maps a bare key to `"1"` rather than `""` (`crates/ex-ray/args.go`'s
-    /// `parsePluginOptions`), so a caller replicating ex-ray's read of a flag
-    /// must too.
+    /// maps a bare key to `"1"` rather than `""` (its `parsePluginOptions`),
+    /// so a caller replicating ex-ray's read of a flag must too.
     pub value: String,
     /// Whether the segment had an unescaped `=` at all — `true` for `tls=`,
     /// `false` for bare `tls`. See [`value`](Self::value)'s doc for why this
@@ -222,12 +229,10 @@ fn split_on_unescaped_borrowed(s: &str, delimiter: char) -> Result<Vec<&str>, Ma
 /// rather than each re-implementing it — they differ only in what
 /// `on_escaped` does with the escaped byte.
 ///
-/// `pub` (and `#[doc(hidden)]`) rather than `pub(crate)` only because that
-/// one other caller is a sibling crate, not this one — Rust has no
-/// workspace-scoped visibility narrower than `pub`. This is NOT general
-/// public API: it exists for `garter-bin::config::escaping`'s single call
-/// site, not for external consumers of the published `garter` crate, which
-/// is why it's hidden from its rendered docs.
+/// `pub` and `#[doc(hidden)]` because its one other caller is a sibling crate
+/// and Rust has no visibility narrower than `pub` that reaches it. It is NOT
+/// general public API: it exists for `garter-bin::config::escaping`'s single
+/// call site, which is why it is hidden from the rendered docs.
 ///
 /// `Err` only on a dangling trailing `\` that escapes nothing.
 #[doc(hidden)]

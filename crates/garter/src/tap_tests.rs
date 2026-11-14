@@ -9,16 +9,15 @@
 //!
 //! Subscriber capture goes through
 //! [`crate::tracing_test::set_default_in_current_thread`], which enforces
-//! the current-thread tokio runtime invariant — see
-//! [bindreams/hole#302](https://github.com/bindreams/hole/issues/302).
+//! the current-thread tokio runtime invariant.
 //! `#[skuld::test] async fn` builds a current-thread runtime by default.
 //!
 //! `run_with_tap` takes the tap's public address from the `ready` channel
 //! (port 0); a start failure panics with `run()`'s result. Stubs bind the
 //! address the tap gave them and report it: the tap forwards only to the
 //! address it gave. A stub that loses that bind to another process reports a
-//! typed `BindConflict`, and `start_tap` starts a new tap (a fresh port), as the
-//! bridge's bind retry does.
+//! typed `BindConflict`, and `start_tap` starts a new tap (a fresh port), as a
+//! caller retrying a lost bind does.
 //!
 //! Three waits remain unbounded in-process: the "tap closed" line,
 //! `client_body`, and the `plugin_handle.await` after `shutdown.cancel()`
@@ -100,7 +99,7 @@ enum Behavior {
     SilentDrop,
     /// Set SO_LINGER=0 and drop — sends RST instead of FIN. Cross-platform via socket2.
     Reset,
-    /// Read N bytes, sleep, close without writing (the #248 shape).
+    /// Read N bytes, sleep, close without writing (the silent-then-FIN shape).
     SilentAfterRead { read_bytes: usize, delay: Duration },
 }
 
@@ -352,7 +351,7 @@ async fn silent_drop_records_zero_bytes_and_no_ttfb() {
 
 #[skuld::test]
 async fn silent_after_read_matches_248_shape() {
-    // The #248 shape: client writes some bytes, upstream reads them,
+    // The silent-then-FIN shape: client writes some bytes, upstream reads them,
     // upstream NEVER replies, then closes. Tap must record bytes_to=N,
     // bytes_from=0, ttfb=None.
     let captured = run_with_tap(
@@ -384,7 +383,7 @@ async fn silent_after_read_matches_248_shape() {
     );
     assert!(
         captured.contains("ttfb_ms=None"),
-        "ttfb_ms must be None for the #248 silent-then-FIN shape:\n{captured}"
+        "ttfb_ms must be None for the silent-then-FIN shape:\n{captured}"
     );
 }
 

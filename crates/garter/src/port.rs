@@ -77,10 +77,10 @@ pub(crate) async fn pick_with(
 
 /// Whether a failed `bind((ip, 0))` is a race that a later pick can win.
 ///
-/// The same classes as `util::retry::is_bind_race`, which garter (published)
-/// cannot depend on: on Windows a `bind(:0)` fails with `PermissionDenied` or
-/// `AddrNotAvailable` when the excluded-port-range tables disagree about the
-/// port it was handed.
+/// Mirrors `util::retry::is_bind_race` in the Hole workspace, which garter
+/// (published) cannot depend on; keep the two in step. On Windows a `bind(:0)`
+/// fails with `PermissionDenied` or `AddrNotAvailable` when the excluded-port-range
+/// tables disagree about the port it was handed.
 pub(crate) fn is_port_race(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -88,7 +88,7 @@ pub(crate) fn is_port_race(err: &io::Error) -> bool {
     )
 }
 
-/// The pause between retries of the tap's and the chain's own loops: 5ms doubling to a 50ms cap.
+/// The pause between retries of the tap's and the chain's own loops.
 pub(crate) fn retry_backoff() -> Backoff {
     Backoff::new(Duration::from_millis(5), Duration::from_millis(50))
 }

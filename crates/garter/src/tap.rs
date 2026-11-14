@@ -8,10 +8,9 @@
 //! time-to-first-upstream-byte, and a Win32+POSIX-aware `close_kind`
 //! taxonomy.
 //!
-//! Designed for diagnostic mode — the extra loopback round-trip per byte
-//! is fine for an on-demand tap but inappropriate as default. Bridge gates
-//! it behind either the persistent `diagnostic_plugin_tap` config flag or
-//! the dev-only `HOLE_BRIDGE_PLUGIN_TAP=1` env var.
+//! Designed for diagnostic mode: the extra loopback round-trip per byte is
+//! fine for an on-demand tap but inappropriate as a default, so the embedder
+//! decides when to wrap a plugin in one.
 //!
 //! Lifecycle:
 //! 1. Allocate an internal port for the inner plugin via a bind-drop-rebind-drop
@@ -34,31 +33,13 @@
 //!    its IPv4 address, and under a wildcard ip any ip of that family, since the
 //!    inner listens on all of them. Else the start is `Fatal`. Forwarders connect
 //!    to the given address (its loopback for a wildcard), never to the reported
-//!    one. A typed failure the inner
-//!    reports (`BindConflict` when another process took the internal port,
-//!    `Fatal`) becomes the tap's own, so the caller sees the same retryable
-//!    or terminal class. When the tap is an intermediate hop, the chain
-//!    restarts it on that `BindConflict` (whatever address it names, not only the
-//!    tap's own), and the re-run's step 1 picks a fresh inner port. Bounded at 30s, covering an inner that drops its
-//!    readiness sender but keeps running. Every failed start from here on (that
-//!    timeout, a listener outside the given address, a failure the inner reports
-//!    while running, the step-4 bind) cancels the inner's token, a child of
-//!    `shutdown`, and waits for the inner task before reporting: the output it is
-//!    still relaying is drained first. The chain is still starting, so no
-//!    `drain_timeout` runs: the wait has a bound of its own, a `BinaryPlugin`
-//!    inner's whole take-down plus a second, which an inner that honours its
-//!    token never reaches. On expiry the tap
-//!    warns, naming the plugin, and aborts the inner. How the inner ended is
-//!    logged (an exit status at debug, a panic at warn) and otherwise dropped:
-//!    the failure being reported is the tap's, unless the inner delivered a typed
-//!    start failure by the time it stopped (a `BinaryPlugin` delivers one it
-//!    decided at the end of its take-down): that is reported instead. The
-//!    readiness bound and a shutdown before readiness read it so; the latter then
-//!    also fails `run` instead of only dropping `ready`. The other failed starts
-//!    here follow a report the inner has already made, its one readiness message.
-//!    A start failure the tap has
-//!    reported is also its `run` error, so a runner with no `on_ready` sees the
-//!    chain fail. `Error::Chain` propagates.
+//!    one. A typed failure the inner reports (`BindConflict` when another
+//!    process took the internal port, `Fatal`) becomes the tap's own, so the
+//!    caller sees the same retryable or terminal class. When the tap is an
+//!    intermediate hop, the chain restarts it on that `BindConflict` (whatever
+//!    address it names, not only the tap's own), and the re-run's step 1 picks a
+//!    fresh inner port. The wait is bounded by `INNER_READY_TIMEOUT`, which
+//!    covers an inner that drops its readiness sender but keeps running.
 //! 4. Bind the tap's public listener on `local` (only after step 3, so the
 //!    public bind happens only once the data plane is actually wired
 //!    through), then report the tap's OWN readiness on the `ready` channel
@@ -73,9 +54,35 @@
 //!    exit); its forwarders then retry until it does.
 //! 6. On shutdown: abort all in-flight forwarders, await the inner task,
 //!    propagate its exit status as ours. If the accept loop fails instead, the
-//!    tap stops the inner as in step 3 and fails with an error naming the
-//!    accept failure. The inner task is aborted if the tap is dropped (the
+//!    tap stops the inner as in "Failed starts" and fails with an error naming
+//!    the accept failure. The inner task is aborted if the tap is dropped (the
 //!    chain's `drain_timeout` aborts it), so it never outlives the tap.
+//!
+//! # Failed starts
+//!
+//! Every failed start after step 2 stops the inner before it is reported: the
+//! readiness timeout, a listener outside the given address, a failure the
+//! inner reports while running, and the step-4 bind. The tap cancels the
+//! inner's token (a child of `shutdown`) and waits for the inner task, so the
+//! output the inner is still relaying is drained first.
+//!
+//! The chain is still starting, so no `drain_timeout` runs. The wait has a
+//! bound of its own, `INNER_STOP_BOUND`: the whole take-down of a
+//! `BinaryPlugin` inner plus headroom, which an inner that honours its token
+//! never reaches. On expiry the tap warns, naming the plugin, and aborts the
+//! inner.
+//!
+//! How the inner ended is logged (an exit status at debug, a panic at warn) and
+//! otherwise dropped: the failure reported is the tap's, unless the inner
+//! delivered a typed start failure by the time it stopped (a `BinaryPlugin`
+//! delivers one it decided at the end of its take-down), which is reported
+//! instead. The readiness timeout and a shutdown before readiness read the
+//! inner's delivery this way; the latter then also fails `run` instead of only
+//! dropping `ready`. The other failed starts follow a report the inner has
+//! already made, its one readiness message.
+//!
+//! A start failure the tap has reported is also its `run` error, so a runner
+//! with no `on_ready` sees the chain fail.
 
 use std::future::Future;
 use std::io;
@@ -103,9 +110,8 @@ use crate::sitrep::{PluginReady, StartError, Transports};
 /// `closed` lines for a single connection.
 static NEXT_TAP_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Maximum time we wait for the inner plugin to bind its internal port
-/// before the tap gives up. Mirrors [`crate::chain::ChainRunner`]'s 30s
-/// readiness budget for the outermost listener.
+/// Failure bound on an inner plugin that may never report readiness: past it the
+/// tap stops the inner and reports a `Fatal` start failure.
 const INNER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Failure bound on the wait for the inner to return after the tap cancelled its token to report a failed start. An
@@ -156,6 +162,7 @@ fn tcp_connector() -> Connector {
 }
 
 impl TapPlugin {
+    /// A tap around `inner`; see the module docs for the lifecycle.
     pub fn wrap(inner: Box<dyn ChainPlugin>) -> Self {
         Self {
             inner: Arc::from(inner),

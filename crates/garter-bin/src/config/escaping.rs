@@ -7,12 +7,9 @@
 
 /// Whether `c` is one of the three bytes that must be re-escaped to
 /// round-trip as one segment through `garter::split_plugin_options`: `;`
-/// (that crate's `split_on_unescaped_borrowed` delimiter), `=` (its
-/// `find_unescaped` key/value separator), and `\` (the escape character
-/// itself). Defined locally rather than in `garter::sip003` — that crate's
-/// own decoder has no metacharacter notion to reuse (a `\` there escapes
-/// any byte), and this one-line body has no reason to expand garter's
-/// published API for a single external caller.
+/// (the segment delimiter), `=` (the key/value separator), and `\` (the
+/// escape character itself). Defined here because garter's own decoder has
+/// no metacharacter notion to reuse (a `\` there escapes any byte).
 fn is_sip003_metacharacter(c: char) -> bool {
     matches!(c, ';' | '\\' | '=')
 }
@@ -23,7 +20,9 @@ fn is_sip003_metacharacter(c: char) -> bool {
 /// can explain itself; see [`load_config_or_explain_escaping`].
 #[derive(Debug)]
 pub struct ConfigPath {
+    /// The decoded `config=` value.
     pub path: String,
+    /// Set when decoding likely dropped a literal backslash the operator forgot to double.
     pub mangled_from: Option<MangledPath>,
 }
 
@@ -35,7 +34,9 @@ pub struct ConfigPath {
 /// offering it as a "fix" there would be actively misleading.
 #[derive(Debug)]
 pub struct MangledPath {
+    /// The `config=` value with every literal backslash doubled.
     pub doubled: String,
+    /// The `config=` value with forward slashes; `None` off Windows.
     pub forward_slashes: Option<String>,
 }
 
@@ -94,11 +95,9 @@ fn mangled_spellings(segment: &garter::OptionSegment<'_>) -> MangledPath {
 /// bytes decodes as usual (consumed) — the operator escaped correctly
 /// there. A `\` before any OTHER byte is instead kept as BOTH characters
 /// rather than consumed: the actual defect, treated as a literal `\` the
-/// operator forgot to double, so it can be re-escaped exactly once by a
-/// caller re-serializing `intended` rather than escaped a second time on
-/// top of an escape that was already correct (a naive "double every
-/// backslash in `s`" would do that on a partially-escaped value). Returns
-/// whether any such defect was found.
+/// operator forgot to double, so a caller re-serializing `intended` escapes it
+/// exactly once and leaves an already-correct escape alone. Returns whether
+/// any such defect was found.
 ///
 /// A value starting with exactly two backslashes (not four or more) is a
 /// special case: a Windows UNC (`\\server\share\...`) or extended-length
@@ -163,19 +162,20 @@ pub(crate) fn escape_sip003(s: &str) -> String {
         .collect()
 }
 
-/// Load the chain config at `config.path`. If the path came from a
-/// `config=` value `value_was_mangled_by_unescaping` flagged (an unescaped
-/// literal backslash silently dropped) and the load then fails with ANY
-/// IO-layer error — narrowly checking `NotFound` would miss e.g.
-/// `PermissionDenied` (a dropped backslash collapsing the path into a
-/// protected location) on the same known-mangled path — names the
-/// escaping as the cause and offers two corrected spellings, rather than a
-/// bare IO error that gives no hint the real cause was SIP003 escaping. A
-/// legitimately doubled/clean path never has `mangled_from` set, so it
-/// never triggers this text — and neither does a YAML-parse failure on a
-/// path that DID resolve to a real file: `yaml_serde` errors don't
-/// downcast to `std::io::Error`, so that failure has nothing to do with
-/// escaping and is left to speak plainly rather than misattributed.
+/// Load the chain config at `config.path`.
+///
+/// If the path came from a `config=` value `value_was_mangled_by_unescaping`
+/// flagged (an unescaped literal backslash silently dropped) and the load then
+/// fails with ANY IO-layer error, the error names the escaping as the cause and
+/// offers two corrected spellings, rather than a bare IO error that gives no
+/// hint the real cause was SIP003 escaping. The check is on any IO error, not
+/// only `NotFound`: a dropped backslash can also collapse the path into a
+/// protected location (`PermissionDenied`).
+///
+/// A path with no `mangled_from` never gets this text. Neither does a
+/// YAML-parse failure on a path that DID resolve to a real file: `yaml_serde`
+/// errors don't downcast to `std::io::Error`, so that failure has nothing to do
+/// with escaping and is left to speak plainly rather than misattributed.
 pub fn load_config_or_explain_escaping(config: &ConfigPath) -> anyhow::Result<crate::config::ChainConfig> {
     crate::config::load_config(std::path::Path::new(&config.path)).map_err(|e| {
         let io_failure = e.downcast_ref::<std::io::Error>().is_some();

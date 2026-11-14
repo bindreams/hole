@@ -2,10 +2,10 @@
 //!
 //! A silently black-holed transport — a middlebox dropping packets with no
 //! RST/FIN — produces no death signal of its own, so an idle tunnel otherwise
-//! waits out ex-ray's inherited 300 s `ConnectionIdle`
-//! (`third_party/v2ray-core/features/policy/policy.go`, `SessionDefault`) before
-//! anything notices. This module bounds that recovery instead, without relying
-//! on any timer further down the stack.
+//! waits out ex-ray's inherited `ConnectionIdle` (v2ray-core's
+//! `features/policy` `SessionDefault`) before anything notices. This module
+//! bounds that recovery instead, without relying on any timer further down
+//! the stack.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -34,8 +34,8 @@ pub(crate) const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// Detection itself needs no help: a black-holed transport delivers neither an
 /// echo nor anything else. But a server whose echo task is merely slow would be
-/// silent too, and what covers it is yamux's own RTT ping — due again 10 s after
-/// the last pong, and emitted the moment our probe wakes the driver. That holds
+/// silent too, and what covers it is yamux's own RTT ping — due again a ping
+/// interval after the last pong, and emitted the moment our probe wakes the driver. That holds
 /// only while a probe cannot come due sooner than a ping is, so the interval may
 /// not drop below yamux's cadence. `PING_INTERVAL` is private to that crate, so
 /// the relation is pinned here rather than imported.

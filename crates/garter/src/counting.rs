@@ -12,9 +12,9 @@
 //! distinguishes "upstream sent nothing for the whole connection" from
 //! "upstream sent some bytes then closed."
 //!
-//! Lives in `garter` (Apache-2.0) so both the bridge's DNS path and the
-//! `TapPlugin` decorator can share it without an Apache → GPL → Apache
-//! dependency cycle.
+//! Lives in `garter` so `TapPlugin` and embedders (Hole's bridge counts its DNS
+//! path with it) share one implementation without a dependency cycle between
+//! the Apache-2.0 library and a GPL embedder.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};

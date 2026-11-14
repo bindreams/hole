@@ -48,7 +48,7 @@ fn sip003_env_client_mode_straight_through() {
 /// semantics again (SS_REMOTE = inbound listener, SS_LOCAL = outbound
 /// dial), so a double-swap restores the chain's intended direction.
 /// Without this swap the binary listens on `remote` and forwards to
-/// `local`, colliding with the previous chain link. See bindreams/hole#396.
+/// `local`, colliding with the previous chain link.
 #[skuld::test]
 fn sip003_env_server_mode_swaps_addresses() {
     let listen: SocketAddr = "[::]:80".parse().unwrap();
@@ -109,8 +109,8 @@ fn readiness_mode_auto_is_selectable() {
 fn fixed_env_sets_gotraceback_crash() {
     // The always-injected env pairs include GOTRACEBACK=crash so a Go
     // plugin (ex-ray) dumps full goroutine state to stderr on a native fault
-    // (the bridge relays that stderr through tracing). Harmless to Rust
-    // plugins, which ignore it. See bindreams/hole#438.
+    // (garter relays that stderr through tracing). Harmless to Rust
+    // plugins, which ignore it.
     let pairs = crate::binary::fixed_plugin_env();
     assert!(
         pairs.iter().any(|(k, v)| *k == "GOTRACEBACK" && *v == "crash"),
@@ -628,7 +628,7 @@ async fn a_failed_kill_skips_the_exit_edge_and_gives_even_a_kernel_owned_join_th
 }
 
 /// An exit edge that cannot be awaited does not strand the drain: the readers still get the bound. A platform that
-/// cannot observe the edge (bindreams/hole#1124) is logged at debug only, by plugin name: it is every take-down there.
+/// cannot observe the edge (Windows) is logged at debug only, by plugin name: it is every take-down there.
 #[skuld::test]
 async fn an_exit_edge_that_errors_falls_back_to_the_bounded_reader_wait() {
     let log = drain_with_an_edge_that_errors(unsupported).await;

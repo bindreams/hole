@@ -40,22 +40,20 @@ pub enum ReadinessMode {
     /// the probe. `probe_standdown` is a child of `shutdown`, so chain shutdown
     /// also stops the probe.
     ///
-    /// Use for harnesses that mix sitrep and non-sitrep plugins (the plugin-e2e
-    /// server fixture: ex-ray/galoshes speak sitrep, stock v2ray-plugin does not).
-    /// The probe connects to whatever listens on `local`, so on a bind conflict it
-    /// wins whenever another process holds the port and the plugin's `hello` has not
-    /// yet stood it down: it reports ready for the other process's listener and the
-    /// plugin's `BindConflict` is lost. Only when nothing listens on the port can
-    /// the probe not win. On success either path may win; both report the same
-    /// listen address, so the sitrep-preference (better transports) is best-effort,
-    /// not guaranteed. Prefer explicit `ExpectSitrep` when the plugin is known to
+    /// Use for harnesses that mix sitrep and non-sitrep plugins (ex-ray and
+    /// galoshes speak sitrep, stock v2ray-plugin does not). The probe connects
+    /// to whatever listens on `local`, so on a bind conflict it wins whenever
+    /// another process holds the port and the plugin's `hello` has not yet
+    /// stood it down: it reports ready for the other process's listener and the
+    /// plugin's `BindConflict` is lost. Only when nothing listens on the port
+    /// can the probe not win. On success either path may win; both report the
+    /// same listen address, so the sitrep-preference (better transports) is
+    /// best-effort, not guaranteed. Prefer explicit `ExpectSitrep` when the plugin is known to
     /// speak sitrep AND authoritative transports or a deterministic `BindConflict`
-    /// matter (the bridge does).
+    /// matter.
     ///
     /// The concurrent probe is a TCP connect (as in `Probe`), so it cannot ready
-    /// a UDP-only listener; a UDP-only plugin must therefore speak sitrep. All
-    /// first-party UDP plugins (ex-ray/galoshes QUIC) do, so this is not a
-    /// limitation in practice.
+    /// a UDP-only listener; a UDP-only plugin must therefore speak sitrep.
     Auto,
 }
 
@@ -76,8 +74,8 @@ pub(crate) struct Sip003Env {
 
 /// Callback invoked synchronously when a binary plugin process is spawned.
 /// Receives the child PID immediately after `Command::spawn()` returns,
-/// before any `.await` point. Consumers use this to record PIDs for crash
-/// recovery (e.g. persist to a state file).
+/// before any `.await` point, so a consumer can record it for crash
+/// recovery (e.g. persist it to a state file).
 pub type PidSink = Arc<dyn Fn(u32) + Send + Sync>;
 
 /// Sink for a plugin's raw log lines, mirroring [`PidSink`]. Invoked for EVERY
@@ -160,6 +158,9 @@ fn exec_refused_the_program(_cause: &cosca::error::Error) -> bool {
 }
 
 impl BinaryPlugin {
+    /// A plugin that runs the executable at `path` with `options` as its `SS_PLUGIN_OPTIONS`. The plugin's
+    /// [name](ChainPlugin::name) is the file stem of `path`. A bare file name is looked up on `PATH`; a caller
+    /// that runs with privileges must pass an absolute path.
     pub fn new(path: impl Into<PathBuf>, options: Option<&str>) -> Self {
         let path = path.into();
         let name = extract_name(&path);
@@ -206,10 +207,8 @@ impl BinaryPlugin {
         self.readiness
     }
 
-    /// Compute the SIP003 env-var mapping for `(local, remote)`. Public
-    /// to `crate` for testability; production callers use [`Self::run`]
-    /// which feeds this into `Command::env`. See [`Sip003Env`] for the
-    /// client/server semantics.
+    /// The SIP003 env-var mapping for `(local, remote)`, which [`ChainPlugin::run`] feeds into the child's
+    /// environment. See [`Sip003Env`] for the client/server semantics.
     pub(crate) fn sip003_env(&self, local: SocketAddr, remote: SocketAddr) -> crate::Result<Sip003Env> {
         // In server mode the binary itself swaps SS_LOCAL/SS_REMOTE
         // semantics (SS_REMOTE = inbound listener, SS_LOCAL = outbound
@@ -231,8 +230,8 @@ impl BinaryPlugin {
 /// Environment variables always injected into a binary plugin's child
 /// process, independent of SIP003 config. `GOTRACEBACK=crash` makes a Go
 /// plugin (ex-ray) dump full goroutine state to stderr on a native fault
-/// (the bridge relays that stderr through tracing). Harmless to Rust
-/// plugins, which ignore it. See bindreams/hole#438. `NO_COLOR=1` /
+/// (garter relays the child's stderr through tracing). Harmless to Rust
+/// plugins, which ignore it. `NO_COLOR=1` /
 /// `CLICOLOR=0` strip ANSI a plugin child's logger may write to stderr —
 /// `tracing-subscriber` (galoshes) already honors `NO_COLOR`; ex-ray never
 /// colors, so both are a no-op there.
@@ -253,7 +252,7 @@ fn extract_name(path: &Path) -> String {
 /// any), and return it so the caller's own tracing macro — level and
 /// conditionality differ per reader, so that stays inline at each call site
 /// — relays the same ANSI-clean text. A reader that reaches `sink` any other
-/// way bypasses this guarantee; there is currently no such path.
+/// way bypasses this guarantee.
 fn relay_to_sink<'a>(line: &'a str, sink: &Option<LogSink>) -> Cow<'a, str> {
     let clean = crate::ansi::strip_sgr(line);
     if let Some(sink) = sink {
@@ -306,21 +305,18 @@ impl ChainPlugin for BinaryPlugin {
         // Spawn as the root of a contained process tree (Windows job object /
         // Linux cgroup / Unix process group), with stdio handle hygiene, so a
         // force-kill reaps the plugin's whole descendant tree and an orphaned
-        // grandchild can never hold the host's pipe handles (bindreams/hole#197).
+        // grandchild can never hold the host's pipe handles.
         // Containment is also what gives the child its own console process group
         // on Windows, which is what `terminate`'s CTRL_BREAK addresses.
         // `Nesting::Mark` keeps the root-only group rule: a nested garter (e.g.
         // galoshes inside the bridge's chain) joins this tree instead of creating
         // one Unix pgids could escape from.
         //
-        // Only ONE marker name is recognised. The ancestor and the descendant
-        // must therefore agree on it, and within hole they always do: galoshes
-        // takes garter by path, so a galoshes binary and the garter inside it are
-        // always the same commit, and hole's release builds galoshes from its own
-        // checkout and resolves plugins to the sidecar beside its executable. The
-        // pairing that can skew is a separately-released `garter-bin` driving a
-        // separately-released `galoshes` — mixed pre-1.0 binaries, which this
-        // project does not support and does not bridge.
+        // Only ONE marker name is recognised, so an ancestor and a descendant
+        // must agree on it. A galoshes binary and the garter inside it are built
+        // from one commit and always agree; a separately-released `garter-bin`
+        // driving a separately-released `galoshes` can skew, and mixed pre-1.0
+        // binaries are not supported.
         cmd.contain();
         cmd.nesting(cosca::containment::Nesting::Mark);
         let mut child = cmd.spawn().map_err(|e| {
@@ -639,24 +635,24 @@ impl Drop for FailureHold {
     }
 }
 
-/// Spawn the sitrep stdout reader.
+/// Spawn the sitrep stdout reader. It parses sitrep events, decides exactly one readiness result, and relays
+/// every line to the log sink, and every non-event line to tracing, until stdout closes.
 ///
-/// The reader parses `@sitrep` events and decides exactly one readiness result. On an unknown protocol
-/// major (`FallBackToTier2`) it hands readiness to a self-probe, sharing the single sender via
-/// [`SharedReady`] so at most one send ever happens. When `auto` is true ([`ReadinessMode::Auto`]) a
-/// concurrent self-probe is ALSO started up front and stood down on a supported `hello`, so a non-sitrep
-/// plugin (including one silent on stdout) is still readied by the probe. Non-event lines pass through
-/// to tracing as logs.
+/// On an unknown protocol major (`FallBackToTier2`) the reader hands readiness to a self-probe, sharing the single
+/// sender via [`SharedReady`] so at most one send ever happens. When `auto` is true ([`ReadinessMode::Auto`]) a
+/// concurrent self-probe is ALSO started up front and stood down on a supported `hello`, so a non-sitrep plugin
+/// (including one silent on stdout) is still readied by the probe. The probes are `probes`, which end with
+/// `shutdown` or when the plugin's `run` ends them.
 ///
-/// A `ready` is sent at once. A failure (`fatal`, `bind_conflict`, an empty `ready`, or stdout closing
-/// where no probe owns readiness: a sitrep plugin's readiness travels on stdout, so it can never become
-/// ready) is not: it is held in the returned [`FailureHold`], which [`supervise_plugin`] takes the plugin
-/// down for, drains its output, and only then delivers. Once a shutdown starts taking a live plugin down,
-/// a stdout close the reader has not yet seen is the take-down's and no failure, whoever closed it: nothing
-/// orders the close against the take-down, and the caller asked for the shutdown. A failure the reader
-/// decided first, or a plugin whose root had already exited, keeps its failure. Either way the output is
-/// relayed. The reader keeps relaying lines until stdout closes. The probes it starts are `probes`, which end with
-/// `shutdown` or when the plugin's `run` ends them; the reader logs under their plugin's name.
+/// A `ready` is sent at once. A failure (`fatal`, `bind_conflict`, an empty `ready`, or stdout closing where no
+/// probe owns readiness: a sitrep plugin's readiness travels on stdout, so it can never become ready) is held in
+/// the returned [`FailureHold`] instead. [`supervise_plugin`] takes the plugin down for it, drains its output,
+/// and only then delivers it.
+///
+/// Once a shutdown starts taking a live plugin down, a stdout close the reader has not yet seen is the
+/// take-down's and no failure, whoever closed it: nothing orders the close against the take-down, and the caller
+/// asked for the shutdown. A failure the reader decided first, or a plugin whose root had already exited, keeps
+/// its failure.
 pub(crate) fn spawn_sitrep_stdout_reader(
     stdout: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     local: SocketAddr,
@@ -811,11 +807,10 @@ pub(crate) fn spawn_sitrep_stdout_reader(
 ///
 /// The loop is unbounded by design and terminates on the **child's** stdout
 /// EOF, which `run` waits for (bounded) once the child's tree is killed or the
-/// child is dropped (`kill_on_drop`). This reads the child's pipe,
-/// not the host's, so it cannot reproduce the #197 runtime-drop hang (that was
-/// an orphan holding the *host's* stdio); and because it runs inside a detached
-/// `tokio::spawn`, runtime drop aborts it at the await point rather than
-/// blocking on it.
+/// child is dropped (`kill_on_drop`). It reads the child's pipe, not the
+/// host's, so an orphan holding the host's stdio cannot hang it; and because
+/// it runs inside a detached `tokio::spawn`, runtime drop aborts it at the
+/// await point rather than blocking on it.
 async fn drain_remaining_logs(
     lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
     plugin_name: &str,
@@ -1387,7 +1382,8 @@ pub(crate) async fn drain_readers_after_exit(
             if exit_edge_proves_the_tree_gone(containment) {
                 match tree.wait_tree_drained().await {
                     Ok(()) => {}
-                    // A known platform gap (bindreams/hole#1124), so not worth a warning on every take-down.
+                    // `Unsupported` is the expected answer on Windows (see `wait_tree_drained`), where every
+                    // take-down lands here, so it is not worth a warning.
                     Err(e @ cosca::error::Error::Unsupported { .. }) => tracing::debug!(
                         plugin = %plugin,
                         error = &e as &dyn std::error::Error,
