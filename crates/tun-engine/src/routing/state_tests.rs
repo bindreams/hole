@@ -580,7 +580,7 @@ fn load_v1_loopback_migrates_without_the_bypass() {
 // crash recovery) must route through: groups sharing an identity — the
 // tuple that determines the teardown argv they'd each emit — merge into one,
 // each survivor is sanitized against `planned_routes(server_ip)`, and an
-// empty survivor is dropped. See CONTRIBUTING's Route ownership section.
+// empty survivor is dropped.
 
 fn group(server_ip: IpAddr, installed: Vec<RouteId>) -> StaleRecord {
     StaleRecord {

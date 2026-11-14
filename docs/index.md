@@ -85,6 +85,17 @@ TCP accept refusal <contributing/architecture/tcp-admission.md>
 The DNS forwarder <contributing/architecture/dns-forwarder.md>
 Plugin binaries <contributing/architecture/plugin-binaries.md>
 The galoshes transport <contributing/architecture/galoshes-transport.md>
+Route commands and what failing means <contributing/architecture/route-failure-policy.md>
+Route ownership <contributing/architecture/route-ownership.md>
+Crash recovery <contributing/architecture/crash-recovery.md>
+Config corruption recovery <contributing/architecture/config-recovery.md>
+Privileged code in folders a user may own <contributing/architecture/privileged-folders.md>
+File lock and state files <contributing/architecture/file-lock.md>
+System tools and absolute paths <contributing/architecture/system-tools.md>
+Update cutover <contributing/architecture/update-cutover.md>
+Native crashes and test panics <contributing/architecture/native-crashes.md>
+Windows service stop reporting <contributing/architecture/windows-service-stop.md>
+Spawn contention and port allocation <contributing/architecture/contention-and-ports.md>
 Development <contributing/development.md>
 Testing <contributing/testing.md>
 Continuous integration <contributing/ci.md>
