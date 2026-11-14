@@ -213,8 +213,8 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 /// Disengage a standing lockdown cover and clear the persisted intent, with no
 /// running bridge required.
 ///
-/// The escape hatch must disengage or FAIL LOUD: it disengages FIRST and flips the
-/// intent off only after a confirmed success. A swallowed failure (e.g. run
+/// The escape hatch must disengage or FAIL LOUD: it records the target off,
+/// disengages, and flips the intent off only after a confirmed success. A swallowed failure (e.g. run
 /// unprivileged) would leave the cover engaged, egress still blocked, while the
 /// intent reads "off".
 ///
@@ -227,9 +227,9 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 /// **`Ok` is qualified, and the caller must surface it.** The returned
 /// [`Clearance`] is what the disengage could not prove (on Windows, the two
 /// boot-time twins on any boot where no bridge engaged). Here that matters most:
-/// the intent is written off after the disengage, so no later engage will re-arm
-/// or re-delete those keys. `hole bridge unlock` prints [`release_clearance_report`] for that
-/// reason.
+/// the intent is written off after the disengage, so no engage re-arms or
+/// re-deletes those keys until Lockdown is turned on again. `hole bridge unlock`
+/// prints [`release_clearance_report`] for that reason.
 pub fn unlock() -> std::io::Result<Clearance> {
     let state_dir = service_state_dir();
     unlock_with(&state_dir, |lock| {
@@ -274,8 +274,9 @@ fn unlock_with(
         .map_err(|e| std::io::Error::other(format!("could not record the lockdown intent off: {e}")))?;
     // On success the clearance is handed back, never dropped: the intent is now
     // off, so nothing after this will pre-delete a boot-time key or look at one
-    // again (see [`unlock`]). If either write above fails, the clearance is lost
-    // with the error: bindreams/hole#1325.
+    // again until Lockdown is turned on (see [`unlock`]). If the candidate or
+    // the intent write fails, the clearance is lost with the error:
+    // bindreams/hole#1325.
     Ok(clearance)
 }
 
@@ -285,8 +286,9 @@ fn unlock_with(
 /// Wider than [`unlock`], which disengages only the standing cover. Like
 /// [`unlock`] it REFUSES against a live bridge instance, so no in-process posture
 /// is left claiming a cover that no longer exists (`release_covers_with` names
-/// which state dirs it probes). `bridge uninstall` tears the service down first,
-/// which is what frees the liveness lock; without that, every call refuses.
+/// which state dirs it probes). `bridge uninstall` stops the service before it
+/// calls this; a bridge it does not stop, such as a foreground `hole bridge
+/// run`, makes the call refuse.
 ///
 /// Only the target write and the release itself abort the call: the MSI runs it
 /// `Return="check"`, and failing on the trailing bookkeeping would roll back an

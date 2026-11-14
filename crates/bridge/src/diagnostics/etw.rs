@@ -8,8 +8,7 @@
 //! Volume is deliberately unbounded, to diagnose hard network issues on customer
 //! machines: connection-level events at `info`, anomalies (retransmit at or above
 //! [`RETRANSMIT_WARN_THRESHOLD`], connection-request timeout, abort) at `warn`.
-//! No NDIS packet-capture provider is subscribed, and the high-volume per-packet
-//! TCPIP events are dropped in userspace ([`HIGH_VOLUME_TCPIP_EVENTS`]).
+//! No NDIS packet-capture provider is subscribed.
 //!
 //! # Architecture
 //!

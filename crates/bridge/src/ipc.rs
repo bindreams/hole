@@ -1609,8 +1609,9 @@ pub(crate) fn write_installer_user_sid(dir: &Path, sid: &str) -> std::io::Result
 /// unconditionally replaces the file. No test asserts its effects (the group
 /// membership, the SID file's creation by this call). It does run end to end in
 /// the installer lanes (the MSI's `bridge install` custom action, and `hole bridge
-/// install` in the macOS DMG install test), but those check that the service is
-/// registered and that the bridge answers, not the group or the SID file.
+/// install` in the macOS DMG install test). The MSI lane checks only that the
+/// service is registered, the DMG lane also that the bridge answers; neither
+/// checks the group or the SID file.
 pub fn prepare_ipc_access() -> std::io::Result<()> {
     crate::group::create_group()?;
     let user = crate::group::installing_username()?;

@@ -140,10 +140,10 @@ fn unlock_successful_disengage_flips_intent_off() {
 
 #[skuld::test]
 fn unlock_hands_back_what_the_disengage_could_not_prove() {
-    // `unlock_with` must hand back the disengage's verdict, not `()`. It writes the
-    // kill-switch intent OFF once the disengage returns, so no later engage re-arms
-    // or re-deletes a boot-time key (the pre-delete runs only from
-    // `engage_lockdown`, which an off intent prevents). This is the last moment the
+    // `unlock_with` must hand back the disengage's verdict, not `()`. After a
+    // successful disengage it writes the kill-switch intent OFF, so no engage
+    // re-arms or re-deletes a boot-time key until Lockdown is turned on again (the
+    // pre-delete runs only from `engage_lockdown`). This is the last moment the
     // qualification can reach anybody, which is why `hole bridge unlock` prints it.
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();

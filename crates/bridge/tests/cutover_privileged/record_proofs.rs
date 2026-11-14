@@ -576,8 +576,7 @@ fn service_dacl(service_name: &str) -> Vec<u8> {
 /// interactive user open it for `SERVICE_QUERY_CONFIG`, the one right the GUI's
 /// start-type read asks for, so the GUI can tell a disabled service from a
 /// stopped one without elevation. If this fails the GUI cannot tell the two
-/// cases apart unprivileged, and the design returns to the owner (the descriptor
-/// and this test are not patched around it). Red under:
+/// cases apart unprivileged, and the design returns to the owner. Red under:
 /// a security descriptor on the service that does not grant it (`sc sdset`).
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_the_service_dacl_lets_an_interactive_user_query_its_config() {
@@ -644,8 +643,7 @@ fn service_key_user_rights() -> u32 {
 /// made by the production `install()` (`KEY_QUERY_VALUE`), so the GUI can tell
 /// an interrupted uninstall's disable from an administrator's. If this fails
 /// the GUI cannot tell the two apart unprivileged, and the design returns to the
-/// owner (the descriptor and this test are not patched around it). Red under: a
-/// security descriptor on the key that grants Users nothing.
+/// owner. Red under: a security descriptor on the key that grants Users nothing.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_the_service_key_lets_an_interactive_user_read_the_record() {
     ProvisionedService::require_no_leftover();

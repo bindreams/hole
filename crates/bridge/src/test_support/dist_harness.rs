@@ -51,9 +51,9 @@ const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
 
 /// Max spawn attempts when Windows Defender / macOS exec-busy holds the
 /// freshly-built `hole.exe`. Retries back off exponentially from
-/// [`SPAWN_BACKOFF`]. The total backoff of this many attempts was found
-/// empirically enough to let a Defender scan release the handle; the cap itself
-/// is open: bindreams/hole#1298.
+/// [`SPAWN_BACKOFF`]. The cap assumes the total backoff outlasts a Defender
+/// scan's hold on the handle; no measurement of that is recorded, and the cap
+/// itself is open: bindreams/hole#1298.
 const MAX_SPAWN_ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).expect("literal");
 const SPAWN_BACKOFF: Duration = Duration::from_millis(500);
 
