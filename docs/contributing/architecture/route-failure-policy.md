@@ -67,14 +67,15 @@ things and nothing else; its doc comment is the source of truth.
 1. It issues no further setup commands.
 1. It runs teardown narrowed to the routes that the per-command checkpointing confirmed installed, never to the planned set.
 1. It clears the persisted record only once nothing is left unconfirmed. A command whose fate is unknown stays recorded for
-   the next start to retry.
+   the next start to retry. That includes a command that could not be spawned, even though it certainly did not run: see
+   [checkpointing](route-ownership.md#checkpointing).
 1. It returns `Err(RoutingError::RouteSetup)`. No `SystemRoutes` guard is built, so no caller can report the tunnel up.
 
 A command that ran but did not confirm is the same failure. If `setup_routes` finishes without error but fewer routes are
 confirmed than `planned_routes(server_ip)` lists, `install_with` rolls back and returns `Err` too. A partial tunnel is
 worse than no tunnel: the user believes traffic is captured when some of it is not. The error text names the suspected
-cause, another process holding a conflicting route. A route that never confirmed is never recorded, and Hole's stop leaves
-it alone.
+cause, another process holding a conflicting route. A route whose command ran and did not confirm is not left in the record,
+and Hole's stop leaves it alone; the exception is a command that could not be spawned.
 
 ## The accepted trade
 

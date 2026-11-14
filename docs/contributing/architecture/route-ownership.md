@@ -9,7 +9,8 @@ means](route-failure-policy.md).
 ## The rule
 
 Teardown and recovery delete **only** the routes in the `installed` list of `bridge-routes.json`. A route whose install
-failed is never recorded, so it is never deleted: it belongs to whoever holds it now.
+failed is not recorded once the install knows it failed, so it is never deleted: it belongs to whoever holds it now. The one
+exception is a setup command that could not be spawned ([checkpointing](#checkpointing)).
 
 The routes are the five values of `RouteId` ({src}`crates/tun-engine/src/routing.rs`): the four split routes (`0.0.0.0/1`,
 `128.0.0.0/1`, `::/1`, `8000::/1`) and the server bypass, which keeps traffic to the proxy server out of the tunnel. A
@@ -17,9 +18,9 @@ loopback server has no bypass, and `planned_routes` leaves it out.
 
 ## Why only the record can say "ours"
 
-A delete command could in principle say "delete this route only if it is mine". Neither platform's command can say it for
-the split routes, so *provenance*, the record of what this run installed, is the only handle. It also outlives the
-interface: the {term}`TUN` device is closed before the routes are dropped (see [what one connect
+A delete command could in principle say "delete this route only if it is mine". No macOS command can, and a Windows
+delete can only narrow itself (see the tabs), so *provenance*, the record of what this run installed, is the handle the
+code relies on. It also outlives the interface: the {term}`TUN` device is closed before the routes are dropped (see [what one connect
 holds](overview.md#what-one-connect-holds)), and the device of a crashed run is gone.
 
 ````{tab-set}
@@ -34,7 +35,9 @@ install knows the gateway, so the record carries it as `original_gateway` and th
 VPN's route to the same destination has a different gateway, so Hole's delete fails to match it and is a no-op. That
 scoping is from `route.exe`'s documented syntax; nothing in the tree measures a takeover.
 
-The split-route deletes cannot be scoped and rely on provenance alone.
+The split-route deletes name the TUN interface (`netsh interface ip delete route 0.0.0.0/1 <tun name>`, and the `ipv6`
+form for the other two), so they match an entry on that interface only. That is from `netsh`'s syntax; nothing in the tree
+measures a delete against a route another VPN placed on the same prefix.
 
 A record from an old schema has no gateway. Schemas 1 and 2 never stored one, so `original_gateway` is `None` and the
 bypass delete falls back to the unscoped form. That is a disclosed residual.
@@ -42,8 +45,9 @@ bypass delete falls back to the unscoped form. That is a disclosed residual.
 ```{tab-item} macOS
 :sync: macos
 
-No qualifier on `route delete` can express "only if it is ours", and the code deliberately names no interface in any
-macOS delete (`platform_split_teardown_commands`, `platform_bypass_teardown_command`).
+No qualifier on `route delete` can express "only if it is ours", and the code deliberately names no interface and no
+gateway in any macOS delete (`platform_split_teardown_commands`, `platform_bypass_teardown_command`): a split delete
+carries only the prefix, and the bypass delete only the server address.
 
 - `route delete` is read, from the sources of `route(8)` and the kernel, as choosing its victim by destination and
   netmask alone. `-interface <name>` would then scope nothing, and with a name that no longer resolves the command exits
@@ -82,6 +86,13 @@ that fails stops the install before the command runs, since a mutation Hole coul
 recovery have no pre-write: they rewrite the record after each command, narrowing it. A route is dropped from the record
 only once its delete is confirmed gone ([what counts as gone](#what-counts-as-gone)); one that is not confirmed, or whose
 command fails to spawn, stays recorded so the next start retries it, and nothing after it is skipped.
+
+A setup command that fails to spawn is the one case where the record is left naming a route Hole never installed. The
+pre-command write has already named the id, and `setup_routes` corrects the record after a failed command only when the
+program ran and exited non-zero (`CommandFailure::Exit`); on `CommandFailure::Spawn` it leaves the id, and `install_with`
+keeps it recorded as `uncertain` after the rollback. The next recovery then deletes it like any other recorded route. On
+macOS the split and bypass deletes are unscoped, so if another VPN holds that prefix by then, the delete takes its route
+down. A spawn failure means the `route` or `netsh` binary could not be started at all.
 
 "Next start" means the next `install`, not only the next process. `recover_routes` runs once per bridge process, but one
 process can install several times (a reconnect, a server switch), so `install` itself sweeps a record a previous install

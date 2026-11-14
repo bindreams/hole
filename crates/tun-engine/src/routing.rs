@@ -28,10 +28,11 @@ pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// One of the routes an install creates. Recorded in [`state::RouteState`] so
 /// teardown and crash recovery delete only the routes this run actually
-/// installed. Provenance is the only selectivity handle for the split
-/// routes on both platforms and for the bypass route on macOS — no
-/// delete-side qualifier can express "only if it is ours" there (see
-/// docs/contributing/architecture/route-ownership.md); the Windows bypass delete can additionally be scoped by gateway
+/// installed. On macOS provenance is the only selectivity handle, for the
+/// split routes and the bypass alike: no delete-side qualifier can express
+/// "only if it is ours" there (see
+/// docs/contributing/architecture/route-ownership.md). On Windows the split
+/// deletes name the TUN interface and the bypass delete is scoped by gateway
 /// when one is known. Provenance is also the only handle that outlives the
 /// interface a crashed or stopped run's utun took with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

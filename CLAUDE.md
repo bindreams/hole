@@ -127,8 +127,9 @@ before editing; the sections linked below are the authoritative source.
   [docs/contributing/architecture/route-ownership.md](docs/contributing/architecture/route-ownership.md)
 - **Route-command failure policy.** Install is fatal, teardown/crash recovery
   are best-effort — the type system (`FatalPhase`/`BestEffortPhase`) enforces
-  which runner a phase gets, and per-command fatality tolerates the IPv6
-  splits failing on a TUN with no IPv6 binding. →
+  which runner a phase gets. A per-command flag lets the runner continue past an
+  IPv6 split failing on a TUN with no IPv6 binding, but the install still fails
+  on the missing route. →
   [docs/contributing/architecture/route-failure-policy.md](docs/contributing/architecture/route-failure-policy.md)
 - **Crash-recovery sweep.** `bridge-{routes,plugins,dns}.json` + ETW sessions are
   replayed/cleaned on next startup after the IPC socket binds. →

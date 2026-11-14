@@ -20,7 +20,8 @@ again. It does only signal-safe work. It writes a fixed-format file, `crash-<kin
 with no allocation, no lock, no `format!` and no tracing. It swallows every I/O error. Everything it needs, the open
 directory and the marker's name, was prepared in `attach`.
 
-The log directory is the interactive user's, and the bridge writes in it as root, so `attach` opens it once through
+A log directory may be the interactive user's while the bridge writes in it as root (a bridge run in the foreground, or
+under `HOLE_LOG_DIR`), so `attach` opens it once through
 `util::dir::Dir` ([privileged folders](privileged-folders.md)) and holds it for the process's life. The handler creates the
 marker, and the Windows dev-only `.dmp`, relative to that handle with an exclusive create: `openat(O_CREAT | O_EXCL | O_NOFOLLOW)` on Unix, `NtCreateFile(FILE_CREATE)` on Windows. An entry already at the name is never written through,
 truncated or replaced. `attach` picks a name that is free at that moment (`-1`, `-2` after the pid when an earlier process
@@ -56,11 +57,16 @@ holds keys and traffic.
 
 `tombstone::sweep(log_dir)` runs at start. It reports each `crash-*.marker` it finds with a `tracing::error!` under the
 target `crash`, then deletes the marker and leaves a sibling `.dmp`. Reporting and deleting are two steps, and a marker is
-reported by whichever process sweeps the directory first: two sweeps that overlap can both report it. The bridge, the app and
-the command line share the log directory, which the code treats as readable by the unprivileged app even when the bridge is
-elevated; a marker the bridge writes is created world-readable and left root-owned on purpose, since the signal-safe handler
-cannot chown it. galoshes is the exception: it attaches and sweeps its own per-user runtime directory, so its markers are
-reported on its next start and not by the bridge.
+reported by whichever process sweeps the directory first: two sweeps that overlap can both report it. The app and the command
+line share the per-user log directory (`resolve_log_dir`), and so does a bridge run in the foreground; the code treats that
+directory as readable by the unprivileged app even when the bridge is elevated, so a marker the bridge writes is created
+world-readable and left root-owned on purpose, since the signal-safe handler cannot chown it. Two bridges do not share it:
+
+- The installed service bridge logs to the service log directory (`update_marker::service_log_dir`: `ProgramData\hole\logs`
+  on Windows, `/var/log/hole` on macOS), and sweeps that directory at its own next start. The app never sweeps it, so the
+  app does not report a service bridge's crash; the service's next start does, in `bridge.log`.
+- galoshes attaches and sweeps its own per-user runtime directory, so its markers are reported on its next start and not by
+  the bridge.
 
 The sweep opens `log_dir` through `Dir` and reads each marker through a `ReadDir` by its name inside that handle. A symlink at a
 marker name is reported unreadable and unlinked as itself, a FIFO is never waited for, and a marker the directory's owner cannot

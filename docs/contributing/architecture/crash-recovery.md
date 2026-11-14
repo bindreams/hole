@@ -19,10 +19,12 @@ one's state. The order, in {src}`crates/bridge/src/foreground.rs` and the two se
    one an auto-connect is about to start. IPC is not served until this returns.
 1. **The crash-marker sweep** reports a native crash of an earlier run; see [native crashes](native-crashes.md).
 
-The Windows service path adds two steps before this order: the startup repairs
-(`registration::run_startup_repairs`) run first, and the stale update marker is swept right after the bind, before any
-recovery. The foreground bridge and macOS sweep the marker last. The ETW consumer, whose sweep is in the table below,
-starts after the crash-marker sweep on the service path and before it on the foreground path.
+The Windows service path differs. Right after the bind and the liveness lock it sweeps the stale update marker and reports
+Running, before any other step. Its remaining steps (`registration::run_startup_steps`) then run in this order: the
+startup repairs (`registration::run_startup_repairs`), DNS recovery, `boot::recover_then_reconcile`, the crash-marker
+sweep, and last the sweep of `hole.exe.old-*` leftovers from a cutover. The foreground bridge and macOS sweep the update
+marker last, after the crash markers. The ETW consumer, whose sweep is in the table below, starts after all the service
+path's steps and before the crash-marker sweep on the foreground path.
 
 ## What is recorded
 
@@ -74,9 +76,10 @@ with `hole-bridge-etw-`: by name prefix, not by the dead bridge's process id.
 
 ## Records that cannot be read
 
-Every record above is a `VersionedFile` ([file lock and state files](file-lock.md#state-files)), and each declares a
+Every file record above is a `VersionedFile` ([file lock and state files](file-lock.md#state-files)), and each declares a
 `Role` ({src}`crates/util/src/versioned_file/role.rs`) that decides what happens to a copy this release cannot read: one
-from a newer release, a corrupt one, or one whose read failed. The records of what the bridge did to the machine are the
+from a newer release, a corrupt one, or one whose read failed. The ETW session is not a file and the
+`HoleDisabledByHole` value is a registry value, so neither has a role. The records of what the bridge did to the machine are the
 strictest. `bridge-routes.json` and `bridge-plugins.json` are `OsRecord`s: an unreadable one is never replaced, removed or
 acted on, since it is the only evidence of what the run left behind, and a route record also refuses a connect. The
 cover's records have a role of their own. `bridge-dns.json` is a `LegacyRecord`: kept, never

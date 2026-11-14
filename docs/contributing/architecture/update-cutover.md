@@ -87,7 +87,11 @@ does two jobs:
 
 - The app holds its last snapshot while a marker is set, instead of flashing *Disconnected*. A marker that names no
   identifiable driver reports the failed update instead.
-- The bridge's shutdown disarms the cover while a marker is set.
+- The bridge's shutdown reads it to name its cause: with a marker set the event is `CutoverRestart`, without one
+  `ProcessExiting` (`shutdown_reason` in {src}`crates/bridge/src/foreground.rs`). Only the *transient* cover's fate
+  depends on the choice: `transient_cover_disposition` keeps it for `CutoverRestart` and releases it for
+  `ProcessExiting`. The standing cover goes through `cover_step` for either event, as T10 of the [kill switch
+  Transitions table](kill-switch.md#transitions) says.
 
 The marker holds the cutover driver's identity (a process id and its kernel start token, so a recycled id never matches), and
 its presence is the single-occupancy claim. The new bridge clears it unconditionally, by removing the name and never by parsing
