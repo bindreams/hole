@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import html from "./index.html?raw";
 
-// Static-markup accessibility contract for issue #476: every interactive
+// Static-markup accessibility contract: every interactive
 // control in index.html must be a real <button> (focusable, native
 // Enter/Space activation) carrying the ARIA state its pattern requires.
 const doc = new DOMParser().parseFromString(html, "text/html");

@@ -26,11 +26,11 @@ pub struct AppState {
     /// run) instead of the platform default. In that mode the GUI does NOT own
     /// the bridge lifecycle: it must not prompt to install the production service
     /// nor elevate, since the elevated helper and the post-install reachability
-    /// poll both target the default production socket, not this one (#569).
+    /// poll both target the default production socket, not this one.
     bridge_externally_supervised: bool,
 }
 
-// Loading (with quarantine, logging, and the #481/#467 recovery dialog data)
+// Loading (with quarantine, logging, and the recovery dialog data)
 // lives in `ConfigStore::load`; main.rs calls it and hands the results here.
 
 impl AppState {
@@ -102,12 +102,6 @@ fn resolve_bridge_socket(override_path: Option<PathBuf>) -> (PathBuf, bool) {
 
 // BridgeLink ==========================================================================================================
 
-/// The GUI's bridge channel plus the runtime-state cell it feeds (#462).
-///
-/// All pooled requests flow through `send`, which commits what the
-/// exchange revealed about `running` (see `observed_running`) BEFORE
-/// releasing the client lock — commit order therefore equals bridge
-/// processing order, with no separate synchronization.
 /// Fired (off the reactor) whenever a bridge exchange reveals a version
 /// mismatch, to drive the GUI self-heal. Injected so `BridgeLink` stays
 /// testable and holds no `AppHandle` of its own.
@@ -155,6 +149,12 @@ fn production_driver_liveness() -> DriverLiveness {
     }
 }
 
+/// The GUI's bridge channel plus the runtime-state cell it feeds.
+///
+/// All pooled requests flow through `send`, which commits what the
+/// exchange revealed about `running` (see `observed_running`) BEFORE
+/// releasing the client lock — commit order therefore equals bridge
+/// processing order, with no separate synchronization.
 pub struct BridgeLink {
     socket_path: PathBuf,
     /// SERVICE log dir where the privileged bridge writes the update-in-progress
@@ -207,8 +207,8 @@ impl BridgeLink {
     /// fresh per exchange so the masking window opens and closes with the marker.
     fn cutover_state(&self) -> (hole_common::update_marker::Marker, cosca::identity::Liveness) {
         let marker = hole_common::update_marker::read(&self.service_log_dir);
-        // Only `Present` has a driver to name. Asking for a liveness with no
-        // payload to resolve is the shape the `0` sentinel used to fill.
+        // Only `Present` has a driver to name; every other marker state has no
+        // identity to resolve.
         let driver = match &marker {
             hole_common::update_marker::Marker::Present(m) => (self.driver_liveness)(m),
             _ => cosca::identity::Liveness::Unknown,
@@ -324,9 +324,8 @@ impl BridgeLink {
     /// Deliberately never commits an observation: the raced Start's own
     /// outcome carries the truth.
     ///
-    /// Unix-domain-socket connect latency is sub-millisecond, so the
-    /// per-call overhead is negligible. Use sparingly — the pooled client
-    /// is still the right choice for normal request traffic.
+    /// Use sparingly — the pooled client is the right choice for normal
+    /// request traffic.
     pub async fn send_oneshot(&self, req: BridgeRequest) -> Result<BridgeResponse, ClientError> {
         let mut client = BridgeClient::connect(&self.socket_path).await?;
         let result = client.send(req).await;
@@ -377,7 +376,7 @@ pub struct ProxySnapshot {
     pub seq: u64,
     pub running: bool,
     /// Reason for the most recent running transition, when the bridge reported
-    /// one (#470). Carried on BOTH the poll and the `proxy-state-changed` event
+    /// one. Carried on BOTH the poll and the `proxy-state-changed` event
     /// so whichever channel wins the death-seq race surfaces the same string.
     /// Only ever a path-free sentinel or `None`: the bridge's out-of-band-death
     /// reason (set by `commit_status`; cleared by `commit`) OR the GUI-set
@@ -385,11 +384,10 @@ pub struct ProxySnapshot {
     /// cleared by `clear_update_failed`). A toast of this value cannot leak PII —
     /// see `commands::map_status_response`.
     pub error: Option<String>,
-    /// Standing kill-switch intent (#527), from the bridge's StatusResponse.
+    /// Standing kill-switch intent, from the bridge's StatusResponse.
     pub lockdown_enabled: bool,
-    /// What the bridge measured about a standing lockdown cover on the host
-    /// (bindreams/hole#825). `enabled && == Absent` is a tray warning state —
-    /// never silent green.
+    /// What the bridge measured about a standing lockdown cover on the host.
+    /// `enabled && == Absent` is a tray warning state, never silent green.
     pub cover_presence: CoverPresence,
     /// Whether a covered start (auto-connect) failed and left the host
     /// fail-closed (blocked, not leaked) while not running — a distinct blocked
@@ -397,7 +395,7 @@ pub struct ProxySnapshot {
     pub blocked_until_connected: bool,
 }
 
-/// Single owner of the GUI's view of "is the proxy running" (#462).
+/// Single owner of the GUI's view of "is the proxy running".
 pub struct ProxyStateCell {
     tx: tokio::sync::watch::Sender<ProxySnapshot>,
 }
@@ -653,8 +651,8 @@ pub(crate) fn observed_running(
     }
 }
 
-/// The error a Status exchange revealed, if any. Only a `Status` Ok carries it
-/// (#470); every other exchange yields None. `StatusResponse.error` is the
+/// The error a Status exchange revealed, if any. Only a `Status` Ok carries it;
+/// every other exchange yields None. `StatusResponse.error` is the
 /// bridge's path-free `death_reason` (NOT the PII-bearing `last_error`; see
 /// `ProxyManager::DEATH_REASON`), so this can never carry PII to the toast.
 pub(crate) fn observed_error(result: &Result<BridgeResponse, ClientError>) -> Option<String> {

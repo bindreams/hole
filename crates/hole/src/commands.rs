@@ -17,7 +17,7 @@ use tauri::{Emitter, State};
 use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 
-const MAX_IMPORT_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+const MAX_IMPORT_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 // ImportFailure =======================================================================================================
 
@@ -60,13 +60,13 @@ pub enum ImportFailure {
 /// `ImportFailure`. The categorization is the only thing this function
 /// does — it's not a one-to-one map; for example,
 /// `ImportError::Parse { .. }` collapses to `CorruptedJson` (no detail),
-/// which is defense in depth over the variant itself no longer carrying
-/// the `serde_json::Error` that echoes file content. The `supported`
+/// which is defense in depth over the variant itself carrying no
+/// `serde_json::Error` (it echoes file content). The `supported`
 /// plugin list is fetched directly
 /// from the single source of truth via
 /// [`hole_common::plugin::user_visible_plugin_names`] — no comma-string
 /// round-trip, and the non-user-visible `ex-ray` impl-detail entry is
-/// filtered out (bindreams/hole#414).
+/// filtered out.
 fn to_import_failure(err: import::ImportError) -> ImportFailure {
     match err {
         import::ImportError::Parse { .. } => ImportFailure::CorruptedJson,
@@ -77,7 +77,7 @@ fn to_import_failure(err: import::ImportError) -> ImportFailure {
             plugin: name,
             // Only user-visible plugins — `ex-ray` is an impl detail of
             // `v2ray-plugin` and must not appear in the GUI's supported
-            // list (bindreams/hole#414).
+            // list.
             supported: hole_common::plugin::user_visible_plugin_names()
                 .map(String::from)
                 .collect(),
@@ -92,7 +92,7 @@ pub fn get_config(state: State<AppState>) -> AppConfig {
 }
 
 /// Apply a webview settings snapshot to `config`: merge the UI-owned portion by
-/// id (membership stays backend-owned, #504) then heal the selection so it
+/// id (membership stays backend-owned) then heal the selection so it
 /// always names a real server — a stale snapshot can name one deleted
 /// concurrently. Pure helper — `save_config` wraps it with the lock + persist.
 fn apply_ui_settings(config: &mut AppConfig, settings: crate::ui_settings::UiSettings) {
@@ -281,7 +281,7 @@ pub fn import_file(state: &AppState, path: &Path) -> Result<Vec<ServerEntry>, Im
 
 /// Delete the server with `entry_id` from the config (by id) and persist.
 ///
-/// Membership is backend-owned (#504): removal is a dedicated by-id operation,
+/// Membership is backend-owned: removal is a dedicated by-id operation,
 /// like import is for addition — never a side effect of the wholesale
 /// `save_config`, which would drop servers imported concurrently. Idempotent:
 /// deleting an absent id persists the unchanged config and returns `Ok`.
@@ -303,7 +303,7 @@ pub fn delete_server(state: State<AppState>, entry_id: String) -> Result<(), Str
 /// Poll the proxy's status. The exchange commits the observation to the
 /// `ProxyStateCell` (inside `BridgeLink::send`); `running`, `state_seq`, and
 /// `error` all come from the committed snapshot so the frontend applies
-/// observations monotonically (#462) and the death `error` (#470) is the same
+/// observations monotonically and the death `error` is the same
 /// string the `proxy-state-changed` event carries — see `map_status_response`.
 /// The remaining fields are cosmetics from the raw response.
 ///
@@ -323,7 +323,7 @@ pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::
 /// Map a Status exchange + the committed snapshot to the GUI status JSON.
 /// `running`, `state_seq`, and `error` come from the snapshot — the single
 /// committed source of truth, so they agree with the `proxy-state-changed`
-/// event regardless of which channel wins the death-seq race (#470). The
+/// event regardless of which channel wins the death-seq race. The
 /// cosmetics come from the response. Capabilities are `null` (unknown) when the
 /// exchange did not return a Status: the bridge cannot vouch for them, and a
 /// `true` default would flicker the connected-state dots on a transient
@@ -602,7 +602,7 @@ pub async fn get_public_ip() -> Result<serde_json::Value, String> {
 /// both listener flags: with it off, the bridge receives
 /// `proxy_socks5 = proxy_http = false` and runs a pure-VPN start — the
 /// TUN data plane binds an internal ephemeral SOCKS5 instance and
-/// nothing listens on `local_port` / `local_port_http` (#459). The
+/// nothing listens on `local_port` / `local_port_http`. The
 /// nested toggles keep their persisted values for re-enable.
 pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
     let selected_id = config.selected_server.as_ref()?;

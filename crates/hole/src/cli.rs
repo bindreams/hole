@@ -79,8 +79,8 @@ pub(crate) enum ProxyAction {
         #[arg(long, default_value_t = 4073)]
         local_port: u16,
         /// Local HTTP CONNECT port the bridge should bind when
-        /// `--http` is used. Defaults to 4074. Must differ from
-        /// `--local-port` when both listeners are enabled.
+        /// `--http` is used. Must differ from `--local-port` when both
+        /// listeners are enabled.
         #[arg(long, default_value_t = 4074)]
         local_port_http: u16,
         /// Disable the user-facing SOCKS5 listener (default: enabled).
@@ -192,7 +192,8 @@ pub(crate) enum BridgeAction {
         /// leave every fail-closed cover engaged and the kill switch armed.
         /// The standing cover is what holds the update-cutover gap.
         ///
-        /// Hidden: hand-running it reproduces #1003 exactly.
+        /// Hidden: hand-running it leaves the host blocked with no bridge left
+        /// to release the cover.
         #[arg(long, hide = true)]
         keep_covers: bool,
         /// Override the log directory (the MSI passes the one directory every
@@ -413,7 +414,7 @@ pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBu
     }
 }
 
-// Elevated-run owner resolution (#572) ================================================================================
+// Elevated-run owner resolution =======================================================================================
 
 /// Resolve the real interactive user for an elevated, non-`--service` bridge
 /// run. `Some` only when this process is privileged AND not the launchd/SCM
@@ -449,9 +450,7 @@ fn resolved_owner(_service: bool) -> Option<()> {
     None
 }
 
-/// Extract `(uid, gid)` from a resolved [`hole_bridge::group::RealUser`]. Named `to_ids` (not
-/// `to_uid_gid`/a method) to avoid shadowing the local `owner_ids` binding at
-/// the call site.
+/// Extract `(uid, gid)` from a resolved [`hole_bridge::group::RealUser`].
 #[cfg(target_os = "macos")]
 fn to_ids(u: &hole_bridge::group::RealUser) -> (u32, u32) {
     (u.uid, u.gid)
@@ -1078,9 +1077,7 @@ fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
 /// The direct-DACL-update path is a workaround for the Windows
 /// token-snapshot limitation: process tokens are immutable snapshots of
 /// group memberships captured at logon time. There is no Win32 API to
-/// refresh a process's token to pick up new group memberships, and
-/// `klist purge`/`nltest` only affect Kerberos/AD tickets, not local
-/// group tokens. Adding the user's own SID directly to the DACL provides
+/// refresh a process's token to pick up new group memberships. Adding the user's own SID directly to the DACL provides
 /// immediate access — a user's own SID is always present in their token.
 fn handle_grant_access(
     then_send: Option<String>,
@@ -1243,8 +1240,7 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_fil
 ///
 /// Called from exactly one place, [`send_bridge_request_inner`] — the funnel
 /// every payload path reaches. Test-enforced
-/// (`redaction_is_armed_only_by_the_wire_funnel`): when this was a call-site
-/// obligation instead, one of the three paths did not meet it.
+/// (`redaction_is_armed_only_by_the_wire_funnel`).
 ///
 /// Exhaustive, no `_` arm: a new variant states whether it carries a secret
 /// instead of silently inheriting `{}` from its neighbours (mirrors
@@ -1353,7 +1349,7 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                 attempt_id: uuid::Uuid::new_v4().to_string(),
                 // The CLI has no Settings preference to push; `None` leaves
                 // whatever startup preference is already persisted untouched
-                // (#979 — a `Some` here would stomp a real GUI preference).
+                // (a `Some` here would stomp a real GUI preference).
                 on_startup: None,
             };
             match send_bridge_request_inner(request) {

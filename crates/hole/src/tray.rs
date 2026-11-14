@@ -79,7 +79,7 @@ pub(crate) enum StartDecision {
 /// and non-elevated paths so they read identically. The bridge message is shown
 /// raw: it is authored by the bridge running as a system account (LocalSystem /
 /// root) with system-scoped paths, and `ProxyConfig` carries no path field, so it
-/// cannot contain user PII (#475). A future change that threads a user path into a
+/// cannot contain user PII. A future change that threads a user path into a
 /// bridge request and echoes it here must revisit this.
 pub(crate) fn bridge_error_toast(message: &str) -> String {
     format!("Bridge error: {message}")
@@ -116,7 +116,7 @@ pub(crate) fn transport_after_elevation_toast(detail: &str) -> String {
 /// Toast shown when an externally-supervised bridge (`HOLE_BRIDGE_SOCKET`)
 /// denies the connection. Hole will not elevate in this mode: the elevated
 /// `hole bridge ipc-send` helper connects to the default production socket, not
-/// this caller-provided one, so elevation would mis-target (#569). The
+/// this caller-provided one, so elevation would mis-target. The
 /// underlying permission error still lands in `gui.log`.
 pub(crate) fn external_bridge_denied_toast() -> String {
     "Permission denied by the bridge. Hole does not elevate an externally-supervised bridge \
@@ -135,11 +135,11 @@ pub(crate) enum ElevationDecision {
 
 /// Decide whether a `NeedsElevation` should actually elevate.
 /// - Externally supervised (`HOLE_BRIDGE_SOCKET`): never — the elevated helper
-///   targets the default production socket, not this one (#569). Checked first,
+///   targets the default production socket, not this one. Checked first,
 ///   so it overrides the disconnect/prompts rules below.
 /// - Disconnect (when GUI-owned) is always interactive, so it may elevate.
-/// - Connect may elevate only when prompts are allowed; an unattended startup
-///   auto-connect (#458) fails passively instead of throwing UAC at a login.
+/// - Connect may elevate only when prompts are allowed; an unattended connect
+///   (the blocked-state Retry) fails passively instead of prompting.
 pub(crate) fn decide_elevation(
     externally_supervised: bool,
     prompts: Prompts,
@@ -195,11 +195,11 @@ pub(crate) fn outcome_for_stop_response(
     }
 }
 
-/// Sole writer of persisted `config.enabled` (#462): records the last user
-/// intent the bridge honored. The startup-connect decision itself no longer
-/// reads this field — the bridge decides and persists its own boot-time
-/// target from what it observes and is pushed (#979); display and direction
-/// still come from the `ProxyStateCell`, never this flag.
+/// Sole writer of persisted `config.enabled`: records the last user intent the
+/// bridge honored. The startup-connect decision does not read this field: the
+/// bridge decides and persists its own boot-time target from what it observes
+/// and is pushed. Display and direction come from the `ProxyStateCell`, never
+/// this flag.
 pub(crate) fn persist_intended_enabled(
     config: &std::sync::Mutex<hole_common::config::AppConfig>,
     store: &hole_common::config_store::ConfigStore,
@@ -215,7 +215,7 @@ pub(crate) fn persist_intended_enabled(
     }
 }
 
-/// Install-gate decision (#569). The GUI prompts to install the production bridge
+/// Install-gate decision. The GUI prompts to install the production bridge
 /// service only when it OWNS the bridge lifecycle. When the bridge is externally
 /// supervised (`HOLE_BRIDGE_SOCKET` — dev-console / manual dev run) a live bridge
 /// is already reachable on that socket and the production install state (launchd
@@ -296,8 +296,8 @@ fn unblock_dialog_message(response: &Result<BridgeResponse, crate::bridge_client
 // Tray creation =======================================================================================================
 
 /// Tray label for the lockdown toggle from the (enabled, cover_presence)
-/// snapshot. `enabled && cover_presence == Absent` is a warning state — never
-/// silent green (#527). Every non-`Absent` reading — including
+/// snapshot. `enabled && cover_presence == Absent` is a warning state, never
+/// silent green. Every non-`Absent` reading — including
 /// `Indeterminate`/`Unreachable`, an uncertain probe — renders as engaged: an
 /// uncertain probe must never resolve toward "nothing is blocking".
 fn lockdown_menu_label(enabled: bool, cover_presence: CoverPresence) -> String {
@@ -354,7 +354,7 @@ fn tray_actions(running: bool, transition: Option<bool>, blocked: bool) -> TrayA
 /// while leaving the kill switch armed; `Unblock` clears that same cover
 /// *and* the standing one *and* disarms the intent. They read as distinct
 /// actions with distinct labels ("keeps Lockdown armed" vs "turns Lockdown
-/// off"), so both are shown when both apply — rule #0 favours more escapes
+/// off"), so both are shown when both apply: the menu favours more escapes
 /// over fewer, never fewer for the sake of a tidier menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EscapeItems {
@@ -362,15 +362,13 @@ struct EscapeItems {
     unblock: bool,
 }
 
-/// Resolve which escape items to show. The two conditions are independent —
-/// exhaustive table test over all 10 `(cover_presence,
-/// blocked_offers_go_offline)` rows. `unblock` keys on `cover_presence`
-/// alone: gating it on `!running` was deriving a lockdown answer from the
-/// tunnel surface, exactly the coupling this model removes — the escape's
-/// handler (`ipc::handle_unblock`) reads no session posture either, so the
-/// affordance must not pretend one exists, and this signature must not carry
-/// an input it does not read. `Indeterminate`/`Unreachable` count as present
-/// — an uncertain probe must never resolve toward "nothing is blocking".
+/// Resolve which escape items to show. The two conditions are independent;
+/// a table test covers every `(cover_presence, blocked_offers_go_offline)`
+/// pair. `unblock` keys on `cover_presence` alone: the escape's handler
+/// (`ipc::handle_unblock`) reads no session posture, so the affordance must
+/// not pretend one exists and this signature carries no input it does not
+/// read. `Indeterminate`/`Unreachable` count as present: an uncertain probe
+/// must never resolve toward "nothing is blocking".
 fn escape_items(cover_presence: CoverPresence, blocked_offers_go_offline: bool) -> EscapeItems {
     EscapeItems {
         go_offline: blocked_offers_go_offline,
@@ -381,10 +379,10 @@ fn escape_items(cover_presence: CoverPresence, blocked_offers_go_offline: bool) 
 /// Build the tray menu, optionally including an "Install Update" item.
 ///
 /// `running` is the bridge's actual state (from the `ProxyStateCell`,
-/// never persisted config — #462); `transition` is an in-flight
+/// never persisted config); `transition` is an in-flight
 /// connect/disconnect target, rendered as Connecting…/Disconnecting…
 /// with the action item disabled. `lockdown_enabled`/`cover_presence` render
-/// the standing kill-switch toggle (#527).
+/// the standing kill-switch toggle.
 fn build_tray_menu(
     app: &AppHandle,
     update: Option<&hole::update::UpdateInfo>,
@@ -395,7 +393,7 @@ fn build_tray_menu(
     blocked: bool,
 ) -> Result<tauri::menu::Menu<tauri::Wry>, tauri::Error> {
     // The action item carries the intent its label displays: a click dispatches
-    // on the item ID, with no state read at click time (#462).
+    // on the item ID, with no state read at click time.
     let acts = tray_actions(running, transition, blocked);
 
     let status = MenuItem::with_id(app, ID_STATUS, acts.status, false, None::<&str>)?;
@@ -417,8 +415,8 @@ fn build_tray_menu(
         transition.is_none(),
         None::<&str>,
     )?;
-    // Shown whenever the kill-switch intent is on and nothing is running —
-    // unconditionally, independent of whether a cover is actually stranded.
+    // Shown whenever a cover is present (`escape_items`), whether or not
+    // anything is running.
     let unblock = MenuItem::with_id(app, ID_UNBLOCK, UNBLOCK_ITEM_LABEL, transition.is_none(), None::<&str>)?;
     let autostart = CheckMenuItem::with_id(app, ID_AUTOSTART, "Start at Login", true, false, None::<&str>)?;
     // Checked tracks intent; the warning label covers the enabled-but-inactive
@@ -504,9 +502,9 @@ fn sync_autostart_state(app: &AppHandle, menu: &tauri::menu::Menu<tauri::Wry>) {
 /// Create and register the system tray icon with its menu.
 ///
 /// Renders from the `ProxyStateCell` (false until the first Status lands),
-/// never from persisted config — a relaunch can no longer show "Connected"
-/// over no tunnel (#462); the status reconciler's immediate first tick
-/// corrects the genuine bridge-survived-a-GUI-crash case.
+/// never from persisted config, so a relaunch cannot show "Connected" over no
+/// tunnel; the status reconciler's immediate first tick corrects the
+/// bridge-survived-a-GUI-crash case.
 pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
     let snap = app.state::<AppState>().proxy_snapshot();
     let menu = build_tray_menu(
@@ -550,9 +548,9 @@ pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
 /// The whole rebuild (state reads included) is dispatched to the main
 /// thread: worker-thread callers would otherwise read state on one
 /// thread and commit the menu later via a queued `set_menu`, letting a
-/// stale menu overwrite a newer one (#473). The icon is committed inside
-/// the same ordered closure for the same reason (#492 — a worker-thread
-/// read paired with a queued `set_icon` can commit a stale icon).
+/// stale menu overwrite a newer one. The icon is committed inside the same
+/// ordered closure for the same reason: a worker-thread read paired with a
+/// queued `set_icon` can commit a stale icon.
 /// `run_on_main_thread` executes inline when already on the main thread.
 pub fn rebuild_tray_menu(app: &AppHandle) {
     let handle = app.clone();
@@ -586,7 +584,7 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
             Err(e) => warn!(error = &e as &dyn std::error::Error, "failed to rebuild tray menu"),
         }
         // `true` mirrors the build-time `icon_as_template(true)`; on
-        // non-macOS this falls back to plain `set_icon` (see #469).
+        // non-macOS this falls back to plain `set_icon`.
         if let Err(e) = tray.set_icon_with_as_template(Some(tray_icons::tray_image(snap.running.into())), true) {
             warn!(error = &e as &dyn std::error::Error, "failed to set tray icon");
         }
@@ -602,9 +600,8 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
 /// Send a best-effort Stop to the bridge and exit the application.
 ///
 /// Persisted `config.enabled` is deliberately untouched: it is the record of
-/// the last honored intent (#462); the startup-connect decision is the
-/// bridge's own now (#979), and the tray renders from bridge Status, never
-/// from that flag.
+/// the last honored intent; the startup-connect decision is the bridge's own,
+/// and the tray renders from bridge Status, never from that flag.
 pub(crate) async fn exit_app(app: AppHandle) {
     let state = app.state::<AppState>();
     let _ = state.bridge_send(BridgeRequest::Stop).await;
@@ -671,7 +668,7 @@ async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<
 
 /// Whether a connect attempt may surface UI that demands a human: the
 /// bridge-install prompt, the UAC/elevation prompt, an error modal.
-/// `Forbidden` is the unattended startup auto-connect path (#458) — it must
+/// `Forbidden` is the unattended path (the blocked-state Retry): it must
 /// fail passively into the tray's Disconnected state, never block a login on a
 /// modal.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -686,21 +683,13 @@ pub async fn set_proxy_enabled(app: &AppHandle, enable: bool, attempt_id: String
     set_proxy_enabled_inner(app, enable, Prompts::Allowed, attempt_id).await
 }
 
-/// The blocked-state Retry entry (`ID_BLOCKED_RETRY`) — a background
-/// reattempt the tray fires without the user having to sit through a prompt,
-/// so it suppresses prompts the same way the (now-deleted) startup
-/// auto-connect path used to. Connect-only by construction.
+/// The blocked-state Retry entry (`ID_BLOCKED_RETRY`): a background reattempt
+/// the tray fires without a prompt. Connect-only by construction.
 ///
-/// #979: this can no longer retry *covered*. Once the bridge decides
-/// auto-connect, no wire signal can make an IPC-driven start covered any
-/// more (`handle_start` hardcodes `covered = false` unconditionally) — the
-/// only source of a genuinely covered start is the bridge's own reconcile
-/// (boot today, an ongoing loop once #617 lands). A failed retry here no
-/// longer keeps the host blocked; it fails open, exactly like any other
-/// manual connect attempted while blocked (`proxy_manager.rs`'s documented
-/// "uncovered start while blocked" behaviour). Retrying while blocked
-/// without releasing the cover is intended to become the reconcile loop's
-/// job, not this button's.
+/// The retry is not covered: no wire signal makes an IPC-driven start covered
+/// (`handle_start` always uses `Coverage::Uncovered`), so a failed retry fails
+/// open, like any other manual connect attempted while blocked
+/// (`proxy_manager.rs`'s documented "uncovered start while blocked" behaviour).
 async fn connect_silently(app: &AppHandle) -> Result<ToggleOutcome, String> {
     set_proxy_enabled_inner(app, true, Prompts::Forbidden, uuid::Uuid::new_v4().to_string()).await
 }
@@ -714,13 +703,13 @@ async fn connect_silently(app: &AppHandle) -> Result<ToggleOutcome, String> {
 /// client lock), the state-sync watcher repaints the tray and notifies
 /// the webview, and persisted `config.enabled` records only an intent
 /// the bridge actually honored. On failure, one follow-up Status commits
-/// reality — a failed Disconnect can no longer re-assert "Connected"
+/// reality — a failed Disconnect cannot re-assert "Connected"
 /// over a stopped tunnel. Used by the tray menu items and the
 /// `start_proxy`/`stop_proxy` commands.
 ///
 /// `prompts` is consulted only on the enable path's two prompt sites (the
 /// bridge-install gate and the elevation fallback): `Allowed` shows the UI;
-/// `Forbidden` (unattended startup) suppresses both and fails passively. The
+/// `Forbidden` (unattended) suppresses both and fails passively. The
 /// disconnect path is always interactive (startup never disconnects).
 async fn set_proxy_enabled_inner(
     app: &AppHandle,
@@ -733,7 +722,7 @@ async fn set_proxy_enabled_inner(
     // Bridge install gate: when the GUI owns the bridge lifecycle and the
     // production service is missing or disabled, prompt BEFORE anything else.
     // An externally-supervised bridge (HOLE_BRIDGE_SOCKET, dev) skips this
-    // entirely — it is already reachable on its own socket (#569).
+    // entirely — it is already reachable on its own socket.
     if enable {
         match install_gate_for(
             state.bridge_is_externally_supervised(),
@@ -746,7 +735,7 @@ async fn set_proxy_enabled_inner(
                         return Err(prompt.declined_error().into());
                     }
                 }
-                // Startup must not throw an admin install wizard at a login.
+                // An unattended connect must not throw an admin install wizard.
                 Prompts::Forbidden => return Err(prompt.unattended_error().into()),
             },
             InstallGate::ChangeInProgress => return Err(CHANGE_IN_PROGRESS_ERROR.into()),
@@ -773,10 +762,10 @@ async fn set_proxy_enabled_inner(
     };
 
     let result: Result<ToggleOutcome, String> = if enable {
-        // Push the current Settings preference alongside the connect (#979):
-        // the bridge persists it and applies it at its own next boot, with no
-        // GUI running. This is a preference push, not a decision — the GUI no
-        // longer decides whether a start is auto-connect-covered.
+        // Push the current Settings preference alongside the connect: the
+        // bridge persists it and applies it at its own next boot, with no GUI
+        // running. This is a preference push, not a decision; the GUI does not
+        // decide whether a start is auto-connect-covered.
         let on_startup = state.config.lock().unwrap().on_startup;
         let request = BridgeRequest::Start {
             config: proxy_config.expect("built above for the enable path"),
@@ -870,7 +859,7 @@ fn handle_tray_icon_event(tray: &TrayIcon, event: TrayIconEvent) {
 fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
         // The clicked item's ID carries the user's intent — the intent the
-        // displayed label offered, not a flip of any state read now (#462).
+        // displayed label offered, not a flip of any state read now.
         id @ (ID_CONNECT | ID_DISCONNECT) => {
             let enable = id == ID_CONNECT;
             info!(enable, "tray: connect/disconnect clicked");
@@ -903,8 +892,8 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
             info!("tray: retry clicked from the blocked state");
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
-                // #979: no longer a covered retry (see `connect_silently`'s doc) — a
-                // failed attempt here can fail the host open rather than re-block it.
+                // The retry is not covered (see `connect_silently`'s doc): a failed
+                // attempt can fail the host open rather than re-block it.
                 match connect_silently(&app_handle).await {
                     Ok(outcome) => info!(?outcome, "blocked-state retry settled"),
                     Err(reason) => info!(%reason, "blocked-state retry did not connect"),
@@ -1435,7 +1424,7 @@ fn build_dashboard(app: &AppHandle, dashboard: &hole::dashboard::DashboardWindow
 
 /// Start the proxy. The caller transmits explicit intent — direction is
 /// decided by the state the user SAW, never re-derived backend-side from
-/// possibly-stale state (#462); the bridge's idempotence ("already
+/// possibly-stale state; the bridge's idempotence ("already
 /// running" → Running) absorbs a stale view instead of inverting the
 /// user's intent. Returns a `ToggleOutcome` (Running / Stopped /
 /// Cancelled); the frontend distinguishes the three cases in its
@@ -1456,7 +1445,7 @@ pub async fn stop_proxy(app: AppHandle) -> Result<ToggleOutcome, String> {
 /// cancel can race an in-flight `start_proxy` on the main pooled
 /// bridge connection. The `attempt_id` (minted by the frontend for this
 /// connect attempt and shared with `start_proxy`) scopes the cancel to that
-/// exact attempt (#465). Always returns `Ok(())` on a successful bridge
+/// exact attempt. Always returns `Ok(())` on a successful bridge
 /// round-trip — the bridge's `/v1/cancel` route is idempotent.
 #[tauri::command]
 pub async fn cancel_proxy(state: tauri::State<'_, AppState>, attempt_id: String) -> Result<(), String> {
@@ -1477,7 +1466,7 @@ pub async fn cancel_proxy(state: tauri::State<'_, AppState>, attempt_id: String)
 
 /// Read whether the GUI is registered to start at OS login. The OS registration
 /// (Windows Run key / macOS LaunchAgent) is the single source of truth; the
-/// dashboard renders this live rather than from config (#457).
+/// dashboard renders this live rather than from config.
 #[tauri::command]
 pub fn get_autostart(app: AppHandle) -> Result<bool, String> {
     use tauri_plugin_autostart::ManagerExt;
@@ -1491,7 +1480,7 @@ pub fn get_autostart(app: AppHandle) -> Result<bool, String> {
 
 /// Register or unregister GUI start-at-login through the same `crate::autostart`
 /// seam this tray uses, then re-sync the tray checkmark from the new OS state.
-/// Returns the live OS state (#457).
+/// Returns the live OS state.
 #[tauri::command]
 pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
     use tauri_plugin_autostart::ManagerExt;
@@ -1538,8 +1527,8 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
             // solely from a Start (slow, user/startup I/O; there is no
             // auto-reconnect on death), so it cannot land in the wake window. A
             // coalesced lockdown-only re-commit keeps running=false and the
-            // sticky error, so the death still reaches the webview (#470).
-            // clone: ProxySnapshot owns a String and is no longer Copy.
+            // sticky error, so the death still reaches the webview.
+            // clone: ProxySnapshot owns a String, so it is not Copy.
             let snap = rx.borrow_and_update().clone();
             rebuild_tray_menu(&app);
             if let Err(e) = app.emit("proxy-state-changed", snap) {
@@ -1561,9 +1550,9 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
 /// this loop (`BridgeLink::send` commits synchronously). The immediate first
 /// tick doubles as the startup reconcile.
 ///
-/// Startup auto-connect is no longer this loop's concern: the bridge
-/// decides and applies it at its own boot, before any GUI runs. This poll is
-/// purely presentational.
+/// Startup auto-connect is not this loop's concern: the bridge decides and
+/// applies it at its own boot, before any GUI runs. This poll is purely
+/// presentational.
 pub fn spawn_status_reconciler(app: &AppHandle, _settled: LaunchWindowsSettled) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {

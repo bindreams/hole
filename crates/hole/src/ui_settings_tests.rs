@@ -45,9 +45,8 @@ fn default_settings_json() -> serde_json::Value {
     })
 }
 
-// The defect-1 regression (#462): backend-owned fields are unrepresentable
-// on the wire — a frontend that sends them must fail loudly, not be
-// silently merged or ignored.
+// Backend-owned fields are unrepresentable on the wire — a frontend that
+// sends them must fail loudly, not be silently merged or ignored.
 #[skuld::test]
 fn deserialize_rejects_enabled_key() {
     let mut json = default_settings_json();
@@ -93,13 +92,13 @@ fn apply_preserves_backend_owned_fields() {
     assert!(current.elevation_prompt_shown);
 }
 
-// Membership is backend-owned (#504): apply merges UI-owned fields by id and
+// Membership is backend-owned: apply merges UI-owned fields by id and
 // can neither add nor drop members.
 
 #[skuld::test]
 fn apply_keeps_servers_absent_from_payload() {
     // Backend imported "c" after the webview took its snapshot; the stale
-    // save payload only knows "a" and "b". "c" must survive (#504).
+    // save payload only knows "a" and "b". "c" must survive.
     let mut current = AppConfig {
         servers: vec![entry("a"), entry("b"), entry("c")],
         selected_server: Some("a".into()),
@@ -175,8 +174,8 @@ fn apply_duplicate_incoming_ids_update_single_member() {
 
 #[skuld::test]
 fn apply_keeps_current_order_ignoring_payload_order() {
-    // `current` order is authoritative; iterating the payload (as the old
-    // wholesale-replace did) would let a reordered snapshot reorder the list.
+    // `current` order is authoritative; iterating the payload would let a
+    // reordered snapshot reorder the list.
     let mut current = AppConfig {
         servers: vec![entry("a"), entry("b")],
         ..Default::default()
@@ -301,7 +300,7 @@ fn ui_settings_debug_omits_the_password_and_the_address() {
 }
 
 /// Both newtypes are `#[serde(transparent)]`, so the payload the frontend
-/// sends is byte-identical to the one it sent before they existed.
+/// sends is the plain JSON strings.
 #[skuld::test]
 fn ui_server_entry_deserializes_the_secrets_from_bare_strings() {
     let settings = secret_settings();

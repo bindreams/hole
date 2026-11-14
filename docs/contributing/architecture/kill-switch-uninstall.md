@@ -52,10 +52,16 @@ so the error names every failure:
    act's exit code: the job can leave the service manager between a probe and the act (a concurrent uninstall, an operator's
    own stop, the daemon exiting), and `launchctl bootout` of a label launchd does not have exits with neither 0 nor the
    "no such service" status. Only an answer taken after the act is about the world the act left.
+   A service marked for deletion still opens, and a stop reaches it through its handle; macOS has the plist deleted over a
+   still-loaded job.
 1. **Deregister the service**, only after a *confirmed* stop and only when something is registered. An unconfirmed stop
    leaves the registration alone, because it is the only handle a later attempt has.
 1. **Release the covers**, unconditionally unless `--keep-covers` is passed. It is never gated on registration and never
-   skipped because an earlier step failed. Recording the target `Off` before the release is what makes a late failure
+   skipped because an earlier step failed. Cover existence is independent of service registration: the Windows filters
+   are keyed on compile-time GUIDs and are machine-wide, so a lost registration (a failed install, `sc delete`, an aborted
+   prior uninstall) must not turn the release into a no-op over a live block. Releasing against a bridge this run failed to
+   stop is safe by construction: `release_covers` holds that bridge's liveness lock and refuses rather than desyncing its
+   posture. Recording the target `Off` before the release is what makes a late failure
    safe: whatever happens after, a later start releases the cover (T16 in [Transitions](kill-switch.md#transitions)).
 
 On macOS the uninstall runs only when the user takes it: the tray's **Uninstall Helper** runs `hole bridge uninstall`

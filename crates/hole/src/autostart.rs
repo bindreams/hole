@@ -1,6 +1,6 @@
-// "Start at Login" toggle logic for the tray menu, extracted from tray.rs so
-// the decision logic is unit-testable (the tray handler itself needs a full
-// Tauri app context).
+// "Start at Login" toggle logic for the tray menu. It lives apart from the
+// tray so the decision logic is unit-testable (the tray handler itself needs a
+// full Tauri app context).
 
 use tauri_plugin_autostart::{AutoLaunchManager, Error};
 

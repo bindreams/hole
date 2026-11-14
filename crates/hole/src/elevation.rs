@@ -8,8 +8,7 @@
 //
 // Windows process tokens are immutable snapshots of group memberships captured
 // at logon time. There is no Win32 API to refresh a process's token to pick up
-// new group memberships — `klist purge` and `nltest` only affect Kerberos/AD
-// tickets, not local group tokens.
+// new group memberships.
 //
 // When the user is first added to the `hole` group (either at install time or
 // via `grant-access`), no running process will reflect that membership until
@@ -163,7 +162,7 @@ pub fn read_result_file(path: &std::path::Path) -> std::io::Result<ElevatedOutco
 /// parent renders the same toast the non-elevated path would. A bridge message is
 /// carried verbatim: it is authored by the bridge running as a system account with
 /// system-scoped paths, and `ProxyConfig` carries no path field, so it cannot
-/// contain user PII (#475).
+/// contain user PII.
 pub fn classify_elevated_send(
     result: &Result<hole_common::protocol::BridgeResponse, crate::bridge_client::ClientError>,
 ) -> ElevatedOutcome {

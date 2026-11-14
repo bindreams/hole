@@ -138,7 +138,7 @@ fn truncate_for_dialog_under_limit_no_trailing_newline() {
 
 #[skuld::test]
 fn truncate_for_dialog_over_limit_cuts_at_line_boundary() {
-    // Build a big repeating line, well over DIALOG_OUTPUT_BUDGET (3 KiB).
+    // Build a big repeating line, well over DIALOG_OUTPUT_BUDGET.
     let line = "AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA";
     let big = std::iter::repeat_n(line, 100).collect::<Vec<_>>().join("\n");
     let truncated = truncate_for_dialog(&big);
@@ -341,10 +341,10 @@ fn uninstall_removes_the_socket_and_answers_ok_for_a_missing_one() {
 
 // `bridge uninstall` orchestration ====================================================================================
 
-// bindreams/hole#1003: uninstalling with a fail-closed cover engaged left the
-// host blocked with no binary left to release it. The release must therefore
-// run after the bridge is dead, run regardless of the teardown's outcome or the
-// service registration, and be the failure that aborts.
+// Uninstalling with a fail-closed cover engaged must not leave the host
+// blocked with no binary left to release it. The release therefore runs after
+// the bridge is dead, runs regardless of the teardown's outcome or the service
+// registration, and is the failure that aborts.
 
 struct UninstallOutcome {
     result: Result<(), Box<dyn std::error::Error>>,
@@ -497,8 +497,8 @@ fn uninstall_fails_loud_when_the_release_fails() {
     );
 }
 
-/// An early `?` on the release swallowed whatever went wrong before it, which
-/// is exactly the context needed to explain why the release refused.
+/// An early `?` on the release would swallow whatever went wrong before it,
+/// which is exactly the context needed to explain why the release refused.
 #[skuld::test]
 fn uninstall_reports_every_failed_step_not_just_the_last() {
     let out = uninstall_probe(UninstallScript {
@@ -1044,8 +1044,8 @@ fn the_service_is_started_exactly_when_the_repair_says_it_may_be() {
 // Everything above drives `uninstall_bridge_with` through injected closures, so
 // all of it stays green if the production wiring is severed — the release
 // replaced by `Ok(())`, the CLI arm returning `0` without dispatching. That is
-// the whole failure this change is about: the path where severing it leaves a
-// machine fail-closed with its only escape binary deleted (#1003).
+// the failure these guards exist for: severing it leaves a machine fail-closed
+// with its only escape binary deleted.
 //
 // So walk the sources and pin WHO calls the real effects, the same instrument
 // `crates/bridge/src/reconciler_tests.rs` uses for the cover-release callers.
@@ -1138,8 +1138,7 @@ fn the_start_type_hold_is_wired_to_both_elevated_changes() {
     );
 }
 
-/// The other half of #1003's dead end: the stop must not be conditional on a
-/// registration record. A severed `ensure_stopped` leaves nothing stopping the
+/// The stop must not be conditional on a registration record. A severed `ensure_stopped` leaves nothing stopping the
 /// bridge, and the release then refuses forever.
 #[skuld::test]
 fn the_bridge_stop_is_wired_ahead_of_every_deregistration() {

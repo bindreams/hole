@@ -44,7 +44,7 @@ use tauri::Manager;
 /// last-window-closed `RunEvent::ExitRequested { code: None }` callback
 /// (which fires after we destroy the dashboard from the `code: Some(_)`
 /// arm of `handle_run_event`) does not call `prevent_exit` and abort the
-/// exit we just initiated. See `handle_run_event` and issue #144.
+/// exit we just initiated. See `handle_run_event`.
 static EXITING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(not(test))]
@@ -72,7 +72,7 @@ fn main() {
 
 // Install the workspace test subscriber + panic hook. The dev-dep
 // is gated on cfg(test) because it isn't linked in non-test builds.
-// See `crates/test-observability/` and bindreams/hole#301.
+// See `crates/test-observability/`.
 #[cfg(test)]
 hole_test_observability::register!();
 
@@ -102,7 +102,7 @@ fn launch_gui(show_dashboard: bool) {
 
     let _log_guard = logging::init(&log_dir);
 
-    // Native-crash observability (bindreams/hole#438): report any crash
+    // Native-crash observability: report any crash
     // marker a previously-crashed GUI/foreground-bridge left in this dir.
     // GUI startup is synchronous and pre-event-loop, so sweep inline (no
     // spawn_blocking — there is no runtime worker to protect yet).
@@ -200,11 +200,11 @@ fn launch_gui(show_dashboard: bool) {
             tray::create_tray(app)?;
             // Tray + webview follow the ProxyStateCell; the reconciler's
             // immediate first tick is the startup resync against the
-            // bridge's actual state (#462).
+            // bridge's actual state.
             tray::spawn_proxy_state_sync(app.handle());
-            // Startup auto-connect is the bridge's own decision now (#979): it
-            // applies its persisted `on_startup` preference at its own boot,
-            // before any GUI runs — the GUI has nothing to arm here.
+            // Startup auto-connect is the bridge's own decision: it applies its
+            // persisted `on_startup` preference at its own boot, before any GUI
+            // runs, so the GUI has nothing to arm here.
             platform::on_setup(app)?;
             // Registrations written before the dashboard flag existed carry no
             // arguments and would open a window at login. Best-effort: never
@@ -238,11 +238,10 @@ fn launch_gui(show_dashboard: bool) {
         .run(handle_run_event);
 }
 
-/// Tauri run-event handler. Implements the Tauri 2 equivalent of Qt's
-/// `QApplication::setQuitOnLastWindowClosed(false)` and a destroy-then-exit
-/// dance that works around tao calling `std::process::exit` at the
-/// end of `EventLoop::run` (which bypasses every `Drop` in the wry/Tauri
-/// tree).
+/// Tauri run-event handler: keeps the app running for the tray after the last
+/// window closes, and destroys the webview windows before an explicit exit,
+/// because tao calls `std::process::exit` at the end of `EventLoop::run`, which
+/// bypasses every `Drop` in the wry/Tauri tree.
 ///
 /// The wry runtime fires `RunEvent::ExitRequested` from two places:
 ///
@@ -255,8 +254,7 @@ fn launch_gui(show_dashboard: bool) {
 ///     need to destroy any remaining webview windows here, BEFORE letting
 ///     the exit through. Otherwise the dashboard's `Chrome_WidgetWin_0`
 ///     HWND survives to AtExit time and Chromium logs
-///     `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`
-///     (issue #144).
+///     `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`.
 ///
 /// Calling `WebviewWindow::destroy()` from this callback is safe on the
 /// main thread: the wry runtime intercepts

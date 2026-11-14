@@ -14,7 +14,7 @@ use std::path::Path;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1 MiB
+const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
 
 // Errors ==============================================================================================================
 
@@ -296,7 +296,8 @@ impl BridgeClient {
     /// POST counterpart to [`http_get`](Self::http_get). `headers` are attached
     /// verbatim; the transport is otherwise header-agnostic — each `send` arm
     /// supplies the per-request headers it needs (Start/Cancel the
-    /// `X-Hole-Attempt-Id`, an auto-connect Start the `X-Hole-Covered`).
+    /// `X-Hole-Attempt-Id`, a Start with a startup preference the
+    /// `X-Hole-On-Startup`).
     async fn http_post(
         &mut self,
         path: &str,

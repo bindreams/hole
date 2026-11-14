@@ -52,7 +52,7 @@ export interface ToggleDeps {
 
 /// Issue `start_proxy`/`stop_proxy` — explicit intent on the wire, so
 /// the backend never re-derives direction from its own possibly-stale
-/// state (#462) — and apply the resulting state transition.
+/// state — and apply the resulting state transition.
 ///
 /// The UI stays in `connecting`/`disconnecting` until the bridge IPC
 /// returns; there is no client-side timeout. A wedged transition is
@@ -64,7 +64,7 @@ export async function toggleFromIdle(goingToConnect: boolean, deps: ToggleDeps, 
   const op = deps.beginOp();
   op.settle(() => deps.setState(goingToConnect ? "connecting" : "disconnecting"));
 
-  // The connect carries the per-attempt id (#465) so a later Cancel can be
+  // The connect carries the per-attempt id so a later Cancel can be
   // scoped to this exact start; Stop carries none (it is not cancellable).
   const command = goingToConnect ? "start_proxy" : "stop_proxy";
   let outcome: ToggleOutcome;

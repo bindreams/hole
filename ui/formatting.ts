@@ -1,6 +1,5 @@
 // Pure formatting helpers for byte counts, transfer speeds, and durations.
-// Used by the stats table + graph scale label; extracted from sidebar.ts
-// for unit testability.
+// Used by the stats table + graph scale label.
 
 /** Format a byte count to a human-readable string (e.g. "1.24 GB"). */
 export function formatBytes(bytes: number): string {

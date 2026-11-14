@@ -1,4 +1,4 @@
-//! Cross-uid ownership proofs for #572 — need real root to give a file to
+//! Cross-uid ownership proofs — need real root to give a file to
 //! another uid. Rides the macOS root lane (`SKULD_LABELS=tun`, sudo). NOT
 //! `#[ignore]`d; an unprivileged run asserts the EPERM / self-owned direction
 //! and PASSES. Covers both the bare `chown_path` primitive and the cutover

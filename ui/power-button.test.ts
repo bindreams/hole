@@ -162,7 +162,7 @@ describe("power-button state machine", () => {
     // while the bridge still reports the same (seq, running=true)
     // observation. The seq gate keeps the failure cue visible until the
     // state actually CHANGES (a new seq), instead of repainting it to
-    // plain `connected` on the next 5s poll.
+    // plain `connected` on the next poll.
     let rejectStop!: (reason: unknown) => void;
     const stopPromise = new Promise<never>((_, reject) => {
       rejectStop = reject;
@@ -286,7 +286,7 @@ describe("power-button state machine", () => {
     expect(getConnectionState()).toBe("disconnecting");
   });
 
-  // Death-error toast (#470): exactly once on a genuine connected->stopped
+  // Death-error toast: exactly once on a genuine connected->stopped
   // transition that carries a reason, fed by BOTH the poll and the event.
   it("toasts once on a death (connected -> disconnected carrying an error)", async () => {
     const { initPowerButton, updateProxyStatus } = await import("./power-button");

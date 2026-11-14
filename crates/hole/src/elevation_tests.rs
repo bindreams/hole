@@ -207,7 +207,7 @@ fn start_attempt_id_survives_request_file_roundtrip() {
     // The attempt id is a STRUCT FIELD, so it round-trips through the elevation
     // re-serialization path (write/read_request_file). A header minted only in
     // bridge_client would be dropped on the elevated replay — then an elevated
-    // Start could never match a pre-arm (#465).
+    // Start could never match a pre-arm.
     let request = BridgeRequest::Start {
         config: ProxyConfig::default(),
         attempt_id: "elev-attempt-42".into(),

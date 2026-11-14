@@ -144,7 +144,7 @@ describe("startPublicIpAutoRefresh", () => {
     initIpDisplay();
     startPublicIpAutoRefresh();
 
-    // Visible at start → one 60s interval, no immediate fetch (init owns the first).
+    // Visible at start → one refresh interval, no immediate fetch (init owns the first).
     expect(setIntervalMock).toHaveBeenCalledTimes(1);
     expect(setIntervalMock.mock.calls[0][1]).toBe(60000);
 
