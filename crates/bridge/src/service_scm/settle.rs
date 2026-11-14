@@ -140,8 +140,7 @@ impl ProcessFate {
 /// while the service is not STOPPED, with or without a process held. The SCM
 /// sends a service marked for deletion no notification, and no process exit
 /// says its state moved, so this only paces re-queries of an SCM that sends
-/// nothing. It is not a return to the sleep-poll `service_scm`
-/// replaced: nothing is concluded from its expiry, a wake with nothing changed
+/// nothing. Nothing is concluded from its expiry, a wake with nothing changed
 /// waits again, and the loop ends only on a state a query reads.
 pub const SCM_REQUERY_MILLIS: u32 = 2_000;
 

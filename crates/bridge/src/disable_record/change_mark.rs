@@ -19,6 +19,7 @@
 //! stamp (one process) and a per-process `seq` (two changes that process ends
 //! at the same count). A bare `<n>`, which earlier builds wrote at rest, is
 //! still read: it seeds the count and names no holder.
+//!
 //! The mark sits in the service's key, which an unprivileged user can read and
 //! no user can write.
 

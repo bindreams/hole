@@ -115,9 +115,9 @@ fn a_registration_probe_classifies_by_cause() {
 
 #[skuld::test]
 fn an_unanswerable_probe_is_never_a_stopped_bridge() {
-    // The silent-success hole itself. `uninstall_bridge_with` gates
-    // deregistration on this returning Ok, and deleting the plist over a
-    // still-loaded job leaves a running bridge nothing names.
+    // `uninstall_bridge_with` gates deregistration on this returning Ok, and
+    // deleting the plist over a still-loaded job leaves a running bridge nothing
+    // names.
     let err = ensure_stopped_verdict(Registration::Unknown("launchctl not found".into()))
         .expect_err("an unanswerable probe must fail loud");
     assert!(format!("{err}").contains("launchctl not found"), "{err}");
@@ -190,13 +190,11 @@ fn the_bootout_is_issued_before_launchd_is_asked_anything() {
 
 #[skuld::test]
 fn a_failed_bootout_over_a_job_launchd_no_longer_has_is_a_stopped_bridge() {
-    // The window the probe-then-act shape left open: the job leaves launchd
-    // between the question and the bootout — a concurrent `hole bridge
-    // uninstall`, an operator's own `launchctl bootout`, the daemon exiting
-    // and being reaped — and the bootout then fails over a bridge that is in
-    // fact stopped. `uninstall_bridge_with` refuses to deregister on an
-    // unconfirmed stop, so the plist and the privileged helper stay on disk
-    // and the uninstall fails instead of succeeding.
+    // The job can leave launchd before the bootout (a concurrent `hole bridge
+    // uninstall`, an operator's own `launchctl bootout`, the daemon exiting), and
+    // the bootout then fails over a bridge that is in fact stopped. That must
+    // read as stopped: `uninstall_bridge_with` refuses to deregister on an
+    // unconfirmed stop, so the uninstall would otherwise fail.
     for code in [Some(3), Some(LAUNCHD_NO_SUCH_SERVICE), Some(1), None] {
         let result = ensure_stopped_with(|| Ok(code), || Registration::Absent);
         assert!(

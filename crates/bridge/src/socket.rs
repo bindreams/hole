@@ -277,7 +277,7 @@ pub fn bind(path: &Path) -> io::Result<LocalListener> {
 
 /// Like [`bind`], but applies restrictive OS-level permissions during creation.
 ///
-/// On macOS, identical to `bind()` (umask guard is always applied).
+/// On macOS, restricts the socket file to mode 0600 right after the bind.
 /// On Windows, applies a protected DACL (SYSTEM + Administrators only) between
 /// `bind()` and `listen()` to prevent a TOCTOU race on socket permissions.
 #[allow(dead_code)]

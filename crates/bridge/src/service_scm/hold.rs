@@ -371,19 +371,14 @@ impl<P> ProcessHolds<P> {
 
     /// Read the service and hold the process it names.
     ///
-    /// The id is a claim, not an identity. Microsoft documents it
-    /// ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks)):
-    ///
-    /// > The process identifier returned in the SERVICE_STATUS_PROCESS structure
-    /// > is valid provided that the state of the service is one of SERVICE_RUNNING,
-    /// > SERVICE_PAUSE_PENDING, SERVICE_PAUSED, or SERVICE_CONTINUE_PENDING. If
-    /// > the service is in a SERVICE_START_PENDING or SERVICE_STOP_PENDING state,
-    /// > however, the process identifier may not be valid, and if the service is
-    /// > in the SERVICE_STOPPED state, it is never valid.
-    ///
-    /// START_PENDING and STOP_PENDING are states this code acts on, so a pid
-    /// read in either may name a process that is not the service's, and an id
-    /// may be reused. What makes a hold safe is not the state but the process:
+    /// The id is a claim, not an identity. Microsoft documents it valid in
+    /// RUNNING, PAUSE_PENDING, PAUSED and CONTINUE_PENDING, "may not be valid" in
+    /// START_PENDING and STOP_PENDING, and "never valid" in STOPPED
+    /// ([`QueryServiceStatusEx`, Remarks][qsse-remarks];
+    /// [`Observed::reported_pid`]). START_PENDING and STOP_PENDING are states
+    /// this code acts on, so a pid read in either may name a process that is not
+    /// the service's, and an id may be reused. What makes a hold safe is not the
+    /// state but the process:
     /// [`ProcessSource::open`] keeps a process only if its token carries the
     /// service SID (`NT SERVICE\<name>`, enabled by
     /// `SERVICE_CONFIG_SERVICE_SID_INFO`), which the SCM puts only on a process
@@ -397,6 +392,8 @@ impl<P> ProcessHolds<P> {
     /// that keeps changing is followed, one pass per real change, with no count.
     /// A process that fails the SID check is dropped the same way and reported
     /// as [`Named::NotTheService`]; it is never held. Returns the last look.
+    ///
+    /// [qsse-remarks]: https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks
     pub fn hold_current<S: ProcessSource<Process = P>>(&mut self, source: &mut S) -> io::Result<Hold> {
         let mut reading = source.read()?;
         loop {
