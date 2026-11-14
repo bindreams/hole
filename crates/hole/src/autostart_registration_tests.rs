@@ -16,7 +16,7 @@ fn adds_the_flag_to_an_argument_less_value() {
 #[skuld::test]
 fn tolerates_the_trailing_space_auto_launch_writes() {
     // auto-launch formats "{path} {args}", so an empty arg list leaves a
-    // trailing space in every registration written before this change.
+    // trailing space in every registration written with no args.
     assert_eq!(
         set_dashboard_flag_in_value(r"C:\Program Files\hole\bin\hole.exe ", FLAG),
         r"C:\Program Files\hole\bin\hole.exe --no-show-dashboard"

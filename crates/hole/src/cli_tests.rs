@@ -3,7 +3,7 @@ use clap::Parser;
 use skuld::temp_dir;
 use std::path::Path;
 
-// Elevated-run owner resolution (#572) ================================================================================
+// Elevated-run owner resolution =======================================================================================
 
 #[skuld::test]
 fn user_dirs_derive_from_home_not_env() {
@@ -851,7 +851,7 @@ fn bridge_unlock_takes_no_args() {
 }
 
 // The MSI invokes these two by name; a rename here silently breaks the
-// installer's uninstall custom actions (bindreams/hole#1003).
+// installer's uninstall custom actions.
 
 #[skuld::test]
 fn bridge_release_covers_takes_only_a_log_dir() {
@@ -1215,8 +1215,8 @@ fn redaction_is_armed_only_by_the_wire_funnel() {
         "arming must have exactly one call site, got: {arm_calls:?}"
     );
 
-    // No second mechanism: a hand-rolled `arm_server` beside a send is how two
-    // of the six paths used to do this, and is what let the sixth do nothing.
+    // No second mechanism: a hand-rolled `arm_server` beside a send would be a
+    // second arming path.
     let ad_hoc = calls("arm_server(");
     assert!(
         ad_hoc.iter().all(|l| l.contains("=> arm_server(")),

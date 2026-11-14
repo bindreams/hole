@@ -27,8 +27,8 @@ import { showToast } from "./toast";
 import type { Config, DiagnosticsData, ImportOutcome, Metrics, ProxyStatus, UiSettings } from "./types";
 
 /// Maximum number of concurrent server tests during bulk auto-test (e.g.
-/// after a JSON import). 50 concurrent plugin processes is non-trivial
-/// RAM and looks like a port scan from one IP to commercial SS providers.
+/// after a JSON import). Many concurrent plugin processes cost non-trivial
+/// RAM and look like a port scan from one IP to commercial SS providers.
 export const TEST_CONCURRENCY = 5;
 
 // State ===============================================================================================================
@@ -61,7 +61,7 @@ export async function loadConfig() {
 
 /// Strip backend-owned fields before persisting: the wire type rejects
 /// unknown keys, so sending `validation` (or any future backend-owned
-/// field) fails loudly instead of silently clobbering. See #462.
+/// field) fails loudly instead of silently clobbering.
 function toUiSettings(c: Config): UiSettings {
   return {
     servers: c.servers.map(({ id, name, server, server_port, method, password, plugin, plugin_opts }) => ({
@@ -102,7 +102,7 @@ export async function saveConfig() {
 
 /**
  * Whether the app is registered to start at OS login. The OS is the source of
- * truth (#457) — the dashboard reads this live, not from config. Rejects on
+ * truth — the dashboard reads this live, not from config. Rejects on
  * failure so the caller can surface it.
  */
 export async function getAutostart(): Promise<boolean> {
@@ -111,7 +111,7 @@ export async function getAutostart(): Promise<boolean> {
 
 /**
  * Set OS start-at-login; resolves to the resulting live state. Rejects with the
- * backend's PII-free message so the caller can revert and toast (#457).
+ * backend's PII-free message so the caller can revert and toast.
  */
 export async function setAutostart(enabled: boolean): Promise<boolean> {
   return await invoke<boolean>("set_autostart", { enabled });
@@ -129,10 +129,10 @@ export function isDirty() {
 
 // Polling =============================================================================================================
 
-/** Poll proxy status every 5 seconds. */
+/** Poll proxy status. */
 async function pollProxyStatus() {
   // Capture the filters epoch before the round-trip; a mutation during the
-  // fetch invalidates the response's invalid_filters indices (#470).
+  // fetch invalidates the response's invalid_filters indices.
   const epoch = filtersEpoch();
   try {
     const status = await invoke<ProxyStatus>("get_proxy_status");
@@ -157,7 +157,7 @@ async function pollProxyStatus() {
   }
 }
 
-/** Poll metrics every 1 second. */
+/** Poll metrics; scheduled by `init`. */
 async function pollMetrics() {
   try {
     const metrics = await invoke<Metrics>("get_metrics");
@@ -167,7 +167,7 @@ async function pollMetrics() {
   }
 }
 
-/** Poll diagnostics every 5 seconds. */
+/** Poll diagnostics; scheduled by `init`. */
 async function pollDiagnostics() {
   try {
     const data = await invoke<DiagnosticsData>("get_diagnostics");
@@ -261,22 +261,18 @@ function setupEventListeners(): Promise<unknown> {
   });
 
   // Tray- or backend-initiated proxy state changes reach the power
-  // button immediately instead of waiting for the 5s poll (#462). Routed
+  // button immediately instead of waiting for the next poll. Routed
   // through the same seq-monotone, IDLE-guarded application as the poll.
   const proxyStateReady = listen<{
     seq: number;
     running: boolean;
     error: string | null;
-    // The backend also serializes lockdown/blocked fields; this listener uses only
-    // running/error. The blocked state is surfaced in the tray; the dashboard
-    // blocked state is deferred (#625).
-    lockdown_enabled?: boolean;
-    lockdown_active?: boolean;
-    blocked_until_connected?: boolean;
   }>("proxy-state-changed", (event) => {
+    // The event also carries lockdown and blocked-state fields that the
+    // dashboard ignores: it has no blocked state (bindreams/hole#625).
     // Pass `error` so a death observed first (or only) via the event still
     // surfaces the exactly-once toast — the tray reconciler can be the poller
-    // that commits the death (#470).
+    // that commits the death.
     const result = applyProxyStateObservation(event.payload.seq, event.payload.running, event.payload.error);
     if (result.changed) {
       updatePublicIp();
@@ -397,8 +393,8 @@ async function init() {
     setInterval(pollProxyStatus, 5000);
     setInterval(pollMetrics, 1000);
     setInterval(pollDiagnostics, 5000);
-    // Public IP refreshes every 60s while the dashboard is visible, paused
-    // when minimized/hidden to the tray (#464).
+    // Public IP refreshes while the dashboard is visible, paused when
+    // minimized/hidden to the tray.
     startPublicIpAutoRefresh();
 
     result = { ok: true, error: null };

@@ -48,7 +48,7 @@ let openDropdown: (HTMLDivElement & { _td?: HTMLTableCellElement }) | null = nul
 /** Index of the row being edited inline (address input), or -1. */
 let editingIndex = -1;
 
-// Invalid-filter badges (#470) ========================================================================================
+// Invalid-filter badges ===============================================================================================
 
 /// The bridge's list of dropped rules from the latest status poll, keyed by
 /// their index in `config.filters`. Repainted onto rows by `applyInvalidFilterBadges`.
@@ -85,7 +85,7 @@ export function setInvalidFilters(list: InvalidFilter[] | null): void {
 
 /// Targeted badge paint: add/remove a `.filter-invalid` marker on each row by
 /// its index. NOT a full re-render — it must not cancel a drag, close a
-/// dropdown, or commit a half-typed edit on the 5s poll. Derives purely from
+/// dropdown, or commit a half-typed edit on the status poll. Derives purely from
 /// the current rows + the cache, so it is correct however it is reached.
 function applyInvalidFilterBadges(): void {
   const byIndex = new Map<number, string>();
@@ -122,7 +122,7 @@ let persistChain: Promise<void> = Promise.resolve();
 
 function persistFilters(): Promise<void> {
   // The bridge has not re-judged the mutated ruleset; drop stale badges now and
-  // invalidate any in-flight poll result via the epoch (#470).
+  // invalidate any in-flight poll result via the epoch.
   invalidateInvalidFilters();
   persistChain = persistChain.then(async () => {
     await saveConfig();
@@ -156,7 +156,7 @@ function ensureDefaultRule() {
       action: "proxy",
     });
     // The unshift shifts every later index — stale invalid-filter indices no
-    // longer match the rows (#470).
+    // longer match the rows.
     invalidateInvalidFilters();
     saveConfig();
   }
@@ -331,7 +331,7 @@ export function renderFilters() {
     tbody.querySelector<HTMLElement>(`tr[data-index="${index}"] ${restoreControl}`)?.focus({ preventScroll: true });
   }
 
-  // Repaint invalid-filter badges from the cache (#470): the table was rebuilt,
+  // Repaint invalid-filter badges from the cache: the table was rebuilt,
   // so the prior badge spans are gone.
   applyInvalidFilterBadges();
 

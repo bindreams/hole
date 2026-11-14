@@ -242,8 +242,7 @@ describe("external re-renders", () => {
   });
 });
 
-// Merged from main's servers.test.ts (#482) — in-flight test repaint and
-// failure handling, adapted to this file's fixture and mock names.
+// In-flight test repaint and failure handling.
 describe("server test failure handling", () => {
   function pendingRejectableTest(): (reason: unknown) => void {
     let reject!: (reason: unknown) => void;

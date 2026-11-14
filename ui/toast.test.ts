@@ -34,11 +34,11 @@ describe("showToast", () => {
   });
 
   it("auto-dismisses after the default duration for the kind", () => {
-    const info = showToast("info msg", "info"); // default 5000ms
+    const info = showToast("info msg", "info"); // default duration
     expect(info.isConnected).toBe(true);
     vi.advanceTimersByTime(4_999);
     expect(info.isConnected).toBe(true);
-    vi.advanceTimersByTime(2); // crosses 5000ms — synchronous removal
+    vi.advanceTimersByTime(2); // crosses the default duration — synchronous removal
     expect(info.isConnected).toBe(false);
   });
 

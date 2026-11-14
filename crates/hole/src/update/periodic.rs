@@ -6,10 +6,14 @@ use tracing::{debug, info, warn};
 use super::check::check_for_update;
 use super::UpdateState;
 
+/// How long the checker waits between checks.
+pub const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// Start the periodic update checker.
 ///
-/// Checks immediately on launch, then every 24 hours. Once an update is found,
-/// publishes it to `UpdateState` and calls `on_update_found`, then stops.
+/// Checks immediately on launch, then every [`UPDATE_CHECK_INTERVAL`]. Once an
+/// update is found, publishes it to `UpdateState` and calls `on_update_found`,
+/// then stops.
 pub fn start_update_checker(app: AppHandle, on_update_found: impl Fn(&AppHandle, &super::UpdateInfo) + Send + 'static) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -38,7 +42,7 @@ pub fn start_update_checker(app: AppHandle, on_update_found: impl Fn(&AppHandle,
                 }
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+            tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
         }
     });
 }

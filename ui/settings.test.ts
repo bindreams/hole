@@ -345,8 +345,7 @@ describe("settings dropdowns", () => {
   });
 });
 
-// Merged from main's settings.test.ts (#482) — port validation and
-// null-config guards, adapted to this file's fixture and mock names.
+// Port validation and null-config guards.
 
 function changePort(id: string, value: string) {
   const input = document.getElementById(id) as HTMLInputElement;

@@ -1,5 +1,5 @@
 // Pure helper: format the toast message for a `start_proxy`/`stop_proxy` failure.
-// Extracted so the message shape is unit-testable without DOM/Tauri-
+// Kept pure so the message shape is unit-testable without DOM/Tauri-
 // mock plumbing. Surfaces real bridge failures to the user instead of
 // only logging to console.
 

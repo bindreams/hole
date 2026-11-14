@@ -10,7 +10,7 @@ use hole_common::verify::VerifyError;
 
 use super::error::UpdateError;
 
-/// Maximum size for sidecar file downloads (1 MiB).
+/// Maximum size for sidecar file downloads.
 const SIDECAR_SIZE_LIMIT: u64 = 1024 * 1024;
 
 // Public API ==========================================================================================================

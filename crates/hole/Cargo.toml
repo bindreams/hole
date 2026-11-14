@@ -19,7 +19,7 @@ workspace = true
 # production builds (msi-installer / release CI) just work. Dev paths
 # (build.yaml's `hole` and `hole-tests` targets, dev-console) pass
 # `--no-default-features` to keep `cfg(dev) = true` for the Vite-served
-# workflow. See bindreams/hole#372 for the incident.
+# workflow.
 default = ["tauri/custom-protocol"]
 # Passthrough to hole-common's dev-only minidump writer. NON-DEFAULT. The
 # dev/test build paths (build.yaml hole / hole-tests) pass
@@ -61,7 +61,7 @@ contracts = "0.6"
 dirs = "7"
 hyper = { version = "1", features = ["http1", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-# Support-bundle redaction on collection, and the #572 cross-uid ownership
+# Support-bundle redaction on collection, and the cross-uid ownership
 # proof's `util::ownership::chown_path`.
 util = { path = "../util" }
 http-body-util = "0.1"

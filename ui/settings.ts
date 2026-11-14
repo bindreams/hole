@@ -171,7 +171,7 @@ function wireToggle(id: string, apply: (on: boolean) => void) {
 const AUTOSTART_TOGGLE_ID = "toggle-start-on-login";
 
 /**
- * Flip the "Start Hole on login" toggle to `target` OS autostart state (#457).
+ * Flip the "Start Hole on login" toggle to `target` OS autostart state.
  * The OS is the single source of truth: optimistic flip, `set_autostart` through
  * the same `crate::autostart` seam the tray uses, then commit the state the
  * backend reports; on failure revert and toast the PII-free reason.
