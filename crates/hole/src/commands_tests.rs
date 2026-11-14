@@ -359,7 +359,7 @@ fn get_diagnostics_unexpected_response_falls_back() {
     assert_eq!(json["bridge"], "unknown");
 }
 
-// map_status_response (#470) ==========================================================================================
+// map_status_response =================================================================================================
 
 fn status_snap(seq: u64, running: bool, error: Option<&str>) -> crate::state::ProxySnapshot {
     crate::state::ProxySnapshot {
@@ -576,7 +576,7 @@ fn import_rejects_nonexistent_path() {
 #[skuld::test]
 fn import_rejects_oversized_file(#[fixture(temp_dir)] dir: &Path) {
     let file = dir.join("huge.json");
-    let data = vec![b' '; 11 * 1024 * 1024]; // 11 MB
+    let data = vec![b' '; 11 * 1024 * 1024];
     std::fs::write(&file, &data).unwrap();
     let err = validate_and_read_import(&file).unwrap_err();
     match err {
@@ -834,8 +834,8 @@ fn apply_import_emits_summary_event() {
 // `to_import_failure` converts the file-I/O + parse error surface into
 // the tagged enum the frontend deserializes, so the frontend can show the
 // right blocking dialog without any string parsing. Dropping the parse
-// detail is defense in depth, not the cure: `ImportError::Parse` no longer
-// holds the `serde_json::Error` that echoes file content
+// detail is defense in depth, not the cure: `ImportError::Parse` holds no
+// `serde_json::Error` (it echoes file content)
 // (`import::the_parse_variant_never_carries_the_input`).
 
 #[skuld::test]

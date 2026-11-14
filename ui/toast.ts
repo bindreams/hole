@@ -1,5 +1,5 @@
 // Toast: bottom-right popups for surfacing IPC errors, success counts, and
-// other user-visible signals that previously vanished into `console.error`.
+// other user-visible signals.
 //
 // Lazy-mounts a single `.toast-container` on first call so the rest of the
 // app doesn't have to thread a container ref. Capped at MAX_VISIBLE
@@ -40,9 +40,9 @@ function dismiss(toast: HTMLDivElement) {
 }
 
 /**
- * Show a toast in the bottom-right corner. Caps at 5 visible at once; older
- * toasts auto-dismiss when a 6th arrives. Returns the toast element so callers
- * can dismiss it manually if they want.
+ * Show a toast in the bottom-right corner. At most `MAX_VISIBLE` show at
+ * once; the oldest is auto-dismissed when another arrives. Returns the toast
+ * element so callers can dismiss it manually if they want.
  */
 export function showToast(message: string, kind: ToastKind, durationMs?: number): HTMLDivElement {
   const c = ensureContainer();

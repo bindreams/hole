@@ -1,6 +1,6 @@
 //! Tracks the single dashboard window's identity so the tray, menu, and
 //! single-instance paths can reveal a live window or build a fresh one
-//! without racing Tauri's destroy-on-close teardown (#466).
+//! without racing Tauri's destroy-on-close teardown.
 
 use std::sync::Mutex;
 

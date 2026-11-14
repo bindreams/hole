@@ -1,9 +1,9 @@
-// Unit tests for the extracted toggle-flow module. The key invariants
+// Unit tests for the toggle-flow module. The key invariants
 // tested here: `toggleFromIdle` schedules NO client-side timer (the UI
 // stays in `connecting`/`disconnecting` until the bridge IPC returns;
 // the user's Cancel button (`cancel_proxy`) is the only escape hatch),
 // and the user's direction is transmitted as explicit start/stop intent
-// on the wire (#462).
+// on the wire.
 //
 // Synchronization note (docs/contributing/testing.md#no-synchronization-by-elapsed-time): this
 // test uses `vi.useFakeTimers()` + `vi.getTimerCount()` to assert the
@@ -123,8 +123,8 @@ describe("toggleFromIdle: outcome handling", () => {
     await toggleFromIdle(true, h.deps, "attempt-xyz");
     expect(h.state).toBe("connected");
     expect(h.updatePublicIp).toHaveBeenCalled();
-    // Explicit intent on the wire (#462): the direction the user chose, plus
-    // the per-attempt id (#465) so the bridge can scope a matching cancel.
+    // Explicit intent on the wire: the direction the user chose, plus the
+    // per-attempt id so the bridge can scope a matching cancel.
     expect(h.invoke).toHaveBeenCalledWith("start_proxy", { attemptId: "attempt-xyz" });
   });
 
@@ -195,7 +195,7 @@ describe("toggleFromIdle: outcome handling", () => {
     h.deps.setState("cancelling");
     await togglePromise;
 
-    // The follow-up carries explicit STOP intent (#462) — the backend
+    // The follow-up carries explicit STOP intent — the backend
     // must not be left to derive direction from its own state.
     expect(proxyCalls).toEqual(["start_proxy", "stop_proxy"]);
     // Final state honors the user's cancel intent: Stopped → disconnected.

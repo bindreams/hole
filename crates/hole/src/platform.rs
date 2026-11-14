@@ -29,13 +29,13 @@ pub fn on_setup(_app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-/// Show dock icon (call when settings window opens).
+/// Show the dock icon (call when the dashboard window opens).
 #[cfg(target_os = "macos")]
 pub fn show_dock_icon(app: &tauri::AppHandle) {
     set_menu_bar_mode(app, true);
 }
 
-/// Hide dock icon (call when settings window closes).
+/// Hide the dock icon (call when the dashboard window closes).
 #[cfg(target_os = "macos")]
 pub fn hide_dock_icon(app: &tauri::AppHandle) {
     set_menu_bar_mode(app, false);

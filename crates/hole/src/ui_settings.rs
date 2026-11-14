@@ -1,4 +1,4 @@
-//! The settings payload the webview is allowed to persist (#462).
+//! The settings payload the webview is allowed to persist.
 //!
 //! Backend-owned state (`enabled`, `elevation_prompt_shown`,
 //! `servers[].validation`) is structurally absent from these types: the
@@ -58,7 +58,7 @@ pub struct UiServerEntry {
 impl UiSettings {
     /// Merge the UI-owned portion of the webview's snapshot into `current`.
     ///
-    /// Membership is backend-owned (#504): additions flow through import,
+    /// Membership is backend-owned: additions flow through import,
     /// removals through `delete_server`. This method therefore only updates
     /// the UI-owned fields of servers that still exist (matched by id),
     /// preserving backend-owned per-server `validation`. A member absent from

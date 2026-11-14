@@ -34,8 +34,9 @@ function stopRefreshTimer(): void {
 }
 
 /**
- * Refresh the public IP every 60s while the dashboard is visible; pause when
- * minimized or closed to the tray so we never poll in the background (#464).
+ * Refresh the public IP every `PUBLIC_IP_REFRESH_MS` while the dashboard is
+ * visible; pause when minimized or closed to the tray so we never poll in the
+ * background.
  * The initial fetch is owned by init(); this only fetches on a hidden→visible
  * return. Call once at startup.
  */
@@ -67,7 +68,7 @@ export async function updatePublicIp(): Promise<void> {
     }
   } catch (err) {
     console.error("get_public_ip failed:", err);
-    // Never keep a possibly pre-VPN value on failure (#464): clear the
+    // Never keep a possibly pre-VPN value on failure: clear the
     // copyable IP and show a placeholder distinct from the empty-success
     // "unknown".
     currentIp = "";

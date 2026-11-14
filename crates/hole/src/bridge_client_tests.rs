@@ -241,7 +241,7 @@ fn send_cancel_receives_ack() {
 #[skuld::test]
 fn start_and_cancel_send_attempt_id_header() {
     // Start and Cancel must put their attempt_id on the X-Hole-Attempt-Id
-    // request header — the bridge keys start-cancellation on it (#465). A
+    // request header — the bridge keys start-cancellation on it. A
     // capturing server records the header the BridgeClient actually sent.
     rt().block_on(async {
         let path = test_socket_path("attempt-id-header");
@@ -324,7 +324,7 @@ fn start_and_cancel_send_attempt_id_header() {
 
 #[skuld::test]
 fn start_sends_x_hole_on_startup_header_only_when_a_preference_is_pushed() {
-    // The load-bearing wire seam of #979: a Start carrying `Some` preference
+    // The wire seam for the bridge-owned startup connect: a Start carrying `Some` preference
     // (the GUI's case) sends it on the wire; `None` (the CLI's case — no
     // Settings preference to push) omits the header entirely rather than
     // sending some default, so the bridge knows to leave whatever it already
@@ -678,11 +678,10 @@ fn absent_version_header_is_version_mismatch() {
 
 /// Mock serving GET /v1/status with a mismatched version header AND a body
 /// missing `cover_presence` — a field this client's `StatusResponse` requires.
-/// If body decoding ran before (or instead of) the version check, this would
-/// surface as `ClientError::Protocol` (a decode failure); the wire removal
-/// of `lockdown_active` in favor of a required `cover_presence` field rests
-/// on the version check running first, so this pins that ordering rather
-/// than assuming it.
+/// An older bridge's body can lack a required field, so if decoding ran before
+/// (or instead of) the version check it would surface as `ClientError::Protocol`
+/// (a decode failure) and never trigger the version-mismatch self-heal; this
+/// pins that the version check runs first.
 async fn spawn_version_skewed_incompatible_status_mock(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
     let listener = hole_bridge::socket::LocalListener::bind(path).unwrap();
     let router = axum::Router::new().route(
@@ -921,7 +920,7 @@ fn unblock_200_maps_to_ack() {
 #[skuld::test]
 fn unblock_409_maps_to_protocol() {
     rt().block_on(async {
-        // The handler reads no session posture (Task 8b), so the bridge
+        // The handler reads no session posture, so the bridge
         // never answers Unblock with a 409 in the first place; but if it
         // ever did, Unblock must not special-case it — same as `Stop`.
         let result = unblock_against_status(

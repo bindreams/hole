@@ -1,4 +1,4 @@
-//! User-facing messaging for config quarantine (#467).
+//! User-facing messaging for config quarantine.
 
 use hole_common::config_store::ConfigRecovery;
 

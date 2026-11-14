@@ -16,7 +16,7 @@ use std::sync::Mutex;
 #[skuld::test]
 fn tray_actions_blocked_offers_retry_and_go_offline() {
     // A covered start failed → host fail-closed while not running: a distinct
-    // blocked state (never silent Disconnected), Retry (covered) + Go Offline.
+    // blocked state (never silent Disconnected), Retry + Go Offline.
     let a = tray_actions(false, None, true);
     assert_eq!(a.status, "Blocked — connect failed");
     assert_eq!(a.action_id, ID_BLOCKED_RETRY);
@@ -195,11 +195,10 @@ fn lockdown_off_renders_plain_label() {
 
 #[skuld::test]
 fn escape_items_offers_unblock_and_go_offline_independently() {
-    // Exhaustive over the gate's REAL domain: 5 `CoverPresence` variants x
-    // `blocked_offers_go_offline`. `running` was removed from the signature —
-    // the escape is gated on observed cover presence alone, never on recorded
-    // session posture (Task 8b) — so crossing it in would have duplicated
-    // every row rather than testing anything.
+    // Exhaustive over the gate's real domain: every `CoverPresence` variant x
+    // `blocked_offers_go_offline`. The escape is gated on observed cover
+    // presence alone, never on recorded session posture, so `running` is not an
+    // input and crossing it in would only duplicate rows.
     let table = [
         // (cover_presence, blocked_offers_go_offline, expect_go_offline, expect_unblock)
         (CoverPresence::Live, true, true, true),
@@ -411,7 +410,7 @@ fn elevation_matrix_when_gui_owns_bridge() {
     use ElevationDecision::*;
     // Connect, prompts allowed -> elevate.
     assert!(matches!(decide_elevation(false, Prompts::Allowed, false), Elevate));
-    // Connect, unattended startup -> decline (no UAC at login).
+    // Connect, unattended -> decline (no UAC).
     assert!(matches!(decide_elevation(false, Prompts::Forbidden, false), Decline(_)));
     // Disconnect is always interactive -> elevate regardless of prompts.
     assert!(matches!(decide_elevation(false, Prompts::Allowed, true), Elevate));
@@ -427,11 +426,10 @@ fn external_bridge_denied_toast_is_actionable() {
 
 // Structural guard ====================================================================================================
 
-/// #979: the startup-connect decision moved to the bridge
-/// (`hole_bridge::target::startup_should_connect`) and the GUI's own copy was
-/// deleted, not left dormant. Same idiom as
-/// `the_standing_cover_field_has_exactly_one_reader`: a name reappearing in
-/// non-test GUI source would mean a second decider crept back in.
+/// The startup-connect decision lives in the bridge
+/// (`hole_bridge::target::startup_should_connect`); the GUI has no copy of it.
+/// Same idiom as `the_standing_cover_field_has_exactly_one_reader`: a name
+/// reappearing in non-test GUI source would mean a second decider crept back in.
 #[skuld::test]
 fn the_gui_no_longer_decides() {
     let needle = "startup_should_connect";
