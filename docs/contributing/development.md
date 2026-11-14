@@ -136,12 +136,19 @@ HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 
 The bridge's options are listed under [Bridge and proxy commands](bridge-cli.md).
 
+## Coding rules
+
+- **Remove a hazard rather than guard it.** If a function has a precondition no test can enforce, change the code so
+  the precondition cannot be broken. `CoverGuard::disarm` closes the handle it holds instead of leaking it, so it needs
+  no "call only before the process exits" rule: nothing is left to police.
+
 ## Things that catch people
 
 - **A dev run and an installed Hole share one identity.** The dev app uses the same application id, `com.hole.app`, as
   the installed one. If an installed Hole is running, the single-instance guard forwards your launch to it and the dev
   window never appears. Quit the installed Hole first.
 - **Use an absolute, short path for `--socket-path`.** Windows limits the length of an AF_UNIX socket path.
-- **If a crashed dev run breaks your network,** run {src}`scripts/network-reset.py` from an elevated shell.
+- **If a crashed dev run breaks your network,** run {src}`scripts/network-reset.py` from an elevated shell: `sudo python3 scripts/network-reset.py` on macOS, `python scripts/network-reset.py` in an elevated PowerShell on Windows. [Route
+  ownership](architecture/route-ownership.md#the-escape) says what it removes.
 - **The first `cargo xtask deps` is slow.** It compiles ex-ray and downloads `wintun.dll`; later runs reuse Go's build
   cache and the verified download.

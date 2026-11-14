@@ -63,7 +63,8 @@ pub enum Roundtrip {
 }
 
 /// Tunable timeouts. Every budget here is a failure-to-human bound for a wedged
-/// *subprocess* (CLAUDE.md sync-exception class 2), NOT intra-process
+/// *subprocess* (the external-event exception in
+/// docs/contributing/testing.md#no-synchronization-by-elapsed-time), NOT intra-process
 /// synchronization — so each must be generous enough to never fire on a
 /// legitimate-but-slow operation, only on a genuine hang.
 ///

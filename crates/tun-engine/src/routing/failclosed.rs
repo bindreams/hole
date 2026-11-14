@@ -562,7 +562,7 @@ pub enum KeyLifetime {
 /// of another — "not `NotFound`, therefore `Removed`" — folds an access
 /// denial, a transient RPC failure and a genuine removal into a single
 /// verdict, and that verdict is what the MSI deletes `hole.exe` on the
-/// strength of. See CLAUDE.md's "per-variant policy lives on the type".
+/// strength of. Per-variant policy lives on the type (docs/contributing/architecture/kill-switch.md#the-decisions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyOutcome {
     /// The delete removed a live object (`ERROR_SUCCESS`). Proof of removal
@@ -1356,8 +1356,8 @@ mod clearance_tests;
 mod boot_time_tripwire_tests;
 
 // Also a source-tree scan, also deliberately NOT platform-gated. The type it
-// guards is Windows-only; the invariant (CLAUDE.md's "per-variant policy lives
-// on the type") is not, and neither is reading text.
+// guards is Windows-only; the invariant (per-variant policy lives on the type,
+// docs/contributing/architecture/kill-switch.md#the-decisions) is not, and neither is reading text.
 #[cfg(test)]
 #[path = "failclosed/stale_key_policy_tests.rs"]
 mod stale_key_policy_tests;

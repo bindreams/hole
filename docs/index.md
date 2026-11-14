@@ -109,6 +109,14 @@ Commit messages <contributing/commit-messages.md>
 Building in detail <contributing/build.md>
 The installers <contributing/installers.md>
 Bridge and proxy commands <contributing/bridge-cli.md>
+Maintainers <contributing/maintainers/index.md>
+Releasing <contributing/maintainers/releases.md>
+Publishing garter <contributing/maintainers/garter-crates-io.md>
+Ship blockers and stated limits <contributing/maintainers/ship-blockers.md>
+Rollback <contributing/maintainers/rollback.md>
+Rotating the signing key <contributing/maintainers/minisign-key-rotation.md>
+When an uninstall refuses to complete <contributing/maintainers/uninstall-gate.md>
+Icons <contributing/maintainers/icons.md>
 ```
 
 ```{toctree}

@@ -13,6 +13,12 @@ time budgets. This page is the map.
 A pull request needs all of these to merge into `main`: the six `Build, lint, test (<os>/<arch>)` checks, one per
 runner, and `Validate PR title` ([Commit messages](commit-messages.md)).
 
+## The macOS runners are a shared pool
+
+Each pull request takes two macOS jobs, one per architecture, from a small shared pool, and the Windows and Linux legs
+finish long before them. Queue depth grows with the number of concurrent branches, not their size, so land what is open
+before starting more.
+
 ## How a runner works
 
 A runner provisions once, then runs its lanes as steps in a fixed order, on one target directory. Every lane step:
