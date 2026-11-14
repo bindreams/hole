@@ -1,8 +1,8 @@
 # When an uninstall refuses to complete
 
 On Windows the MSI's `BridgeRelease` custom action releases every fail-closed {term}`cover` and turns the {term}`kill switch` off before the uninstaller deletes `hole.exe`. It is the one uninstall action whose failure aborts the uninstall
-(`Return="check"`), because the kill switch's filters are persistent: leaving them behind would be a host blocked on every
-boot with no binary left to remove them. [Uninstall and the service](../architecture/kill-switch-uninstall.md) has the
+(`Return="check"`), because the kill switch's filters are persistent: leaving them behind would be a host that stays blocked with no binary
+left to remove them. [Uninstall and the service](../architecture/kill-switch-uninstall.md) has the
 mechanism. This page is for the person whose uninstall stopped there.
 
 An uninstall that aborts at `BridgeRelease` is the gate working. Fix the cause first. The release talks to the Base
@@ -21,7 +21,8 @@ msiexec /x hole.msi LEAVE_NETWORK_BLOCKED=1
 
 ```{danger}
 This can leave the host blocked. `LEAVE_NETWORK_BLOCKED=1` skips the release entirely: every cover in place stays (the
-kill switch's firewall rules and, if one was engaged, the transient startup cover), and the target is not recorded off.
+kill switch's firewall rules, and a transient cover an older bridge left: no current start engages one,
+[The transient cover](../architecture/kill-switch.md#the-transient-cover)), and the target is not recorded off.
 If a cover was engaged, the network stays blocked.
 ```
 
@@ -31,8 +32,11 @@ cannot delete a boot-time key it was never taught.
 
 ## Getting the network back
 
-Reinstalling Hole alone does not clear a cover, because the new bridge adopts a live one. After the reinstall, release it
-from the running bridge or from the command line:
+Reinstalling Hole alone usually does not clear a cover: after `LEAVE_NETWORK_BLOCKED=1` the kill switch's intent is still
+on, so the new bridge adopts a live one. Rows T15 and T16 of the
+[transitions](../architecture/kill-switch.md#transitions) say when a starting bridge releases it instead (a startup
+preference of **Do not connect** is one). After the reinstall, release it from the running bridge or from the command
+line:
 
 - **From the app.** Untick **Lockdown**, or choose **Unblock Network** in the tray. Either releases every cover
   ({term}`Unblock Network`; rows T11 and T12 of the [transitions](../architecture/kill-switch.md#transitions)).

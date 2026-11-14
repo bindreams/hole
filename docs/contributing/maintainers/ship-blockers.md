@@ -31,9 +31,10 @@ Two further effects of the failed update are worth knowing when users report it:
 
 The standing {term}`lockdown` cover's block-all filter pair has a twin flagged `FWPM_FILTER_FLAG_BOOTTIME`, aimed at the
 window between the kernel starting and the Base Filtering Engine (BFE) starting ([Windows: filters and the boot
-window](../architecture/kill-switch-windows.md)). A stranded persistent filter heals itself: BFE re-adds it at every boot,
-so a later build that knows its key can delete it. A stranded boot-time one does not, and a build that never learned its
-key cannot delete it by key.
+window](../architecture/kill-switch-windows.md)). Hole assumes a stranded persistent filter heals itself: BFE re-adds it at every
+start, so a later build that knows its key can delete it. A stranded boot-time one is assumed not to, and a build that
+never learned its key cannot delete it by key. Both are unmeasured ([what is measured, and what is
+not](../architecture/kill-switch-windows.md#what-is-measured-and-what-is-not)).
 
 Every release and every unlock runs a sweep that deletes each boot-time filter under Hole's provider that no key list
 names ([The provider
@@ -48,8 +49,9 @@ one. A twin is stranded only by:
    live after BFE starts, so neither a delete by key nor the enumeration finds it on a later boot. Whether it does is an
    open measurement ([#1043](https://github.com/bindreams/hole/issues/1043)); the reboot strands it.
 
-**Effect.** Egress is blocked from kernel start until BFE starts, on every boot. It is a soft block: the machine boots and
-works after that.
+**Effect, as the design assumes it.** Egress is blocked from kernel start until BFE starts, on each boot. Whether the
+kernel enforces a twin in that window, and on boots after the one that follows its install, is unmeasured (the section
+linked above). It is a soft block, meant to end when BFE starts.
 
 **Way out.** Reinstall the release that installed the twin, or a later one (the uninstall gate's report names the running
 build's release), turn the kill switch on, then off. After a reboot the stranded twin is not live, so `hole bridge unlock`

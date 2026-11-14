@@ -40,7 +40,8 @@ that introduces the key **N**.
 1. **After N is published, replace the public key in the workflow files** ({src}`.github/workflows/publish-release-hole.yaml`
    and the reusable one) with the new key.
 
-1. **Release N+1 and every later release are signed with the new key.** Clients that installed N verify them.
+1. **Release N+1 and every later release are signed with the new key.** Pass it to the script as
+   `--secret-key <new key>`: without `--secret-key`, minisign's default key signs. Clients that installed N verify them.
 
 ```{warning}
 Signing N with the new key makes every installed client reject N. Putting the new public key in the workflows before N
@@ -60,12 +61,24 @@ it accepts.
 
 ### Checking a rehearsal
 
-Rehearse on a personal fork, never on the production repository: a production publish flips `/releases/latest`. Run the
-fork's draft, sign, and publish workflows, and confirm that the `Verify signature` step passes.
+Rehearse on a personal fork, never on the production repository: a production publish flips `/releases/latest`.
 
-A fork cannot exercise the client half, because the updater's repository is the constant `REPO` in `check.rs`. Check the
-key in `verify.rs` against a release signed by the new key with the same tool the workflow uses:
+`scripts/sign-release.py` cannot be used on a fork. It hard-codes `REPO = "bindreams/hole"` in every `gh` call, so on a
+rehearsal it would look at the production repository and, if a draft of that version exists there, upload the signature
+to it. Sign the fork's draft by hand, naming the fork in each command:
 
 ```sh
-minisign -Vm SHA256SUMS -P <the public key in verify.rs> -x SHA256SUMS.minisig
+gh release download <tag> -R <fork> --pattern SHA256SUMS
+minisign -Sm SHA256SUMS -s <secret key>
+gh release upload <tag> -R <fork> SHA256SUMS.minisig
+```
+
+Run the fork's draft workflow, sign by hand, run its publish workflow, and confirm that the `Verify signature` step
+passes. That step checks the public key in the fork's own workflow file, so a rehearsal of step 3 edits it there.
+
+A fork cannot exercise the client half, because the updater's repository is the constant `REPO` in `check.rs`. Check the
+key in {src}`crates/common/src/verify.rs` against a release signed by the new key with the same tool the workflow uses:
+
+```sh
+minisign -Vm SHA256SUMS -P <the public key in crates/common/src/verify.rs> -x SHA256SUMS.minisig
 ```

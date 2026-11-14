@@ -53,7 +53,7 @@ install: [README.md](README.md). Everything else: [docs/index.md](docs/index.md)
   [galoshes transport](docs/contributing/architecture/galoshes-transport.md#telling-that-the-transport-is-dead)
 - **galoshes mux default.** galoshes appends `mux=0` for its embedded ex-ray; an earlier operator `mux=` wins. →
   [galoshes transport](docs/contributing/architecture/galoshes-transport.md#the-mux-default)
-- **Fail-closed covers.** The kill switch's standing cover outlives the bridge, and a transient one bounds a start. →
+- **Fail-closed covers.** The kill switch's standing cover outlives the bridge; the transient cover is dormant, and only its leftovers are swept. →
   [kill switch](docs/contributing/architecture/kill-switch.md)
 - **Server-address redaction.** The configured address is replaced by a token before any log, toast or bundle. →
   [redaction](docs/contributing/architecture/redaction.md)

@@ -21,8 +21,9 @@ Every release also carries `SHA256SUMS`. The six platforms are `windows`, `linux
 the one definition of which files a release ships, and `cargo xtask release-assets --tag <tag>` prints the list.
 
 Only `hole` is signed, because it updates itself: the app and the bridge check each download against the signed
-`SHA256SUMS` ([key rotation](minisign-key-rotation.md) covers the key). The other three are either embedded in `hole`,
-and so covered by its signature, or built from source by people who pin the hash in `SHA256SUMS`.
+`SHA256SUMS` ([key rotation](minisign-key-rotation.md) covers the key). `hole`'s files carry `ex-ray` and `galoshes`, so
+its signature covers those copies. The standalone `ex-ray`, `galoshes` and `garter` files are not signed, and the
+`SHA256SUMS` beside them is a checksum list only. `garter`'s binary is not inside `hole`.
 
 Each track's versions live in its crates' `[package.metadata.hole-release].group`, and in
 {src}`crates/ex-ray/version.toml` for ex-ray; [The workspace](../workspace.md) says how the groups work, and
@@ -42,8 +43,11 @@ The split is deliberate: the draft does everything that can be undone, and publi
 `SHA256SUMS` verifies against the signature. The tag exists only once the release is published, so deleting a draft
 removes everything it made.
 
-The notes are built from the pull-request titles since the track's previous tag ([Commit
-messages](../commit-messages.md)), plus a Downloads table made from the same file list the draft checks.
+The notes are built from the commit subjects since the track's previous tag ([Commit
+messages](../commit-messages.md)): the highest-versioned release tag of that track that is an ancestor of the commit.
+Only commits that touched a file matching the track's `include_paths` in `.github/release-<product>.yaml` are listed, so a
+release whose notes look empty touched none of them. The first release of a track prints the config's `initial_release`
+text instead. A Downloads table follows, made from the same file list the draft checks.
 
 ### `/releases/latest` belongs to hole
 
@@ -56,8 +60,8 @@ release.
 A draft ships what CI tested, because it ships the files the tests ran on and builds nothing itself.
 
 ```{dropdown} How a draft is made
-The `validate` job of {src}`.github/workflows/reusable-draft-release.yaml` normalizes the version, checks that the commit
-is on `main` ({src}`.github/actions/verify-release-commit-on-main/action.yaml`), tags it locally and runs
+The `validate` job of {src}`.github/workflows/reusable-draft-release.yaml` checks that the commit
+is on `main` ({src}`.github/actions/verify-release-commit-on-main/action.yaml`), normalizes the version, tags it locally and runs
 `cargo xtask version --check --exact --group <product>`, which fails unless the declared version equals the tag. Then it
 calls {src}`.github/workflows/ci.yaml` on that commit with `release-tag` set. The call has its own concurrency group, so
 two drafts never cancel each other.
