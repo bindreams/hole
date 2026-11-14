@@ -349,10 +349,11 @@ fn a_stranger_is_named_by_the_guid_netsh_prints_for_its_filter() {
 
 #[skuld::test]
 fn a_refused_delete_of_an_unrecognised_filter_does_not_fail_the_disengage_and_is_reported() {
-    // A live boot-time filter is measured NOT to be enforced once BFE has started, so a stranger the OS will not let
-    // go of blocks nothing now, and failing the sweep over it would keep `bridge unlock` and the tray's Unblock from
-    // writing the lockdown intent off: the next start would re-engage the kill switch, a lockout loop over a filter
-    // that does nothing at runtime. The refusal is reported instead, by the GUID the operator can match.
+    // The code assumes (unmeasured) that a live boot-time filter is not enforced once BFE has started, so a stranger
+    // the OS will not let go of blocks nothing now, and failing the sweep over it would keep `bridge unlock` and the
+    // tray's Unblock from writing the lockdown intent off: the next start would re-engage the kill switch, a lockout
+    // loop over a filter that does nothing at runtime. The refusal is reported instead, by the GUID the operator can
+    // match.
     let keys = sweep_answering(FWP_E_FILTER_NOT_FOUND_DWORD, ERROR_SUCCESS.0);
     let outcome = disengage_verdict(&keys, &sweep_deleting_one_stranger(5), ArmingWitness::Unset);
     let clearance = outcome

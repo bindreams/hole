@@ -1,14 +1,9 @@
-//! The evidence a SEQUENCE of sweeps carries, which is the only shape the
-//! defect this module fixes can take.
+//! The evidence a sequence of sweeps carries, the shape the consumed-witness defect takes.
 //!
-//! Every test here drives at least two sweeps over one `state_dir`. A single
-//! observation slice cannot express "an earlier sweep removed the sibling", so
-//! a suite built from single slices — which is what
-//! `Clearance::leftover_keys`'s first form shipped with — cannot see a gate
-//! that goes permanently silent after one ordinary user action.
-//!
-//! `#[cfg]`-free for the reason `clearance_tests` gives: the hazard is
-//! Windows-only and its proof must not live only on Windows.
+//! Every test here drives at least two sweeps over one `state_dir`. A single observation slice cannot express "an
+//! earlier sweep removed the sibling", so a suite built from single slices cannot see a gate that goes permanently
+//! silent after one ordinary user action. `#[cfg]`-free like `clearance_tests`: the hazard is Windows-only and its proof
+//! must not live only on Windows, so the pure folds run on every lane.
 
 use std::path::Path;
 
@@ -110,16 +105,11 @@ fn dir() -> tempfile::TempDir {
 
 #[skuld::test]
 fn a_sweep_that_consumed_the_sibling_leaves_a_later_one_able_to_report() {
-    // bindreams/hole#1010 F1, end to end. The user arms the kill switch in one
-    // boot, reboots (BFE re-adds the PERSISTENT half from its own store; the
-    // twin's runtime object is gone), turns the switch off, and later
-    // uninstalls.
-    //
-    // Sweep 1 is the ONE sweep in the whole lifecycle that can see the
-    // evidence — and it is also the sweep that deletes it. Sweep 2 is the
-    // uninstall gate, running at the moment `RemoveFiles` is about to delete
-    // the only binary on the host that could issue an FWPM delete. Reading the
-    // empty sibling set as "no cover was ever here" is what made that silent.
+    // End to end: the user arms the kill switch in one boot, reboots (BFE re-adds the persistent half from its own
+    // store; the twin's runtime object is gone), turns the switch off, and later uninstalls. Sweep 1 is the one sweep
+    // in the lifecycle that can see the evidence, and it also deletes it. Sweep 2 is the uninstall gate, running when
+    // `RemoveFiles` is about to delete the only binary that could issue an FWPM delete. Reading the empty sibling set
+    // as "no cover was ever here" is what made that silent.
     let state = dir();
 
     let first = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_not_found()]);
@@ -164,18 +154,11 @@ fn a_host_that_never_armed_a_twin_stays_silent_across_every_sweep() {
 
 #[skuld::test]
 fn arming_then_unblocking_in_one_boot_clears_the_record_and_stays_clear() {
-    // The most ordinary kill-switch lifecycle there is: arm the switch, then
-    // hit "Unblock Network" (or turn it off) in the SAME boot, then uninstall
-    // later. The unblock deletes a LIVE twin and gets `ERROR_SUCCESS` back.
-    //
-    // This sequence used to be the one that had to stay loud and is now the
-    // one that goes quiet, and the flip is exactly bindreams/hole#1043's
-    // assumption: the by-key delete purges the boot-time policy record along
-    // with the runtime object it demonstrably removed. The silence is
-    // therefore about a twin somebody WATCHED go, not about one nobody
-    // measured — which is the distinction #1003 collapsed. What still cannot
-    // go quiet is an empty answer; that is
-    // `an_empty_sibling_set_never_clears_a_recorded_twin`.
+    // The most ordinary kill-switch lifecycle: arm the switch, then hit "Unblock Network" (or turn it off) in the same
+    // boot, then uninstall later. The unblock deletes a live twin and gets `ERROR_SUCCESS` back. This sequence is quiet
+    // because of the purge assumption (`KeyLifetime::BootTime`): the silence is about a twin somebody watched go, not
+    // one nobody measured. What still cannot go quiet is an empty answer
+    // (`an_empty_sibling_set_never_clears_a_recorded_twin`).
     let state = dir();
     arm(state.path());
 
@@ -202,15 +185,10 @@ fn arming_then_unblocking_in_one_boot_clears_the_record_and_stays_clear() {
 
 #[skuld::test]
 fn an_uninstall_on_the_boot_that_armed_the_twin_watched_it_go() {
-    // Arm the kill switch, then uninstall straight away. The MSI stops the
-    // bridge and runs `release-covers` while the twins are still live, so
-    // every key — sibling and twin alike — answers `ERROR_SUCCESS`.
-    //
-    // The gate is the very sweep doing the removing, so no persisted record
-    // could ever rescue this one — which is why it mattered so much that the
-    // twin's own delete be conclusive. Under #1043's assumption it is: the
-    // sweep took the record away with the object, and `RemoveFiles` deleting
-    // the binary afterwards strands nothing.
+    // Arm the kill switch, then uninstall straight away. The MSI stops the bridge and runs `release-covers` while the
+    // twins are still live, so every key, sibling and twin alike, answers `ERROR_SUCCESS`. The gate is the sweep doing
+    // the removing, so no persisted record could rescue this one; the twin's own delete has to be conclusive. Under the
+    // purge assumption it is, and `RemoveFiles` deleting the binary afterwards strands nothing.
     let state = dir();
     arm(state.path());
 
@@ -260,17 +238,13 @@ fn the_engage_records_the_twin_before_any_sweep_could_have_seen_it() {
 
 #[skuld::test]
 fn a_failed_sweep_that_already_removed_the_sibling_still_records_what_it_saw() {
-    // bindreams/hole#1010 F1. Both Windows sweeps ISSUE every delete before
-    // inspecting ANY code, so `Err` arrives AFTER the sibling's own delete
-    // succeeded: the sibling is gone from the host and its `Removed` is
-    // sitting in the observation set. Returning early on the failure threw
-    // that away, and one act then consumed BOTH evidence sources — the live
-    // sibling deleted, the record never written.
+    // Both Windows sweeps issue every delete before inspecting any code, so `Err` arrives after the sibling's own
+    // delete succeeded: the sibling is gone from the host and its `Removed` is in the observation set. Returning early
+    // on the failure would throw that away and consume both evidence sources in one act.
     //
-    // The state dir starts empty on purpose: this is the host the disjointness
-    // argument names the sibling as the fallback for (an OS in-place reset, a
-    // profile migration, a user deleting the folder), so the record is the
-    // thing that has to be created here, not merely preserved.
+    // The state dir starts empty on purpose: this is the host for which the sibling is the fallback (an OS in-place
+    // reset, a profile migration, a user deleting the folder), so the record has to be created here, not merely
+    // preserved.
     let state = dir();
     let err = failing_sweep(
         state.path(),
@@ -366,17 +340,14 @@ fn a_recorded_twin_survives_being_read_back() {
 
 #[skuld::test]
 fn every_update_and_record_pair_has_one_write_answer() {
-    // The whole write table in one place. Three properties it pins, each of
-    // which was a bug in some earlier shape of this file:
+    // The whole write table in one place. Three properties it pins:
     //
-    // * `Arm` over `Disarmed` DOES write — a file that says "not armed" was
-    //   written by something that claimed a proof, and this sweep just found a
-    //   twin it could NOT prove gone.
-    // * `Disarm` over `Unset` writes NOTHING. A host that never armed a twin
-    //   must not gain a file saying so, on every `release-covers` it ever
-    //   runs.
-    // * `Disarm` over `Unreadable` DOES write — a corrupt file reports forever
-    //   otherwise, and this sweep watched the twin go.
+    // * `Arm` over `Disarmed` writes: a file that says "not armed" was written by something that claimed a proof, and
+    //   this sweep just found a twin it could not prove gone.
+    // * `Disarm` over `Unset` writes nothing: a host that never armed a twin must not gain a file saying so on every
+    //   `release-covers` it runs.
+    // * `Disarm` over `Unreadable` writes: a corrupt file would otherwise report forever, and this sweep watched the
+    //   twin go.
     let table = [
         (ArmingWitness::Armed, WitnessUpdate::Leave, None),
         (ArmingWitness::Disarmed, WitnessUpdate::Leave, None),
@@ -592,32 +563,19 @@ fn item_body<'a>(src: &'a str, head: &str) -> &'a str {
 
 #[skuld::test]
 fn the_engage_arms_the_record_at_the_commit_and_nowhere_downstream_of_it() {
-    // Source tripwire, the technique and the reason of `windows_tests`'
-    // `neither_engage_discards_its_pre_delete_codes`: no fixture in any lane
-    // can make a real `FwpmTransactionCommit0` succeed and the read-back after
-    // it fail, and that single run is the only one where this ordering is
-    // observable at all. The privileged lane's
-    // `..._every_engage_rearms_the_twins_...` asserts `load(dir) == Armed`
-    // after an engage that already returned `Ok`, so it cannot tell "recorded
-    // at the commit" from "recorded after the read-back".
+    // Source tripwire, the technique and the reason of `windows_tests`' `neither_engage_discards_its_pre_delete_codes`:
+    // no fixture can make a real `FwpmTransactionCommit0` succeed and the read-back after it fail, and that run is the
+    // only one where this ordering is observable. The privileged lane's `..._every_engage_rearms_the_twins_...` asserts
+    // `load(dir) == Armed` after an engage that already returned `Ok`, so it cannot tell "recorded at the commit" from
+    // "recorded after the read-back". It lives here rather than beside that guard: the hazard is Windows-only, and its
+    // proof must not live only on Windows.
     //
-    // It lives here rather than beside that guard for the reason this module's
-    // doc and `record_armed`'s own doc both give: the hazard is Windows-only
-    // and its proof must not live only on Windows.
-    //
-    // What it holds. `commit_and_record` is one step because the fact the
-    // record describes becomes true the instant the commit returns
-    // `ERROR_SUCCESS` — the twins are in the store, the cover is in force —
-    // and every statement after it can fail over a cover that still stands.
-    // Moving the record down beside `verify_boottime_twins`, so it "only goes
-    // in once the twins are confirmed", reads as MORE careful and is
-    // bindreams/hole#1003: a host whose read-back fails then holds a
-    // committed, in-force boot-time block-all with nothing recorded, and when
-    // its `PERSISTENT` sibling is later cleared by something that is not a
-    // sweep — an external FWPM delete, a firewall reset — no sweep ever held
-    // the evidence to copy. That is not hypothetical: this PR introduced that
-    // exact split once, in the round that fixed its predecessor, with the
-    // whole suite green.
+    // What it holds: `commit_and_record` is one step because the fact the record describes becomes true when the commit
+    // returns `ERROR_SUCCESS`, and every later statement can fail over a cover that still stands. Moving the record
+    // down beside `verify_boottime_twins`, so it "only goes in once the twins are confirmed", reads as more careful and
+    // loses the record on a read-back failure: the host then holds a committed, in-force boot-time block-all with
+    // nothing recorded, and when its persistent sibling is later cleared by something that is not a sweep, no sweep
+    // ever held the evidence to copy.
     let src = include_str!("windows.rs");
 
     let engage = item_body(src, "pub fn engage_lockdown(");

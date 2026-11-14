@@ -10,9 +10,9 @@
 //! a live one may be another bridge's cover, which no sweep of this build may delete. Another provider's filter is
 //! never in scope either.
 //!
-//! The enumeration names every layer and no provider. A template naming no layer is refused (`FWP_E_LAYER_NOT_FOUND`,
-//! measured), so the layers are listed from the engine rather than hardcoded, and the provider is selected in code by
-//! [`unrecognised_keys`], which re-reads every record it is handed, so the property is testable without a firewall.
+//! The enumeration names every layer and no provider. A template needs a layer, so the layers are listed from the
+//! engine rather than hardcoded, and the provider is selected in code by [`unrecognised_keys`], so the selection is
+//! testable without a firewall.
 
 use std::fmt;
 

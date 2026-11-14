@@ -29,17 +29,11 @@ pub struct LockdownPfState {
     /// `/etc/pf.conf` instead of `main_snapshot`. Read by
     /// `StateFile::restore_choice`, which every standing release asks.
     ///
-    /// A bool, not `main_snapshot.is_empty()`: a host really can have an empty
-    /// filter ruleset, and that IS its policy — keying on emptiness would
-    /// silently reload `/etc/pf.conf` over it.
+    /// A bool, not `main_snapshot.is_empty()`: a host can have an empty filter ruleset, and that is its policy.
     ///
-    /// Defaults `true` (NO schema bump) so a file written before this field
-    /// existed reads as the captured baseline it was. Bumping the schema
-    /// version instead would make every existing file `Unusable`, which a
-    /// reader that took it for an absent record would answer with an early
-    /// `Ok(())` from `disengage_lockdown` over a still-blocked host — silently
-    /// breaking `hole bridge unlock` and the tray's Unblock item on the
-    /// ordinary macOS upgrade path.
+    /// Defaults `true` without a schema bump, so a file written before this field existed reads as the captured
+    /// baseline it was. A bump would make every existing file `Unusable`, which a reader treating it as absent would
+    /// answer with an early `Ok(())` from `disengage_lockdown` over a still-blocked host.
     #[serde(default = "default_true")]
     pub main_snapshot_captured: bool,
 }

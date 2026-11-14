@@ -189,13 +189,13 @@ downgrade cannot strand a twin that a newer build installed under a GUID this on
 cover; another provider's filter is never touched. A layer is required in the enumeration (a template naming none is
 refused with `FWP_E_LAYER_NOT_FOUND`), so the layers are listed from the engine and the provider is selected in code.
 
-A delete of such a stranger that the OS refuses, and a view that cannot be read, never fail a sweep: the code records
-that a live boot-time filter is not enforced once BFE has started ([below](#what-is-measured-and-what-is-not)), and
-failing `unlock` or Unblock over it would keep them from recording the intent off, so the next start would re-engage the
-switch. Both are reported (`Clearance::refused_strangers`, `unenumerated_views`). A refused delete sets the witness. An
-unreadable view sets it only when the twin's siblings leave one possible, and otherwise only keeps a set record from
-being cleared. A persistent filter that a later build installed under a key this build never learned survives unlock,
-`release-covers` and uninstall ([#1242](https://github.com/bindreams/hole/issues/1242)).
+A delete of such a stranger that the OS refuses, and a view that cannot be read, never fail a sweep: the code assumes
+that a live boot-time filter is not enforced once BFE has started, which no test measures
+([below](#what-is-measured-and-what-is-not)), and failing `unlock` or Unblock over it would keep them from recording the
+intent off, so the next start would re-engage the switch. Both are reported (`Clearance::refused_strangers`,
+`unenumerated_views`). A refused delete sets the witness. An unreadable view sets it only when the twin's siblings leave
+one possible, and otherwise only keeps a set record from being cleared. A persistent filter that a later build
+installed under a key this build never learned survives unlock, `release-covers` and uninstall ([#1242](https://github.com/bindreams/hole/issues/1242)).
 
 What the sweep does not reach: `recover_cover`, the transient sweep, stays by key, because a boot-time filter under the
 provider may be the standing cover's. The presence probe reads the fixed keys, so a stranger alone on a host reads
@@ -216,11 +216,11 @@ The privileged lane measures, on the real firewall and with no reboot, in
   the machine it runs on.
 - Every engage re-creates the twins while the persistent block-all beside them is not re-created.
 
-The code also records, as measured, that a live boot-time filter is not enforced once BFE has started, and relies on it:
-it is why a refused delete of an unlisted twin and an unreadable view never fail a sweep, and on it a stranded twin
-affects the next boot's early window and not the running host. No test in this tree makes that measurement. The privileged
-lane's probes are permits on documentation addresses, because a boot-time block could lock the machine out, so if the
-measurement was made by hand, its record is not in the tree.
+The code assumes that a live boot-time filter is not enforced once BFE has started, and relies on it: it is why a
+refused delete of an unlisted twin and an unreadable view never fail a sweep, and on it a stranded twin affects the next
+boot's early window and not the running host (`KeyRole::refusal_fails_the_sweep` states it as an assumption). No test in
+this tree measures it. The privileged lane's probes are permits on documentation addresses, because a boot-time block
+could lock the machine out.
 
 Nothing measures anything that spans a reboot, and the lane does not reboot:
 

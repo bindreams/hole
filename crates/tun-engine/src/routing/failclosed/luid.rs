@@ -1,17 +1,11 @@
 //! Resolve the `hole-tun` interface alias to a `NET_LUID` for the Windows
-//! lockdown cover's `IP_LOCAL_INTERFACE` permit. The LUID is NEVER persisted —
-//! a TUN teardown/recreate or a reboot mints a fresh LUID, so the cover
-//! re-resolves and re-engages on every connect (and recovery deletes
-//! stale-LUID filters before re-engaging).
-//!
-//! `gateway.rs` already calls `ConvertInterfaceAliasToLuid`, but it converts
-//! onward to an interface *index* and discards the LUID; this seam is the
-//! net-new alias->LUID path the cover needs.
+//! lockdown cover's `IP_LOCAL_INTERFACE` permit. The LUID is never persisted: a TUN teardown or a reboot mints a
+//! fresh one, so the cover re-resolves on every connect.
 
 use crate::error::RoutingError;
 
 /// Resolves an interface alias (e.g. `hole-tun`) to its `NET_LUID` as a `u64`.
-/// Behind a trait so unit tests substitute a canned LUID without FFI (#165).
+/// Behind a trait so unit tests substitute a canned LUID without FFI.
 pub trait LuidResolver: Send + Sync {
     fn resolve(&self, alias: &str) -> Result<u64, RoutingError>;
 }

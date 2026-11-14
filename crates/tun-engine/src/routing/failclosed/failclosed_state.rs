@@ -26,10 +26,8 @@ pub struct FailClosedState {
     /// when that read failed (the engage warns and does not fail on it). Diagnostic
     /// only: recovery restores `/etc/pf.conf` and drops our refcount regardless.
     ///
-    /// Stays a plain `bool`, never an `Option`: this file must parse under every
-    /// release that may run the sweep after a crash, and a rolled-back binary's
-    /// `bool` rejects `null` — `state::load` then reads the file as absent and
-    /// leaves `block out all` on the host.
+    /// A plain `bool`, never an `Option`: a rolled-back release's `bool` rejects `null`, and a file it cannot parse
+    /// reads as absent, which leaves `block out all` on the host.
     pub pf_was_enabled: bool,
 }
 
