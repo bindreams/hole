@@ -42,7 +42,7 @@ impl DumpValue {
     }
 }
 
-/// Blessed tag names. Only [`SECRET`] and [`ELIDED`] change how the
+/// Blessed tag names. Only [`SECRET`](tag::SECRET) and [`ELIDED`](tag::ELIDED) change how the
 /// formatter renders a node; the others render as ordinary tags and
 /// document what the inner value holds.
 ///
