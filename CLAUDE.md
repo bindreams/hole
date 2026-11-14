@@ -96,6 +96,8 @@ install: [README.md](README.md). Everything else: [docs/index.md](docs/index.md)
   keyed to an enum variant belongs in ONE exhaustive match on that type, and two
   variants are never grouped because they share a consequence; test-enforced.
   [→](docs/contributing/architecture/kill-switch.md#the-decisions)
+  Prefer removing a hazard outright over guarding it:
+  [coding rules](docs/contributing/development.md#coding-rules).
 - **Privileged code in a folder a user may own walks through handles** —
   `util::dir::Dir` (or `ReadDir`, for code that only reads), never a path call,
   and never `canonicalize` the path first.

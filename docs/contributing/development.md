@@ -136,6 +136,12 @@ HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 
 The bridge's options are listed under [Bridge and proxy commands](bridge-cli.md).
 
+## Coding rules
+
+- **Remove a hazard rather than guard it.** If a function has a precondition no test can enforce, change the code so
+  the precondition cannot be broken. `CoverGuard::disarm` closes the handle it holds instead of leaking it, so it needs
+  no "call only before the process exits" rule: nothing is left to police.
+
 ## Things that catch people
 
 - **A dev run and an installed Hole share one identity.** The dev app uses the same application id, `com.hole.app`, as

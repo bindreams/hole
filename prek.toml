@@ -156,6 +156,7 @@ name = "no file points at the agent instructions file"
 # Code and docs must stand on their own. The script's docstring lists the exemptions.
 entry = "python scripts/check-no-claude-md-refs.py"
 language = "python"
+types = ["text"]
 
 [[repos.hooks]]
 id = "format-section-comments"

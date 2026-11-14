@@ -2,39 +2,63 @@
 """Fail when a file refers to the agent instructions file by name.
 
 Code and docs must stand on their own: a reader of either should never be sent to
-a file written for coding agents. The check reads the files prek passes it, so the
-hook's own `exclude` (vendored code) applies, and prints `path:line` for each hit.
+a file written for coding agents. The check reads the files prek passes it and prints
+`path:line` for each hit; vendored code is left out by prek's top-level `exclude`, not
+by this script. The match ignores case, since the name resolves on case-insensitive
+filesystems.
 
-Exempt: the agent files themselves (`CLAUDE.md`, `CLAUDE.local.md`, `.claude/`), this
-script, and a release config's `include_paths` entry that is exactly `- CLAUDE.md`
-(it names a path whose changes belong in the release notes, not a reference to read).
+Exempt: the agent files themselves (any `CLAUDE.md` or `CLAUDE.local.md`, anything
+under a `.claude` folder), this script, and an entry of a release config's
+`include_paths` list that is exactly `- CLAUDE.md` (it names a path whose changes
+belong in the release notes, not a reference to read).
 """
 
 import fnmatch
+import re
 import sys
 from pathlib import Path
 
-NEEDLE = "CLAUDE.md"
-EXEMPT_FILES = frozenset({"CLAUDE.md", "CLAUDE.local.md", "scripts/check-no-claude-md-refs.py"})
+NEEDLE = re.compile(r"claude\.md", re.IGNORECASE)
+AGENT_BASENAMES = frozenset({"claude.md", "claude.local.md"})
+AGENT_FOLDER = ".claude"
+SELF = "scripts/check-no-claude-md-refs.py"
 RELEASE_CONFIG = ".github/release-*.yaml"
-INCLUDE_PATHS_ENTRY = "- CLAUDE.md"
+INCLUDE_PATHS_KEY = "include_paths"
+INCLUDE_PATHS_ENTRY = "- claude.md"
 
 
 def posix(path: str) -> str:
     return path.replace(chr(92), "/")
 
 
+def is_exempt_file(path: str) -> bool:
+    parts = path.split("/")
+    return path == SELF or parts[-1].lower() in AGENT_BASENAMES or AGENT_FOLDER in parts[:-1]
+
+
+def top_level_key(line: str) -> str | None:
+    """Return the mapping key a column-0 line opens, or None when the line opens none."""
+    if not line or line[0] in " \t#-" or ":" not in line:
+        return None
+    return line.split(":", 1)[0].strip()
+
+
 def scan(path: str, text: str) -> list[int]:
     """Return the 1-based line numbers in `text` that are references, given the file's repo-relative `path`."""
     path = posix(path)
-    if path in EXEMPT_FILES or path.startswith(".claude/"):
+    if is_exempt_file(path):
         return []
     is_release_config = fnmatch.fnmatchcase(path, RELEASE_CONFIG)
-    return [
-        number
-        for number, line in enumerate(text.splitlines(), start=1)
-        if NEEDLE in line and not (is_release_config and line.strip() == INCLUDE_PATHS_ENTRY)
-    ]
+    hits = []
+    key = None
+    for number, line in enumerate(text.splitlines(), start=1):
+        key = top_level_key(line) or key
+        if not NEEDLE.search(line):
+            continue
+        if is_release_config and key == INCLUDE_PATHS_KEY and line.strip().lower() == INCLUDE_PATHS_ENTRY:
+            continue
+        hits.append(number)
+    return hits
 
 
 def main(argv: list[str]) -> int:
@@ -83,14 +107,46 @@ def test_exempts_the_script_itself() -> None:
     assert scan("scripts/check-no-claude-md-refs.py", 'NEEDLE = "CLAUDE.md"\n') == []
 
 
+def test_exempts_agent_files_by_basename_and_folder_at_any_depth() -> None:
+    for path in ("docs/CLAUDE.md", "crates/x/CLAUDE.local.md", "src/.claude/x.rs", "a/.claude/b/c.md"):
+        assert scan(path, "CLAUDE.md\n") == [], path
+
+
 def test_does_not_exempt_a_file_that_only_looks_like_an_agent_file() -> None:
-    assert scan("docs/CLAUDE.md", "x\nCLAUDE.md\n") == [2]
-    assert scan("src/.claude/x.rs", "CLAUDE.md\n") == [1]
+    assert scan("docs/NOT-CLAUDE.md", "CLAUDE.md\n") == [1]
+    assert scan("docs/claude.md.bak", "CLAUDE.md\n") == [1]
+    assert scan("src/claude/x.rs", "CLAUDE.md\n") == [1]
+    assert scan("src/x.claude", "CLAUDE.md\n") == [1]
+
+
+def test_matches_any_case() -> None:
+    assert scan("a.rs", "// see claude.md\n// see CLAUDE.MD\n// Claude.Md\n") == [1, 2, 3]
+    assert scan("a.rs", "// claude_md and claudeXmd are not it\n") == []
+
+
+def test_exempts_the_agent_files_in_any_case() -> None:
+    assert scan("docs/claude.md", "CLAUDE.md\n") == []
+    assert scan("CLAUDE.MD", "CLAUDE.md\n") == []
 
 
 def test_exempts_a_release_config_include_paths_entry() -> None:
     text = "include_paths:\n  - docs/**\n  - CLAUDE.md\n  - README.md\n"
     assert scan(".github/release-hole.yaml", text) == []
+
+
+def test_the_exemption_is_only_for_the_include_paths_list() -> None:
+    cfg = ".github/release-hole.yaml"
+    assert scan(cfg, "initial_release:\n  - CLAUDE.md\ninclude_paths:\n  - docs/**\n") == [2]
+    assert scan(cfg, "other:\n  - CLAUDE.md\n") == [2]
+    assert scan(cfg, "include_paths:\n  - docs/**\nother:\n  - CLAUDE.md\n") == [4]
+    assert scan(cfg, "- CLAUDE.md\n") == [1]
+
+
+def test_exempts_an_include_paths_entry_with_an_unindented_list_or_other_case() -> None:
+    cfg = ".github/release-hole.yaml"
+    assert scan(cfg, "include_paths:\n- CLAUDE.md\n") == []
+    assert scan(cfg, "include_paths:\n  - claude.md\n") == []
+    assert scan(cfg, "initial_release: |\n  - CLAUDE.md\ninclude_paths:\n  - docs/**\n") == [2]
 
 
 def test_flags_other_mentions_in_a_release_config() -> None:
@@ -105,7 +161,7 @@ def test_the_include_paths_exemption_is_only_for_release_configs() -> None:
 
 
 def test_accepts_windows_separators() -> None:
-    assert scan(r".github\release-hole.yaml", "  - CLAUDE.md\n") == []
+    assert scan(r".github\release-hole.yaml", "include_paths:\n  - CLAUDE.md\n") == []
     assert scan(r"crates\x\a.rs", "CLAUDE.md\n") == [1]
 
 

@@ -1083,6 +1083,10 @@ def test_verifyreadydlg_back_publishes_to_shortcutsdlg(package: ET.Element) -> N
 # Substrings that make a `netsh wfp` mention honest rather than a remedy.
 _NETSH_IS_NOT_A_REMEDY = ("no delete verb", "cannot remove", "diagnostics-only")
 
+# What a paragraph naming LEAVE_NETWORK_BLOCKED must say clears it: a reinstall alone does not, the
+# reinstalled bridge has to release the cover.
+_REMEDY_PARTS = ("reinstall", "release-covers")
+
 
 def _wxs_comments() -> list[str]:
     return re.findall(r"<!--(.*?)-->", WXS_PATH.read_text(encoding="utf-8"), re.DOTALL)
@@ -1107,7 +1111,11 @@ def _netsh_claims_without_qualifier(comment: str) -> list[str]:
 
 def _leave_network_blocked_claims_without_remedy(comment: str) -> list[str]:
     """Paragraphs naming LEAVE_NETWORK_BLOCKED without naming, in that paragraph, what clears it."""
-    return [p for p in _paragraphs(comment) if "LEAVE_NETWORK_BLOCKED" in p and "reinstall" not in p.lower()]
+    return [
+        p
+        for p in _paragraphs(comment)
+        if "LEAVE_NETWORK_BLOCKED" in p and not all(part in p.lower() for part in _REMEDY_PARTS)
+    ]
 
 
 def test_wxs_comments_offer_no_remedy_that_does_not_exist() -> None:
@@ -1133,8 +1141,9 @@ def test_leave_network_blocked_comment_names_the_only_way_back() -> None:
     """LEAVE_NETWORK_BLOCKED strands the block; the paragraph that names it must say what clears it.
 
     Removing a WFP filter takes an FWPM call and hole.exe is the only caller
-    of one on the host, so reinstalling Hole is the whole remedy. Saying
-    nothing leaves the escape looking cheaper than it is.
+    of one on the host, so the remedy is a reinstall followed by a release of
+    the cover. Saying nothing, or "reinstall" alone, leaves the escape looking
+    cheaper than it is.
     """
     assert any("LEAVE_NETWORK_BLOCKED" in c for c in _wxs_comments()), (
         "no hole.wxs comment explains LEAVE_NETWORK_BLOCKED"
@@ -1142,8 +1151,8 @@ def test_leave_network_blocked_comment_names_the_only_way_back() -> None:
     for comment in _wxs_comments():
         silent = _leave_network_blocked_claims_without_remedy(comment)
         assert not silent, (
-            "the LEAVE_NETWORK_BLOCKED rationale must name reinstalling Hole as the way back, in the "
-            "paragraph that names the property\n---\n" + "\n---\n".join(p.strip() for p in silent)
+            "the LEAVE_NETWORK_BLOCKED rationale must name a reinstall and `release-covers` as the way back, "
+            "in the paragraph that names the property\n---\n" + "\n---\n".join(p.strip() for p in silent)
         )
 
 
@@ -1155,7 +1164,8 @@ _QUALIFIED_PARAGRAPH = """\
          `netsh wfp` is diagnostics-only — capture, dump, help, set, show, and
          no delete verb — and removing a WFP filter takes an FWPM call, whose
          only caller on the host is the hole.exe this uninstall is about to
-         delete. Reinstalling Hole is the way back (#1003)."""
+         delete. A reinstall brings that caller back; it must then release the
+         cover (`hole bridge release-covers`, or Unblock Network)."""
 
 _PRE_PR_LEAVE_NETWORK_BLOCKED_PARAGRAPH = """\
          LEAVE_NETWORK_BLOCKED is the escape from the escape: Return="check"
