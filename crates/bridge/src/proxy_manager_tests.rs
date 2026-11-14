@@ -1001,15 +1001,10 @@ fn start_reaches_dns_apply_when_the_forwarder_answers() {
     });
 }
 
-/// Call-site wiring only, not a naming guard. Under `#[cfg(test)]`, `start_inner` builds its
-/// `TunIdentity` from `TunIdentity::synthetic(0xFEED, WINDOWS_TUN_ALIAS)` rather than the real
-/// device-discovery path, so this test cannot catch a regression in macOS's kernel-assigned
-/// naming; the guard for that is `dispatcher_privileged_tests.rs::dispatcher_opens_tun_names_the_interface_it_opened`.
-/// What it pins: `Routing::install`,
-/// `Routing::install_lockdown`, and `Dns::apply` are all handed the SAME `TunIdentity`'s alias
-/// from one Full-mode start with the standing lockdown engaged. The three signatures take
-/// `&TunIdentity`, so passing three DIFFERENT names is a compile error rather than a runtime
-/// drift.
+/// Pins that `Routing::install`, `Routing::install_lockdown` and `Dns::apply` receive the same
+/// `TunIdentity` alias from one Full-mode start with the standing lockdown engaged. The identity
+/// is synthetic here, so this is no naming guard: macOS's kernel-assigned naming is pinned by
+/// `dispatcher_privileged_tests.rs::dispatcher_opens_tun_names_the_interface_it_opened`.
 #[skuld::test]
 fn install_and_lockdown_name_the_device_dns_was_given() {
     rt().block_on(async {

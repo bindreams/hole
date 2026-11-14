@@ -84,7 +84,7 @@ pub struct Dispatcher {
     /// The identity of the TUN device this dispatcher opened. Captured
     /// before the device is consumed by `Engine::build`; threaded to
     /// `Dns::apply` so DNS is confined to the adapter this process actually
-    /// opened, never a name lookup.
+    /// opened.
     identity: TunIdentity,
 }
 
@@ -159,11 +159,10 @@ impl Dispatcher {
         // Give hole-tun the lowest possible interface metric so Windows
         // prefers whatever resolver Hole advertises over the physical
         // adapter's (the confining half is `tun_engine::dns_confine`).
-        // IPv4 absence is fatal: a v4 row must
-        // exist for an adapter that was just created. IPv6 absence is
-        // logged and accepted: `Device::build` already waited for the IPv6
-        // half, so a missing row follows from `Assigned::Ipv6StackAbsent`
-        // (see `tun_engine::net::metric`'s module doc).
+        // IPv4 absence is fatal: a v4 row must exist for an adapter that was
+        // just created. IPv6 absence is logged and accepted: `Device::build`
+        // already waited for the IPv6 half, so a missing row follows from
+        // `Assigned::Ipv6StackAbsent` (see `tun_engine::net::metric`'s module doc).
         #[cfg(target_os = "windows")]
         {
             use tun_engine::net::metric::{set_interface_metric, Family, MetricOutcome, TUNNEL_INTERFACE_METRIC};
@@ -184,7 +183,7 @@ impl Dispatcher {
             match set_interface_metric(luid, TUNNEL_INTERFACE_METRIC, Family::V6) {
                 Ok(MetricOutcome::Applied) => {}
                 Ok(MetricOutcome::NoInterfaceRow) => {
-                    warn!("hole-tun has no IPv6 interface row yet; IPv6 metric not set (host may lack IPv6, or the row has not appeared)");
+                    warn!("hole-tun has no IPv6 interface row after the device's wait for it; IPv6 metric not set (the device's Ipv6StackAbsent verdict, contested: bindreams/hole#1301)");
                 }
                 Err(e) => {
                     return Err(
@@ -199,9 +198,7 @@ impl Dispatcher {
         // frozen config, so no later read is possible.
         let ipv6_assigned = device.ipv6_assigned();
 
-        // Captured BEFORE `Engine::build` consumes `device` below — this is
-        // the identity of the concrete OS object this call opened, never a
-        // name lookup.
+        // Captured BEFORE `Engine::build` consumes `device` below.
         let identity = device.identity().clone();
 
         // Build the two endpoints, the drop sink, and the HoleRouter.
@@ -250,9 +247,10 @@ impl Dispatcher {
     }
 
     /// What the OS TUN interface ended up holding for [`TUN_SUBNET6`]; `None`
-    /// when no IPv6 address was requested. Reported in the start log only: the
-    /// fatality of an IPv6 split-route failure is decided inside
-    /// `Routing::install`, by an OS probe of the TUN's own name.
+    /// when no IPv6 address was requested. Reported in the start log only. The
+    /// probe of the TUN's own name decides whether the route runner stops at a
+    /// failed IPv6 split, but `SystemRouting::install` fails the start on any
+    /// missing planned route, an IPv6 split included (open, bindreams/hole#1299).
     pub fn ipv6_assigned(&self) -> Option<Assigned> {
         self.ipv6_assigned
     }

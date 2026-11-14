@@ -2,7 +2,7 @@
 //!
 //! Kept apart from any call site so cover fate and tunnel fate are decided in one place and
 //! not re-derived by imitation. Nothing here performs I/O: every function is a table lookup
-//! from measured/decided inputs to a step, and the actual driving of those steps lives elsewhere.
+//! from measured/decided inputs to a step.
 
 use std::sync::Arc;
 
@@ -224,18 +224,20 @@ pub fn teardown_cover_disposition(
 /// Separate from [`teardown_cover_disposition`] because the two covers answer
 /// different questions. The standing cover asks what the target authorises;
 /// this one asks only **"will a successor process adopt these filters"** —
-/// true for `CutoverRestart` alone, where a replacement bridge is already
-/// starting. Nothing adopts them on a clean shutdown, so keeping them there
+/// true for `CutoverRestart` (with the `Blipped` exception below), where a
+/// replacement bridge is already starting. Nothing adopts them on a clean shutdown, so keeping them there
 /// blocks the host from boot until the bridge next runs.
 ///
 /// Exhaustive with no wildcard, and never grouped by a shared consequence to
 /// the target: that is what would let `ProcessExiting` inherit an answer chosen
 /// for a cutover.
 ///
-/// `Blipped` keeps the cover engaged, though no successor process adopts it:
-/// `stop_with` has already replaced the posture with `Idle` by this point, so
-/// nothing would own a cover that survived an in-process retry either. Whether a
-/// blip's cover should be released is a policy call, not settled here.
+/// `Blipped` is the one exception to "a successor adopts": it keeps the cover
+/// engaged with no successor process. `stop_with` has already replaced the
+/// posture with `Idle` by this point, so nothing owns the cover until the next
+/// start sweeps it, and the host stays blocked meanwhile. Whether a blip's cover
+/// should be released is an open policy call (bindreams/hole#1270, which also
+/// records that production never engages a transient cover today).
 pub fn transient_cover_disposition(event: SessionEvent) -> CoverDisposition {
     match event {
         SessionEvent::CutoverRestart => CoverDisposition::KeepEngaged,
@@ -249,9 +251,7 @@ pub fn transient_cover_disposition(event: SessionEvent) -> CoverDisposition {
 /// The order the two surfaces move in this reconcile pass.
 ///
 /// Engaging goes lockdown-then-tunnel; releasing goes tunnel-then-lockdown, so
-/// egress is never open while the tunnel is still half-standing. The order is a
-/// value derived from the decision, not a second statement sequence an author
-/// can get wrong at a new call site.
+/// egress is never open while the tunnel is still half-standing.
 pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
     match cover {
         CoverStep::Release => [Phase::Tunnel(tunnel), Phase::Cover(cover)],

@@ -299,8 +299,7 @@ struct BlockedStart<C> {
 // Posture =============================================================================================================
 
 /// Who owns `ProxyManager`'s per-cycle state right now: nobody, a pending
-/// covered start, or a live session. One enum rather than independent fields, so a
-/// session and a pending start both holding covers is not representable.
+/// covered start, or a live session.
 enum Posture<P: Proxy, R: Routing, D: Dns> {
     Idle,
     PendingStart(BlockedStart<R::Cover>),
@@ -1377,32 +1376,16 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// `?` anywhere here leaves what was acquired in the session for [`Session::teardown`].
     ///
     /// Each long-running phase observes the supplied `cancel` token and returns `Err(ProxyError::Cancelled)`
-    /// cooperatively:
-    /// - **Phase 1 (plugin chain)**: the token is threaded into `start_plugin_chain`, which derives child tokens
-    ///   for each attempt and races readiness against cancel.
-    /// - **Phase 2 (proxy.start)**: `tokio::select!` around `proxy.start(ss_config)`. Drop-on-cancel is sound:
-    ///   Proxy implementations own no async cleanup obligations on an in-flight start.
-    /// - **Phase 3 (build_local_dns)**: builds the in-TUN endpoint + forwarder synchronously; the outer
-    ///   `tokio::select!` against cancel re-emits Cancelled canonically.
-    /// - **Phase 4 (forwarder self-test)**: the token is threaded into `run_forwarder_self_test`, which races its
-    ///   one walk against cancel in a `biased` `select!` and drops the in-flight walk on cancel.
-    /// - **Phase 5 (Dispatcher::new)**: the token is threaded in, and the device build runs on `spawn_blocking`
-    ///   raced against it. The build waits for the TUN interface's IPv6 half, and on a covered start a Cancel the
-    ///   phase could not observe would extend the window during which the host is fail-closed. On cancel the
-    ///   blocking task finishes and drops its own `Device`; nothing is future-drop-cancelled.
-    /// - **Phase 6 (routing.install)**: sync; cancel observed at the phase boundary only. The netsh/route
-    ///   shell-outs are uninterruptible from our process.
-    /// - **Phase 7 (dns.apply)**: the token is threaded into [`Dns::apply`], which observes cancel between
-    ///   per-adapter FFIs. A cancel mid-apply restores any partially-applied adapters inline before
-    ///   `DnsError::Cancelled` propagates as `ProxyError::Cancelled`. The `DnsApplied` guard exists only on the
-    ///   `Ok` path, so its drop bomb is never armed on an `Err`.
+    /// cooperatively. Two phases differ:
+    /// - **Phase 2 (proxy.start)** is dropped, not awaited, on cancel. That is sound because a `Proxy` owns no async
+    ///   cleanup obligation on an in-flight start.
+    /// - **Phase 6 (routing.install)** is synchronous and checked at its boundary only: the netsh/route shell-outs
+    ///   cannot be interrupted from this process. The recovery-state-before-mutation ordering is
+    ///   [`tun_engine::routing::SystemRouting::install`]'s contract.
     ///
-    /// CRITICAL ORDERING: the routing provider is responsible for
-    /// persisting the recovery state BEFORE mutating routes. A panic
-    /// or SIGKILL between `setup_routes` and `SystemRoutes`
-    /// construction would otherwise leak routes with no on-disk record,
-    /// defeating crash recovery on next startup. See
-    /// [`tun_engine::routing::SystemRouting::install`] for the invariant.
+    /// Phase 5 (`Dispatcher::new`) is raced on `spawn_blocking` because its device build waits for the TUN
+    /// interface's IPv6 half, and on a covered start a cancel it could not observe would extend the fail-closed
+    /// window; on cancel the blocking task finishes and drops its own `Device`.
     // DI params (the proxy/routing/dns seams + config + cancel + the
     // test-querier seam); bundling into a struct adds more noise than the warning.
     #[allow(clippy::too_many_arguments)]
@@ -1561,9 +1544,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // CRITICAL ORDERING (phases 3..=7 below): the forwarder self-test gate (4) runs before any
         // system state (routes, system DNS, TUN adapter) is mutated, so a failing gate leaves nothing to
-        // undo beyond the proxy and plugin chain the session teardown releases. `Dispatcher::new` (5) is
-        // what makes the local DNS endpoint reachable through the cascade; `routing.install` (6) makes
-        // the TUN routes live; `Dns::apply` (7) points the OS adapters at the resolver IPs. Reordering
+        // undo beyond the proxy and plugin chain the session teardown releases. Reordering
         // re-introduces a dead-tunnel DNS hijack with the GUI reporting "Running".
         // `start_blocks_on_forwarder_self_test_failure` pins that `routing.install` is not called when
         // the gate fails.
@@ -1809,8 +1790,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // and the standing lockdown cover (`install_standing_cover`, which hands it to `install_lockdown`).
         //
         // Under `#[cfg(test)]` the dispatcher is stubbed out (creating a real TUN needs elevation),
-        // so a synthetic identity stands in. That makes phase 7 reachable from a unit test on any
-        // machine.
+        // so a synthetic identity stands in.
         #[cfg(not(test))]
         let tun_identity = session
             .dispatcher
@@ -1822,8 +1802,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         let tun_identity = tun_engine::TunIdentity::synthetic(0xFEED, WINDOWS_TUN_ALIAS);
 
         // The TUN's IPv6 verdict, read from the dispatcher because `Engine::build` has consumed the
-        // device. Logged only: whether an IPv6 split route's failure is fatal is decided inside
-        // `routing.install`, by an OS probe of the TUN's own name.
+        // device. Logged only. The probe of the TUN's own name decides whether the route runner stops at a
+        // failed IPv6 split, but `SystemRouting::install` fails the start on any missing planned route, an
+        // IPv6 split included (open, bindreams/hole#1299).
         let tun_ipv6 = session.dispatcher.as_ref().and_then(|d| d.ipv6_assigned());
 
         // Phase 6: cancel checkpoint before routing.install (sync; mid-

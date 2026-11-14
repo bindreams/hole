@@ -143,9 +143,8 @@ fn turn_lockdown_on_reports_an_unsaved_intent_as_the_store_error() {
 
 #[skuld::test]
 fn turn_lockdown_off_releases_even_when_presence_reads_absent() {
-    // No presence check stands in front of the release: it is idempotent, and at an explicit
-    // disarm a stale `Absent` would report success to the user while the host stays blocked. The
-    // redundant call costs nothing.
+    // A stale `Absent` read still releases: no presence check stands in front of it (see
+    // `ProxyManager::turn_lockdown_off`).
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());

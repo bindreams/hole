@@ -124,9 +124,7 @@ impl Drop for SsRuntime {
 ///
 /// `ShadowsocksProxy` itself is stateless (zero-sized): per-session state
 /// (the dedicated runtime, the spawned task, the traffic counters) lives in
-/// the returned [`ShadowsocksRunning`]'s `SsRuntime`. It is a named type so
-/// [`crate::proxy_manager::ProxyManager`]'s `P: Proxy` parameter can be
-/// substituted for a mock in tests.
+/// the returned [`ShadowsocksRunning`]'s `SsRuntime`.
 #[derive(Debug, Default)]
 pub struct ShadowsocksProxy;
 

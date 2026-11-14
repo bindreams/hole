@@ -368,8 +368,7 @@ pub fn apply(
 // Startup preference ==================================================================================================
 
 /// Pure launch-time decision: should the bridge auto-connect at its own next
-/// boot? `last_enabled` is the persisted last-honored intent, and the
-/// exhaustive match makes a new `StartupBehavior` variant a compile error here.
+/// boot? `last_enabled` is the persisted last-honored intent.
 pub fn startup_should_connect(behavior: StartupBehavior, last_enabled: bool) -> bool {
     match behavior {
         StartupBehavior::DoNotConnect => false,

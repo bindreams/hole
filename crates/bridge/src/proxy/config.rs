@@ -101,7 +101,7 @@ pub enum ProxyError {
     PluginResolve(#[from] PluginResolveError),
     /// Plugin options a SIP003 parser rejects. Refused rather than forwarded:
     /// ex-ray fails fatally on the same string, so refusing here fails earlier
-    /// and attributably, before spawning a process that would die immediately. PII-free
+    /// and attributably. PII-free
     /// `Display` by construction — the wrapped `MalformedOptions` names the
     /// fault class and a segment index, never the segment, which can carry a
     /// per-connection secret.
@@ -295,8 +295,7 @@ impl From<tun_engine::DeviceError> for ProxyError {
 /// `Dispatcher::new` keeps `DeviceError` distinguishable from its other
 /// start-time I/O failures (metric set, engine build). The `Device` arm
 /// delegates to the `DeviceError` impl above, so `ProxyError::ForeignAdapter`
-/// is reachable from `start_inner`; flattening to `io::Error` would convert
-/// it to `ProxyError::Runtime`.
+/// is reachable from `start_inner`.
 impl From<crate::dispatcher::DispatcherStartError> for ProxyError {
     fn from(e: crate::dispatcher::DispatcherStartError) -> Self {
         match e {

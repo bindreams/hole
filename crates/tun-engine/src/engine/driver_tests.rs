@@ -325,15 +325,10 @@ async fn a_half_closing_router_still_receives_the_clients_final_bytes() {
 /// The router task ended and dropped its flow, so nothing can be delivered.
 /// Bytes still in `rx_buffer` at removal are acknowledged and then dropped,
 /// which this test does not cover.
-///
-/// A live spawned router cannot be observed reaching this state without a
-/// sleep or a poll-with-timeout. This closes the driver's own `to_handler`
-/// directly instead of dropping a router's `TcpFlow`: the test is about what
-/// the driver does once that channel is closed, not about how it got closed, so
-/// it does not demonstrate that a dropped router causes the closure.
 #[skuld::test]
 async fn a_dropped_router_leaves_the_clients_final_bytes_undelivered() {
-    let mut d = driver(4);
+    let (dropped_tx, dropped_rx) = oneshot::channel();
+    let mut d = driver_with(4, Arc::new(DroppingRouter(std::sync::Mutex::new(Some(dropped_tx)))));
     let (handle, synack_seq) = admit_one(&mut d, client(), dest(), 1000, 0);
     d.stack.enqueue_rx(ack(client(), dest(), 1001, synack_seq));
     d.stack.poll(t(2));
@@ -355,10 +350,7 @@ async fn a_dropped_router_leaves_the_clients_final_bytes_undelivered() {
     assert_eq!(d.stack.socket(handle).state(), tcp::State::TimeWait);
     assert_eq!(d.stack.socket(handle).recv_queue(), 100);
 
-    let (dead_tx, dead_rx) = mpsc::channel(1);
-    drop(dead_rx);
-    d.connections.get_mut(&handle).unwrap().to_handler = dead_tx;
-
+    dropped_rx.await.expect("the router task dropped its flow");
     d.relay_tcp_data();
     assert_eq!(
         d.stack.socket(handle).recv_queue(),

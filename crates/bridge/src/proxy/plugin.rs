@@ -349,7 +349,7 @@ fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
 /// Single-attempt plugin-runner spawn. Constructs `BinaryPlugin`
 /// (with optional `pid_sink`), wraps in `TapPlugin` when the tap is enabled
 /// ([`resolve_tap_source`]), builds the `ChainRunner`, spawns it,
-/// and awaits readiness, bounded by [`READINESS_TIMEOUT`]. The chain's task is owned
+/// and awaits readiness, bounded by `READINESS_TIMEOUT`. The chain's task is owned
 /// by a [`ChainTask`] from the spawn on: a failure ends it before it returns
 /// (see [`ready_or_end`]), and the future being dropped ends it, so a retried attempt by `bind_ephemeral` doesn't
 /// leak the previous attempt's task. On success returns `(task, ready_addr, transports)`
@@ -614,10 +614,7 @@ pub(crate) fn ech_doh_will_reach_ex_ray(
 /// [`classify_ech_doh`] with `inject_plugin_directives`, so the permit
 /// derivation and the plugin spawn read the same parse and the same outrank
 /// decision, but it does not re-trigger `inject_plugin_directives`'s
-/// `tracing::warn!` calls (this is queried once per start attempt by
-/// `ProxyManager::start_cancellable`; the spawn calls
-/// `inject_plugin_directives` again for real, so calling it here would
-/// double-emit every ECH-posture warning). A malformed `opts` string reads as
+/// `tracing::warn!` calls. A malformed `opts` string reads as
 /// `None` too: the same input makes `inject_plugin_directives` return `Err`,
 /// so the plugin chain never starts.
 pub(crate) fn effective_ech_doh(
@@ -665,15 +662,13 @@ pub(crate) fn derive_ech_doh(
 /// ex-ray's own default for the `host` option (`crates/ex-ray/config.go`) — a
 /// real DOMAIN, not "no SNI". An absent `host` segment is NOT the same as an
 /// unreachable config. `ex_ray_default_host_matches_vendored_config_go` pins it
-/// against the vendored Go source by text, so a change there without a matching
-/// edit here fails loudly.
+/// against the vendored Go source by text.
 const EX_RAY_DEFAULT_HOST: &str = "cloudfront.com";
 
 /// Whether ex-ray's config build would REJECT this segment set outright: the plugin then exits before it dials
 /// anything, ECH-config fetch included. Mirrors `parseOptsIntoFlags` (options.go, main.go), `registerTCPKeepAlive`
 /// and `generateConfig` (config.go) and `core.New`, checking in ex-ray's own order. Returns the first rejecting key;
-/// among segments sharing a key the first wins, as `Args.Get` does. Callers that only ask whether a fetch can happen
-/// need `.is_some()`; the order exists so the returned key is the one ex-ray itself would report.
+/// among segments sharing a key the first wins, as `Args.Get` does.
 ///
 /// Not modelled (reasons: the ECH-config reachability gate in docs/contributing/architecture/kill-switch.md):
 /// - `loglevel`: `inject_plugin_directives` always replaces it.
@@ -1038,9 +1033,7 @@ fn ex_ray_local_addr_is_invalid(value: &str) -> bool {
 /// (`::ffff:0.0.0.0`) to plain IPv4 BEFORE the unspecified test, mirroring
 /// v2ray-core's own `IPAddress()` constructor (third_party/v2ray-core/common/net/address.go,
 /// which folds when `bytes[:10]==0 && [10]==[11]==0xff`). Without the fold,
-/// `Ipv6Addr::is_unspecified()` (`octets() == [0; 16]`) misses it:
-/// `::ffff:0.0.0.0`'s 11th/12th octets are `0xff`, so the raw 16-byte check
-/// does not read it as unspecified.
+/// `Ipv6Addr::is_unspecified()` (`octets() == [0; 16]`) misses it.
 fn ex_ray_remote_addr_is_invalid(value: &str) -> bool {
     let normalized = v2ray_core_normalize(value);
     match normalized.parse::<std::net::IpAddr>() {
