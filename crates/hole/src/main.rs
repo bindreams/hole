@@ -272,18 +272,23 @@ fn keep_running_for_tray(app: &tauri::AppHandle, api: &tauri::ExitRequestApi) {
 }
 
 /// Destroys every webview window before an explicit `AppHandle::exit(N)`
-/// (`ExitRequested { code: Some(_) }`: tray Exit, dashboard File->Exit, post-MSI
-/// install exit) and sets `EXITING`. Needed because tao calls `process::exit`
-/// at the end of `EventLoop::run`, bypassing every `Drop` in the wry/Tauri tree:
-/// a window left alive survives to AtExit, where Chromium logs `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`.
+/// (`ExitRequested { code: Some(_) }`: `tray::exit_app`, reached from the tray's
+/// Exit and the dashboard's File > Exit, and the version-mismatch self-heal's
+/// relaunch) and sets `EXITING`. Needed because tao calls `process::exit` at the
+/// end of `EventLoop::run`, bypassing every `Drop` in the wry/Tauri tree: a
+/// window left alive survives to AtExit, where Chromium logs `Failed to
+/// unregister class Chrome_WidgetWin_0. Error = 1412`.
 fn destroy_windows_before_exit(app: &tauri::AppHandle) {
     EXITING.store(true, Ordering::SeqCst);
     for window in app.webview_windows().values() {
-        // Safe on the main thread: wry routes this to `on_window_close`, and tao defers
-        // the `ControlFlow::Exit` until the destroy has been processed.
+        // Safe on the main thread: wry routes this to `on_window_close`, not to the
+        // `WindowMessage::Destroy` arm of `handle_user_message`, which panics there.
+        // On Windows, tao's `runner.handling_events()` guard defers the
+        // `ControlFlow::Exit` until the destroy has been processed; the ordering
+        // on macOS has not been checked.
         if let Err(e) = window.destroy() {
-            // stderr, not `tracing`: the async appender is not flushed before `process::exit`.
-            // A failed destroy brings back the 1412 error, so it must be seen.
+            // stderr, not `tracing`: the async appender is not flushed before
+            // `process::exit`. Only dev builds have a console to show it.
             eprintln!(
                 "warning: failed to destroy webview window {:?} on exit: {e}",
                 window.label(),
