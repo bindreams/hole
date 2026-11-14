@@ -13,8 +13,9 @@
 //! `hello` handshake and typed events decide readiness. Tier 2 is a TCP
 //! connect probe on the plugin's listener, which carries no typed failure.
 //! [`ReadinessMode`](crate::ReadinessMode) chooses between them: `Probe` always
-//! uses tier 2, and `Auto` starts the probe and stands it down on a supported
-//! `hello`, so tier 2 is its fallback for a plugin that sends none. `ExpectSitrep`
+//! uses tier 2, and `Auto` races the probe against the `hello`, standing the
+//! probe down on a supported `hello` that arrives first (see
+//! [`ReadinessMode::Auto`](crate::ReadinessMode::Auto)). `ExpectSitrep`
 //! has no such fallback: a plugin that never sends `hello` fails (it closes
 //! stdout) or never readies (it stays silent). A `hello` whose protocol MAJOR
 //! the consumer does not know falls back to tier 2 in `ExpectSitrep` and `Auto`

@@ -9,7 +9,7 @@ pub enum Error {
     PluginExit { name: String, code: i32 },
 
     /// A plugin process ended without an exit code: a signal on Unix. Never produced on Windows, where
-    /// `ExitStatus::code()` is always `Some`, so a forced kill arrives as [`Error::PluginExit`].
+    /// `ExitStatus::code()` is always `Some`.
     #[error("plugin '{name}' was killed by signal")]
     PluginKilled { name: String },
 

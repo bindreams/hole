@@ -1333,12 +1333,13 @@ pub fn parse_udp_timeout(plugin_options: Option<&str>) -> Result<Duration> {
 }
 
 /// The yamux hop of the galoshes chain: carries TCP connections and UDP associations as substreams of a yamux
-/// transport connection, and reports both transports.
+/// transport connection. It reports both transports at its TCP listen address.
 ///
-/// - A client instance binds `local` for TCP and for UDP, serves both there, and relays them over one transport
-///   connection that it dials to `remote` and redials when it dies.
+/// - A client instance binds `local` for TCP and for UDP and relays both over one transport connection that it dials
+///   to `remote` and redials when it dies. With port 0 the two binds get separate ports, and only the TCP one is
+///   reported.
 /// - A server instance binds only a TCP listener on `local`, accepts any number of transport connections there, and
-///   relays each substream, TCP or UDP, to `remote`.
+///   relays each substream, TCP or UDP, to `remote`: UDP reaches it as substreams over the TCP transport.
 pub struct YamuxPlugin {
     config: yamux::Config,
     is_server: bool,

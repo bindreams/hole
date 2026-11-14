@@ -81,9 +81,10 @@
 //!
 //! A start failure the tap has reported is also its `run` error, so a runner
 //! with no `on_ready` sees the chain fail. That error is an
-//! [`Error::Chain`](crate::Error::Chain) naming the tap. The one exception is an
-//! inner that ended before it was ready: the tap returns what the inner returned,
-//! and an [`Error::Chain`](crate::Error::Chain) when that was `Ok`.
+//! [`Error::Chain`](crate::Error::Chain) naming the tap, except when the inner
+//! ended before it was ready or was shut down before it was: the tap then returns
+//! what the inner returned, and an [`Error::Chain`](crate::Error::Chain) when that
+//! was `Ok`.
 
 use std::future::Future;
 use std::io;
@@ -116,10 +117,9 @@ static NEXT_TAP_CONN_ID: AtomicU64 = AtomicU64::new(1);
 /// being stopped (e.g. `BindConflict`), else a `Fatal` start failure.
 pub const INNER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Failure bound on the wait for the inner to return after the tap cancelled its token to report a failed start. An
-/// inner must return once its token fires, so this expires only on an inner that does not: the tap then warns and
-/// aborts it. The chain is still starting, so no [`drain_timeout`](crate::ChainRunner::drain_timeout) runs to end the
-/// wait.
+/// Failure bound on the wait for the inner to return after the tap cancelled its token: to report a failed start, or
+/// after an accept failure while serving. An inner must return once its token fires, so this expires only on an inner
+/// that does not: the tap then warns and aborts it.
 ///
 /// It is the whole take-down of a [`BinaryPlugin`](crate::BinaryPlugin) inner (its root's grace period to exit, then
 /// the bound on its output closing) plus headroom, so that inner is never cut off.
@@ -308,6 +308,7 @@ impl ChainPlugin for TapPlugin {
         //    task itself so an early plugin failure doesn't leave us blocked.
         //    `biased`: a report already delivered outranks the exit that
         //    follows it.
+        // Failure bound on an external event that may never happen (see `INNER_READY_TIMEOUT`).
         let ready_deadline = tokio::time::Instant::now() + INNER_READY_TIMEOUT;
         let reported = tokio::select! {
             biased;

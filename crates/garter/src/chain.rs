@@ -268,9 +268,9 @@ impl ChainRunner {
     /// picks for it just before it starts.
     ///
     /// A hop that reports a bind conflict on its intermediate port is stopped and run again on a fresh port, without
-    /// a cap and without disturbing the hops already running; only a shutdown ends that. Whatever address the conflict
-    /// names counts, not only the hop's own port: a [`TapPlugin`](crate::TapPlugin) reports its inner's. A conflict on
-    /// the public port is the caller's and is reported.
+    /// a cap and without disturbing the hops already running; only a shutdown ends that. The decision is by the hop's
+    /// position, not the address the conflict names: a [`TapPlugin`](crate::TapPlugin) reports its inner's. Every bind
+    /// conflict of the public hop is the caller's and is reported.
     ///
     /// Any other start failure (a hop's reported failure, or a hop that ends before it is ready) ends the chain: every
     /// plugin is cancelled, with or without an [`on_ready`](ChainRunner::on_ready) callback, and `run` returns

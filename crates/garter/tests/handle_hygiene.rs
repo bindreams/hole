@@ -3,8 +3,8 @@
 //! stdio. A grandchild whose own stdio was redirected elsewhere can therefore still
 //! hold a duplicate of its grandparent's stdout write end, and the supervisor reading
 //! that pipe never sees EOF. This test is the only guard on the invariant that a
-//! contained spawn does not leak it: cosca has no test for it either (open as
-//! bindreams/cosca#103).
+//! cosca spawn naming its program does not leak that write end: cosca has no test
+//! for it either (open as bindreams/cosca#103).
 //!
 //! The two legs differ only in HOW the grandchild is spawned. The control leg uses
 //! `std::process::Command`, which scopes nothing, and must observe the leak; the real

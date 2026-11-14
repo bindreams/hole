@@ -316,8 +316,9 @@ impl ChainPlugin for BinaryPlugin {
         // `garter-bin`, or any embedder) and galoshes' inner garter must agree on
         // it. Pairing the garter crate at one version with a galoshes built on
         // another can mismatch the marker. The nested garter then does not see
-        // this tree's marker and makes its own process group, which the kill of
-        // this tree does not reach. Mixed pre-1.0 binaries are not supported.
+        // this tree's marker and, on Unix, makes its own process group, which the
+        // kill of this tree does not reach (Windows jobs nest, so a job kill still
+        // reaches it). Mixed pre-1.0 binaries are not supported.
         cmd.contain();
         cmd.nesting(cosca::containment::Nesting::Mark);
         let mut child = cmd.spawn().map_err(|e| {
