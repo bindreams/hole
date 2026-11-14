@@ -125,7 +125,7 @@ fn run_spawn_grandchild(own_console_group: bool) -> ! {
     cmd.env(MODE_ENV, "sleep");
     // Windows: unless the caller wants it reachable by CTRL_BREAK, give the
     // grandchild its OWN console group so a CTRL_BREAK to the root can't
-    // reach it — it dies ONLY via the job, the case containment exists for.
+    // reach it — it dies only via the job, the case containment exists for.
     #[cfg(windows)]
     if own_console_group {
         use std::os::windows::process::CommandExt as _;

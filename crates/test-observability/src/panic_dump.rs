@@ -74,9 +74,10 @@ fn next_key() -> u64 {
 /// the same `Arc` twice is allowed (refcount semantics — both guards
 /// must drop before the source is removed).
 ///
-/// On a poisoned registry mutex (e.g. a panic hook is currently
-/// iterating), registration silently no-ops and the returned guard is
-/// a tombstone — its `Drop` is also a no-op.
+/// On a poisoned registry mutex, registration silently no-ops and the returned
+/// guard is a tombstone — its `Drop` is also a no-op. The lock is held only for
+/// map insert, remove and snapshot, so the one way to poison it is a source whose
+/// own `Drop` panics when the guard's removal releases the last `Arc` to it.
 ///
 /// Registry keys come from a `u64` counter, which a test run cannot overflow.
 pub fn register(source: Arc<dyn PanicDumpSource>) -> PanicDumpGuard {
@@ -95,8 +96,9 @@ pub fn register(source: Arc<dyn PanicDumpSource>) -> PanicDumpGuard {
 /// libtest) and chains it after the dispatcher pass.
 ///
 /// On panic: iterate registry → call `dump` on each source → chain
-/// to previous hook. A poisoned registry mutex makes the hook return without
-/// calling the previous hook (open: bindreams/hole#1300).
+/// to previous hook. Known defect, open as bindreams/hole#1300: a poisoned
+/// registry mutex makes the hook return without calling the previous hook, so
+/// the panic loses the chain's normal report.
 ///
 /// Called from [`crate::install`]; test-support consumers should not
 /// call this directly — registering a source is enough.

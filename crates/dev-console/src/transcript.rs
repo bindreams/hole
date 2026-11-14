@@ -3,7 +3,7 @@
 //! The dev console writes to the terminal; a [`Transcript`] additionally
 //! mirrors the dev console's OWN output — status lines and the multiplexed
 //! child stream — into `dev-console.log`, ANSI stripped. Preflight cargo/npm
-//! children keep inherited stdio and are NOT captured. Best-effort: a failed file open disables
+//! children keep inherited stdio and are not captured. Best-effort: a failed file open disables
 //! the sink rather than failing the run.
 
 use std::io::Write;

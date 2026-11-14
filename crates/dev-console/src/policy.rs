@@ -171,11 +171,9 @@ pub const NETWORK_RESET_WARNING: &str = "\x1b[33mThe bridge did not exit within 
 // Dev-run log filtering ===============================================================================================
 
 /// First-party crates pinned to TRACE in the dev-run file logs. Deps stay at
-/// the `debug` default. Parallels `hole_test_observability::DEFAULT_FILTER`'s
-/// crate list, which differs only in naming `hole_test_observability` and not
-/// `ex_ray` (kept separate: that crate is a dev-dep and `util` is deliberately
-/// Hole-agnostic, so there is no shared home without a heavyweight dep — a new
-/// first-party crate must be added to both lists).
+/// the `debug` default. Mirrors `hole_test_observability::DEFAULT_FILTER`, which
+/// also names `hole_test_observability` and omits `ex_ray`. There is no shared
+/// home (`util` is Hole-agnostic); add a new first-party crate to both lists.
 const DEV_RUN_TRACE_CRATES: &[&str] = &[
     "hole",
     "hole_common",

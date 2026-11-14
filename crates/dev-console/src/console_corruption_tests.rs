@@ -40,7 +40,8 @@ impl Drop for ConsoleModeGuard {
 /// LOUDLY if the marker never comes (the corruption check is meaningless
 /// against a child that never initialized its console handlers — and Vite's
 /// output format changing must break this test, not silently pass it).
-/// The marker wait is a class-2 bound (third-party child; per-test timeout).
+/// The marker wait is bounded only by the per-test timeout, a failure bound reported to a human
+/// for a third-party child.
 async fn run_vite_and_measure(stdin: cosca::Stdio) -> u32 {
     let npm = crate::steps::resolve_npm().expect("npm on PATH");
     let mut cmd = cosca::tokio::Command::new();
@@ -92,7 +93,7 @@ async fn run_vite_and_measure(stdin: cosca::Stdio) -> u32 {
     console_input_mode().expect("console mode after")
 }
 
-/// BOTH legs — the vacuity guard matters: if leg 1 (inherited stdin) no
+/// Both legs — the vacuity guard matters: if leg 1 (inherited stdin) no
 /// longer reproduces the corruption, the stdin=null assertion in leg 2 proves
 /// nothing and the test must say so.
 #[skuld::test(labels = [WINDOWS_CONSOLE])]

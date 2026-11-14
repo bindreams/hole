@@ -77,8 +77,8 @@ fn bare_line_without_open_buffer_emits_immediately() {
     assert_eq!(line, "thread 'main' panicked at x");
 }
 
-/// PINNED TRADE-OFF: an anchor-less line arriving
-/// while a buffer IS open is appended to that entry — pinned explicitly so a
+/// An anchor-less line arriving
+/// while a buffer is open is appended to that entry — pinned explicitly so a
 /// future behavior change is noticed.
 #[skuld::test]
 fn bare_line_with_open_buffer_appends_to_entry() {

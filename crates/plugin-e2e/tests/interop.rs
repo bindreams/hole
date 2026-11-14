@@ -159,9 +159,8 @@ fn interop_stock_client_ex_ray_server() {
 /// returns only once the server is accepting. A single roundtrip therefore
 /// suffices — no retry, no time budget, no sleep. (A TCP `wait_for_port` would
 /// not work here regardless: the public endpoint is UDP-only and a TCP poll
-/// can't observe a UDP listener.) Every *active* QUIC test below uses ex-ray as
-/// the server; the lone stock-as-QUIC-server direction is `#[ignore]`d (#428),
-/// so `ReadinessMode::Auto`'s sitrep path always drives readiness here.
+/// can't observe a UDP listener.) Every active QUIC test below uses ex-ray as
+/// the server, so `ReadinessMode::Auto`'s sitrep path always drives readiness here.
 #[cfg(not(target_os = "windows"))]
 mod quic {
     use super::{require_binary, rt, start_fake_sentinel, PORT_ALLOC};

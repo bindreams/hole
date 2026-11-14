@@ -1,7 +1,7 @@
 //! Multiplexed child-log printing with atomic multi-line entries.
 //!
 //! Streams that emit ISO-timestamped tracing entries (bridge, GUI) are framed
-//! so a multi-line entry (panic backtrace, YAML body) is written as ONE block
+//! so a multi-line entry (panic backtrace, YAML body) is written as one block
 //! and can never be interleaved with another stream's lines; Vite (no timestamp anchor)
 //! prints per-line. Atomicity is structural: every stream pumps into one
 //! mpsc consumed by a single printer task — one writer, no lock.
@@ -86,8 +86,8 @@ impl EntryFramer {
             }
         } else if !self.buffer.is_empty() {
             // Continuation — including anchor-less panic-hook lines arriving
-            // mid-entry. PINNED TRADE-OFF (see mux_tests): appended, not
-            // emitted out-of-band.
+            // mid-entry. Appended, not emitted
+            // out-of-band (pinned in mux_tests).
             self.buffer.push(line);
             FramerOutput::None
         } else {

@@ -74,9 +74,8 @@ pub enum Roundtrip {
 /// (Windows Defender on a just-built `ex-ray.exe`) can push the first
 /// roundtrip past a single-digit-second bound. On a healthy host the roundtrip
 /// completes in milliseconds and the budget is never approached; on a true
-/// wedge the test still fails in bounded time. Do NOT tighten them to "make the
-/// suite faster" — a tight class-2 bound that flakes on cold-start is exactly
-/// the timing assumption the invariant forbids.
+/// wedge the test still fails in bounded time. These are failure bounds, not
+/// expected durations; do not tighten them.
 pub struct RoundtripConfig {
     pub ss_connect_timeout: Duration,
     pub read_timeout: Duration,

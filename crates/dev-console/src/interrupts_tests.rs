@@ -13,8 +13,8 @@ async fn signal_before_first_recv_is_buffered() {
     // SIGINT stream was registered by install(), replacing the default
     // disposition before the raise.
     assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
-    // Resolves via the buffered event; bounded by the per-test timeout
-    // (class-2 failure-to-human bound).
+    // Resolves via the buffered event; bounded only by the per-test timeout, a failure
+    // bound reported to a human.
     interrupts.recv().await;
 }
 

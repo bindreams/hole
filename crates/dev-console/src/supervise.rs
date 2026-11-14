@@ -360,16 +360,14 @@ async fn startup_and_supervise(
     pump_child_output(bridge, ChildRole::Bridge, StreamMode::EntryBuffered, tx);
 
     // Ready rendezvous: bridge-exit checked before the token; interrupt
-    // anywhere tears down via the funnel. The sleep is the class-2
-    // human-failure bound for an out-of-process startup that might never
-    // succeed.
+    // anywhere tears down via the funnel. The sleep is a failure bound reported
+    // to a human, for an out-of-process startup that might never succeed.
     tokio::select! {
         biased;
         status = bridge.wait() => {
             let status = status?;
-            // Supervisor status lines print directly to stdout (as the dev.py
-            // script this replaced did), not via the mux printer, so one can
-            // interleave with a child entry; that is accepted.
+            // Supervisor status lines print directly to stdout, not via the mux
+            // printer, so one can interleave with a child entry; that is accepted.
             note!(
                 "{YELLOW}Bridge exited with code {} (sudo credentials may have expired, or a \
                  restrictive sudoers env_check/env_delete rejected --preserve-env){RESET}",

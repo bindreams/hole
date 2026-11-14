@@ -151,8 +151,8 @@ pub async fn port_in_use(port: u16) -> bool {
 /// Probe until something accepts on `port` via ANY address `localhost`
 /// resolves to (v4 and/or v6), or `budget` elapses. Polls because the OS exposes
 /// no "process N bound port P" event (docs/contributing/testing.md#no-synchronization-by-elapsed-time).
-/// The budget is the class-2 failure bound surfaced to a human; the pause
-/// between rounds is a class-3 paced re-check inside it. The caller's select!
+/// `budget` is a failure bound reported to a human, not a sync point; the pause
+/// between rounds only paces re-checks within it. The caller's select!
 /// on child-exit short-circuits a dead Vite.
 pub async fn wait_for_port(port: u16, budget: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + budget;
@@ -171,7 +171,7 @@ pub async fn wait_for_port(port: u16, budget: Duration) -> bool {
                 return true;
             }
         }
-        // Class-3 paced re-check: the OS announces no bind event, and every round re-probes.
+        // Paces the re-check: the OS announces no bind event, and every round re-probes.
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     false
