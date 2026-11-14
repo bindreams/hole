@@ -4,7 +4,9 @@
 //! Supported attributes:
 //!
 //! - Field: `#[dump(skip)]`, `#[dump(rename = "...")]`,
-//!   `#[dump(secret)]`.
+//!   `#[dump(secret)]`. On the field of a single-field tuple variant only
+//!   `secret` is read; `skip` is ignored there
+//!   ([bindreams/hole#1337](https://github.com/bindreams/hole/issues/1337)).
 //! - Container: `#[dump(rename_all = "kebab-case" | "snake_case")]`.
 //!
 //! ## `rename_all` scope

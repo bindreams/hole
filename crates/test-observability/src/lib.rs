@@ -35,8 +35,9 @@
 //! calls `tracing_log::LogTracer::init()` as a side effect. That sets
 //! `log::max_level()` to `Trace` and routes every `log::debug!` /
 //! `log::trace!` from `shadowsocks-service`, `tokio`, `mio`, `hyper`
-//! through tracing, and the per-event allocation in `tracing-log` is slow
-//! enough to time out tests that do real network I/O. We install via the bare
+//! through tracing. That per-event allocation in `tracing-log` pushed
+//! `server_test_tests` (real localhost TCP, 5 s timeouts) into a timeout on
+//! GitHub Actions Windows runners. We install via the bare
 //! `tracing::subscriber::set_global_default` (not `try_init`), but the
 //! load-bearing safeguard is the EnvFilter default: the noisy
 //! third-party namespaces stay at `info` so their `log::trace!` /

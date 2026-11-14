@@ -106,8 +106,9 @@ async fn teardown_reaps_grandchild_tree() {
     teardown_grouped(&mut child, ChildRole::Vite).await;
 
     // Teardown alone must leave no survivors: on Windows CTRL_BREAK stops at
-    // console-group boundaries, so a grandchild in its own console group (the
-    // production shape) dies only to the tree kill.
+    // console-group boundaries, so a grandchild in its own console group dies
+    // only to the tree kill. That is the plugin-chain case, which garter's
+    // mock plugin and `test_child.rs` create.
 
     let mut buf = [0u8; 1];
     match conn.read(&mut buf).await {

@@ -250,10 +250,11 @@ mod roundtrips {
         });
     }
 
-    /// galoshes server↔client over QUIC (off Windows — see file header). Readiness is deterministic — the launcher returns only
-    /// after galoshes' sitrep `ready` — so a single roundtrip suffices, no
-    /// retry/sleep. (A flake here would mean a real readiness gap to root-cause,
-    /// not a reason to re-add timing.)
+    /// galoshes server↔client over QUIC (off Windows — see file header).
+    /// Readiness is deterministic — the launcher returns only after galoshes'
+    /// sitrep `ready` — so a single roundtrip suffices, no retry/sleep. (A flake
+    /// here would mean a real readiness gap to root-cause, not a reason to
+    /// re-add timing.)
     #[cfg(not(target_os = "windows"))]
     #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
     fn galoshes_quic_roundtrip() {

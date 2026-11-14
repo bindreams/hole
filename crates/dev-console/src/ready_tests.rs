@@ -65,8 +65,8 @@ async fn port_probe_finds_v4_listener() {
 
 /// The v6-only case: a listener on ::1 only must still be found (hosts-file
 /// ordering can make Vite's `localhost` bind v6-only). Loud-fail by design if
-/// ::1 is unavailable: a runner without IPv6 loopback should break this test,
-/// not skip it.
+/// ::1 is unavailable: all six GitHub-hosted runner images have IPv6 loopback,
+/// so a runner without it should break this test, not skip it.
 #[skuld::test]
 async fn port_probe_finds_v6_only_listener() {
     let Ok(l) = std::net::TcpListener::bind("[::1]:0") else {

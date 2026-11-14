@@ -1,4 +1,5 @@
-//! The stdin=null contract: a child spawned with null stdin cannot corrupt the console input mode.
+//! The stdin=null contract: a child spawned with null stdin cannot corrupt the
+//! console input mode.
 //! Label `windows_console`: needs a real interactive console and npm.
 //! Run locally:
 //! `SKULD_LABELS=windows_console cargo nextest run -p dev-console -E 'test(null_stdin_child_cannot_corrupt_console_mode)'`

@@ -1,5 +1,8 @@
-//! Pure supervision policy: every platform-dependent supervision decision, as
-//! data — testable on any host.
+//! Pure supervision policy as data, testable on any host: the per-OS elevation
+//! verdict, the sudo-prefixed bridge and grant-access argv, child roles with
+//! their grace-timeout actions, exit causes and codes, and the dev-run log
+//! filtering and child env. The POSIX sudo preflight and the `hole`-group gate
+//! run in `supervise.rs`.
 
 /// Env vars carried across the sudo boundary into the elevated bridge — log
 /// filtering, backtraces, per-sink levels, and the dev-run log dir. sudo
