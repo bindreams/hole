@@ -1,66 +1,38 @@
 //! Tripwire: per-variant [`StaleKeyPolicy`] policy lives on the type.
 //!
-//! The rule — *a decision keyed to an enum variant belongs in ONE
-//! exhaustive match on that type*
-//! (docs/contributing/architecture/kill-switch.md#the-decisions) — is already
-//! test-enforced for `SessionEvent` and `CoverPresence`
-//! (`crates/bridge/src/reconciler_tests.rs`), after that shape produced four
-//! separate bugs in one change. `StaleKeyPolicy` is the
-//! third enum with the same exposure and the same consequence: a site that
-//! writes `== StaleKeyPolicy::Fail` silently groups any future variant with
-//! `Degrade`, which is the fail-OPEN arm — it keeps a stale filter rather than
-//! aborting the engage. Both of `add_filter`'s were exactly that shape.
+//! The rule, that a decision keyed to an enum variant belongs in one exhaustive match on that type
+//! (docs/contributing/architecture/kill-switch.md#the-decisions), is test-enforced for `SessionEvent` and
+//! `CoverPresence` (`crates/bridge/src/reconciler_tests.rs`) and here. A site that writes `== StaleKeyPolicy::Fail`
+//! silently groups any future variant with `Degrade`, the fail-open arm, which keeps a stale filter rather than
+//! aborting the engage.
 //!
-//! An exhaustive `match` on the type is not the hazard and is not what this
-//! forbids: a third variant is a compile error there, which is the whole point.
-//! What it forbids is DECIDING from one variant by comparison — `==`, `!=`,
-//! `matches!`, a lone match arm, an `if let`/`while let`/let-else, an
-//! `assert_eq!`/`assert_ne!`, a `PartialEq` method — outside the type's own
-//! `impl`.
+//! An exhaustive `match` on the type is not the hazard: a third variant is a compile error there. What this forbids is
+//! deciding from one variant by comparison (`==`, `!=`, `matches!`, a lone match arm, an `if let`/`while let`/let-else,
+//! `assert_eq!`/`assert_ne!`, a `PartialEq` method) outside the type's own `impl`.
 //!
-//! `#[cfg]`-free on purpose, for the reason `clearance_tests` and
-//! `boot_time_tripwire_tests` both give: `StaleKeyPolicy` is Windows-only, this
-//! is a source scan that needs no FWPM, and a guard that runs only where the
-//! hazard lives runs nowhere else.
+//! `#[cfg]`-free: `StaleKeyPolicy` is Windows-only, but this is a source scan that needs no FWPM, and a guard that runs
+//! only where the hazard lives runs nowhere else.
 //!
 //! ## Disclosed residuals
 //!
-//! It is a LINE scan over a FIXED set of deciding tokens, so it sees a
-//! decision only where the variant path and one of those tokens are both
-//! reachable from one line. Four classes are handled explicitly because an
-//! ordinary edit produces them, each with its own fixture: a decision rustfmt
-//! wrapped ([`is_bare_variant`]); a comparison spelled as an assertion or a
-//! `PartialEq` method rather than an operator ([`line_decides`]); a variant
-//! import or a RENAME of the type ([`renames_the_type`]), both flagged at the
-//! binding since the spend is then written under a name this scan's literal
-//! does not contain; and an `impl` nested in a `mod`, whose exemption is
-//! bounded by its own indentation ([`item_span`]).
+//! It is a line scan over a fixed set of deciding tokens. Four classes are handled explicitly, each with a fixture: a
+//! decision rustfmt wrapped ([`is_bare_variant`]); a comparison spelled as an assertion or a `PartialEq` method
+//! ([`line_decides`]); a variant import or a rename of the type ([`renames_the_type`]); and an `impl` nested in a
+//! `mod`, whose exemption is bounded by its own indentation ([`item_span`]).
 //!
-//! What it still does NOT see, stated as the list it is rather than as one
-//! example:
+//! What it does not see:
 //!
-//! * **Binding the variant to a local** (`let fail = StaleKeyPolicy::Fail; …
-//!   if policy == fail`) puts the decision on a line naming neither the type
-//!   nor the variant. Separating that from a legitimate construction is
-//!   dataflow, not lexing.
-//! * **A comparison performed by a callable the token list does not name** —
-//!   `[StaleKeyPolicy::Fail].contains(&p)`, a helper of one's own taking two
-//!   policies. The list is extended by adding to it, never by inference, so
-//!   every spelling outside it is invisible by construction.
-//! * **An `impl` whose body shares a line with its head**
-//!   (`impl StaleKeyPolicy { fn … }`) has no closing brace at its own
-//!   indentation, so its exemption runs to the next one that is — rustfmt does
-//!   not produce this shape, and nothing here would catch it if something did.
+//! * Binding the variant to a local (`let fail = StaleKeyPolicy::Fail; … if policy == fail`), which is dataflow, not
+//!   lexing.
+//! * A comparison by a callable the token list does not name (`[StaleKeyPolicy::Fail].contains(&p)`, a helper taking
+//!   two policies). The list is extended by adding to it, never by inference.
+//! * An `impl` whose body shares a line with its head: its exemption runs to the next closing brace at its indentation.
+//!   rustfmt does not produce this shape.
 //!
-//! What stands behind all three is the same thing that stands behind the other
-//! two enums' guards — review, and the fact that the indirection has to be
-//! written on purpose.
-//!
-//! It is also STRUCTURAL: it proves where the rule lives, never what the rule
-//! says. That `Fail` aborts and `Degrade` warns is behaviour, and is tested as
-//! behaviour in `windows_tests`
-//! (`a_refused_pre_delete_fails_a_lockdown_engage_and_degrades_a_transient_one`)
-//! — on the Windows lane only, because it needs the type.
+//! What stands behind these is review, and the fact that the indirection has to be written on purpose. The scan is also
+//! structural: it proves where the rule lives, not what it says. That `Fail` aborts and `Degrade` warns is tested as
+//! behaviour in `windows_tests` (`a_refused_pre_delete_fails_a_lockdown_engage_and_degrades_a_transient_one`), on the
+//! Windows lane only.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -78,9 +50,8 @@ use std::path::{Path, PathBuf};
 /// The assertion and method spellings carry no operator at all:
 /// `assert_eq!`/`assert_ne!` (and so the `debug_assert_*` pair that contains
 /// them) and `PartialEq`'s own `eq`/`ne`, reached as a method or as a path.
-/// `debug_assert!(… || policy == StaleKeyPolicy::Fail, …)` is the line this
-/// change removed from `add_filter`, and `debug_assert_eq!` is its obvious
-/// tidy-up.
+/// `debug_assert!(… || policy == StaleKeyPolicy::Fail, …)` is the form `add_filter` must not take, and
+/// `debug_assert_eq!` is its obvious tidy-up.
 fn line_decides(line: &str) -> bool {
     let t = line.trim();
     t.contains("=>")
@@ -288,9 +259,8 @@ fn stale_key_policy_lives_on_the_type_not_at_call_sites() {
 
 #[skuld::test]
 fn the_guard_fires_on_a_call_site_and_stays_quiet_inside_the_type() {
-    // Non-vacuity, asserted against the scan rather than by mutating a real
-    // source. The first block is what `add_filter` looked like before this
-    // landed; the second is the exhaustive match that must stay legal.
+    // Non-vacuity, asserted against the scan rather than by mutating a real source. The first block is the shape
+    // `add_filter` must not take; the second is the exhaustive match that must stay legal.
     let offending = "\
 fn add_filter(policy: StaleKeyPolicy) {
     debug_assert!(boot_time || policy == StaleKeyPolicy::Fail);
@@ -390,9 +360,8 @@ fn the_guard_sees_a_second_name_bound_to_the_type() {
 
 #[skuld::test]
 fn the_guard_sees_a_comparison_written_as_an_assertion_or_a_method() {
-    // `debug_assert!(… || policy == StaleKeyPolicy::Fail, …)` is the literal
-    // line this change replaced, and `debug_assert_eq!` is its obvious tidy-up
-    // — a form with no `==` in it at all. The method forms are the same
+    // `debug_assert!(… || policy == StaleKeyPolicy::Fail, …)` is the form `add_filter` must not take, and
+    // `debug_assert_eq!` is its obvious tidy-up, a form with no `==` in it at all. The method forms are the same
     // comparison spelled through `PartialEq` instead of an operator.
     let asserted = "\
 fn f(p: StaleKeyPolicy) {
@@ -416,8 +385,7 @@ fn f(p: StaleKeyPolicy) -> bool {
 fn an_exemption_cannot_drift_past_the_impl_it_is_anchored_to() {
     // `item_span` bounds on the type's OWN column-0 closing brace. Without
     // that, an exemption anchored at the `impl` would swallow every decision
-    // site below it in the file — which on `windows.rs` is both of the ones
-    // this change removed.
+    // site below it in the file, which on `windows.rs` includes `add_filter`'s.
     let src = "\
 impl StaleKeyPolicy {
     fn refuses_a_stale_key(self) -> bool {

@@ -1,20 +1,20 @@
 //! The two pf cover records (`bridge-failclosed.json`, `bridge-lockdown-pf.json`) as one generic module.
 //!
-//! Mutators ([`swap`], [`clear_if_token`]) take `&CoverLock`, readers ([`read`]) take a path, and nothing outside the
+//! Mutators ([`swap`], [`clear_if_token`]) take `&CoverLock`, readers ([`read`]) take a path. Nothing outside the
 //! process writes these records while a bridge runs (`hole bridge unlock`, the uninstall and the cutover run under
-//! `BridgeLiveness`). So no function here
-//! compares what a caller read against what is on disk: there is no concurrent party for the compare to catch.
-//! What a record still guards is a failure a sequential order reaches. A release whose restore failed, or whose clear
-//! could not write, leaves a record, so a later engage that overwrites it must drop the token it names ([`swap`]). A
-//! clear by a party whose token a later engage displaced must not remove the newer record ([`clear_if_token`]). A
-//! record that cannot be read is neither absent nor removable ([`StateFile::Unreadable`], [`Cleared::Kept`]).
+//! `BridgeLiveness`), so no function here compares what a caller read against what is on disk.
 //!
-//! **A record names only a token Hole holds.** pf hands a freed token's value to the next `pfctl -E` of any app, so a
-//! record that still names a token Hole dropped would have a later `pfctl -X` release another app's reference. The
-//! order that keeps it: a release whose restore held clears the record ([`clear_if_token`]) and drops the token only
-//! when that removed it. A clear that finds another token, nothing, or a record it cannot read leaves the token
-//! undropped: a displaced token was dropped by the engage that displaced it, and a failed write leaves the record
-//! naming a token still held. A release whose restore failed touches neither record nor token.
+//! What a record still guards is a failure a sequential order reaches:
+//!
+//! - A release whose restore failed, or whose clear could not write, leaves a record, so a later engage that
+//!   overwrites it must drop the token it names ([`swap`]).
+//! - A clear by a party whose token a later engage displaced must not remove the newer record ([`clear_if_token`]).
+//! - A record that cannot be read is neither absent nor removable ([`StateFile::Unreadable`], [`Cleared::Kept`]).
+//!
+//! A record names only a token Hole holds: pf hands a freed token's value to the next `pfctl -E` of any app, so a
+//! later `pfctl -X` on a stale name would release another app's reference. A release whose restore held clears the
+//! record and drops the token only when that clear removed it; a release whose restore failed touches neither
+//! (docs/contributing/architecture/kill-switch-macos.md#release).
 
 use std::path::Path;
 
