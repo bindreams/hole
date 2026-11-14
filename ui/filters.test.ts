@@ -280,9 +280,8 @@ describe("external re-renders", () => {
   });
 });
 
-// Merged from main's filters.test.ts (#482) — persist-chain, edit-switching,
-// drag-cancel, and abandoned-rule coverage, adapted to this file's fixture
-// (3 rules: *, example.com, 10.0.0.0/8) and mock names.
+// Persist-chain, edit-switching, drag-cancel, and abandoned-rule coverage,
+// against this file's fixture (3 rules: *, example.com, 10.0.0.0/8).
 
 describe("reload_proxy_filters on mutation", () => {
   it("deleting a rule saves and reloads the live proxy", async () => {

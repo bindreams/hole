@@ -1,4 +1,4 @@
-// Capability indicators (#470): two sidebar dots showing whether the current
+// Capability indicators: two sidebar dots showing whether the current
 // connection supports UDP proxying and IPv6 bypass. Informational only — they
 // gate no connection logic. Fed every status poll.
 

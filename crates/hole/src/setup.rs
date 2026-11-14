@@ -144,7 +144,7 @@ impl InstallPrompt {
         }
     }
 
-    /// The connect's failure when it may not prompt (unattended startup).
+    /// The connect's failure when it may not prompt (unattended).
     pub fn unattended_error(self) -> &'static str {
         match self {
             InstallPrompt::Install => "The Hole bridge is not installed.",
@@ -665,51 +665,38 @@ pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Err
 }
 
 /// `uninstall_bridge`'s ordering, with the five effects injected so tests can
-/// drive it without touching SCM/launchd or the host firewall.
+/// drive it without touching SCM/launchd or the host firewall. The reasons for
+/// the order are in `docs/contributing/architecture/kill-switch-uninstall.md`.
 ///
-/// **The uninstall holds the start-type lock for its whole run.** `hold` is
-/// taken before the stop and kept until this returns, so no repair or enable
-/// runs between the stop's restore and the delete, and the delete never
-/// discards a start type that one just set. The steps take the lock themselves;
-/// the thread running them already owns it, so they proceed. A lock that cannot
-/// be taken skips the stop and the deregistration, leaving the service as it
-/// is, and fails the uninstall; the release below does not touch the start type
-/// and still runs.
-///
-/// **Stop, deregister, release — and the stop is gated on nothing.** Whether a
-/// bridge is running and whether a registration record still names it are
-/// independent facts; the fail-closed covers are held by the live process, not
-/// by the record. Gating the stop on a registration record made the two look like one,
-/// and a lost record then skipped the teardown that would have stopped the
-/// bridge — whose liveness lock refuses the release forever. A service marked
-/// for deletion still opens, and a stop reaches it through its handle. macOS has
-/// the plist deleted over a still-loaded job. `has_anything_to_uninstall` gates only the deregistration.
-///
-/// **Deregistration requires a confirmed stop.** The registration is the only
-/// handle a later attempt has, so a stop that could not be confirmed leaves it
-/// alone: the uninstall fails, and the next one still has something to work
-/// with. The platform `uninstall()`s enforce the same rule at their own level.
-///
-/// **The release is unconditional** — never gated on `has_anything_to_uninstall`, never
-/// skipped because an earlier step failed. Cover existence is independent of
-/// service registration: the Windows filters are keyed on compile-time GUIDs
-/// and are machine-wide, so a lost registration (a failed install, `sc delete`,
-/// an aborted prior uninstall) must not turn the release into a no-op over a
-/// live block. It is also the one failure worth being loud about — the MSI runs
-/// it `Return="check"` so a failed release aborts before `RemoveFiles` deletes
-/// the only binary that could remove a persistent WFP filter
-/// (bindreams/hole#1003). Releasing against a bridge this run failed to stop is
-/// safe by construction: `release_covers` holds that bridge's liveness lock and
-/// refuses rather than desyncing its posture.
-///
-/// **Every failure surfaces.** The steps do not short-circuit each other, and
-/// the report names all of them — an early `?` on the release would have
-/// swallowed the stop or deregister error that explains why it refused.
-///
-/// `keep_covers` skips the release entirely. Its one caller is the MSI, whose
-/// major-upgrade path (`RemoveExistingProducts`) must tear the old service down
-/// so its image can be replaced WITHOUT disarming the kill switch: the standing
-/// cover is what holds the update-cutover gap, and the new bridge re-adopts it.
+/// - **The start-type lock is held for the whole run.** `hold` is taken before
+///   the stop and kept until this returns, so no repair or enable runs between
+///   the stop's restore and the delete. The steps take the lock themselves; the
+///   thread running them already owns it, so they proceed. A lock that cannot
+///   be taken skips the stop and the deregistration, leaving the service as it
+///   is, and fails the uninstall; the release does not touch the start type and
+///   still runs.
+/// - **The stop is gated on nothing.** `has_anything_to_uninstall` gates only
+///   the deregistration.
+/// - **Deregistration requires a confirmed stop.** An unconfirmed stop leaves
+///   the registration alone and fails the uninstall. The platform
+///   `uninstall()`s enforce the same rule at their own level.
+/// - **The release is unconditional**: never gated on
+///   `has_anything_to_uninstall`, never skipped because an earlier step failed.
+///   The MSI does not reach this release: it passes `keep_covers` and releases
+///   through its separate `bridge release-covers` action, which is
+///   `Return="check"`, so a failed release aborts the uninstall before
+///   `RemoveFiles` deletes the only binary that could remove a persistent WFP
+///   filter. Releasing against a bridge this run failed to stop
+///   is safe: that bridge holds its liveness lock, so `release_covers` cannot
+///   take it and refuses rather than desyncing the bridge's posture.
+/// - **Every failure surfaces.** The steps do not short-circuit each other and
+///   the report names all of them.
+/// - **`keep_covers` skips the release entirely.** Its one caller is the MSI,
+///   on every removal. On an uninstall its `bridge release-covers` action
+///   releases instead. On a major upgrade (`RemoveExistingProducts`) nothing
+///   releases: the old service is torn down so its image can be replaced, the
+///   standing cover holds the update-cutover gap, and the new bridge re-adopts
+///   it.
 fn uninstall_bridge_with<Hold>(
     keep_covers: bool,
     hold: impl FnOnce() -> std::io::Result<Hold>,

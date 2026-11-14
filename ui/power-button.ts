@@ -25,8 +25,8 @@ let powerBtn: HTMLElement | null = null;
 let statusWord: HTMLElement | null = null;
 // Id of the in-progress connect attempt. Minted when leaving idle to connect
 // and reused for the Cancel fired during that attempt's spinner, so the bridge
-// scopes the cancel to exactly this start and a stale arm can't kill a later one
-// (#465). Module-scoped because start and cancel are two separate clicks.
+// scopes the cancel to exactly this start and a stale arm can't kill a later one.
+// Module-scoped because start and cancel are two separate clicks.
 let currentAttemptId = "";
 
 /// Fences stale transition continuations: a Tauri invoke() can't be aborted, so
@@ -114,9 +114,9 @@ export function initPowerButton(): void {
 }
 
 /// The seq of the newest applied observation. Observations arrive on two
-/// unordered channels (the 5s poll and `proxy-state-changed` events);
+/// unordered channels (the status poll and `proxy-state-changed` events);
 /// applying them monotonically by the backend's commit seq means an
-/// out-of-order arrival can never render an older state (#462).
+/// out-of-order arrival can never render an older state.
 let lastAppliedSeq = -1;
 
 /**
@@ -163,7 +163,7 @@ export function applyProxyStateObservation(
     return { state: currentState, changed: false };
   }
   setState(polled);
-  // Exactly-once death cue (#470): a genuine on->off transition carrying a
+  // Exactly-once death cue: a genuine on->off transition carrying a
   // reason. The seq gate fires this once per death seq across BOTH channels
   // (poll + event), `isEffectivelyOn(prior)` excludes connection-failed and
   // startup-into-dead, and `error` is non-null only on an out-of-band death

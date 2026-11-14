@@ -54,7 +54,7 @@ fn successor_env(show_dashboard: bool) -> Option<&'static str> {
 /// read our identity (the `READY` line). The caller exits next, at which point
 /// the successor's wait fires.
 ///
-/// The wire protocol is unchanged and must stay so: `spawn_successor` can spawn
+/// The wire protocol must not change: `spawn_successor` can spawn
 /// an OLDER image (a rollback), so `HOLE_AWAIT_EXIT_PID` keeps its name and its
 /// bare-decimal-pid value and the successor still writes the literal `READY`.
 pub fn spawn_successor(canonical: &Path, show_dashboard: bool) -> std::io::Result<()> {

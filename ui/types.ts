@@ -92,7 +92,7 @@ export interface Config {
 export type UiServer = Omit<Server, "validation">;
 
 /// The settings payload `save_config` accepts. Mirrors the Rust
-/// `UiSettings` (#462): backend-owned state (`enabled`,
+/// `UiSettings`: backend-owned state (`enabled`,
 /// `elevation_prompt_shown`, `servers[].validation`) is not part of the
 /// wire type, and the backend rejects unknown keys — send exactly this.
 export interface UiSettings {
@@ -113,7 +113,7 @@ export interface UiSettings {
 /// A filter rule the bridge compiled and DROPPED (not enforced). `index` is
 /// the rule's position in the submitted ruleset, 1:1 with `config.filters`
 /// (incl. the default rule at index 0). Mirrors the Rust `InvalidFilter` in
-/// `crates/common/src/protocol.rs` (#470).
+/// `crates/common/src/protocol.rs`.
 export interface InvalidFilter {
   index: number;
   error: string;
@@ -123,11 +123,11 @@ export interface ProxyStatus {
   running: boolean;
   /// Commit seq of the backend's ProxyStateCell at response time. The
   /// frontend applies observations monotonically by this value; see
-  /// `applyProxyStateObservation` in `ui/power-button.ts` (#462).
+  /// `applyProxyStateObservation` in `ui/power-button.ts`.
   state_seq: number;
   uptime_secs: number;
   /// Reason for the most recent running transition, when the bridge reported
-  /// one (#470). Non-null only on an out-of-band death (the path-free
+  /// one. Non-null only on an out-of-band death (the path-free
   /// sentinel); drives the exactly-once death toast.
   error: string | null;
   /// Filter rules the bridge rejected and is NOT enforcing. `null` when the

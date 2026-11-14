@@ -263,7 +263,7 @@ async function selectServer(id: string) {
 
 /** Delete a server by ID. Removal is a dedicated by-id backend op
  * (`delete_server`), never a wholesale `save_config` — that would drop
- * servers imported concurrently (#504). The optimistic local removal gives
+ * servers imported concurrently. The optimistic local removal gives
  * instant feedback; the trailing `loadConfig` reconciles with backend truth
  * (concurrent imports, healed selection) and, on failure, restores the server
  * the optimistic removal hid. */

@@ -208,7 +208,7 @@ fn commit_clears_blocked_on_a_settled_running_edge() {
     );
 }
 
-// error field (#470) ==================================================================================================
+// error field =========================================================================================================
 
 #[skuld::test]
 fn commit_status_carries_error_on_death() {
@@ -408,7 +408,7 @@ fn observed_running_update_in_progress_holds_snapshot() {
     let ok: Result<BridgeResponse, ClientError> = Ok(status_resp(true));
     assert_eq!(observed_running(ReqKind::Status, &ok, true), Some(true));
     // A reachable Ok{running:false} DURING a cutover is masked (held), but flips
-    // to Disconnected once the marker is gone (Step 6b).
+    // to Disconnected once the marker is gone.
     let ok_false: Result<BridgeResponse, ClientError> = Ok(status_resp(false));
     assert_eq!(observed_running(ReqKind::Status, &ok_false, true), None, "masking");
     assert_eq!(
@@ -1287,7 +1287,7 @@ async fn a_swept_marker_retracts_the_failed_update() {
 fn a_driver_record_from_a_foreign_platform_is_unassessed() {
     // Restorable-looking, but refused by `ProcessId::try_from` — so the probe
     // has nothing to assess. A fallback to the record's bare pid would answer
-    // Alive or Dead. This is where the deleted `0` sentinel's job now lives.
+    // Alive or Dead; the resolver answers `Unknown`.
     let mut driver = cosca::identity::ProcessId::current()
         .to_record()
         .expect("persist this process's identity");
