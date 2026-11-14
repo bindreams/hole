@@ -1,4 +1,4 @@
-//! TUN write path, extracted from `Driver::flush_to_tun`.
+//! The TUN write path behind `Driver::flush_to_tun`.
 //!
 //! `poll_write` on a real TUN device is the loop's only await the OS can
 //! hold `Pending` indefinitely: on unix, `tun`'s `AsyncFd`-backed

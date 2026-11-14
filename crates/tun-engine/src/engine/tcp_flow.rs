@@ -21,8 +21,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::PollSender;
 
-/// Channel capacity for the driver ↔ handler data path. Sized to roughly
-/// match a TCP window (~64 KiB at 1400 MTU ≈ 46 segments).
+/// Capacity, in messages, of each channel on the driver ↔ handler data path.
 const CHANNEL_CAPACITY: usize = 64;
 
 /// Async read/write adapter backed by mpsc channels. The engine's driver

@@ -60,7 +60,7 @@ impl Device {
     ///
     /// **Windows ownership check happens BEFORE the adapter is created** —
     /// see `crate::device::identity`'s module doc for the full argument.
-    /// `tun` 0.8.13 opens an existing adapter before falling back to create,
+    /// `tun` opens an existing adapter before falling back to create,
     /// so without this a pre-existing `hole-tun` left by a crashed run would
     /// be silently adopted. A pre-existing adapter that isn't ours refuses
     /// with `DeviceError::ForeignAdapter`, having written and engaged
@@ -87,13 +87,10 @@ impl Device {
                     return Err(DeviceError::InvalidConfig("tun_name is required"));
                 }
             }
-            // Only macOS's `utun` driver actually grants a kernel-assigned
-            // name (see `TunName`'s doc); refusing it here, uniformly on
-            // every other platform, is what keeps the Windows ownership
-            // probe below and `resolve_identity`'s read-back arm from ever
-            // running on a config they were never meant to see — a runtime
-            // check the type itself no longer encodes now that the variant
-            // exists everywhere.
+            // Only macOS's `utun` driver grants a kernel-assigned name (see
+            // `TunName`); refusing it on every other platform keeps the Windows
+            // ownership probe and `resolve_identity`'s read-back arm from
+            // seeing a config they cannot handle.
             TunName::KernelAssigned => {
                 if !cfg!(target_os = "macos") {
                     return Err(DeviceError::InvalidConfig(
@@ -111,13 +108,10 @@ impl Device {
 
         let config = c.freeze();
 
-        // Pre-create ownership check (Windows only — see the module doc on
-        // `identity` for why this MUST run before `create_as_async`, never
-        // after). `TunName` has both variants on every platform now, so this
-        // destructure is genuinely refutable here — but the validation match
-        // above already turned `KernelAssigned` into `InvalidConfig` on every
-        // non-macOS platform, so by the time this line runs on Windows the
-        // `KernelAssigned` arm is unreachable, not merely unlikely.
+        // Pre-create ownership check (Windows only; it must run before
+        // `create_as_async`, see the module doc on `identity`). The validation
+        // above already rejected `KernelAssigned` off macOS, so that arm is
+        // unreachable here.
         #[cfg(target_os = "windows")]
         {
             let TunName::Requested(requested_name) = &config.tun_name else {
@@ -145,9 +139,8 @@ impl Device {
 
         let tun = tun::create_as_async(&tun_config).map_err(|e| DeviceError::TunOpen(std::io::Error::other(e)))?;
 
-        // Nothing is verified after the open — see the module doc on
-        // `identity` for why a post-hoc check would be a permanent-refusal
-        // hazard. The LUID comes from the concrete device this call just
+        // Nothing is verified after the open (see the module doc on
+        // `identity`). The LUID comes from the concrete device this call just
         // opened, never a name lookup.
         #[cfg(target_os = "windows")]
         let luid = {
@@ -209,7 +202,7 @@ impl Device {
 
     /// The identity of the adapter this call opened — see
     /// `crate::device::identity`'s module doc. Used by `Dispatcher::new` to
-    /// set the tunnel's interface metric (#846) and threaded through to
+    /// set the tunnel's interface metric and threaded through to
     /// `Dns::apply` and (Windows) `dns_confine::engage`.
     pub fn identity(&self) -> &TunIdentity {
         &self.identity
@@ -225,25 +218,16 @@ impl Device {
 
 /// Assemble the `tun::Configuration` [`Device::build`] hands to
 /// `tun::create_as_async` — name, MTU, IPv4 address/netmask, and (Windows)
-/// the requested adapter GUID. Extracted so
-/// `config::config_tests::build_requests_the_hole_adapter_guid` exercises
-/// this exact function instead of a re-executed copy of the same lines,
-/// which would stay green through a regression in `Device::build` itself.
+/// the requested adapter GUID. A separate function so a test can call it directly.
 fn build_tun_configuration(config: &DeviceConfig) -> tun::Configuration {
     let mut tun_config = tun::Configuration::default();
     match &config.tun_name {
         TunName::Requested(name) => {
             tun_config.tun_name(name);
         }
-        // Leave `tun::Configuration::tun_name` unset. macOS's `Device::new`
-        // reads an unset name as `sc_unit: 0`, which asks the kernel to
-        // assign the next free `utunN` instead of parsing a name we don't
-        // have (`tun-0.8.13/src/platform/macos/device.rs:81-91`). Reached
-        // only on macOS in practice — `Device::build`'s validation rejects
-        // `KernelAssigned` everywhere else before this function is called —
-        // but the match itself must be exhaustive on every platform now
-        // that the variant exists everywhere, and leaving the name unset is
-        // harmless even if that invariant were ever violated.
+        // Leave `tun::Configuration::tun_name` unset: macOS's `Device::new`
+        // reads an unset name as `sc_unit: 0`, which asks the kernel for the
+        // next free `utunN`. `Device::build` rejects this variant off macOS.
         TunName::KernelAssigned => {}
     }
     tun_config.mtu(config.mtu).up();

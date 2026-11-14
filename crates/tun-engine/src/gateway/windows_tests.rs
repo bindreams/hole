@@ -21,7 +21,7 @@ struct OracleRoute {
 /// it is an independent *implementation* of the selection rather than a
 /// reimplementation of the *policy* — sorting `Get-NetRoute` by metric in
 /// PowerShell would be the latter, and reimplementing route selection outside
-/// the OS is the mistake bindreams/hole#798 is made of. It proves we read the
+/// the OS is the mistake the `default-net` lookup made. It proves we read the
 /// right fields off the right row; it cannot prove the selection itself.
 ///
 /// It emits TWO objects: the source `NetIPAddress` (no `DestinationPrefix`) and
@@ -170,10 +170,9 @@ fn gateway_global_net_state_interface_alias_matches_get_netadapter_name() {
             checked += 1;
         }
     }
-    // Both `if let`s above are real skip conditions on SOME hosts, but this
-    // box (and every unprivileged CI runner) always has a default route
-    // through a real NIC — if neither ever ran, the oracle query broke, not
-    // the environment.
+    // Both `if let`s above are real skip conditions on SOME hosts, but a
+    // developer box or CI runner always has a default route through a real NIC:
+    // if neither ever ran, the oracle query broke, not the environment.
     assert!(
         checked > 0,
         "no default route through a real NIC was found to compare against — the oracle is broken, not this host"

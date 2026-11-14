@@ -58,9 +58,7 @@ pub fn encode_socks5_udp(dst: SocketAddr, domain: Option<&str>, payload: &[u8]) 
 ///
 /// If the datagram's ATYP is `Domain` (0x03), the returned `SocketAddr`
 /// carries `IpAddr::V4(Ipv4Addr::UNSPECIFIED)` (i.e. `0.0.0.0`) as a
-/// sentinel — callers must NOT use it as a connect target. A richer
-/// return type distinguishing IP vs Domain is tracked as a follow-up
-/// (bindreams/hole#229).
+/// sentinel — callers must NOT use it as a connect target.
 pub fn decode_socks5_udp(data: &[u8]) -> Option<(SocketAddr, usize)> {
     // Minimum: RSV(2) + FRAG(1) + ATYP(1) + addr(4 for IPv4) + port(2) = 10
     if data.len() < 10 {
@@ -185,8 +183,8 @@ impl Socks5UdpRelay {
             }
         };
 
-        // Replace 0.0.0.0 with localhost (shadowsocks-rust returns 0.0.0.0
-        // when it means "same host as the control connection").
+        // Replace 0.0.0.0 with the proxy's own address (shadowsocks-rust returns
+        // 0.0.0.0 when it means "same host as the control connection").
         let relay_addr = if relay_addr.ip().is_unspecified() {
             SocketAddr::new(proxy.ip(), relay_addr.port())
         } else {

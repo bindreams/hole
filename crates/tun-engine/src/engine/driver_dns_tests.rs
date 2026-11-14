@@ -1,13 +1,11 @@
 //! The `DnsInterceptor` hook.
 //!
-//! This is generic `tun-engine` API — **Hole registers no `DnsInterceptor`**
+//! This is generic `tun-engine` API: **Hole registers no `DnsInterceptor`**
 //! (`crates/bridge/src/dispatcher.rs` builds the engine with the default
 //! `dns_interceptor: None`). Hole's own UDP/53 divert is `HoleRouter`'s
-//! `local_dns` slot, proved unprivileged in `hole_router_dispatch_tests.rs`.
-//! Without this paragraph, a green file named
-//! `driver_dns_tests` would read as coverage of Hole's DNS path — it is not.
-//! What it pins is the hook itself, for any future `tun-engine` consumer
-//! that registers one.
+//! `local_dns` slot, proved unprivileged in `hole_router_dispatch_tests.rs`, so
+//! this file is not coverage of Hole's DNS path. It pins the hook itself, for
+//! any `tun-engine` consumer that registers one.
 
 use std::sync::Arc;
 

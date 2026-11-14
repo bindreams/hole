@@ -52,7 +52,7 @@ async fn a_tun_read_error_ends_the_run_loop() {
     h.wire.fail_next_read(io::ErrorKind::Other);
 
     // Rendezvous: joining IS the observable. This is the driver's live exit
-    // path (`tun-0.8.13` never produces `Ok(0)`, only `Err`) — contrast
+    // path (`tun` never produces `Ok(0)`, only `Err`) — contrast
     // `dropping_the_wire_reports_eof_to_the_engine_side` in `wire_tests.rs`,
     // which pins only the simulator's own EOF contract.
     let _ = h.join().await;
