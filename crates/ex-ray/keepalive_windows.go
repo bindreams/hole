@@ -2,9 +2,11 @@ package main
 
 import "golang.org/x/sys/windows"
 
-// Windows exposes the three timings as ordinary setsockopt options from build
-// 10.0.16299; below that they are rejected and Go's stdlib falls back to
-// SIO_KEEPALIVE_VALS. Hole's installer refuses anything below build 19041
+// setTCPKeepAlive enables SO_KEEPALIVE on the socket fd and sets the idle,
+// interval and probe-count options from p. Windows exposes the three timings as
+// ordinary setsockopt options from build 10.0.16299; below that they are
+// rejected (Go's stdlib falls back to SIO_KEEPALIVE_VALS) and this returns an
+// error. Hole's installer refuses anything below build 19041
 // (msi-installer/src/msi_installer/hole.wxs), so no installed build can reach
 // the rejection.
 func setTCPKeepAlive(fd uintptr, p keepAliveParams) error {

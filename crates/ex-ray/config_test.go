@@ -19,20 +19,17 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
-// sentinelTestError is a distinct, named error type (unlike errors.New's
-// unexported concrete type) so errors.As below can prove it retrieves
-// this SPECIFIC underlying cause, not just any error in the chain --
-// errors.As against a bare `error`-typed target would trivially match
-// err itself without ever exercising Unwrap().
+// sentinelTestError is a named error type so errors.As can show it retrieves
+// this specific cause: a bare `error` target would match err itself without
+// calling Unwrap.
 type sentinelTestError struct{ msg string }
 
 func (e *sentinelTestError) Error() string { return e.msg }
 
-// redactedError exists specifically to let errors.Is/errors.As see through
-// to cause (needed by TestBuildV2RayMissingCertIsNotBindConflict's
-// fs.ErrNotExist check) while keeping Error() limited to msg. Both halves
-// of that contract are pinned directly here, not just exercised
-// incidentally through the sites that use it.
+// TestRedactedErrorUnwrapsToCauseWithoutEchoingItsText pins both halves of
+// redactedError's contract: Unwrap exposes the cause (which
+// TestBuildV2RayMissingCertIsNotBindConflict relies on for its fs.ErrNotExist
+// check) and Error() returns only msg.
 func TestRedactedErrorUnwrapsToCauseWithoutEchoingItsText(t *testing.T) {
 	cause := &sentinelTestError{msg: "cause text: SUPERSECRETVALUE"}
 	err := &redactedError{msg: "redacted", cause: cause}
@@ -74,10 +71,8 @@ func TestUint32OptInRange(t *testing.T) {
 }
 
 func TestUint32OptOutOfRange(t *testing.T) {
-	// tooBig is evaluated in int context; this relies on int being 64-bit (true
-	// for all six CI targets). A hypothetical 32-bit port would make this
-	// constant overflow int at compile time — an intentional tripwire, not a
-	// silent bug.
+	// tooBig is evaluated as an int, so this relies on int being 64-bit. A 32-bit
+	// port would fail to compile here, deliberately.
 	const tooBig = math.MaxUint32 + 1
 	cases := []struct {
 		name string
@@ -108,11 +103,10 @@ func withFlags(t *testing.T, muxV, fwmarkV int, serverV bool) func() {
 	return func() { *mux, *fwmark, *server = origMux, origFwmark, origServer }
 }
 
-// generateConfig validates mux/fwmark *before* the server/client split, so an
-// out-of-range value must be rejected identically in BOTH modes — the "uniform
-// validation" invariant. A future refactor that pushed validation back down
-// into the client-only cast site would silently regress server mode (where a
-// negative mux still flips connectionReuse); this test guards against that.
+// generateConfig validates mux and fwmark before the server/client split, so an
+// out-of-range value must be rejected identically in both modes. Validation moved
+// into the client-only cast site would regress server mode, where a negative mux
+// still flips connectionReuse.
 func TestGenerateConfigRejectsOutOfRange(t *testing.T) {
 	cases := []struct {
 		desc      string
@@ -141,8 +135,8 @@ func TestGenerateConfigRejectsOutOfRange(t *testing.T) {
 	}
 }
 
-// The Hole default (mux=1, fwmark=0) and any in-range value must build a config
-// without error in both modes — proves the hardening adds no false rejections.
+// The flag defaults must build a config without error in both modes, so the
+// range validation adds no false rejections.
 func TestGenerateConfigAcceptsValidDefaults(t *testing.T) {
 	for _, srv := range []bool{false, true} {
 		restore := withFlags(t, 1, 0, srv)
@@ -154,9 +148,8 @@ func TestGenerateConfigAcceptsValidDefaults(t *testing.T) {
 	}
 }
 
-// withEchFlags saves the ech/ech-doh globals, applies values, returns a restore
-// func for defer. parseOptsIntoFlags + generateConfig read these pointers, so
-// tests must leave them as they found them. Mirrors withFlags.
+// withEchFlags saves the ech and ech-doh globals, applies values, and returns a
+// restore func for defer. Mirrors withFlags.
 func withEchFlags(t *testing.T, modeV, dohV string) func() {
 	t.Helper()
 	origMode, origDoh := *echMode, *echDoh
@@ -187,11 +180,8 @@ func TestParseOptsIntoFlagsEch(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.desc, func(t *testing.T) {
-			// withEnv's snapshot must run before withEchFlags mutates
-			// echMode/echDoh, so its t.Cleanup restore (which runs after
-			// this func's own defers) captures the true pre-subtest state.
-			// withEchFlags's own returned restore func is deliberately left
-			// undeferred for the same reason.
+			// withEnv snapshots first, so its t.Cleanup restores the true pre-subtest
+			// state; withEchFlags's restore func is deliberately not deferred.
 			withEnv(t, c.opts)
 			withEchFlags(t, "auto", "")
 			if err := parseOptsIntoFlags(); err != nil {
@@ -254,22 +244,18 @@ func TestBuildTLSConfigEch(t *testing.T) {
 	}
 }
 
-// A client-side pinned CA (certRaw, here) must set DisableSystemRoot on
-// Windows -- otherwise config_windows.go's getCertPool never applies the
-// pin at all and verification silently falls back to the system root
-// pool. Portable across CI platforms: asserts true on Windows, false
-// elsewhere (config_other.go already applies a supplied cert without the
-// flag, so setting it there is a separate, not-made-here decision).
+// A client-side pinned CA (certRaw, here) must set DisableSystemRoot on Windows,
+// where config_windows.go's getCertPool would otherwise ignore the pin. The
+// assertion is true on Windows and false elsewhere, where config_other.go
+// applies the cert without the flag.
 func TestBuildTLSConfigClientPinnedCADisablesSystemRootOnWindows(t *testing.T) {
 	restore := withFlags(t, 1, 0, false) // client mode
 	defer restore()
 	origCert, origCertRaw, origHost, origTLS := *cert, *certRaw, *host, *tlsEnabled
 	defer func() { *cert, *certRaw, *host, *tlsEnabled = origCert, origCertRaw, origHost, origTLS }()
 	*tlsEnabled = true
-	// readCertificate checks *cert first and only falls through to
-	// *certRaw when *cert is empty -- must be cleared explicitly so this
-	// test exercises the certRaw path it claims to, regardless of what an
-	// earlier test in the same binary left *cert holding.
+	// readCertificate prefers *cert, so clear it to exercise the certRaw path
+	// whatever an earlier test left there.
 	*cert = ""
 
 	certPath, _ := writeSelfSignedCertKey(t, "example.com")
@@ -414,8 +400,7 @@ func TestGenerateConfigKeepsPlainTLSForQuicClient(t *testing.T) {
 }
 
 // withKeepAliveFlag saves the tcp-keepalive global, applies a value, and returns
-// a restore func. Mirrors withFlags/withEchFlags: generateConfig and
-// registerTCPKeepAlive read this package-level pointer.
+// a restore func. Mirrors withFlags and withEchFlags.
 func withKeepAliveFlag(t *testing.T, v int) func() {
 	t.Helper()
 	orig := *tcpKeepAlive
@@ -583,10 +568,10 @@ func TestMuxFlagDefault(t *testing.T) {
 	}
 }
 
-// The same property for buildTLSConfig's cert/key read-failure sites --
-// cert, key, and host (via the ~/.acme.sh/{host}/... default path
-// construction) are all reachable from SS_PLUGIN_OPTIONS, and a missing
-// file's os.PathError text would otherwise embed the raw path verbatim.
+// buildTLSConfig's cert and key read failures must not embed option values. cert,
+// key and host (through the ~/.acme.sh/{host}/... default path) all come from
+// SS_PLUGIN_OPTIONS, and a missing file's os.PathError text would carry the raw
+// path.
 func TestBuildTLSConfigCertKeyErrorsNeverEchoOptionValues(t *testing.T) {
 	restore := withFlags(t, 1, 0, true) // server mode
 	defer restore()
@@ -616,11 +601,10 @@ func TestBuildTLSConfigCertKeyErrorsNeverEchoOptionValues(t *testing.T) {
 	}
 }
 
-// A readable cert/key pair that isn't a valid X509 key pair is otherwise
-// never caught before ready: v2ray-core's own BuildCertificates logs
-// "ignoring invalid X509 key pair" at Warning and silently drops it,
-// leaving zero certificates configured (TLS handshakes then fail with no
-// diagnostic ever reaching the sitrep) rather than failing to start.
+// A readable cert/key pair that is not a valid X509 key pair must fail
+// buildTLSConfig. v2ray-core's BuildCertificates only logs a warning and drops it,
+// leaving no certificate configured and TLS handshakes failing with no sitrep
+// diagnostic.
 func TestBuildTLSConfigServerRejectsInvalidX509KeyPair(t *testing.T) {
 	restore := withFlags(t, 1, 0, true) // server mode
 	defer restore()
@@ -651,11 +635,9 @@ func TestBuildTLSConfigServerRejectsInvalidX509KeyPair(t *testing.T) {
 	}
 }
 
-// The client-side pinned-CA equivalent: an unparseable PEM cert is
-// otherwise never caught before ready either -- v2ray-core's GetTLSConfig
-// only logs AppendCertsFromPEM's failure and leaves RootCAs nil, silently
-// falling back to the system root pool instead of the operator's pinned
-// CA.
+// A client's pinned CA that is not valid PEM must fail buildTLSConfig.
+// v2ray-core's GetTLSConfig only logs the failure and falls back to the system
+// root pool instead of the pinned CA.
 func TestBuildTLSConfigClientRejectsInvalidPEMCert(t *testing.T) {
 	restore := withFlags(t, 1, 0, false) // client mode
 	defer restore()
@@ -678,8 +660,8 @@ func TestBuildTLSConfigClientRejectsInvalidPEMCert(t *testing.T) {
 	}
 }
 
-// The same property for buildTLSConfig's invalid-ech-mode site, which
-// needs tlsEnabled=true to reach (TestBuildTLSConfigEch's own precondition).
+// buildTLSConfig's invalid-ech-mode error must not embed the value. It needs
+// tlsEnabled=true to be reached.
 func TestBuildTLSConfigEchErrorNeverEchoesValue(t *testing.T) {
 	restore := withEchFlags(t, `abc\;certRaw=SUPERSECRETVALUE`, "")
 	defer restore()
@@ -692,10 +674,10 @@ func TestBuildTLSConfigEchErrorNeverEchoesValue(t *testing.T) {
 	}
 }
 
-// mux=0 must disable Mux.Cool on BOTH ends of a websocket chain: the client
-// stops attaching MultiplexSettings, and the server stops pointing dokodemo at
-// the v1.mux.cool sentinel. The server half is why a mux=0 client cannot talk
-// to a mux=1 server.
+// mux=0 must disable Mux.Cool on both ends of a websocket chain: the client
+// stops attaching MultiplexSettings, and the server stops pointing dokodemo at the
+// v1.mux.cool address. The server half is why a mux=0 client cannot talk to a
+// mux=1 server.
 func TestGenerateConfigMuxDisablesMultiplexing(t *testing.T) {
 	cases := []struct {
 		desc          string

@@ -73,6 +73,7 @@ func dialWithControl(t *testing.T, ctl func(network, address string, fd uintptr)
 	return tcpConn
 }
 
+// readParams reads the keepalive options back from conn's socket.
 func readParams(t *testing.T, conn *net.TCPConn) (keepAliveParams, bool) {
 	t.Helper()
 	raw, err := conn.SyscallConn()

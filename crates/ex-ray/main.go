@@ -17,45 +17,47 @@ import (
 	core "github.com/v2fly/v2ray-core/v5"
 )
 
+// VERSION is the string `-version` prints. It is "ex-ray" unless a build
+// overrides it with `-ldflags -X main.VERSION=...`.
 var VERSION = "ex-ray"
 
 // failFatal reports err as a `fatal` sitrep and exits with ex-ray's
-// config-class-error code (23) -- distinct from other exit codes so a
-// supervisor like systemd does not treat a bad config as a crash worth
-// restarting.
+// config-class-error code (23), distinct from other exit codes so a
+// supervisor does not treat a bad config as a crash worth restarting.
+//
+// err.Error() becomes the sitrep `detail`, so it must not embed operator-supplied
+// option values (see redactedError).
 func failFatal(err error) {
 	emitFatal(err.Error(), nil)
 	logFatal(err.Error())
-	os.Exit(23) // config-class error
+	os.Exit(23)
 }
 
-// parseOptsIntoFlags reads SS_PLUGIN env vars and cross-assigns them into the
-// package-level flag pointers. This is the env-remap seam: it is split out of
-// buildV2Ray so main() can compute the listen address between the remap and
-// core.New (the config needs the remap to have happened first).
+// parseOptsIntoFlags applies the SIP003 environment (SS_PLUGIN_OPTIONS and the
+// SS_* address variables, via parseEnv) to the package-level flag pointers, on
+// top of whatever flag.Parse left there. Run it before registerTCPKeepAlive and
+// buildV2Ray, both of which read the flags.
 //
 // A non-nil return is fatal: the caller must emit a `fatal` sitrep and exit
-// non-zero rather than proceed with partially-remapped flags.
+// non-zero rather than proceed with partially-applied flags. Option values are
+// never echoed in the error. The per-option rules are on the parse*Option
+// helpers (options.go).
 //
-// localAddr/localPort always name the inbound listener bound by this process,
-// in BOTH modes:
-//   - client mode: localAddr/localPort come from SS_LOCAL_* (the SS client's
-//     plugin-facing endpoint), remoteAddr/remotePort from SS_REMOTE_*.
-//   - server mode: the SS server cross-assigns — localAddr/localPort take the
-//     SS_REMOTE_* values (the public listen endpoint) and remoteAddr/remotePort
-//     take SS_LOCAL_* (the ss-server loopback to forward into).
+// localAddr/localPort always name the inbound listener this process binds, in
+// both modes:
+//   - client mode: localAddr/localPort come from SS_LOCAL_* (the Shadowsocks
+//     client's plugin-facing endpoint), remoteAddr/remotePort from SS_REMOTE_*.
+//   - server mode: the Shadowsocks server swaps them, so localAddr/localPort take
+//     the SS_REMOTE_* values (the public listen endpoint) and remoteAddr/remotePort
+//     take SS_LOCAL_* (the loopback address of the server to forward into).
 //
-// The cross-assignment below mirrors that: under `*server`, a `localAddr`
-// option lands in *remoteAddr and a `remoteAddr` option lands in *localAddr
-// (likewise for ports).
+// Under `*server` a `localAddr` option therefore lands in *remoteAddr and a
+// `remoteAddr` option in *localAddr, likewise for ports.
 func parseOptsIntoFlags() error {
 	opts, err := parseEnv()
 	if err != nil {
-		// Unwrapped, not "invalid SS_PLUGIN_OPTIONS"-prefixed: parseEnv
-		// returns two distinct fault classes (a malformed
-		// SS_PLUGIN_OPTIONS string, or an incomplete SS_* chain-handoff
-		// env, which SS_PLUGIN_OPTIONS may have nothing to do with), and
-		// each already names itself accurately.
+		// Returned as is: parseEnv's two fault classes (a malformed
+		// SS_PLUGIN_OPTIONS, an incomplete SS_* set) each name themselves.
 		return err
 	}
 
@@ -77,9 +79,8 @@ func parseOptsIntoFlags() error {
 	if err := parseStringOption(opts, "path", path, false); err != nil {
 		return err
 	}
-	// cert/certRaw/key: empty is a documented, meaningful "use the
-	// default" spelling (config.go falls back to ~/.acme.sh when both
-	// are empty in server mode) -- not fatal, unlike host/path above.
+	// An empty cert/certRaw/key means "use the default" (server mode falls back to
+	// ~/.acme.sh, see buildTLSConfig), so it is not fatal, unlike host/path above.
 	if err := parseStringOption(opts, "cert", cert, true); err != nil {
 		return err
 	}
@@ -89,31 +90,19 @@ func parseOptsIntoFlags() error {
 	if err := parseStringOption(opts, "key", key, true); err != nil {
 		return err
 	}
-	// loglevel's documented default spelling is "warning" (or an absent
-	// key); an explicit "loglevel=" has no legitimate meaning of its own
-	// -- treated as unrecognized like host/path, not as a meaningful
-	// "use the default" spelling like cert/certRaw/key/ech-doh, so a
-	// silent revert-to-default (e.g. discarding a CLI-set -loglevel=debug)
-	// is fatal instead of invisible.
+	// An empty loglevel is fatal like host/path: its default spelling is "warning"
+	// or an absent key, and "loglevel=" would silently discard a CLI-set -loglevel.
 	if err := parseStringOption(opts, "loglevel", logLevel, false); err != nil {
 		return err
 	}
 	if err := parseBoolOption(opts, "server", server); err != nil {
 		return err
 	}
-	// localAddr/localPort/remoteAddr/remotePort are cross-assigned raw,
-	// with no parse*Option validator -- whether these four should be
-	// operator-settable via SS_PLUGIN_OPTIONS at all is an open question;
-	// adding validation here would answer it unilaterally. The same
-	// bare-key-resolves-to-"1" gap parseIntOption/parseStringOption
-	// document for their own options applies here too: a fat-fingered
-	// bare `remoteAddr` silently sets the upstream destination to the
-	// domain "1", and a bare `localPort`/`remotePort` silently sets port
-	// 1 -- both valid-looking values that sail past every guard added in
-	// this file (port-0 checks, empty/AnyIP remoteAddr checks) because
-	// "1" is neither zero nor empty. Fixing this needs the same args.go
-	// Args grammar change already tracked (not attempted here) to
-	// distinguish a bare key from an explicit "=1".
+	// These four are assigned raw, with no parse*Option validation; the checks
+	// on them are in main and generateConfig. A bare key (no `=`) reads as "1"
+	// (see parsePluginOptions), so a bare `remoteAddr` sets the upstream
+	// destination to the domain "1" and a bare `localPort` or `remotePort` sets
+	// port 1; none of those checks rejects that.
 	if c, b := opts.Get("localAddr"); b {
 		if *server {
 			*remoteAddr = c
@@ -169,8 +158,8 @@ func parseOptsIntoFlags() error {
 	return nil
 }
 
-// buildV2Ray generates the v2ray-core config and constructs the instance. The
-// env-remap (parseOptsIntoFlags) MUST have already run.
+// buildV2Ray generates the v2ray-core config and constructs the instance.
+// parseOptsIntoFlags must have run first.
 func buildV2Ray() (core.Server, error) {
 	config, err := generateConfig()
 	if err != nil {
@@ -183,16 +172,12 @@ func buildV2Ray() (core.Server, error) {
 	return instance, nil
 }
 
-// listenerNetwork reports the IP transport of the inbound listener ex-ray
-// binds, derived from the resolved mode/server flags. Only server+quic binds a
-// UDP listener (the quic inbound faces the remote client); client mode (a plain
-// TCP dokodemo inbound — quic, if configured, applies only to the upstream hop)
-// and server+websocket are both TCP. emitReady reports this as the sitrep
-// `transports`, mirroring the transport generateConfig selects from the same
-// mode/server flags, so the reported transport can never disagree with the one
-// v2ray-core binds. An unknown *mode returns "tcp" here and is then rejected by
-// generateConfig's switch default before emitReady, so no false "ready" can
-// escape. See bindreams/hole#421.
+// listenerNetwork reports the transport of the inbound listener ex-ray binds,
+// from the *server and *mode flags: "udp" for server+quic (the quic inbound faces
+// the remote client), "tcp" for everything else. Client mode is TCP even with
+// mode=quic, because quic then applies only to the upstream hop. main reports the
+// result as the `transports` value of the `ready` sitrep. An unknown *mode
+// returns "tcp" and is rejected by generateConfig before `ready` is emitted.
 func listenerNetwork() string {
 	if *server && *mode == "quic" {
 		return "udp"
@@ -200,6 +185,7 @@ func listenerNetwork() string {
 	return "tcp"
 }
 
+// printCoreVersion logs v2ray-core's version statement to stderr.
 func printCoreVersion() {
 	version := core.VersionStatement()
 	for _, s := range version {
@@ -207,6 +193,7 @@ func printCoreVersion() {
 	}
 }
 
+// printVersion writes the `-version` banner to stdout.
 func printVersion() {
 	fmt.Println("ex-ray", VERSION)
 	fmt.Println("Go version", runtime.Version())
@@ -223,8 +210,8 @@ func main() {
 		return
 	}
 
-	// hello MUST be the first sitrep line, and nothing else may touch stdout
-	// before it on this path. logInit/printCoreVersion log to stderr.
+	// hello must be the first sitrep line; nothing else may write to stdout before
+	// it on this path. logInit and printCoreVersion log to stderr.
 	emitHello()
 
 	logInit()
@@ -234,29 +221,20 @@ func main() {
 		failFatal(err)
 	}
 
-	// Must precede core.New: app/proxyman/outbound reads the registered
-	// controllers when it builds each handler's dialer.
+	// Must precede core.New: the vendored app/proxyman/outbound reads the registered
+	// dialer controllers when it builds each handler's dialer.
 	if err := registerTCPKeepAlive(); err != nil {
 		failFatal(err)
 	}
 
-	// ex-ray requires a CONCRETE local port. It cannot honor the sitrep
-	// port-0 / OS-assigned-port contract: v2ray-core does not expose the
-	// inbound listener's bound port via any public API. Echoing a port-0
-	// spelling as `ready.listen` would be a silent spec violation
-	// (SITREP.md: listen MUST be the bound address).
-	// Hole always hands ex-ray a concrete pre-allocated port; a port-0
-	// input is a misconfiguration we fail loudly on rather than mis-report.
-	// validPort (config.go) is the same parser generateConfig's own
-	// localPort/remotePort validation uses -- a non-canonical spelling
-	// ("00", "000") is also port 0 to it, which would otherwise bind an
-	// OS-assigned ephemeral port while localListenAddr below -- built from
-	// this same raw string -- still reported the original spelling, a
-	// bound port that disagrees with what ready.listen claimed. A parse
-	// failure or an out-of-range value is a different fault (not a port-0
-	// request at all) and gets its own message so the detail doesn't
-	// misdirect the operator at a port-0/OS-assignment problem they don't
-	// have.
+	// ex-ray requires a concrete local port: v2ray-core exposes no public API for
+	// the bound port of an inbound listener, so a port-0 (OS-assigned) request
+	// could not be reported honestly as `ready.listen` (SITREP.md requires it to
+	// be the bound address). Port 0 is therefore fatal. A host must pass a
+	// pre-allocated port. validPort is the parser generateConfig uses too, so a
+	// non-canonical spelling of zero ("00") is caught here as well. A parse
+	// failure or out-of-range value gets its own message, so it is not mistaken
+	// for a port-0 request.
 	localPortNum, portErr := validPort(*localPort)
 	switch {
 	case portErr != nil:
@@ -265,41 +243,31 @@ func main() {
 		failFatal(errors.New("ex-ray requires a concrete local port; port-0 OS-assignment is not supported (v2ray-core does not expose the bound port)"))
 	}
 
-	// localAddr must be exactly one IP literal. Two distinct failure modes
-	// this closes:
-	//   - Multiple addresses: parseLocalAddr (config.go) splits localAddr
-	//     on `|` for a genuine multi-address server-mode listen, but the
-	//     sitrep's `ready` event carries exactly one `listen` address
-	//     (SITREP.md) -- there is no honest way to report a `|`-joined
-	//     value there, and reporting it verbatim produces a string that
-	//     fails garter's SocketAddr parse and is silently dropped as an
-	//     unrecognized log line instead of being observed as ready.
-	//   - A non-IP hostname: "localhost" is the one spelling v2ray-core's
-	//     own listener silently rewrites to 127.0.0.1 (ListenTCP), so
-	//     reporting the raw *localAddr verbatim would produce
-	//     "localhost:<port>", the identical unparseable-SocketAddr
-	//     failure as the multi-address case. Every other non-IP hostname
-	//     already fails loudly via generateConfig's own "domain address
-	//     is not allowed for listening" error; these two are the only
-	//     silent gaps.
+	// localAddr must be exactly one IP literal, because the `ready` event carries
+	// one `listen` address (SITREP.md) that a host parses as a socket address.
+	// Two shapes would otherwise be reported unparseably:
+	//   - A `|`-joined list: parseLocalAddr splits localAddr on `|` for a
+	//     multi-address listen, but `ready` cannot report more than one.
+	//   - "localhost": v2ray-core's listener rewrites it to 127.0.0.1, so
+	//     reporting the raw value would print "localhost:<port>". Every other
+	//     non-IP hostname already fails in generateConfig ("domain address is not
+	//     allowed for listening").
 	if len(parseLocalAddr(*localAddr)) != 1 {
 		failFatal(errors.New("invalid localAddr: a single listen address is required (the ready sitrep cannot report more than one)"))
 	}
-	// canonicalLocalAddr (config.go) folds IP spellings before binding; using
-	// it for both this guard and localListenAddr below keeps them from
-	// drifting apart -- see its doc comment for why.
+	// canonicalLocalAddr folds IP spellings the way v2ray-core does before binding;
+	// the guard and localListenAddr below both use it, so the reported address is
+	// the bound one.
 	canonicalAddr, ok := canonicalLocalAddr(*localAddr)
 	if !ok {
 		failFatal(errors.New("invalid localAddr: must be an IP literal"))
 	}
 
-	// localAddr/localPort name the inbound listener in both modes (see
-	// parseOptsIntoFlags for the client/server SS_*_* mapping). This is the
-	// address v2ray-core binds and that emitReady reports.
+	// The address v2ray-core binds and that emitReady reports (see
+	// parseOptsIntoFlags for the client/server mapping).
 	localListenAddr := net.JoinHostPort(canonicalAddr, *localPort)
 
-	// network is the transport the inbound listener binds; emitReady reports it
-	// as the sitrep transports.
+	// The transport the inbound listener binds, reported as the sitrep transports.
 	network := listenerNetwork()
 
 	server, err := buildV2Ray()
@@ -310,17 +278,12 @@ func main() {
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM)
 
-	// A bind conflict here is retryable by the host (bind_ephemeral); any other
-	// Start failure is fatal. localListenAddr is the authoritative bind address we
-	// asked v2ray-core for (never empty); refine to the classifier's exact failed
-	// endpoint only when it carries one, so the SITREP addr is never "" (an empty
-	// addr fails the host's SocketAddr parse and drops the whole bind_conflict).
-	// bind_conflict's addr is meant to name the contended endpoint -- legitimate
-	// diagnostic content, not an echo of a rejected value. The generic fatal
-	// branch is different: v2ray-core's own Start error is unredacted internal
-	// text that can embed *localAddr/*localPort verbatim (e.g. "domain address
-	// is not allowed for listening: <value>"), so it must not reach the sitrep;
-	// the raw error still reaches stderr via logFatal below.
+	// A bind conflict is retryable by the host; any other Start failure is fatal.
+	// The bind_conflict addr is the failed endpoint the classifier reports, or
+	// localListenAddr when it reports none, so it is never empty (a host cannot
+	// parse an empty one). The generic fatal detail is a fixed string, because
+	// v2ray-core's Start error can embed *localAddr or *localPort verbatim; the
+	// raw error still goes to stderr via logFatal.
 	if err := server.Start(); err != nil {
 		if errno, addr, ok := classifyBindError(err); ok {
 			if addr == "" {
@@ -341,12 +304,9 @@ func main() {
 		}
 	}()
 
-	// v2ray-core's Start is synchronous through the listener bind, so the
-	// listener is accepting once Start returns nil.
-	//
-	// localListenAddr is authoritative: ex-ray rejects port 0 (above), so for
-	// every accepted input the requested port == the bound port (v2ray-core
-	// binds it; Start() returning nil confirms).
+	// Start is synchronous through the listener bind, so the listener is accepting
+	// once it returns nil. Port 0 was rejected above, so the requested port is the
+	// bound port.
 	emitReady(localListenAddr, []string{network})
 
 	<-osSignals

@@ -6,11 +6,10 @@ import (
 )
 
 // These canonical lines are byte-identical to the pinned examples in
-// crates/garter/SITREP.md (and the garter sitrep_tests). The whole point of
-// using structs (not map[string]any) is that json.Marshal emits fields in
-// declaration order, so the bytes match serde's `#[serde(tag = "event")]`
-// output exactly. If garter's SitrepEvent field order ever changes, these
-// assertions break — which is the intended cross-impl tripwire.
+// crates/garter/SITREP.md and garter's sitrep tests. json.Marshal emits struct
+// fields in declaration order, so the bytes match serde's
+// `#[serde(tag = "event")]` output. If garter's SitrepEvent field order changes,
+// these assertions break; that is the intended cross-implementation tripwire.
 
 func marshalLine(t *testing.T, v any) string {
 	t.Helper()

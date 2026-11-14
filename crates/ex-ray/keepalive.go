@@ -14,11 +14,14 @@ type keepAliveParams struct {
 	Probes          int32
 }
 
+// enabled reports whether keepalive is configured (a zero idle time means off).
 func (p keepAliveParams) enabled() bool { return p.IdleSeconds > 0 }
 
-// keepAliveDialerController carries the probe count, which SocketConfig cannot
-// express and which is the whole difference between Go's ~150s bound and ours.
-// Non-TCP setsockopt calls would fail, hence the network check below.
+// keepAliveDialerController returns a dialer controller that applies p to every
+// TCP socket before it connects, or nil when p is not enabled. It exists to set
+// the probe count, which v2ray-core's SocketConfig cannot express and which is
+// what shortens the dead-connection bound below the OS default. Non-TCP
+// setsockopt calls would fail, hence the network check below.
 func keepAliveDialerController(p keepAliveParams) func(network, address string, fd uintptr) error {
 	if !p.enabled() {
 		return nil
@@ -28,12 +31,10 @@ func keepAliveDialerController(p keepAliveParams) func(network, address string, 
 			return nil
 		}
 		if err := setTCPKeepAlive(fd, p); err != nil {
-			// Unreachable on installed builds (pre-16299 Windows only, see
-			// keepalive_windows.go); v2ray-core discards this error, so a loud
-			// log is the only recourse. The wrapped error names the option that
-			// failed rather than asserting the resulting socket state: on linux and
-			// darwin the vendored applyOutboundSocketOptions has already
-			// applied idle and interval from the same SocketConfig, so a
+			// v2ray-core discards this error, so the warning is the only report. The
+			// error names the option that failed rather than claiming the socket's
+			// state: on linux and darwin the vendored applyOutboundSocketOptions has
+			// already applied idle and interval from the same SocketConfig, so a
 			// failure on the probe count alone leaves those intact.
 			logWarn("TCP keepalive not fully applied to " + address + ": " + err.Error())
 			return err

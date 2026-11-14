@@ -6,8 +6,10 @@ import (
 	"syscall"
 )
 
-// classifyBindError reports whether err is a listener-bind failure and, if so,
-// the OS errno and the authoritative failed-bind addr to surface.
+// classifyBindError reports whether err is a listener-bind failure: a
+// *net.OpError with Op "listen" anywhere in its chain, whatever the errno. It
+// returns the OS errno (0 if the chain carries none) and the address of the
+// failed bind (empty if the error carries none).
 func classifyBindError(err error) (errno int, addr string, isBindConflict bool) {
 	var opErr *net.OpError
 	if !errors.As(err, &opErr) || opErr.Op != "listen" {
