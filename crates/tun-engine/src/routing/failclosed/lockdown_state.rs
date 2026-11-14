@@ -46,10 +46,8 @@ fn file(state_dir: &Path) -> LockdownFile {
     VersionedFile::new(state_dir)
 }
 
-/// What `bridge-lockdown.json` says about the standing kill switch. A closed
-/// classification rather than a bool, so "the user recorded off" and "we could
-/// not find out" stop being the same answer — conflating them is what let a
-/// bridge with a wiped state dir sweep a live cover.
+/// What `bridge-lockdown.json` says about the standing kill switch. A closed classification rather than a bool, so
+/// "the user recorded off" and "we could not find out" are different answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
     /// The file parsed at the current schema and records `enabled: true`.
@@ -66,24 +64,16 @@ pub enum Intent {
 
 impl Intent {
     /// "Does the user believe the kill switch is armed?" — `On | Unreadable`.
-    /// An unreadable record is not consent to disarm, so it reports armed and
-    /// the tray's Unblock escape stays on the menu.
-    ///
-    /// Consumers, in full: `ProxyManager::lockdown_enabled`.
+    /// An unreadable record is not consent to disarm, so it reports armed.
     pub fn reads_armed(self) -> bool {
         matches!(self, Intent::On | Intent::Unreadable)
     }
 
     /// "Should this start install the STANDING cover?" — `On` only.
     ///
-    /// `Unreadable` answers **no**, and that is what keeps a corrupt-file start
-    /// engaging the transient block-until-connected cover instead of skipping
-    /// it for a standing cover that only arrives after `routing.install`: block
-    /// early, don't leak.
-    ///
-    /// Consumers, in full: the transient-vs-standing branch, the
-    /// reachability-probe suppression, the `install_lockdown` gate, and the
-    /// update-consent gate.
+    /// `Unreadable` answers no, so a corrupt-file start engages the transient block-until-connected cover instead of
+    /// skipping it for a standing cover that only arrives after `routing.install`: block early, don't leak. The two
+    /// folds are described in docs/contributing/architecture/kill-switch-recovery.md#disclosed-residuals.
     pub fn installs_standing_cover(self) -> bool {
         matches!(self, Intent::On)
     }
@@ -122,15 +112,12 @@ pub fn load(state_dir: &Path) -> Option<LockdownState> {
     }
 }
 
-/// Classify the intent file. Never collapses a failure into a recorded value —
-/// see [`Intent`] and its two folds.
+/// Classify the intent file. A failure is never collapsed into a recorded value ([`Intent`]).
 pub fn load_intent(state_dir: &Path) -> Intent {
     Intent::of(&file(state_dir).observe().loaded)
 }
 
-/// Convenience: [`Intent::reads_armed`] over [`load_intent`]. An absent file is
-/// default-off; a corrupt one reads ARMED, because losing the record is not the
-/// user telling us to disarm.
+/// [`Intent::reads_armed`] over [`load_intent`]: an absent file is off; a corrupt one reads armed.
 pub fn load_enabled(state_dir: &Path) -> bool {
     load_intent(state_dir).reads_armed()
 }

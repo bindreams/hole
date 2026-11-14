@@ -15,13 +15,10 @@
 //! These tests drive `engage()` over a live cover. They do not show that the
 //! bridge's own transitions are gap-free: its repair path and its
 //! lockdown-newly-enabled path drop the held `Cover` before engaging, which
-//! reloads `/etc/pf.conf` (bindreams/hole#758).
+//! reloads `/etc/pf.conf`.
 //!
-//! A DESCENDANT module of `platform` (mounted from `macos.rs`) rather than a
-//! sibling of `lockdown_privileged_tests.rs` under `failclosed`: these tests
-//! reach for `Cover`'s private `token` field and the private `pfctl` helper,
-//! and Rust privacy cascades to descendant modules. Descendance is what buys
-//! that access — not sharing a file with the unprivileged builder tests.
+//! A descendant module of `platform` (mounted from `macos.rs`), not a sibling of `lockdown_privileged_tests.rs`: these
+//! tests use `Cover`'s private `token` field and the private `pfctl` helper, and Rust privacy cascades to descendants.
 
 use super::*;
 use std::net::IpAddr;
@@ -350,44 +347,27 @@ fn count_pf_references(listing: &str) -> usize {
 /// one thread alone could be parked inside a single blocked `connect_timeout`
 /// call for a whole transition and never overlap it at all.
 ///
-/// SENSITIVITY IS PRINTED, NOT ASSUMED — every real failure this guard has
-/// caught was the cold `-E`→load window (tens of ms), an order of magnitude
-/// wider than the `-Fa` window it exists for, so a green here is not a bound on
-/// the narrowest window that would still be caught. The run therefore prints its
-/// own numbers (the control's completed-connect ratio and the pool's aggregate
-/// probe rate) rather than leaving a green uninformative;
-/// `.config/nextest.toml` gives this test `success-output` so that line
-/// survives a PASS. See the printed line itself for what it means and its own
-/// caveats — this comment does not restate them.
+/// Sensitivity is printed, not assumed: every real failure this guard has caught was the cold `-E`-to-load window (tens
+/// of ms), an order of magnitude wider than the `-Fa` window it exists for, so a green is not a bound on the narrowest
+/// window that would still be caught. The run prints its own numbers (the control's completed-connect ratio and the
+/// pool's aggregate probe rate), and `.config/nextest.toml` gives this test `success-output` so that line survives a
+/// pass. The printed line says what it means and its caveats.
 ///
-/// LAST MEASURED at `23a529ff` — from this branch's own green privileged darwin
-/// run, and nowhere else; nothing is carried over from the pre-bracket filter's
-/// run, which counted a different set of attempts.
+/// Last measured on a green privileged darwin run (the figures go stale; re-measure before relying on them):
 ///
 /// | lane  | filtered       | raw (unfiltered) | pool                                              |
 /// |-------|----------------|------------------|---------------------------------------------------|
 /// | arm64 | 191/191 100.0% | 229/233 98.3%    | 496 probes / 16 threads / 658.981375ms = 1329 us   |
 /// | amd64 | 496/496 100.0% | 532/541 98.3%    | 1541 probes / 16 threads / 2.225901559s = 1444 us  |
 ///
-/// The raw rate is what [`CONTROL_RATE_FLOOR_PCT`] is set from; see that const
-/// for why the floor sits where it does. Only `filtered` could move on the
-/// bracket's account — raw and pool are measured upstream of the filter — and
-/// that held: raw read 97.2% / 97.1% before the bracket against 98.3% on both
-/// lanes here, sampling variance across runs with different attempt counts.
+/// The raw rate is what [`CONTROL_RATE_FLOOR_PCT`] is set from. The pool column is read against the window being hunted:
+/// that window is not sub-millisecond (`-Fa`'s gap spans the `/etc/pf.os` fingerprint reload plus the rule parse, and a
+/// bare `pfctl -n -f -` round trip measures 2.0 to 2.7ms), so the guard works only while the pool's probe interval is the
+/// same order.
 ///
-/// What those figures answer is the question the printed caveat leaves open:
-/// whether the pool's probe interval is the same order as the window being
-/// hunted. That window is NOT sub-millisecond — `-Fa`'s gap spans the
-/// `/etc/pf.os` fingerprint reload plus the rule parse, and a bare
-/// `pfctl -n -f -` round trip measures 2.0-2.7ms — so the `pool` column is what
-/// has to be read against it, and the guard works only while it is.
-///
-/// An attempt is excluded when its window overlaps a LOAD, not merely the
-/// instant one commits: the bracket opens before the child runs and closes
-/// after its target is published, so the excluded span is the whole load. The
-/// exclusion rate is therefore that span over the transition period. A leg with
-/// slow attempts against fast transitions would exclude most of its sample, and
-/// that too would be the filter working, not a defect.
+/// An attempt is excluded when its window overlaps a load, not merely the instant one commits: the bracket opens before
+/// the child runs and closes after its target is published. A leg with slow attempts against fast transitions would
+/// exclude most of its sample, which is the filter working, not a defect.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     use std::net::TcpStream;

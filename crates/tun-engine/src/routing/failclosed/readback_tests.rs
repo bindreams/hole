@@ -35,7 +35,7 @@ fn classify(views: &[Result<Vec<Record>, u32>]) -> Readback<Record> {
 
 #[skuld::test]
 fn an_unreadable_view_never_concludes_absence() {
-    // bindreams/hole#1010 F2. The caller reads two views ONLY because just one
+    // The caller reads two views only because just one
     // of them may hold the object; under that premise the readable one's empty
     // answer proves nothing about the one that errored. Its caller is
     // fail-fatal, so concluding absence here refuses a connect outright.

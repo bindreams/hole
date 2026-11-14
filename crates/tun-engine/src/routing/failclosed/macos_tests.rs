@@ -82,8 +82,7 @@ fn assert_stateless_loopback_passes(r: &str) {
 /// `no state` is load-bearing: `pfctl -vn -f -` normalizes a bare
 /// `pass out quick on lo0 all` to `... flags S/SA keep state`, which matches
 /// only a SYN. A mid-stream segment would fall through to the block and be
-/// silently discarded under `block-policy drop` — bindreams/hole#1015 again, by
-/// a different route.
+/// silently discarded under `block-policy drop`.
 #[skuld::test]
 fn loopback_is_exempted_twice_over() {
     let r = build_pf_ruleset(v4(), None);
@@ -340,16 +339,12 @@ fn parse_pf_enabled_reads_status() {
     assert!(!parse_pf_enabled("Status: Disabled\n"));
 }
 
-// disengage_lockdown_with (#882: gate on presence, not on the file) ===================================================
+// disengage_lockdown_with (gate on presence, not on the file) =========================================================
 //
-// `disengage_lockdown_absent_cover_is_ok` (the file-only gate this replaces)
-// asserted that an absent *state file* alone was proof of nothing to
-// disengage. That conflated "confirmed absent" with "could not tell" — the
-// exact bug #882 describes: a corrupt/lost file must not read the same as a
-// host pf genuinely confirmed clear. The replacement tests below gate on
-// `CoverPresence` (pf's own answer folded with the file), which is what
-// `disengage_lockdown` now consults, via the same `RecordingPfOps` seam
-// `release_all_with` already uses — so none of this touches a real `pfctl`.
+// An absent state file alone is not proof of nothing to disengage: that would conflate "confirmed absent" with "could
+// not tell", and a corrupt or lost file must not read the same as a host pf confirmed clear. These tests gate on
+// `CoverPresence` (pf's own answer folded with the file), which `disengage_lockdown` consults, via the same
+// `RecordingPfOps` seam `release_all_with` uses, so none of this touches a real `pfctl`.
 
 #[skuld::test]
 fn disengage_lockdown_confirmed_absent_is_ok_and_spawns_no_pfctl() {
@@ -363,8 +358,8 @@ fn disengage_lockdown_confirmed_absent_is_ok_and_spawns_no_pfctl() {
 fn an_absent_state_file_with_a_live_pf_label_still_disengages() {
     // pf's own label says the cover IS loaded even though the state file is
     // gone (lost, or never written this run) — presence is established
-    // independently of the file. The old file-only gate would have read this
-    // as "nothing to disengage" and returned Ok having done nothing (#882).
+    // independently of the file. A file-only gate would read this as
+    // "nothing to disengage" and return Ok having done nothing.
     // With no snapshot to restore from, the fallback is the blind
     // `/etc/pf.conf` reload.
     let mut ops = RecordingPfOps::default();
@@ -396,15 +391,11 @@ fn an_indeterminate_presence_reports_doing_nothing() {
 /// The manual escape hatch's half of the rule `release_all_with` already
 /// obeys: an UNUSABLE record still names the `pf_token` it must release.
 ///
-/// Driven from persisted bytes through the REAL [`pf_record::read`],
-/// so the `Unusable` arm is pinned to a payload a rolled-back bridge really
-/// produces rather than hand-constructed at the seam. The production cause is
-/// a version skew: `serde_json` produced a complete record, token intact, and
-/// only the version check rejected it. `disengage_lockdown` used to read this
-/// through an older release's `lockdown_state::load`, which collapses `Unusable` to `None`, so
-/// `bridge unlock` skipped `pfctl -X` entirely and `clear_standing` then
-/// deleted the only copy of the ticket — pf enabled under an unreferenced
-/// refcount until reboot.
+/// Driven from persisted bytes through the real [`pf_record::read`], so the `Unusable` arm is pinned to a payload a
+/// rolled-back bridge really produces rather than hand-constructed at the seam. The production cause is a version skew:
+/// `serde_json` produced a complete record, token intact, and only the version check rejected it. Reading it as absent
+/// would skip `pfctl -X` and let `clear_standing` delete the only copy of the ticket, leaving pf enabled under an
+/// unreferenced refcount until reboot.
 #[skuld::test]
 fn disengage_lockdown_drops_the_token_salvaged_from_an_unusable_record() {
     let dir = tempfile::tempdir().unwrap();
@@ -462,10 +453,8 @@ fn a_live_presence_with_a_captured_snapshot_restores_it_and_drops_the_token() {
 
 // pfctl_stdout (non-zero exit must not read as an empty success) ======================================================
 //
-// A failed `pfctl -sr`/`-sn` used to be read via `.stdout` with no status
-// check, persisting an empty snapshot as the host's pre-lockdown policy
-// (#901's bug class, surviving in this file). `pfctl_stdout` is the fix: the
-// single place every status-bearing read goes through.
+// A failed `pfctl -sr`/`-sn` read via `.stdout` with no status check would persist an empty snapshot as the host's
+// pre-lockdown policy. `pfctl_stdout` is the single place every status-bearing read goes through.
 
 fn exit_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
     std::process::Output {
@@ -1191,7 +1180,7 @@ fn a_failed_unwind_of_a_failed_persist_still_returns_the_original_error_and_logs
     );
 }
 
-/// The bindreams/hole#1004 residual must FIRE AUDIBLY, not silently.
+/// The transition residual must fire audibly, not silently.
 ///
 /// `engage_with`'s failed-load path calls `transient_restore`, which reloads
 /// `/etc/pf.conf` — the fully-open baseline — over whatever ruleset was live.
@@ -1229,7 +1218,7 @@ fn a_failed_transient_load_warns_that_the_restore_reopens_the_host() {
     );
     let log = writer.snapshot();
     assert!(
-        log.contains("bindreams/hole#1004"),
+        log.contains("TRANSITION"),
         "the restore that reopens the host must name the residual it is: {log}"
     );
     // The warn is emitted BEFORE `transient_restore`, so it may not report the

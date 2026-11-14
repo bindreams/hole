@@ -2,7 +2,8 @@
 //! IP, and (when a plugin needs it) the ECH-config DoH resolver, as an RAII
 //! guard held across a connect attempt so a failed connect leaves the host
 //! blocked, not leaked. OS specifics live in the platform submodules; this
-//! facade is `#[cfg]`-free for callers.
+//! facade is `#[cfg]`-free for callers. The design is in
+//! docs/contributing/architecture/kill-switch.md.
 //!
 //! Mutators take `&CoverLock`, readers take a path ([`lockdown_cover_presence`], [`boottime_witness::load`]): a read
 //! taken outside the lock races a locked writer as the old or the new state, and a read that decides a write is taken
@@ -15,28 +16,17 @@ use std::path::Path;
 use crate::error::RoutingError;
 use util::versioned_file::Loaded;
 
-/// The one port the resolver permit ever needs: `doh_url_for_ip` in
-/// `hole_bridge::dns::ech` never constructs a URL with any other port
-/// (its bare `https://` scheme implies this one — see that crate's
-/// `DOH_PORT` and its executable pin,
-/// `doh_url_for_ip_ports_to_the_https_default`), so this is structurally the
-/// sole value the ECH-config fetch can dial. A separate declaration, not an
-/// import: this crate sits BELOW `hole-bridge` in the dependency graph and
-/// cannot import from it, so the reverse link is what's enforced instead —
-/// `pub` (not `pub(crate)`) so `hole-bridge` CAN import and pin it against
-/// its own `DOH_PORT` (see `crates/bridge/src/dns/ech_tests.rs`,
-/// `resolver_permit_port_matches_doh_port`). Shared by both platform
-/// modules here so the port is named in exactly one place on this side of
-/// the boundary too.
+/// The one port the resolver permit opens: the port `hole_bridge::dns::ech` dials for the ECH-config fetch
+/// (`doh_url_for_ip` never builds a URL with another).
+///
+/// Declared here because this crate sits below `hole-bridge` and cannot import its `DOH_PORT`; `hole-bridge` imports
+/// this and pins it against `DOH_PORT` (`resolver_permit_port_matches_doh_port`). Both platform modules use it.
 pub const RESOLVER_PERMIT_PORT: u16 = 443;
 
 /// A cover's on-disk state-file read, distinguishing "never engaged" from "the
-/// evidence exists but cannot be read". Collapsing the latter into the former
-/// would make [`release_all`] treat a corrupt or version-skewed file as
-/// nothing to clear over a host its cover may still be holding closed — see
-/// `release_all`'s doc for why that distinction is load-bearing. Generic and
-/// declared here (not per-platform) so both macOS state modules share one
-/// reader shape.
+/// evidence exists but cannot be read". [`release_all`] must never treat the
+/// latter as the former, or a corrupt or version-skewed file would read as a clean host. Shared by both macOS
+/// state modules.
 #[derive(Debug, PartialEq)]
 pub enum StateFile<T> {
     /// No file — no cover of this kind was ever engaged (or a prior release
@@ -50,15 +40,9 @@ pub enum StateFile<T> {
     /// release can use: corrupt, or at a version this release does not read.
     /// Treated as a cover to clear, never as absence.
     ///
-    /// `pf_token` is whatever [`StateFile::unusable`] could still salvage from
-    /// the bytes, and carrying it is not a nicety: the reachable cause of this
-    /// variant is a VERSION skew, where `serde_json` produced a complete record
-    /// — token intact — and only the version check rejected it. Discarding the
-    /// record discards the only copy of the `pfctl -E` ticket in existence, and
-    /// the sweep that then runs with no token to hand `pfctl -X` clears the
-    /// file as well, leaking pf's enable refcount until reboot. `None` is the
-    /// honest answer for bytes that yielded nothing: JSON with no usable
-    /// `pf_token`.
+    /// `pf_token` is whatever [`StateFile::unusable`] could salvage from the bytes. A version-skewed file still holds
+    /// the only copy of the `pfctl -E` ticket; without it the sweep leaks pf's enable refcount until reboot. `None`
+    /// when the bytes hold no usable `pf_token`.
     Unusable { pf_token: Option<String> },
     /// A file exists and parsed at the current schema version.
     Present(T),
@@ -68,15 +52,9 @@ impl<T> StateFile<T> {
     /// [`StateFile::Unusable`] for a record whose BYTES we hold, salvaging its
     /// `pf_token` if one can still be read out of them.
     ///
-    /// Deliberately lenient where the typed deserialize is strict: a
-    /// `serde_json::Value` walk ignores the schema version, a field of the
-    /// wrong type, and every sibling field being wrong. One
-    /// implementation for both macOS state files, since both persist a
-    /// `pf_token` and both reach this variant by the same routes.
-    ///
-    /// `pub`, matching the type it constructs, rather than `pub(crate)`: only
-    /// macOS persists a pf token, so a crate-private constructor would be dead
-    /// code on every other target of this cfg-free module.
+    /// Lenient where the typed deserialize is strict: it ignores the schema version and any wrong-typed sibling
+    /// field. Shared by both macOS state files. `pub` like the type it constructs; a crate-private constructor would be
+    /// dead code on every other target of this `#[cfg]`-free module.
     pub fn unusable(bytes: &[u8]) -> Self {
         let pf_token = serde_json::from_slice::<serde_json::Value>(bytes)
             .ok()
@@ -101,10 +79,8 @@ impl<T: Clone> StateFile<T> {
     }
 }
 
-// macOS persists its pf enable token; Windows recovers WFP filters by fixed
-// GUID and needs no state. Compiled for every platform's TESTS, because the
-// rules the two records and their clears implement are platform-free and a rule
-// proved only where the hazard lives is proved nowhere else.
+// macOS persists its pf enable token; Windows recovers WFP filters by fixed GUID and needs no state. Compiled on
+// every platform's test build because the rules these records implement are platform-free.
 #[cfg(any(target_os = "macos", test))]
 pub mod failclosed_state;
 
@@ -124,21 +100,13 @@ pub mod boottime_witness;
 pub mod cover_lock;
 pub use cover_lock::{CoverKind, CoverLock, InstallStamp};
 
-// Compiled out of a macOS PRODUCTION build — Windows' boot-time twin read-back
-// is its only caller — but kept for every lane's TESTS, because the rule it
-// encodes is platform-free and a rule proved only where the hazard lives is
-// proved nowhere else.
+// Windows' boot-time twin read-back is its only caller, so a macOS production build omits it; every test build keeps
+// it because the rule is platform-free.
 #[cfg(any(target_os = "windows", test))]
 pub(crate) mod readback;
 
-// `pub(crate)` (not the default private) ONLY on the Windows arm:
-// `dns_confine::spec` — a sibling module outside this file's own subtree —
-// needs `platform::{FILTER_GUIDS, LOCKDOWN_FILTER_GUIDS, PROVIDER_GUID,
-// SUBLAYER_GUID}` to prove its own WFP GUIDs are disjoint from the cover's,
-// so a copy-paste collision can never let one's fixed-GUID sweep delete the
-// other's filters (or a collision fail `FwpmProviderAdd0`/`FwpmSubLayerAdd0`
-// at runtime). The macOS arm is untouched: nothing outside this file needs
-// it.
+// `pub(crate)` on the Windows arm only: `dns_confine::spec` reads `platform::{FILTER_GUIDS, LOCKDOWN_FILTER_GUIDS,
+// PROVIDER_GUID, SUBLAYER_GUID}` to prove its WFP GUIDs are disjoint from the cover's.
 #[cfg(target_os = "windows")]
 #[path = "failclosed/windows.rs"]
 pub(crate) mod platform;
@@ -147,37 +115,26 @@ pub(crate) mod platform;
 #[path = "failclosed/macos.rs"]
 mod platform;
 
-// The pf cover's sequencing (engage, back-out, release, recovery) runs over
-// injected `pfctl` and record seams, so its tests build on every host. This is
-// the same module as `platform` above, compiled a second time for test builds
-// on hosts that have no `pfctl`: the sequencing is proved where the tests run,
-// not only on the macOS legs.
+// The pf cover's sequencing (engage, back-out, release, recovery) runs over injected `pfctl` and record seams. This
+// compiles the macOS `platform` module a second time on test builds of other hosts, so its tests run everywhere.
 #[cfg(all(test, not(target_os = "macos")))]
 #[path = "failclosed/macos.rs"]
 mod pf_on_any_host;
 
 /// RAII guard for an engaged fail-closed cover. Dropping it disengages the
 /// cover (Windows: delete the WFP filters by GUID; macOS: restore the host's rules, then clear the record and, only if
-/// that clear took it, drop the pf enable refcount; a record that cannot be read stays). `Send` so the PR3 cutover
-/// coordinator can hold it across `.await`.
+/// that clear took it, drop the pf enable refcount; a record that cannot be read stays). `Send`, so it can be held
+/// across `.await`.
 ///
-/// Opaque wrapper over the private `platform::Cover` (the platform module can't
-/// be named by `#[cfg]`-free callers). `_inner` is held only for its `Drop`,
-/// which does the disengage — no explicit `Drop for Cover` needed.
+/// Opaque wrapper over the private `platform::Cover`, whose `Drop` does the disengage.
 pub struct Cover {
     _inner: platform::Cover,
 }
 
 impl crate::routing::CoverGuard for Cover {
-    /// Persist the underlying filters without disengaging: consumes the guard and
-    /// empties what it holds, so its `Drop` disengages nothing. The filters are persistent-by-design, so leaving
-    /// them in force across a cutover restart is exactly correct — the new
-    /// bridge re-adopts them.
-    ///
-    /// Delegates to the platform guard's own `detach`, which releases whatever
-    /// this process still holds, rather than `std::mem::forget` — that skipped
-    /// the Windows FWPM engine handle close too, leaking one handle per call
-    /// for any caller that keeps running (see `CoverGuard::disarm`).
+    /// Leave the filters in force across a cutover restart, where the new bridge re-adopts them: consumes the guard
+    /// and empties what it holds, so its `Drop` disengages nothing. The platform guard's `detach` releases whatever
+    /// this process still holds (on Windows the FWPM engine handle).
     fn disarm(self) {
         self._inner.detach();
     }
@@ -237,17 +194,8 @@ pub fn recover_cover(lock: &CoverLock, adopting: bool) {
 ///
 /// On a platform whose standing cover arms boot-time keys
 /// (`platform::STANDING_COVER_ARMS_BOOT_TIME`) the engage also records the
-/// [`boottime_witness`], covering the host whose sibling is removed by
-/// something that is not a sweep at all (an external FWPM delete, a firewall
-/// reset), where no sweep ever had the evidence to copy.
-///
-/// That write does NOT live here, and bindreams/hole#1010's F3 is why: the
-/// moment the fact becomes true is the moment the transaction commits, and
-/// `platform::engage_lockdown` has post-commit work after it whose failure
-/// leaves the cover standing. A `?` at this level skipped the record for
-/// exactly the host class it exists to cover. The record is written inside
-/// the platform engage, bound to the commit — see `windows.rs`'s
-/// `commit_and_record`.
+/// [`boottime_witness`]. The platform engage writes it, bound to the transaction commit (see `windows.rs`'s
+/// `commit_and_record`), because post-commit work can fail over a cover already standing.
 pub fn engage_lockdown(
     lock: &CoverLock,
     server_ip: IpAddr,
@@ -283,17 +231,9 @@ pub(crate) enum RecoveryDispatch {
 }
 
 /// Classify a [`CoverRecovery`](crate::routing::CoverRecovery) into whether it disengages the standing cover.
-/// Pure, exhaustive, and platform-free, so "`Adopt` never disengages the
-/// cover, on either platform" is a testable statement rather than a claim
-/// about two bodies of code.
-///
-/// `Adopt` never disengages because the volatile-permit refresh it used to
-/// perform for the SERVER-IP permit moved into `engage_lockdown`: a
-/// recovery-time delete would drop a RUNNING first bridge's server permit
-/// whenever a second bridge with a fresh state dir adopted the cover,
-/// hard-blocking a host whose GUI still said Connected. `Noop` never
-/// disengages by definition. Only an explicit recorded-off `Sweep` reaches the
-/// firewall to remove protection.
+/// Pure and platform-free. Only a recorded-off `Sweep` disengages; `Adopt` never does, because a recovery-time
+/// delete would drop a running bridge's server permit when a second bridge adopts the cover (the permit refresh
+/// lives in `engage_lockdown`).
 pub(crate) fn recovery_dispatch(decision: crate::routing::CoverRecovery) -> RecoveryDispatch {
     use crate::routing::CoverRecovery::*;
     match decision {
@@ -316,15 +256,10 @@ pub(crate) fn recovery_dispatch(decision: crate::routing::CoverRecovery) -> Reco
 pub fn recover_lockdown(lock: &CoverLock, decision: crate::routing::CoverRecovery, tun_name: Option<&str>) {
     match recovery_dispatch(decision) {
         RecoveryDispatch::Inert => {
-            // The standing cover itself is untouched: it must survive the
-            // restart (this IS the crash-leak fix), and it may not even be
-            // ours. On macOS the dead utun name in the `pass out quick on
-            // <tun>` line is harmless (it matches no live interface); pf rules
-            // and enable state do not survive a reboot, but the state file
-            // does, so the next connect's `engage_lockdown` re-enables pf and
-            // reloads a live ruleset. Residual: the boot->first-connect
-            // interval is unprotected until that first reconnect re-arms the
-            // host.
+            // The standing cover must survive the restart, and may not be ours. On macOS a dead utun name in the
+            // `pass out quick on <tun>` line matches no live interface; pf does not survive a reboot, so the next
+            // connect's `engage_lockdown` re-enables pf and reloads the ruleset (the boot-to-first-connect interval is
+            // unprotected).
             if decision == crate::routing::CoverRecovery::Adopt {
                 if let Some(tun_name) = tun_name {
                     reclaim_stale_tun_permit(lock, tun_name);
@@ -337,16 +272,8 @@ pub fn recover_lockdown(lock: &CoverLock, decision: crate::routing::CoverRecover
         }
         RecoveryDispatch::Disengage => {
             tracing::info!("lockdown recovery: sweeping leftover cover (intent off)");
-            // Named discard: startup recovery has no operator to report a
-            // qualification to. What it must NOT discard is the evidence — and
-            // it does not, because `disengage_lockdown` persists the
-            // [`boottime_witness`] before returning. This is the one sweep in
-            // the whole lifecycle that can still see a standing cover's
-            // `PERSISTENT` sibling on a host whose kill switch was armed in an
-            // earlier boot and recorded off in this one; the sweep itself then
-            // deletes that sibling, so no later sweep can re-derive it. "The
-            // next start sweeps again" — the justification this discard used
-            // to carry — is false for exactly that reason.
+            // Startup recovery has no operator to report the clearance to; `disengage_lockdown` has already
+            // persisted the evidence in the `boottime_witness`.
             match disengage_lockdown(lock) {
                 Ok(_clearance_is_persisted_not_reported_at_startup) => {}
                 Err(e) => {
@@ -361,30 +288,14 @@ pub fn recover_lockdown(lock: &CoverLock, decision: crate::routing::CoverRecover
 }
 
 /// Windows only: delete the volatile TUN-interface permit pair when
-/// `tun_name` no longer resolves to a live `NET_LUID` — i.e. this permit's
-/// target adapter is provably gone. Called from [`recover_lockdown`] only on
-/// `Adopt`.
+/// `tun_name` no longer resolves to a live `NET_LUID`, i.e. its adapter is provably gone. Called from
+/// [`recover_lockdown`] only on `Adopt`.
 ///
-/// A `NET_LUID` is `IfType<<48 | NetLuidIndex<<24`, and NDIS reassigns a freed
-/// `NetLuidIndex` to the next adapter of the same type. Without this, an
-/// adopted cover's stale TUN permit — a persistent WFP filter that survives a
-/// crash — can silently authorize a LATER, unrelated wintun-based adapter that
-/// happens to inherit the freed index, while Hole still reports the kill
-/// switch armed.
+/// NDIS reassigns a freed `NetLuidIndex` to the next adapter of the same type, so a stale permit that survived a
+/// crash could authorize an unrelated wintun adapter while the kill switch reads armed. A running bridge's own TUN
+/// resolves, so this never deletes a permit a live bridge relies on.
 ///
-/// Unlike the server-IP permit (whose recovery-time deletion is exactly what
-/// moved BOTH volatile deletes into `engage_lockdown`'s own transaction — see
-/// [`crate::routing::CoverRecovery::Adopt`]'s doc), a genuinely running
-/// bridge's own `hole-tun` resolves here successfully, so this can never
-/// delete a permit a live bridge relies on: it only fires when the name is
-/// provably unresolvable.
-///
-/// macOS's lockdown ruleset matches the TUN by literal interface name (`pass
-/// out quick on utunN` — the kernel-assigned name `TunIdentity::alias` reads
-/// back, not the fixed `hole-tun` Windows requests), not
-/// a numeric index the OS can silently reassign to an unrelated adapter, so
-/// there is no macOS analogue and this is a no-op there.
-///
+/// A no-op on macOS, whose lockdown ruleset matches the TUN by literal interface name, which the OS does not reassign.
 pub fn reclaim_stale_tun_permit(lock: &CoverLock, tun_name: &str) {
     #[cfg(target_os = "windows")]
     platform::reclaim_stale_tun_permit(lock, &luid::SystemLuidResolver, tun_name);
@@ -393,19 +304,12 @@ pub fn reclaim_stale_tun_permit(lock: &CoverLock, tun_name: &str) {
 }
 
 /// Fail-loud disengage of a standing lockdown cover, with no running bridge.
-/// Unlike [`recover_lockdown`]'s best-effort `Sweep`, this PROPAGATES failure so
-/// the `bridge unlock` escape hatch can refuse to claim success (and refuse to
-/// flip the intent off) while the cover is still engaged. An absent cover is
-/// `Ok` (nothing to disengage); a real failure (not elevated / engine open /
-/// pfctl) is `Err`. A pf refcount that will not drop is only logged.
+/// Unlike [`recover_lockdown`]'s best-effort `Sweep`, this propagates failure, so `bridge unlock` can refuse to claim
+/// success (and refuse to write the intent off) while the cover is still engaged. An absent cover is `Ok`; a real
+/// failure (not elevated, engine open, `pfctl`) is `Err`. A pf refcount that will not drop is only logged.
 ///
-/// `Ok` carries a [`Clearance`] for the same reason [`release_all`]'s does,
-/// and this is the path where it matters most. `bridge unlock` writes the
-/// kill-switch intent OFF right after this returns, so — unlike every other
-/// disengage — there is no next engage to re-arm or re-delete a boot-time key,
-/// and this is the last moment anything will look at one. macOS answers
-/// [`Clearance::proven`]: pf has no boot-time analogue, a ruleset does not
-/// survive a reboot at all, so a macOS disengage has nothing to leave unproven.
+/// `Ok` carries a [`Clearance`], as [`release_all`]'s does. macOS answers [`Clearance::proven`]: pf has no
+/// boot-time analogue.
 pub fn disengage_lockdown(lock: &CoverLock) -> Result<Clearance, RoutingError> {
     sweep_with_witness(lock, |witness| platform::disengage_lockdown(lock, witness))
 }
@@ -426,82 +330,36 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
     platform::lockdown_cover_presence(state_dir)
 }
 
-/// Clear every fail-closed cover this platform can install — both the
-/// transient block-until-connected cover and the standing lockdown cover —
-/// without ever asking whether either is present. This is the escape from a
-/// stranded cover: the tray's Unblock item and turning the kill switch off
-/// both reach the host through this one function, and nothing else in this
-/// crate clears a cover conditionally on its presence.
+/// Clear every fail-closed cover this platform can install, the transient and the standing one, without asking
+/// whether either is present. The tray's Unblock item and turning the kill switch off both reach the host through
+/// this function. The reasoning is in docs/contributing/architecture/kill-switch.md#the-release-contract.
 ///
-/// Contract, load-bearing for every caller:
+/// 1. **Unconditional.** Never probes the live cover; idempotent. On macOS a clean host is read from Hole's own state
+///    file (`StateFile::Absent`), so a state file lost under a live cover reads as clean and the call answers `Ok`
+///    without touching pf.
+/// 2. **Total.** Clears both cover kinds.
+/// 3. **No short-circuit.** Every clear is attempted before any failure is examined; the only early return is a
+///    Windows engine-open failure, where nothing could have been issued.
+/// 4. **No false success over a detected cover.** `Ok` means every cover this call could detect is cleared; `Err`
+///    may be reported over a host that is in fact open. `Ok` is qualified by its [`Clearance`]:
+///    [`Clearance::is_proven`] is the narrower claim that every empty answer proved its key empty, which a
+///    [`KeyLifetime::BootTime`] key answering [`KeyOutcome::NotFound`] does not. The uninstall gate must read the
+///    narrower one.
+/// 5. **Bookkeeping is best-effort, except the state-file clear.** A failing `pfctl -X` or Windows sublayer/provider
+///    delete only logs. A cover's state-file clear is skipped whenever its restore did not confirm, and after a
+///    confirmed restore a clear that cannot write is that cover's error. macOS clears the record before it drops the
+///    token, and drops the token only if the clear took the record. A record that could not be read is kept, after
+///    its restore, and the answer is an error.
 ///
-/// 1. **Unconditional.** Never probes the LIVE cover (the WFP/pf objects
-///    themselves) to decide whether to act. Idempotent — a clean host
-///    returns `Ok`. On macOS, "clean host" is read from Hole's own state
-///    file — `StateFile::Absent` — because pf has no query for "who is
-///    holding this ruleset"; the file is the only record. A state file lost
-///    out from under a genuinely live cover (not corrupt — entirely absent,
-///    e.g. an external wipe of `state_dir`) is therefore indistinguishable
-///    from a clean host and `release_all` reports `Ok` without touching pf.
-///    See the residuals in docs/contributing/architecture/kill-switch-recovery.md.
-/// 2. **Total.** Clears BOTH cover kinds. Clearing only one would leave a
-///    user with no way out at all.
-/// 3. **No short-circuit.** Every clear is attempted before any failure is
-///    examined. The only early return is a Windows engine-open failure, where
-///    nothing could have been issued in the first place.
-/// 4. **Never a false success from anything `release_all` can observe.** `Ok`
-///    means every cover this call could detect is cleared. The converse does
-///    not hold — the function may report `Err` over a host that is in fact
-///    open. That asymmetry is deliberate: a false `Err` keeps the escape on
-///    the tray menu and the intent armed, while a false `Ok` over a
-///    *detected* cover is the lockout this function exists to remove. Item 1
-///    is the one case where `Ok` can be reported over a still-blocked host —
-///    it is not a violation of this clause, since the cover left no evidence
-///    to detect.
-///
-///    **`Ok` is therefore qualified, not absolute**, and [`Clearance`] — the
-///    `Ok` payload — carries the qualification. `Ok` says every delete this
-///    call issued either removed an object or came back empty;
-///    [`Clearance::is_proven`] is the narrower claim that what a key answered
-///    *proved* it carries nothing. The two differ for exactly one
-///    key-and-answer pair: a [`KeyLifetime::BootTime`] key that came back
-///    [`KeyOutcome::NotFound`], where the delete issued and answered and the
-///    answer proves nothing. The uninstall gate is the caller that must read
-///    the narrower one: it is about to delete the only binary that could act on
-///    the difference.
-/// 5. **Bookkeeping is best-effort, except the state-file clear.** The macOS
-///    `pfctl -X` refcount drop and the Windows sublayer/provider delete log a
-///    warning on failure and do not fail the call: once the host's rules are
-///    restored, a refcount that will not drop blocks nothing, and a record kept
-///    for it would fail the same way on every retry. A cover's state-file clear
-///    is different: it is *skipped* whenever that cover's replacement ruleset did
-///    not confirm, because the file is the cover's only record — clearing it
-///    after an unconfirmed restore would make the next call read a clean host
-///    while the block persists (a manufactured, permanent lockout). After a
-///    confirmed restore, a clear that cannot write is that cover's error.
-///    macOS orders the two so that `pfctl -X` never runs while a record names
-///    its token (pf may hand the value to another app): the clear comes first,
-///    and the token is dropped only if it took the record. After an unconfirmed
-///    restore the cover stays in force with its record and its refcount both
-///    held, and the restore's own error is returned as it is. A record that could not be read is also kept, after
-///    its restore: the answer is an error, never success.
-///
-/// Windows keeps no cover state file at all: the filter set is compiled-in
-/// fixed GUIDs, so there is no bookkeeping that can be corrupt or
-/// version-skewed and nothing to erase — only GUID sweeps run there.
+/// Windows keeps no cover state file: the filter set is compiled-in fixed GUIDs, so only GUID sweeps run there.
 pub fn release_all(lock: &CoverLock) -> Result<Clearance, RoutingError> {
     sweep_with_witness(lock, |witness| platform::release_all(lock, witness))
 }
 
 // Release clearance ===================================================================================================
 
-/// Which record backs a fail-closed filter key, and therefore what a
-/// delete-by-key that finds nothing PROVES about it.
-///
-/// This is the whole reason [`Clearance`] exists. A delete-by-key reports one
-/// of three things — removed, not-found, or a genuine failure — and the
-/// release path has always treated not-found as benign. For one key class
-/// that reading is sound; for the other it is an assumption.
+/// Which record backs a fail-closed filter key, and therefore what a delete-by-key that finds nothing proves about
+/// it. This is what [`Clearance`] carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyLifetime {
     /// The record a by-key delete addresses is the key's ONLY record.
@@ -513,112 +371,57 @@ pub enum KeyLifetime {
     Persistent,
     /// The record a by-key delete addresses may not be the key's only record.
     ///
-    /// Windows `FWPM_FILTER_FLAG_BOOTTIME`: the runtime object exists only
-    /// between kernel start and Base Filtering Engine start, so on any boot
-    /// where it is not live the key answers "not found" **whether or not a
-    /// boot-time policy record is still provisioned behind it**. That is the
-    /// cell that makes this lifetime a separate variant, and no assumption
-    /// softens it: an empty answer is what the key gives on a host that armed
-    /// the kill switch years ago AND on one that never armed it at all.
+    /// Windows `FWPM_FILTER_FLAG_BOOTTIME`: the runtime object is live only between kernel start and Base Filtering
+    /// Engine start, so on any other boot the key answers "not found" whether or not a boot-time policy record is
+    /// still provisioned behind it. "Not found" proves nothing.
     ///
-    /// **A watched removal is treated as proof** ([`KeyOutcome::Removed`] →
-    /// [`KeyObservation::proves_empty`]), on an ASSUMPTION rather than a
-    /// measurement: that `FwpmFilterDeleteByKey0` purges the boot-time policy
-    /// record along with the runtime object it demonstrably removes. Nothing
-    /// here can check it — every read this crate can take (the delete's code, a
-    /// `BOOTTIME_ONLY` enumeration, `netsh wfp show boottimepolicy`) goes
-    /// through the Base Filtering Engine, and the record in question is by
-    /// definition what applies BEFORE BFE starts at the next boot, so only a
-    /// reboot separates "purged" from "provisioned and invisible". The
-    /// assumption is the repo owner's, and verifying it on real hardware is
-    /// tracked as **bindreams/hole#1043**; if it is wrong, a host that watched
-    /// its twins go is silent over a stranded pre-BFE block-all.
-    ///
-    /// Read the assumption as "the record UNDER THAT KEY" — a filter key is
-    /// unique in FWPM, so a delete that removes the object standing under it
-    /// leaves no second record there for an earlier boot to have staged. That
-    /// is a reading of the assumption, not a separate measurement, and it is
-    /// what makes the delete on boot N+1 speak for boot N's provisioning too.
-    /// See docs/contributing/architecture/kill-switch-windows.md.
-    ///
-    /// The harm is bounded: BFE's start is what takes a boot-time filter out
-    /// of effect, so a stranded record blocks egress across the boot→BFE
-    /// window only. How long that window is has not been measured here — the
-    /// claim is that it is bounded and ends before the network stack is
-    /// generally usable, not any particular duration. It is not permanent
-    /// network loss, which is why an unproven key does not fail a release —
-    /// but not for a host whose boot itself needs egress (PXE or iSCSI boot,
-    /// volume unlock against a network key server), where a block in that
-    /// window can stop the boot from ever reaching the BFE start that would
-    /// lift it (see kill-switch-windows.md). What it must not do is read as
-    /// proof.
+    /// A watched removal ([`KeyOutcome::Removed`] → [`KeyObservation::proves_empty`]) is treated as proof, on the
+    /// unmeasured assumption that `FwpmFilterDeleteByKey0` purges the policy record along with the runtime object.
+    /// A stranded record blocks egress across the boot-to-BFE window only (unmeasured, and possibly worse for a host
+    /// whose boot itself needs egress, where the block can keep the boot from reaching the BFE start that lifts it),
+    /// which is why an unproven key does not fail a release but must never read as proof. See docs/contributing/architecture/kill-switch-windows.md#evidence-about-a-boot-time-key.
     BootTime,
 }
 
-/// What one delete-by-key observed about its key, keyed on the CAUSE it
-/// reported rather than on which consequence the caller happens to share.
+/// What one delete-by-key observed about its key, keyed on the cause it reported.
 ///
-/// Three return codes, three variants. Deriving one of them from the absence
-/// of another — "not `NotFound`, therefore `Removed`" — folds an access
-/// denial, a transient RPC failure and a genuine removal into a single
-/// verdict, and that verdict is what the MSI deletes `hole.exe` on the
-/// strength of. Per-variant policy lives on the type (docs/contributing/architecture/kill-switch.md#the-decisions).
+/// Three return codes, three variants. Deriving one from the absence of another would fold an access denial or an RPC
+/// failure into a removal, the verdict the MSI deletes `hole.exe` on. Per-variant policy lives on the type
+/// (docs/contributing/architecture/kill-switch.md#the-decisions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyOutcome {
-    /// The delete removed a live object (`ERROR_SUCCESS`). Proof of removal
-    /// for ANY lifetime — directly for [`KeyLifetime::Persistent`], whose
-    /// runtime object and record are the same thing, and for
-    /// [`KeyLifetime::BootTime`] under the purge assumption that variant's doc
-    /// states (bindreams/hole#1043). What the privileged lane measured is the
-    /// runtime half: the filter leaves the `BOOTTIME_ONLY` view.
+    /// The delete removed a live object (`ERROR_SUCCESS`). Proof of removal for any lifetime: directly for
+    /// [`KeyLifetime::Persistent`], and for [`KeyLifetime::BootTime`] under the purge assumption that variant states.
     Removed,
     /// The delete found nothing on the key (`FWP_E_FILTER_NOT_FOUND`). Proof
     /// of absence only for [`KeyLifetime::Persistent`].
     NotFound,
-    /// The delete neither removed an object nor found the key empty: the OS
-    /// refused or failed (not elevated, engine error, RPC failure). Proof of
-    /// NOTHING, for any lifetime.
+    /// The delete neither removed an object nor found the key empty: the OS refused or failed (not elevated, engine
+    /// error, RPC failure). Proof of nothing, for any lifetime.
     ///
-    /// Such a code also fails the release outright, unless the key is a [`KeyRole::Unlisted`] one
-    /// (`KeyRole::refusal_fails_the_sweep`): the refusal of a filter enumeration found fails nothing, and is
-    /// reported through [`Clearance::refused_strangers`] instead. Either way it reaches the clearance fold, because a
-    /// Windows sweep issues every delete before reading any code and hands back both halves ([`SweepOutcome`]). So a
-    /// refused delete shows up in [`Clearance::unproven_keys`] beside any failure, and an operator is told which key
-    /// the sweep could not settle rather than only that one could not be.
+    /// It fails the release unless the key is [`KeyRole::Unlisted`] (`KeyRole::refusal_fails_the_sweep`), whose
+    /// refusal is reported through [`Clearance::refused_strangers`] instead. Either way it reaches the clearance fold,
+    /// because a Windows sweep issues every delete before reading any code and hands back both halves
+    /// ([`SweepOutcome`]).
     Failed,
 }
 
 /// What a key's outcome is allowed to say about OTHER keys in the same sweep.
 ///
-/// [`KeyOutcome`] answers "what happened to THIS key". That is the whole
-/// answer for a [`KeyLifetime::Persistent`] key, and for a
-/// [`KeyLifetime::BootTime`] one only when its object was live enough to be
-/// REMOVED. On every other boot a boot-time key cannot report on itself: its
-/// runtime object is not live, so it answers [`KeyOutcome::NotFound`] on a host
-/// that armed the kill switch years ago and on a host that never armed it at
-/// all. Some OTHER key has to separate those, and exactly one can.
+/// A [`KeyLifetime::BootTime`] key reports on itself only when its object was live enough to be removed; on every
+/// other boot some other key has to separate "armed years ago" from "never armed", and exactly one can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRole {
     /// Speaks only for itself. Every key whose own outcome is the whole
     /// answer about it.
     Plain,
-    /// The `FWPM_FILTER_FLAG_PERSISTENT` half of the rule a
-    /// [`KeyLifetime::BootTime`] twin copies — installed in the SAME
-    /// transaction as that twin and never without it.
+    /// The `FWPM_FILTER_FLAG_PERSISTENT` half of the rule a [`KeyLifetime::BootTime`] twin copies, installed in the
+    /// same transaction as that twin and never without it.
     ///
-    /// This is the one key in a sweep whose outcome is evidence about ANOTHER
-    /// key, and it is evidence because of the lifetime it does NOT share:
-    /// BFE re-adds a persistent filter from its own store at every boot, so
-    /// removing a live object under this key says a standing cover is
-    /// installed HERE — on this boot, whichever boot armed it. Every sibling
-    /// answering empty says the opposite, that no standing cover is installed
-    /// and so no twin was added alongside one.
-    ///
-    /// The evidence is about the host, not about the twin's own record: it
-    /// says whether a boot-time record is POSSIBLE here, never whether one
-    /// exists. Only the twin's OWN delete can say that, and only when it
-    /// removed a live object — see [`KeyLifetime::BootTime`]. On the boots
-    /// where it cannot, this key is what is left.
+    /// BFE re-adds a persistent filter every boot, so removing a live object under this key says a standing cover is
+    /// installed here, and every sibling answering empty says none is. The evidence is about the host, not the twin's
+    /// own record: whether a boot-time record is possible, never whether one exists. Only the twin's own delete can
+    /// say that, and only when it removed a live object.
     BootTimeSibling,
     /// A boot-time filter under Hole's provider that no key list names, found by enumeration
     /// (`windows::provider_sweep`) and then deleted by key.
@@ -644,10 +447,10 @@ impl KeyRole {
             // would otherwise report gone.
             KeyRole::Plain => true,
             KeyRole::BootTimeSibling => true,
-            // A filter this build never learned. A live boot-time filter is measured not to be enforced once BFE has
-            // started, so one the OS will not let go of blocks nothing now; failing the sweep over it would keep the
-            // escape hatches (`bridge unlock`, the tray's Unblock) from writing the lockdown intent off, and the next
-            // start would re-engage the kill switch. It is reported instead, by its GUID.
+            // A filter this build never learned. A live boot-time filter is not enforced once BFE has started (an
+            // assumption, no test measures it), so one the OS will not let go of blocks nothing now. Failing the
+            // sweep over it would keep `bridge unlock` and the tray's Unblock from writing the lockdown intent off.
+            // It is reported by its GUID instead.
             KeyRole::Unlisted => false,
             // Not a delete at all.
             KeyRole::Enumeration => false,
@@ -734,17 +537,11 @@ impl KeyObservation {
             // The by-key delete addresses a persistent key's only record, so
             // an empty answer proves the key carries nothing.
             (KeyLifetime::Persistent, KeyOutcome::NotFound) => true,
-            // A removal we watched happen is proof for a boot-time key too,
-            // under bindreams/hole#1043's assumption that the by-key delete
-            // purges the policy record along with the runtime object it
-            // demonstrably removed. That assumption is the one thing here no
-            // lane can measure — see [`KeyLifetime::BootTime`].
+            // A removal we watched happen is proof for a boot-time key too, under the purge assumption on
+            // [`KeyLifetime::BootTime`].
             (KeyLifetime::BootTime, KeyOutcome::Removed) => true,
-            // A boot-time key answers empty on any boot where its runtime
-            // object is not live, whether or not a record survives behind it.
-            // This cell never moved and is not covered by #1043's assumption:
-            // an empty answer is what the key gives on a host that armed the
-            // switch years ago AND on one that never armed it.
+            // A boot-time key answers empty on any boot where its runtime object is not live, whether or not a record
+            // survives behind it; the purge assumption does not cover this cell.
             (KeyLifetime::BootTime, KeyOutcome::NotFound) => false,
             // The delete never got an answer about the key at all.
             (_, KeyOutcome::Failed) => false,
@@ -752,56 +549,26 @@ impl KeyObservation {
     }
 }
 
-/// What a [`release_all`] sweep PROVED, as distinct from what it attempted.
+/// What a [`release_all`] sweep proved, as distinct from what it attempted.
 ///
-/// `release_all` returning `Ok` means no delete failed. It does **not** mean
-/// every cover key is demonstrably empty: a [`KeyLifetime::BootTime`] key that
-/// answered [`KeyOutcome::NotFound`] is consistent both with "never installed"
-/// and with "installed in an earlier boot, policy record still provisioned",
-/// and nothing this crate can call separates them.
+/// `Ok` from a sweep means no delete failed. It does not mean every key is demonstrably empty: a
+/// [`KeyLifetime::BootTime`] key answering [`KeyOutcome::NotFound`] fits both "never installed" and "installed in an
+/// earlier boot, record still provisioned". The verdict carries that qualification, which a bare `Ok` would drop and
+/// the MSI would read as safe to delete the binary (docs/contributing/architecture/kill-switch-uninstall.md#what-ok-proves).
+/// It does not fail the release; see [`KeyLifetime::BootTime`] for the bound on the harm.
 ///
-/// Collapsing those into a bare `Ok` is the #1003 hazard recreated for the
-/// pre-BFE window: the MSI runs `bridge release-covers` under `Return="check"`,
-/// reads the exit code as "safe to delete the binary", and `RemoveFiles` then
-/// takes away the only thing that could have acted on the difference. So the
-/// verdict carries the qualification instead of dropping it, and
-/// `#[must_use]` keeps a caller from re-collapsing it by accident.
+/// It carries two independent answers. [`Self::is_proven`] is what the sweep proved: false on every Windows sweep
+/// run on a boot where no bridge engaged. [`Self::leftover_keys`] is what is worth telling an operator, which is
+/// narrower. It reports when either of two sources says a boot-time record is possible:
 ///
-/// **This does not fail the release.** See [`KeyLifetime::BootTime`] for the
-/// bound on the harm: refusing an uninstall over a seconds-long boot-window
-/// block would trade it for a permanently unremovable product, which is
-/// strictly worse. The gate's job is to stop claiming proof it does not have,
-/// not to withhold an uninstall.
+/// * [`KeyRole::BootTimeSibling`], collected in the same sweep: live evidence, and the only one that survives a wiped
+///   `state_dir`;
+/// * [`ArmingWitness`], the persisted record: the only one that survives the sweep that removes the sibling.
 ///
-/// It carries a SECOND, independent answer, and the two must not be confused.
-/// [`Self::is_proven`] is what the sweep proved; it is false on every Windows
-/// sweep run on a boot where no bridge engaged, because the twins answer empty
-/// there and an empty answer proves nothing about a boot-time key (see
-/// [`KeyLifetime::BootTime`]). [`Self::leftover_keys`] is what is worth
-/// telling an operator, which is narrower: an unproven key on a host where no
-/// boot-time twin could ever have been armed did not strand anything, and
-/// reporting one every time is how the host where it is real gets ignored
-/// (see `cutover::release_clearance_report`).
-///
-/// Two independent things can say a record is possible, and `leftover_keys`
-/// reports when EITHER does:
-///
-/// * [`KeyRole::BootTimeSibling`], collected in the same sweep — live
-///   evidence, and the only one that survives a wiped `state_dir`;
-/// * [`ArmingWitness`], the persisted record — the only one that survives the
-///   sweep that REMOVES the sibling.
-///
-/// Neither alone is sound. The sibling is consumed by the first sweep that
-/// removes it, after which every later sweep reads an empty sibling set as "no
-/// cover was ever here" and goes silent for good; the record is lost by a
-/// wiped state dir. See [`boottime_witness`] for the full argument.
-///
-/// **Exactly one observation retracts the record**: a twin whose delete
-/// removed a live object, which is [`boottime_witness::WitnessUpdate::Disarm`]
-/// and rests on bindreams/hole#1043's purge assumption. A twin that answered
-/// EMPTY never retracts anything — that reading is #1003 itself.
+/// See [`boottime_witness`]. Exactly one observation retracts the record: a twin whose delete removed a live object
+/// ([`boottime_witness::WitnessUpdate::Disarm`]). A twin that answered empty never does.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[must_use = "the uninstall gate reads this; dropping it restores the silent `Ok` of #1003"]
+#[must_use = "the uninstall gate reads this; dropping it restores a silent `Ok`"]
 pub struct Clearance {
     unproven: Vec<UnprovenKey>,
     sibling: SiblingEvidence,
@@ -975,43 +742,27 @@ fn sibling_evidence(observations: &[KeyObservation]) -> SiblingEvidence {
 }
 
 impl Clearance {
-    /// The verdict for a sweep with nothing left unproven.
-    ///
-    /// That is every platform whose covers are all
-    /// [`KeyLifetime::Persistent`] — today, macOS. It is NOT every Windows
-    /// key: the standing lockdown cover's boot-time block-all twins
-    /// (bindreams/hole#998) are [`KeyLifetime::BootTime`], so a Windows sweep
-    /// that did not watch them go is unproven and must build its verdict with
-    /// [`Self::from_observations`] rather than reach for this.
+    /// The verdict for a sweep with nothing left unproven: every platform whose covers are all
+    /// [`KeyLifetime::Persistent`], today macOS. Not every Windows key: the standing cover's boot-time block-all twins
+    /// are [`KeyLifetime::BootTime`], so a Windows sweep that did not watch them go builds its verdict with
+    /// [`Self::from_observations`].
     pub fn proven() -> Self {
         Self {
             unproven: Vec::new(),
-            // No key went unproven, so no report can be built from this
-            // whatever the sibling evidence would have been; `Absent` states
-            // the platform's own reason rather than leaving a placeholder.
+            // No key went unproven, so no report is built from this whatever the sibling evidence would be.
             sibling: SiblingEvidence::Absent,
-            // Same reason, for the second evidence source: a platform with no
-            // boot-time key class never writes a record, so `Unset` is its
-            // standing answer rather than a placeholder.
+            // A platform with no boot-time key class never writes a record.
             witness: ArmingWitness::Unset,
             boot_time: BootTimeSightings::None,
         }
     }
 
-    /// Fold per-key observations into a verdict. Pure and total over the
-    /// slice: it inspects every observation rather than stopping at the first
-    /// unproven one, so the operator message can name all of them.
+    /// Fold per-key observations into a verdict. Pure and total over the slice: it inspects every observation, so the
+    /// operator message can name all the unproven ones. An observation is unproven iff it did not prove itself empty
+    /// ([`KeyObservation::proves_empty`]).
     ///
-    /// The per-observation rule is [`KeyObservation::proves_empty`] and is not
-    /// restated here — an observation is unproven iff it did not prove itself
-    /// empty, so a new [`KeyOutcome`] or [`KeyLifetime`] variant cannot slip
-    /// past this fold by failing to match a filter predicate written here.
-    ///
-    /// `witness` is the persisted record this sweep was folded against, and it
-    /// is a PARAMETER rather than a default so no sweep can be built without
-    /// answering the question. A sweep that has no record to consult (macOS,
-    /// whose pf ruleset has no boot-time key class) passes
-    /// [`ArmingWitness::Unset`] and says so.
+    /// `witness` is the persisted record this sweep was folded against. It is a parameter so no sweep can be built
+    /// without answering the question; a platform with no record (macOS) passes [`ArmingWitness::Unset`].
     pub fn from_observations(observations: &[KeyObservation], witness: ArmingWitness) -> Self {
         Self {
             unproven: observations
@@ -1025,15 +776,9 @@ impl Clearance {
         }
     }
 
-    /// Fold another `state_dir`'s persisted record into this verdict.
-    ///
-    /// The record is per-`state_dir`; the WFP filters it describes are
-    /// machine-wide. An elevated non-`--service` bridge keeps its state in the
-    /// interactive user's profile, so the record of a twin IT armed does not
-    /// sit where the MSI's SYSTEM-context `release-covers` reads. The
-    /// uninstall gate therefore folds in every peer dir it already locks
-    /// against a live bridge (`cutover::release_covers_with`); the more
-    /// cautious answer wins.
+    /// Fold another `state_dir`'s persisted record into this verdict, the more cautious answer winning. The record is
+    /// per-`state_dir` and the WFP filters it describes are machine-wide, so the uninstall gate folds in every peer
+    /// directory it already locks against a live bridge (`cutover::release_covers_with`).
     pub fn corroborate(mut self, witness: ArmingWitness) -> Self {
         self.witness = self.witness.or(witness);
         self
@@ -1052,38 +797,18 @@ impl Clearance {
         &self.unproven
     }
 
-    /// The unproven keys that could actually have a record behind them ON
-    /// THIS HOST — what an operator is told about, as distinct from what the
-    /// sweep proved.
+    /// The unproven keys that could have a record behind them on this host: what an operator is told about, as
+    /// distinct from what the sweep proved.
     ///
-    /// Empty is NOT "the sweep proved everything": [`Self::is_proven`] is
-    /// still the proof record and still false. Empty here means BOTH evidence
-    /// sources agree no twin could be outstanding on this host — the sweep
-    /// found no standing cover installed ([`SiblingEvidence::Absent`]) AND no
-    /// record says one was ever armed ([`ArmingWitness::Unset`] or
-    /// `Disarmed`). That is what almost every uninstall looks like, and
-    /// reporting it every time is how the one host where a leftover is real
-    /// gets ignored.
+    /// Empty is not "the sweep proved everything" ([`Self::is_proven`] stays false). It means both evidence sources
+    /// agree no twin could be outstanding: the sweep found no standing cover ([`SiblingEvidence::Absent`]) and no
+    /// record says one was armed ([`ArmingWitness::Unset`] or `Disarmed`). Either source reporting is enough: the
+    /// sibling alone is consumed by the first sweep that removes it, and the record alone is lost with a wiped
+    /// `state_dir`. `Installed` and `Unknown` report for different reasons (a cover is known to be armed; nothing was
+    /// ruled out); [`ArmingWitness`] splits the same way.
     ///
-    /// **Either source reporting is enough**, and the union is the whole fix
-    /// for the alternative: the sibling ALONE is consumed by the first sweep
-    /// that removes it. An ordinary "turn the kill switch off, then uninstall"
-    /// removes the sibling at the first step, and every sweep after it reads
-    /// the empty sibling set as "no cover was ever here" — permanently silent,
-    /// which is the direction that deletes `hole.exe` over a live twin. The
-    /// record alone is lost by a wiped `state_dir`. Neither loss takes the
-    /// other with it.
-    ///
-    /// The other [`SiblingEvidence`] answers report for two different reasons.
-    /// `Installed` is the dangerous case this exists to keep visible — a kill
-    /// switch armed in an earlier boot, BFE re-adding the persistent half at
-    /// this one, the twins answering empty because no twin is ever live once
-    /// BFE has started. `Unknown` reports for the opposite reason, that
-    /// nothing was ruled out. [`ArmingWitness`] splits the same way.
-    ///
-    /// The exception is an unproven key whose role is always reported (`ReportSection::UnenumeratedView`) — an
-    /// enumeration that could not be read. No evidence about a record can excuse it: it is not a key whose absence
-    /// is in question but a look that did not happen.
+    /// The exception is an unproven key in `ReportSection::UnenumeratedView`, an enumeration that could not be read:
+    /// it is a look that did not happen, so no evidence about a record excuses it.
     pub fn leftover_keys(&self) -> impl Iterator<Item = &UnprovenKey> + '_ {
         let record_possible = self.sibling.record_possible() || self.witness.record_possible();
         self.unproven
@@ -1118,25 +843,19 @@ impl Clearance {
             .map(|k| (k.label(), k.code))
     }
 
-    /// What this sweep's own observations say the persisted record should now
-    /// hold — derived here, once, and never at a write site.
+    /// What this sweep's own observations say the persisted record should now hold, derived here once and never at a
+    /// write site.
     ///
-    /// Total over the pair. Two load-bearing cells. The `AllProven` one
-    /// ignores the sibling entirely — a twin this sweep watched being removed
-    /// is direct evidence about the twin, so there is nothing for a key that
-    /// only speaks about the HOST to corroborate. The last one is the reverse:
-    /// an unproven boot-time key on a host whose siblings all answered empty
-    /// writes NOTHING rather than arming. "No cover is installed now" is not
-    /// evidence about a twin's record in EITHER direction, so it neither
-    /// reports nor suppresses.
+    /// Two cells carry weight. `AllProven` ignores the sibling: a twin this sweep watched being removed is direct
+    /// evidence about the twin. An unproven boot-time key on a host whose siblings all answered empty writes nothing:
+    /// "no cover is installed now" is no evidence about a twin's record in either direction.
     pub(crate) fn witness_update(&self) -> boottime_witness::WitnessUpdate {
         use boottime_witness::WitnessUpdate;
         match (self.boot_time, self.sibling) {
             // The sweep touched no boot-time key, so it saw nothing the record
             // is about.
             (BootTimeSightings::None, _) => WitnessUpdate::Leave,
-            // Watched every one of them go — proof for any lifetime, under
-            // bindreams/hole#1043's purge assumption.
+            // Watched every one of them go: proof under the purge assumption on [`KeyLifetime::BootTime`].
             (BootTimeSightings::AllProven, _) => WitnessUpdate::Disarm,
             // A record is possible here and the live evidence for that is
             // about to be deleted by this very sweep. Copy it out first.
@@ -1151,14 +870,9 @@ impl Clearance {
 /// Fold the boot-time keys' outcomes into what this sweep can say about the
 /// persisted record. Pure and total over the slice.
 ///
-/// Reads [`KeyObservation::proves_empty`] rather than re-deriving which
-/// outcomes count, so this and [`Clearance::unproven`] cannot disagree about
-/// whether a given key was proven.
-///
-/// `seen` is tracked separately from `unproven` rather than inferred from an
-/// empty loop: "every boot-time key proved empty" is vacuously true of a sweep
-/// that touched none, and that reading would clear a real record the moment
-/// the twins left the sweep list.
+/// Reads [`KeyObservation::proves_empty`], so this and [`Clearance::unproven`] cannot disagree about whether a key
+/// was proven. `seen` is tracked apart from `unproven` because "every boot-time key proved empty" is vacuously true
+/// of a sweep that touched none.
 fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
     let mut seen = false;
     let mut unproven = false;
@@ -1173,31 +887,18 @@ fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
     }
 }
 
-/// One sweep's whole interaction with the persisted boot-time record: consult
-/// it before the fold, then update it from what the sweep itself observed.
+/// One sweep's whole interaction with the persisted boot-time record: consult it before the fold, then update it from
+/// what the sweep itself observed.
 ///
-/// Every path that removes a standing cover's `PERSISTENT` sibling goes
-/// through here, which is what makes the sites that DISCARD the returned
-/// [`Clearance`] safe: `recover_lockdown`'s `Sweep` arm, `SystemRouting::
-/// release_all_covers`, the reconciler's `CoverStep::Release` through it, and
-/// the standing guard's `Drop` on each platform (Windows' `Cover::delete_filters`,
-/// macOS's `lockdown_disengage`, which also serves the engage's back-out),
-/// which log the `Err` and drop the `Ok`. macOS has no `PERSISTENT` sibling
-/// and no boot-time key, so its record is never written, but it takes the
-/// same path.
-/// The evidence is persisted before anything is returned AT ALL — before the
-/// `Ok` those sites drop, and before the `Err` a failing sweep hands its
-/// caller — so dropping the value costs an operator message on that one call
-/// and nothing beyond it.
+/// Every path that removes a standing cover's `PERSISTENT` sibling goes through here, which is what makes the sites
+/// that discard the returned [`Clearance`] safe: `recover_lockdown`'s `Sweep` arm, `SystemRouting::release_all_covers`,
+/// the reconciler's `CoverStep::Release`, and the standing guard's `Drop` on each platform. macOS has no sibling and no
+/// boot-time key, so its record is never written, but it takes the same path. The evidence is persisted before
+/// anything is returned, `Ok` or `Err`, so dropping the value costs an operator message on that one call and nothing
+/// beyond it.
 ///
-/// Generic over the sweep so the SEQUENCE this exists for — a sweep that
-/// removes the sibling, followed by one that can no longer see it — is
-/// drivable without a firewall, on every platform's lane. A single observation
-/// slice cannot express it, which is why the defect was invisible to tests
-/// built from one. The sweep returns a [`SweepOutcome`] rather than a `Result`
-/// for the reason that type gives: a FAILING sweep is holding observations
-/// too, and the sequence where that matters is equally undrivable from a type
-/// that throws them away.
+/// Generic over the sweep so a sweep that removes the sibling, followed by one that can no longer see it, is drivable
+/// without a firewall. The sweep returns a [`SweepOutcome`] and not a `Result`, for the reason that type gives.
 fn sweep_with_witness(
     lock: &CoverLock,
     sweep: impl FnOnce(ArmingWitness) -> SweepOutcome,
@@ -1208,11 +909,7 @@ fn sweep_with_witness(
         failure,
         released,
     } = sweep(boottime_witness::load(state_dir));
-    // The record is written from what the sweep OBSERVED, before its failure
-    // reaches the caller. A failing sweep is not an unobservant one: this
-    // codebase's own sweeps issue every delete before inspecting any code, so
-    // `Err` arrives after the sibling's delete already succeeded — see
-    // [`SweepOutcome`].
+    // Written from what the sweep observed, before its failure reaches the caller; see [`SweepOutcome`].
     boottime_witness::apply(lock, clearance.witness_update());
     // A kind the sweep released took what its held guards hold, whatever the other kind did. A kind it did not
     // keeps its stamps, so a guard's drop still retries what the sweep could not delete.
@@ -1225,19 +922,12 @@ fn sweep_with_witness(
     }
 }
 
-/// One sweep's whole result: the verdict built from every observation it made,
-/// and the failure — if any — it must still report.
+/// One sweep's whole result: the verdict built from every observation it made, and the failure, if any, it must
+/// still report.
 ///
-/// Deliberately NOT a `Result<Clearance, _>`, and that is bindreams/hole#1010's
-/// F1. Both Windows sweeps ISSUE every delete before inspecting any code (a
-/// structural property `release_all` and `disengage_lockdown` both state), so
-/// a sweep that ends in `Err` has already removed whatever it removed — up to
-/// and including the standing cover's `PERSISTENT` sibling, the one piece of
-/// live evidence no later sweep can re-derive. A `Result` drops those
-/// observations along the `?`, which loses BOTH evidence sources in one act:
-/// the sibling gone from the host, the record never written. The defence the
-/// discard used to carry — "a sweep that failed observed nothing it can write
-/// down" — is false for exactly that reason.
+/// Not a `Result<Clearance, _>`: both Windows sweeps issue every delete before inspecting any code, so a sweep that
+/// ends in `Err` has already removed whatever it removed, up to the standing cover's `PERSISTENT` sibling, the one
+/// piece of live evidence no later sweep can re-derive. A `Result` would drop those observations along the `?`.
 #[must_use = "this carries a `Clearance` AND a failure; dropping it discards both at once, which \
               is the pair this type exists to keep"]
 pub(crate) struct SweepOutcome {
@@ -1281,8 +971,7 @@ impl SweepOutcome {
         }
     }
 
-    /// What the sweep observed, whether or not it also failed. This is the
-    /// half the `?` used to throw away.
+    /// What the sweep observed, whether or not it also failed.
     #[cfg(test)]
     pub(crate) fn clearance(&self) -> &Clearance {
         &self.clearance
@@ -1294,15 +983,9 @@ impl SweepOutcome {
         &self.released
     }
 
-    /// Collapse into the `Result` a caller with no record to update wants.
-    ///
-    /// [`sweep_with_witness`] deliberately does NOT use this: it destructures
-    /// the struct so the observations reach the record before the failure
-    /// reaches the caller. This is for the unit tests of the verdict folds,
-    /// which have no record in play.
-    ///
-    /// What it is NOT for is the sweeps: reaching for it there is how the
-    /// observations got discarded in the first place.
+    /// Collapse into the `Result` a caller with no record to update wants. For the unit tests of the verdict folds;
+    /// [`sweep_with_witness`] destructures the struct instead, so the observations reach the record before the
+    /// failure reaches the caller. Not for sweeps: collapsing there discards the observations.
     #[cfg(test)]
     pub(crate) fn into_result(self) -> Result<Clearance, RoutingError> {
         match self.failure {
@@ -1341,10 +1024,8 @@ mod state_symlink_tests;
 #[path = "failclosed/state_file_tests.rs"]
 mod state_file_tests;
 
-// Deliberately NOT platform-gated. The clearance fold is the decision the
-// uninstall gate reads, and the key class it exists for is Windows-only — so
-// gating its tests to Windows would put the proof on the same platform as the
-// hazard and nowhere else. Pure, so every lane can falsify it.
+// Not platform-gated: the clearance fold is the decision the uninstall gate reads, and it is pure, so every lane can
+// falsify it.
 #[cfg(test)]
 #[path = "failclosed/clearance_tests.rs"]
 mod clearance_tests;
@@ -1355,9 +1036,8 @@ mod clearance_tests;
 #[path = "failclosed/boot_time_tripwire_tests.rs"]
 mod boot_time_tripwire_tests;
 
-// Also a source-tree scan, also deliberately NOT platform-gated. The type it
-// guards is Windows-only; the invariant (per-variant policy lives on the type,
-// docs/contributing/architecture/kill-switch.md#the-decisions) is not, and neither is reading text.
+// Also a source-tree scan, not platform-gated. The type it guards is Windows-only; the invariant (per-variant policy
+// lives on the type, docs/contributing/architecture/kill-switch.md#the-decisions) is not.
 #[cfg(test)]
 #[path = "failclosed/stale_key_policy_tests.rs"]
 mod stale_key_policy_tests;
@@ -1375,40 +1055,34 @@ mod cover_oracle_tests;
 #[path = "failclosed/permit_scenario.rs"]
 mod permit_scenario;
 
-// Privileged-lane real-engage verification (#527): engages the REAL OS cover and
-// asserts it blocks egress. Gated to the elevated `hole-tests` TUN lane by the
-// `TUN` label (see the module docs); excluded from the unprivileged pass.
+// Privileged-lane real-engage verification: engages the real OS cover and asserts it blocks egress. Gated to the
+// elevated `hole-tests` TUN lane by the `TUN` label (see the module docs); excluded from the unprivileged pass.
 #[cfg(test)]
 #[path = "failclosed/lockdown_privileged_tests.rs"]
 mod lockdown_privileged_tests;
 
-// Privileged-lane real-firewall proof that `release_all` really clears both
-// cover kinds and never a clean host's live ruleset. Gated identically to
-// `lockdown_privileged_tests` above — see that module's doc.
+// Privileged-lane proof that `release_all` clears both cover kinds on the real firewall and never a clean host's
+// live ruleset. Gated like `lockdown_privileged_tests`.
 #[cfg(test)]
 #[path = "failclosed/release_privileged_tests.rs"]
 mod release_privileged_tests;
 
-// Privileged-lane falsification: engages the REAL standing lockdown
-// cover against two REAL, live TUN devices and proves the tunnel-permit rule
-// is sensitive to the interface it names, not merely present. Gated
-// identically to `lockdown_privileged_tests` above — see that module's doc.
+// Privileged-lane falsification: engages the real standing lockdown cover against two live TUN devices and proves the
+// tunnel-permit rule is sensitive to the interface it names, not merely present. Gated like
+// `lockdown_privileged_tests`.
 #[cfg(test)]
 #[path = "failclosed/live_tun_permit_privileged_tests.rs"]
 mod live_tun_permit_privileged_tests;
 
-// Privileged-lane measurement (#998) of what WFP does with a BOOT-TIME filter:
-// whether it accepts one under our persistent containers, keeps them, and
-// removes it on a by-key delete. Windows-only — macOS's pf ruleset has no
-// boot-time equivalent (pf rules do not survive a reboot at all, #617). Gated
+// Privileged-lane measurement of what WFP does with a boot-time filter: whether it accepts one under our persistent
+// containers, keeps them, and removes it on a by-key delete. Windows-only: pf rules do not survive a reboot. Gated
 // identically to `lockdown_privileged_tests` above.
 #[cfg(all(test, target_os = "windows"))]
 #[path = "failclosed/boottime_privileged_tests.rs"]
 mod boottime_privileged_tests;
 
-// Privileged-lane proof of the version-independent boot-time sweep (#1008) against the real firewall: a provider-
-// filtered enumeration returns boot-time filters at every layer, and a full sweep removes an unrecognised one and
-// nothing else. Gated identically to `boottime_privileged_tests` above.
+// Privileged-lane proof of the version-independent boot-time sweep against the real firewall: a provider-filtered
+// enumeration returns boot-time filters at every layer, and a full sweep removes an unrecognised one and nothing else. Gated identically to `boottime_privileged_tests` above.
 #[cfg(all(test, target_os = "windows"))]
 #[path = "failclosed/provider_sweep_privileged_tests.rs"]
 mod provider_sweep_privileged_tests;

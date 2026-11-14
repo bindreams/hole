@@ -1,50 +1,33 @@
-//! Privileged-lane real-engage verification for the standing lockdown cover and
-//! the transient block-until-connected cover. Unlike the pure builder unit tests
-//! (`windows_tests` / `macos_tests`, the #165 isolation contract), these engage
-//! the REAL OS cover (Windows: live
-//! FWPM; macOS: live pf) and prove at runtime that it is SELECTIVE: it permits
-//! the configured server IP and blocks all other egress, then restores on
-//! disengage. That catches the block-everything arbitration class of bug (the
-//! permit must beat block-all) AND proves no-leak (a non-permitted host is
-//! blocked). It does NOT prove the tunnel-permit rule is sensitive to the
-//! interface it names — `live_tun_permit_privileged_tests.rs` (this
-//! directory) does, against two real, live TUN devices.
+//! Privileged-lane real-engage verification for the standing lockdown cover and the transient block-until-connected
+//! cover. Unlike the pure builder unit tests (`windows_tests` and `macos_tests`), these engage the real OS cover
+//! (Windows: live FWPM; macOS: live pf) and prove at runtime that it is selective: it permits the configured server IP
+//! and blocks all other egress, then restores on disengage. That catches the block-everything arbitration class of bug
+//! (the permit must beat block-all) and proves no leak (a non-permitted host is blocked). It does not prove the
+//! tunnel-permit rule is sensitive to the interface it names; `live_tun_permit_privileged_tests.rs` does, against two
+//! live TUN devices.
 //!
-//! The probe is OUTBOUND egress, not inbound loopback: an egress kill switch
-//! governs outbound flows, and the GitHub Actions Windows runner's firewall
-//! drops inbound loopback to the test exe — a pre-cover baseline connect to a
-//! local listener TIMES OUT even with no cover, so loopback can't tell a working
-//! cover from a broken one. Outbound to a routable IP works on the runner.
+//! The probe is outbound egress, not inbound loopback: an egress kill switch governs outbound flows, and the GitHub
+//! Actions Windows runner's firewall drops inbound loopback to the test exe, so a pre-cover baseline connect to a local
+//! listener times out even with no cover. Outbound to a routable IP works on the runner.
 //!
-//! They run on the elevated `tun` lane only: the `TUN` label (→ skuld filter
-//! name `tun`) gates them so the unprivileged `SKULD_LABELS="!tun"` pass
-//! excludes them and the `SKULD_LABELS="tun"` pass runs them — Windows under
-//! CI's elevated token, macOS under `sudo` (pf needs root). They are NOT
-//! `#[ignore]`d and do not skip on missing privilege: a default `cargo nextest`
-//! run on an unelevated box runs them and fails loud; opting out is the explicit
-//! `!tun` filter, and CI provisions the elevation.
+//! They run on the elevated `tun` lane only: the `TUN` label gates them so the unprivileged `SKULD_LABELS="!tun"` pass
+//! excludes them and the `SKULD_LABELS="tun"` pass runs them (Windows under CI's elevated token, macOS under `sudo`). They
+//! are not `#[ignore]`d and do not skip on missing privilege: a default `cargo nextest` run on an unelevated box fails
+//! loud, and opting out is the explicit `!tun` filter.
 //!
-//! Cross-binary serialization for the global WFP/pf/TUN state these touch lives
-//! in `.config/nextest.toml` (`global_net_state` test-group) — skuld serializes
-//! across binaries too, but it does not own nextest's thread budget.
+//! Cross-binary serialization for the global WFP/pf/TUN state these touch lives in `.config/nextest.toml`
+//! (`global_net_state` test-group); skuld serializes across binaries too but does not own nextest's thread budget.
 //!
-//! COUPLED NAMES: that group's filter matches these tests by the name substrings
-//! `windows_lockdown_permits_server_ip_`, `macos_lockdown_permits_server_ip_`,
-//! `failclosed_permits_` (the transient-cover tests), and
-//! `macos_lockdown_failed_engage_` (the back-out stamp test). Renaming one
-//! WITHOUT updating `.config/nextest.toml` drops the test from the group → a
-//! silent cross-binary race with the bridge's live-egress `mod tun` e2es.
-//! Change both together.
+//! COUPLED NAMES: that group's filter matches these tests by the name substrings `windows_lockdown_permits_server_ip_`,
+//! `macos_lockdown_permits_server_ip_`, `failclosed_permits_` (the transient-cover tests), and
+//! `macos_lockdown_failed_engage_` (the back-out stamp test). Renaming one without updating `.config/nextest.toml`
+//! drops the test from the group, a silent cross-binary race with the bridge's live-egress `mod tun` e2es.
 //!
-//! The permitted/resolver/non-permitted targets MUST be addresses this host
-//! does NOT itself own (see `RESOLVER`'s doc for why a self-served target is
-//! unsound here: on macOS/BSD it would be silently exempted by `set skip on
-//! lo0` regardless of whether the resolver rule works at all). That leaves a
-//! residual live-network dependency; `RESOLVER` is picked to share PERMITTED's
-//! proven-reliable anycast network rather than eliminate it, and the
-//! resolver-permit assertions cross-check against PERMITTED at the same
-//! instant so a failure here is not blindly reported as "the permit failed"
-//! when it could be a general outage instead.
+//! The permitted, resolver and non-permitted targets must be addresses this host does not itself own (see `RESOLVER`'s
+//! doc: on macOS/BSD a self-served target is silently exempted by `set skip on lo0` whether or not the resolver rule
+//! works). That leaves a live-network dependency; `RESOLVER` shares PERMITTED's anycast network, and the resolver-permit
+//! assertions cross-check against PERMITTED at the same instant so a general outage is not reported as "the permit
+//! failed".
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::cover_oracle::{held_covers, permit_scenario};
@@ -61,20 +44,11 @@ use util::system_tool::SystemTool;
 // block holds.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const PERMITTED: &str = "1.1.1.1:443";
-// A third routable anycast host, standing in for the pinned DoH resolver.
-// Cloudflare's SECONDARY address (1.0.0.1, distinct from PERMITTED's 1.1.1.1)
-// rather than Quad9 (9.9.9.9): `macos_failclosed_permits_resolver_blocks_other_egress`
-// flaked TimedOut against 9.9.9.9 on the darwin/amd64 CI runner (darwin/arm64
-// and every other lane were unaffected), and PERMITTED=1.1.1.1 has never once
-// flaked across the SAME runner in the SAME file — same anycast network,
-// same edge presence, empirically the reliable choice on this infrastructure.
-// A residual live-network dependency remains (see this module's doc for why
-// a fully self-served target is NOT used instead: on macOS/BSD, a connect to
-// ANY address the host itself owns -- primary or aliased -- is routed via an
-// automatic host route through `lo0` before it ever reaches the real
-// interface, and this ruleset's `set skip on lo0` would silently exempt it,
-// making the permit assertion pass regardless of whether the resolver rule
-// works at all).
+// A third routable anycast host, standing in for the pinned DoH resolver: Cloudflare's secondary address (1.0.0.1,
+// distinct from PERMITTED's 1.1.1.1). It shares PERMITTED's network, which has been the reliable one on this
+// infrastructure. A fully self-served target is not used: on macOS/BSD a connect to any address the host owns is routed
+// through `lo0` before it reaches the real interface, and `set skip on lo0` would exempt it, so the permit assertion
+// would pass whether or not the resolver rule works.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const RESOLVER: &str = "1.0.0.1:443";
 // The SAME resolver host, but on its DNS-over-TLS port rather than 443 —
@@ -325,7 +299,7 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     );
 }
 
-/// Proves #617's boot-time reconciliation actually rearms a real host, not
+/// Proves the boot-time reconciliation actually rearms a real host, not
 /// just decides to in a mock: engage the standing cover for real, simulate
 /// what a reboot does to pf (disable + flush the loaded ruleset, but leave
 /// `bridge-lockdown-pf.json` on disk — a reboot resets pf, not the

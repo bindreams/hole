@@ -1,79 +1,54 @@
-//! Live-interface falsification for the standing lockdown cover's
-//! tunnel-permit rule.
+//! Live-interface falsification for the standing lockdown cover's tunnel-permit rule.
 //!
-//! `lockdown_privileged_tests.rs` proves the cover is selective (permit beats
-//! block-all, a non-permitted host is dropped) but engages against an
-//! interface picked only to exercise the resolve path — macOS uses a name
-//! that matches nothing at all, Windows a live-but-irrelevant loopback alias.
-//! Neither proves the permit is sensitive to the interface it names. A rule
-//! naming the wrong live interface — the realistic failure once the macOS TUN
-//! name becomes kernel-assigned, or with a stale/duplicate Windows adapter —
-//! produces a kill switch that blocks everything while the UI reports it
-//! armed and the real tunnel Running.
+//! `lockdown_privileged_tests.rs` proves the cover is selective (permit beats block-all, a non-permitted host is
+//! dropped) but engages against an interface picked only to exercise the resolve path: macOS uses a name that matches
+//! nothing, Windows a live-but-irrelevant loopback alias. Neither proves the permit is sensitive to the interface it
+//! names. A rule naming the wrong live interface (the realistic failure with a kernel-assigned macOS TUN name, or a
+//! stale or duplicate Windows adapter) yields a kill switch that blocks everything while the UI reports it armed and the
+//! tunnel Running.
 //!
-//! This module opens two real TUN devices and drives one probe route through
-//! the first. Four phases per platform:
+//! This module opens two real TUN devices and drives one probe route through the first. Four phases per platform:
 //!
-//! 1. **Control** (no cover): the probe must surface on the device — proves
-//!    the harness itself, not the cover.
-//! 2. **Positive**: engage the real cover naming device 1 (the one carrying
-//!    the route). The probe (UDP and a TCP SYN) must be PERMITTED, a
-//!    non-permitted host still blocked, and the server IP still reachable.
-//! 3. **Mutation**: re-engage naming device 2 — a second interface that is
-//!    genuinely live, just not the one carrying the traffic. The SAME probes
-//!    must now be DROPPED. This is the anti-vacuity mechanism: a permit that
-//!    (wrongly) matched any live TUN-shaped interface would pass phase 2 and
-//!    ALSO pass phase 3, proving nothing. Only a permit that is actually
-//!    keyed on the named interface fails phase 3's mutation.
-//! 4. **Restore**: with nothing engaged, the probe surfaces again and the
-//!    non-permitted host is reachable — the box was left open.
+//! 1. **Control** (no cover): the probe must surface on the device. This proves the harness, not the cover.
+//! 2. **Positive**: engage the real cover naming device 1 (the one carrying the route). The probe (UDP and a TCP SYN)
+//!    must be permitted, a non-permitted host still blocked, and the server IP still reachable.
+//! 3. **Mutation**: re-engage naming device 2, a second live interface that is not the one carrying the traffic. The same
+//!    probes must now be dropped. This is the anti-vacuity mechanism: a permit that wrongly matched any live TUN-shaped
+//!    interface would pass phase 2 and also pass phase 3.
+//! 4. **Restore**: with nothing engaged, the probe surfaces again and the non-permitted host is reachable.
 //!
-//! Every phase's negative rests on the FIFO ordering of one device's frame
-//! queue: a probe sent while covered has its firewall fate decided
-//! synchronously on the send path, before the cover is dropped, so a "tail"
-//! probe sent AFTER the drop — and confirmed to arrive — proves the earlier
-//! probes' fate was already sealed. No sleeps, no poll-until-true.
+//! Every phase's negative rests on the FIFO ordering of one device's frame queue: a probe sent while covered has its
+//! firewall fate decided synchronously on the send path, before the cover is dropped, so a "tail" probe sent after the
+//! drop and confirmed to arrive proves the earlier probes' fate was already sealed. No sleeps, no poll-until-true.
 //!
-//! `serial = TUN` (the crate-root label — a second `#[skuld::label] const
-//! TUN` in this binary would mint a DIFFERENT serial token and race the very
-//! cover tests this must exclude) plus the
-//! `global_net_state` nextest test-group serialize this across the whole
-//! elevated lane; see `.config/nextest.toml`.
+//! `serial = TUN` (the crate-root label; a second `#[skuld::label] const TUN` in this binary would mint a different
+//! serial token and race the cover tests this must exclude) plus the `global_net_state` nextest test-group serialize
+//! this across the whole elevated lane (`.config/nextest.toml`).
 //!
 //! ## The mid-stream proof (macOS)
 //!
-//! `macos_live_tun_permit_cover_carries_a_mid_stream_segment_after_a_state_purge`
-//! reuses this module's devices, route and frame reader for a different
-//! question: whether a cover permit is stateless enough to carry a segment of
-//! an ALREADY-ESTABLISHED flow after pf's state table is purged. It completes
-//! a TCP handshake by hand — reading the kernel's SYN off the device and
-//! writing a crafted SYN-ACK back — so the flow exists with no peer and no
-//! internet. See that test's own doc for its three legs.
+//! `macos_live_tun_permit_cover_carries_a_mid_stream_segment_after_a_state_purge` reuses this module's devices, route and
+//! frame reader to ask whether a cover permit is stateless enough to carry a segment of an already-established flow
+//! after pf's state table is purged. It completes a TCP handshake by hand (reading the kernel's SYN off the device and
+//! writing a crafted SYN-ACK back), so the flow exists with no peer and no internet. See that test's doc for its legs.
 //!
-//! COUPLED NAMES: every test name below contains the literal substring
-//! `live_tun_permit_`, which `.config/nextest.toml`'s `global_net_state`
-//! filter matches. Renaming one without updating that filter silently
-//! drops it from the group.
+//! COUPLED NAMES: every test name below contains `live_tun_permit_`, which `.config/nextest.toml`'s `global_net_state`
+//! filter matches. Renaming one without updating that filter silently drops it from the group.
 //!
 //! ## One state directory, written before the first engage
 //!
-//! [`EscapeGuard`] owns a single `TempDir` for the whole test, reused by all
-//! three engages, and writes the recovery record from it before anything is
-//! armed. A fresh directory per engage would let a silently-failed teardown
-//! (macOS `engage_pf_action`'s `FreshEnable` snapshots whatever is LIVE when
-//! it sees no persisted state) capture a PRIOR cover's block-everything
-//! ruleset as "the host" — and every later restore, including the escape
-//! guard itself, would then reload block-everything as the host and erase the
-//! evidence. Do not reintroduce a directory-per-phase habit here.
+//! [`EscapeGuard`] owns a single `TempDir` for the whole test, reused by all three engages, and writes the recovery
+//! record from it before anything is armed. A fresh directory per engage would let a silently failed teardown (macOS
+//! `engage_pf_action`'s `FreshEnable` snapshots whatever is live when it sees no persisted state) capture a prior
+//! cover's block-everything ruleset as "the host", and every later restore, including the escape guard itself, would
+//! then reload it.
 //!
 //! ## What a real run does to the machine
 //!
-//! **This engages a real, system-wide block-all firewall cover on the host
-//! running it, for a few seconds, more than once.** It is not `#[ignore]`d
-//! and a plain `cargo nextest run` on an unelevated box fails loud (the
-//! privilege check), but on an elevated box it WILL arm the kill switch. If
-//! interrupted, the recovery record written before the first engage names the
-//! platform command to clear it by hand.
+//! **This engages a real, system-wide block-all firewall cover on the host running it, for a few seconds, more than
+//! once.** It is not `#[ignore]`d, and a plain `cargo nextest run` on an unelevated box fails loud (the privilege
+//! check), but on an elevated box it arms the kill switch. If interrupted, the recovery record written before the first
+//! engage names the platform command to clear it by hand.
 
 #![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
@@ -953,17 +928,13 @@ fn abort_mid_stream(stream: tokio::net::TcpStream) {
     drop(stream);
 }
 
-/// The kernel's own verdict on the claim this whole PR rests on: a cover
-/// permit must carry a mid-stream segment of a flow it names ACROSS the
-/// engage's host-wide `pfctl -F states` purge.
+/// The kernel's own verdict on the claim `permit()`'s `no state` rests on: a cover permit must carry a mid-stream
+/// segment of a flow it names across the engage's host-wide `pfctl -F states` purge.
 ///
-/// Everything else behind that claim is `pfctl -vn` TEXT — that a bare `pass`
-/// normalizes to `flags S/SA keep state` and that `no state` suppresses it.
-/// This module's neighbours prove the same property for `lo0`, which is
-/// `set skip`-exempt and therefore says nothing about a permit on a real
-/// interface. Nothing in the suite showed the kernel DELIVERING a mid-stream
-/// segment on a non-`lo0` permit after a purge, and this mechanism has been
-/// wrong three review rounds running.
+/// Everything else behind that claim is `pfctl -vn` text: that a bare `pass` normalizes to `flags S/SA keep state` and
+/// that `no state` suppresses it. This module's neighbours prove the same property for `lo0`, which is `set skip`-exempt
+/// and so says nothing about a permit on a real interface. This test shows the kernel delivering a mid-stream segment on
+/// a non-`lo0` permit after a purge.
 ///
 /// Three legs, in this order:
 ///

@@ -317,6 +317,37 @@ Run `sudo launchctl bootout system/com.hole.bridge`, then `sudo hole bridge unlo
 ```
 ````
 
+## The release contract
+
+`failclosed::release_all` is the function behind Unblock and untick (T11, T12) and behind the sweep of `release-covers`.
+It makes five promises, and each exists because a weaker one strands a user.
+
+1. **Unconditional.** It never probes the live cover to decide whether to act, and a clean host returns `Ok`. On macOS
+   "clean host" is read from Hole's own state file (`StateFile::Absent`), because pf has no query for who holds a ruleset.
+   A state file lost under a live cover (an external wipe of the state directory, not a corrupt file) is therefore
+   indistinguishable from a clean host, and the call answers `Ok` without touching pf. This is a
+   [disclosed residual](kill-switch-recovery.md#disclosed-residuals).
+1. **Total.** It clears both cover kinds. Clearing one would leave a user with no way out.
+1. **No short-circuit.** Every clear is attempted before any failure is examined. The only early return is a Windows
+   engine-open failure, where nothing could have been issued.
+1. **No false success over a detected cover.** `Ok` means every cover the call could detect is cleared. The converse does
+   not hold: it may answer `Err` over a host that is in fact open. The asymmetry is deliberate, because a false `Err`
+   keeps the escape on the tray menu and the intent armed, while a false `Ok` over a detected cover is the lockout the
+   function exists to remove. Promise 1's lost state file is the one `Ok` over a blocked host, and it is no violation:
+   the cover left no evidence to detect. `Ok` is also qualified, by the `Clearance` it carries
+   ([What `Ok` proves](kill-switch-uninstall.md#what-ok-proves)).
+1. **Bookkeeping is best-effort, except the state-file clear.** The macOS `pfctl -X` refcount drop and the Windows
+   sublayer and provider delete log a warning on failure: once the host's rules are restored, a refcount that will not
+   drop blocks nothing, and a record kept for it would fail the same way on every retry. A cover's state-file clear is
+   skipped whenever that cover's restore did not confirm, because the file is the cover's only record, and clearing it
+   after an unconfirmed restore would make the next call read a clean host while the block persists. After a confirmed
+   restore, a clear that cannot write is that cover's error. macOS orders the two so `pfctl -X` never runs while a
+   record names its token ([Release](kill-switch-macos.md#release)). A record that could not be read is kept, after its
+   restore, and the answer is an error.
+
+Windows keeps no cover state file: the filter set is compiled-in fixed GUIDs, so nothing there can be corrupt or
+version-skewed.
+
 ## The transient cover
 
 `Routing::install_failclosed_cover` blocks everything except loopback and the server, with an optional permit for the

@@ -216,11 +216,11 @@ The privileged lane measures, on the real firewall and with no reboot, in
   the machine it runs on.
 - Every engage re-creates the twins while the persistent block-all beside them is not re-created.
 
-The code also records, as measured, that a live boot-time filter is not enforced once BFE has started, and relies on it:
-it is why a refused delete of an unlisted twin and an unreadable view never fail a sweep, and on it a stranded twin
-affects the next boot's early window and not the running host. No test in this tree makes that measurement. The privileged
-lane's probes are permits on documentation addresses, because a boot-time block could lock the machine out, so if the
-measurement was made by hand, its record is not in the tree.
+The code assumes that a live boot-time filter is not enforced once BFE has started, and relies on it: it is why a refused
+delete of an unlisted twin and an unreadable view never fail a sweep, and on it a stranded twin affects the next boot's
+early window and not the running host (`KeyRole::refusal_fails_the_sweep` states it as an assumption). No test in this tree
+measures it. The privileged lane's probes are permits on documentation addresses, because a boot-time block could lock the
+machine out.
 
 Nothing measures anything that spans a reboot, and the lane does not reboot:
 
