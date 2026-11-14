@@ -79,6 +79,12 @@ Recovery, adoption and the cover lock <contributing/architecture/kill-switch-rec
 Windows: filters and the boot window <contributing/architecture/kill-switch-windows.md>
 macOS: the pf ruleset <contributing/architecture/kill-switch-macos.md>
 Uninstall and the service <contributing/architecture/kill-switch-uninstall.md>
+The datapath <contributing/architecture/datapath.md>
+The TUN device: name and IPv6 <contributing/architecture/tun-device.md>
+TCP accept refusal <contributing/architecture/tcp-admission.md>
+The DNS forwarder <contributing/architecture/dns-forwarder.md>
+Plugin binaries <contributing/architecture/plugin-binaries.md>
+The galoshes transport <contributing/architecture/galoshes-transport.md>
 Development <contributing/development.md>
 Testing <contributing/testing.md>
 Continuous integration <contributing/ci.md>

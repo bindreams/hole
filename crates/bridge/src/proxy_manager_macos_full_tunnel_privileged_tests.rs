@@ -37,15 +37,14 @@
 //!
 //! `DnsConfig::default()` (real Cloudflare resolvers, DoH) is used rather
 //! than a synthetic/unreachable address: the bridge's own start-time
-//! forwarder self-test (CLAUDE.md `#dns-forwarder`) would fail Start outright
+//! forwarder self-test (`docs/contributing/architecture/dns-forwarder.md`) would fail Start outright
 //! against a resolver nothing can actually answer through the tunnel. Using
 //! the default also sidesteps the macOS IPv6-assignment-fatality question —
 //! IPv6 assignment is warn-only there, so this test does not need it to
 //! succeed to pass; the assignment attempt itself still runs as a side
-//! effect of `routing.install` inside `Start` (CLAUDE.md `#ipv6-in-the-tunnel`
-//! — `hole-tun` unconditionally holds `TUN_SUBNET6` on the OS interface),
-//! making this test's first real run the first execution of that path on the
-//! darwin TUN lane. This test does not assert anything about IPv6: what that
+//! effect of the device build inside `Start` (`Device::build` assigns
+//! `TUN_SUBNET6` to the utun interface; see
+//! `docs/contributing/architecture/tun-device.md`). This test does not assert anything about IPv6: what that
 //! path actually does must be read out of the run's own logs, not out of
 //! any assertion here (see the module doc on
 //! `tun_engine::device`/`tun_engine::routing`'s IPv6 handling for the open
