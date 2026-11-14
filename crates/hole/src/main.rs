@@ -40,11 +40,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use state::AppState;
 use tauri::Manager;
 
-/// Set when an explicit `AppHandle::exit(N)` is in progress, so the
-/// last-window-closed `RunEvent::ExitRequested { code: None }` callback
-/// (which fires after we destroy the dashboard from the `code: Some(_)`
-/// arm of `handle_run_event`) does not call `prevent_exit` and abort the
-/// exit we just initiated. See `handle_run_event`.
+/// Set by `destroy_windows_before_exit` once an explicit `AppHandle::exit(N)` is in progress.
+///
+/// Destroying the last window fires `ExitRequested { code: None }` again, and the
+/// destroys are processed on a later event-loop iteration. While this is set,
+/// `keep_running_for_tray` must not `prevent_exit` (it would abort the exit in
+/// progress), and a macOS reopen must not build a window on a process about to
+/// `process::exit` past every `Drop`.
 static EXITING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(not(test))]
@@ -238,91 +240,54 @@ fn launch_gui(show_dashboard: bool) {
         .run(handle_run_event);
 }
 
-/// Tauri run-event handler: keeps the app running for the tray after the last
-/// window closes, and destroys the webview windows before an explicit exit,
-/// because tao calls `std::process::exit` at the end of `EventLoop::run`, which
-/// bypasses every `Drop` in the wry/Tauri tree.
-///
-/// The wry runtime fires `RunEvent::ExitRequested` from two places:
-///
-///   - `code: None`  — last window destroyed (the user clicked X on the
-///     dashboard). We want the app to keep running for the tray icon, so
-///     we call `prevent_exit`.
-///
-///   - `code: Some(N)` — `AppHandle::exit(N)` was called explicitly (tray
-///     Exit menu, dashboard File→Exit menu, post-MSI install exit). We
-///     need to destroy any remaining webview windows here, BEFORE letting
-///     the exit through. Otherwise the dashboard's `Chrome_WidgetWin_0`
-///     HWND survives to AtExit time and Chromium logs
-///     `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`.
-///
-/// Calling `WebviewWindow::destroy()` from this callback is safe on the
-/// main thread: the wry runtime intercepts
-/// `Event::UserEvent(Message::Window(_, WindowMessage::Destroy))` with a
-/// direct call to `on_window_close`, avoiding the `WindowMessage::Destroy`
-/// arm in `handle_user_message` (which panics on the main thread). The
-/// destroy message we enqueue is processed by the next event loop
-/// iteration; tao's `runner.handling_events()` guard defers the
-/// `ControlFlow::Exit` break until we have returned to Idle, so the
-/// destroy completes before the loop actually exits and `process::exit`
-/// runs.
-///
-/// After our destroys empty the window store, the runtime fires
-/// `RunEvent::ExitRequested { code: None }` again — that is the re-entry
-/// the `EXITING` flag at the top of this file guards against. Without the
-/// flag, the `None` arm would call `prevent_exit` and abort the explicit
-/// exit we just initiated.
+/// Dispatches Tauri run events: tray persistence, macOS reopen, and the exit contract.
 fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
     match event {
         // No new process is spawned on reopen, so single-instance never fires;
         // this is the only signal. `has_visible_windows` is ignored: reveal-or-build
-        // also covers a minimized dashboard.
-        //
-        // The `EXITING` guard matters: the `Some(_)` arm destroys every window and
-        // returns to the event loop, which processes the destroys on a later
-        // iteration. An activation delivered in that window would build a fresh
-        // webview on a process about to `process::exit` past every `Drop`.
+        // also covers a minimized dashboard. Skipped once `EXITING` is set.
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen { .. } if !EXITING.load(Ordering::SeqCst) => tray::open_settings_window(app),
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen { .. } => {}
 
-        tauri::RunEvent::ExitRequested { code, api, .. } => match code {
-            None => {
-                if EXITING.load(Ordering::SeqCst) {
-                    // Re-entered from the destroys we triggered in the
-                    // `Some(_)` arm. Let the natural shutdown proceed; do
-                    // not call `prevent_exit`.
-                    return;
-                }
-                api.prevent_exit();
-                #[cfg(target_os = "macos")]
-                platform::hide_dock_icon(app);
-            }
-            Some(_) => {
-                EXITING.store(true, Ordering::SeqCst);
-                for window in app.webview_windows().values() {
-                    if let Err(e) = window.destroy() {
-                        // Use eprintln rather than tracing::warn here.
-                        // tracing-subscriber writes through an async
-                        // appender, and tao's `EventLoop::run` is about to
-                        // call `std::process::exit` which bypasses the
-                        // WorkerGuard's flush-on-drop. eprintln hits stderr
-                        // synchronously so dev-mode users (the only ones who
-                        // have a console at all, since release builds use
-                        // windows_subsystem) actually see the failure. If
-                        // destroy fails, the original ERROR_CLASS_HAS_WINDOWS
-                        // bug recurs — surfacing the warning loudly is
-                        // important so the regression is diagnosable.
-                        eprintln!(
-                            "warning: failed to destroy webview window {:?} on exit: {e}",
-                            window.label(),
-                        );
-                    }
-                }
-            }
-        },
+        tauri::RunEvent::ExitRequested { code: None, api, .. } => keep_running_for_tray(app, &api),
+        tauri::RunEvent::ExitRequested { code: Some(_), .. } => destroy_windows_before_exit(app),
 
         _ => {}
+    }
+}
+
+/// Keeps the app running for the tray icon after the last window is destroyed
+/// (`ExitRequested { code: None }`). Does nothing while `EXITING` is set.
+fn keep_running_for_tray(app: &tauri::AppHandle, api: &tauri::ExitRequestApi) {
+    if EXITING.load(Ordering::SeqCst) {
+        return;
+    }
+    api.prevent_exit();
+    #[cfg(target_os = "macos")]
+    platform::hide_dock_icon(app);
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+}
+
+/// Destroys every webview window before an explicit `AppHandle::exit(N)`
+/// (`ExitRequested { code: Some(_) }`: tray Exit, dashboard File->Exit, post-MSI
+/// install exit) and sets `EXITING`. Needed because tao calls `process::exit`
+/// at the end of `EventLoop::run`, bypassing every `Drop` in the wry/Tauri tree:
+/// a window left alive survives to AtExit, where Chromium logs `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`.
+fn destroy_windows_before_exit(app: &tauri::AppHandle) {
+    EXITING.store(true, Ordering::SeqCst);
+    for window in app.webview_windows().values() {
+        // Safe on the main thread: wry routes this to `on_window_close`, and tao defers
+        // the `ControlFlow::Exit` until the destroy has been processed.
+        if let Err(e) = window.destroy() {
+            // stderr, not `tracing`: the async appender is not flushed before `process::exit`.
+            // A failed destroy brings back the 1412 error, so it must be seen.
+            eprintln!(
+                "warning: failed to destroy webview window {:?} on exit: {e}",
+                window.label(),
+            );
+        }
     }
 }
