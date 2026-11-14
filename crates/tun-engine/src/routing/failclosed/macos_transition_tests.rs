@@ -763,6 +763,8 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
 /// held socket still carries traffic: the state entry is the thing pf consults
 /// before the ruleset, so its absence is the property directly, with no
 /// dependence on a remote peer choosing to answer.
+///
+/// The engage's `pfctl -F states` purge is host-wide, so this test must never run beside anything holding pf state.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_cover_state_purge_kills_a_flow_established_before_engage() {
     // Same reliable anycast pair the transition test above uses, and for the

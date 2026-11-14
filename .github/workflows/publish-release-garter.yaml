@@ -1,7 +1,7 @@
 name: Publish Release (garter)
 
 # Thin caller for the shared publish-release reusable workflow.
-# See .github/workflows/reusable-publish-release.yaml and #326.
+# See .github/workflows/reusable-publish-release.yaml.
 
 on:
   workflow_dispatch:

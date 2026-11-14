@@ -8,17 +8,18 @@
 #
 # The service process is spared. What both kill points need is the GUI gone (a free
 # single-instance slot for tauri-driver, no held handles for msiexec); neither
-# needs the bridge dead. Killing it starts the SCM's 1s restart-on-failure
-# clock, and msiexec's uninstall then reaches the bridge about when the restart
-# lands. Left alone, the bridge is stopped by the
-# uninstall the way a user's uninstall stops it.
+# needs the bridge dead. Killing it starts the SCM's restart-on-failure clock
+# (a 1s delay, set in `restart_failure_actions` in
+# crates/bridge/src/platform/windows.rs), and msiexec's uninstall then reaches
+# the bridge about when the restart lands. Left alone, the bridge is stopped by
+# the uninstall the way a user's uninstall stops it.
 #
 # Resolving BEFORE the kill is the point. `Wait-Process -Name hole` resolves its
 # targets once, at the moment it runs; HoleBridge carries SCM restart-on-failure
-# with a 1s delay (`restart_failure_actions`, crates/bridge/src/platform/
-# windows.rs), so a name resolved *after* the kill lands on the freshly
-# restarted bridge and blocks forever on a live process. Waiting on the objects
-# captured before the kill cannot.
+# (`restart_failure_actions`, crates/bridge/src/platform/windows.rs), so a name
+# resolved *after* the kill lands on the freshly restarted bridge and blocks
+# forever on a live process. Waiting on the objects captured before the kill
+# cannot.
 param(
     [string]$InstallDir,
 

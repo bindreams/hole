@@ -90,7 +90,7 @@ export async function assertUiReady(browser: WebdriverIO.Browser): Promise<void>
     }
     // Every outcome has to reach `done`, or the call hangs to the framework
     // timeout instead of reporting what went wrong. The `error` -> `reason`
-    // rename reads properties off the bridge's result, so a malformed one
+    // mapping reads properties off the bridge's result, so a malformed one
     // throws inside the chain rather than rejecting it.
     try {
       Promise.resolve(ready())

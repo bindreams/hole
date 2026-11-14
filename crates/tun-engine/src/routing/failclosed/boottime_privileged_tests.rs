@@ -42,9 +42,11 @@
 //! boottimepolicy` is the manual cross-check for the purge; [`PolicyDump`] captures it, and only that it ran is
 //! asserted.
 //!
-//! Gated to the elevated `tun` lane like `lockdown_privileged_tests`. COUPLED NAMES: `.config/nextest.toml`'s
-//! `global_net_state` filter matches the `boottime_global_net_state_` prefix; renaming without updating it drops the
-//! test from the group.
+//! Gated to the elevated `tun` lane like `lockdown_privileged_tests`. These tests add a real boot-time filter under the
+//! covers' own provider and sublayer, and a cover test's `delete_all` drops that shared sublayer, so none may run beside
+//! one. COUPLED NAMES: `.config/nextest.toml`'s `global_net_state` filter matches the `boottime_global_net_state_`
+//! prefix; the `global_net_state` label and `cargo xtask verify-global-net-state-labels` catch a rename that leaves them
+//! apart.
 
 #![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
