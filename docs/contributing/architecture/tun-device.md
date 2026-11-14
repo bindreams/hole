@@ -149,8 +149,10 @@ its own `Device` on its own thread, which releases the adapter.
 waits for the IPv4 interface and not the IPv6 one, and it swallows `ERROR_NOT_FOUND` on the IPv6 call into a `log` record
 Hole never surfaces, so the IPv6 metric would land or vanish from run to run with no trace. `set_interface_metric` returns
 the absence as `MetricOutcome::NoInterfaceRow`, which the caller logs at `warn`. That removes the silent part of the
-failure and not the race itself: the IPv6 interface row may not exist yet, and waiting for it would take a chosen delay,
-which Hole does not use. No test asserts the row is present.
+failure. The row's presence is ordered by `Device::build`: it waits for the IPv6 half (see
+[above](#windows-wait-for-the-ipv6-half-then-assign)) before `Dispatcher::new` sets the metric, so a
+`NoInterfaceRow` for IPv6 follows from `Assigned::Ipv6StackAbsent`, whose expiry-as-absence is contested in
+bindreams/hole#1301. No test asserts the row is present.
 
 ## Read next
 

@@ -16,9 +16,8 @@ use super::block_log::BlockLog;
 use super::DropSink;
 
 pub struct LoggingDropSink {
-    /// Rate-limited warn/info dedup, keyed on (rule_index, dst). Uses
-    /// `std::sync::Mutex` because the critical section is sub-microsecond
-    /// and never held across an `.await`.
+    /// Rate-limited warn/info dedup, keyed on (rule_index, dst). A
+    /// `std::sync::Mutex` is enough: it is never held across an `.await`.
     block_log: Mutex<BlockLog>,
     /// One-time flag for the IPv6-unreachable warn — different cardinality
     /// from block_log (infrastructure-level, not per-flow).

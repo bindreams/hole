@@ -25,7 +25,7 @@ pub struct ConnInfo {
     pub dst: SocketAddr,
     /// Set when the dispatcher recovered a domain via the TLS/HTTP
     /// sniffer. `None` for raw IP destinations, non-peekable flows, and
-    /// all UDP flows (no UDP peek path today).
+    /// all UDP flows (UDP is never peeked).
     ///
     /// The matcher canonicalizes this value internally on every match
     /// (case-fold + trailing dot strip + IDNA), so callers may pass the

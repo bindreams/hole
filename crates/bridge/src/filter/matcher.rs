@@ -59,7 +59,6 @@ impl Matcher {
     /// - `Exactly`/`WithSubdomains` with an invalid domain or empty string.
     /// - `Wildcard` with a glob that produces an invalid regex.
     /// - IDNA normalization failure on a domain literal.
-    /// - `Exactly` with a value that looks like an IP literal but doesn't parse.
     pub fn compile(address: &str, matching: MatchType) -> Result<Matcher, CompileError> {
         match matching {
             MatchType::Subnet => parse_subnet(address),

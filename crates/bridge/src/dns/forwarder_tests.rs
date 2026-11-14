@@ -457,8 +457,8 @@ fn a_pending_connect_survives_a_higher_ranked_failure_in_the_same_walk() {
     );
 }
 
-/// The two bounds price different questions — nine round trips through a tunnel
-/// versus three on a direct hop — so the tunnel's must be the larger. A weak
+/// The two bounds price different questions (nine round trips through a tunnel
+/// versus three on a direct hop), so the tunnel's must be the larger. A weak
 /// test (two literals, one file), kept only because it catches an accidental
 /// equalisation, which would silently re-price the bootstrap as a tunnel walk.
 #[skuld::test]
@@ -1004,8 +1004,8 @@ mod typed_error_logs {
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
     /// Closed TCP upstream + PlainTcp protocol → the "upstream failed" log
-    /// line must include `layer=connect` and `elapsed_ms=<n>`, so Phase 2
-    /// observation can tell connect-level failures from mid-stream ones.
+    /// line must include `layer=connect` and `elapsed_ms=<n>`, so a reader of
+    /// the log can tell connect-level failures from mid-stream ones.
     #[skuld::test]
     async fn closed_tcp_upstream_logs_connect_layer_and_elapsed_ms() {
         let writer = VecWriter::new();
@@ -1075,7 +1075,7 @@ mod typed_error_logs {
     }
 
     /// The `caused_by` field must surface `std::error::Error::source()` so
-    /// Phase 2 sees the underlying error kind (e.g. `ConnectionRefused`)
+    /// the log shows the underlying error kind (e.g. `ConnectionRefused`),
     /// not just the outer display message.
     #[skuld::test]
     async fn upstream_failure_log_includes_caused_by_chain() {

@@ -1,18 +1,15 @@
-//! Persisted DNS state — read-only escape hatch for a `bridge-dns.json` an
-//! older build left behind. The bridge itself no longer writes this file:
-//! DNS egress is confined by `tun_engine::dns_confine`'s WFP confinement
-//! instead, which persists nothing (see that module's doc for why a
-//! process-scoped dynamic FWPM session needs no crash-recovery state at
-//! all). What remains here is `load` + `clear`/`supersede`, used exactly
-//! once per file by [`crate::dns::recovery`]'s evidence-gated upgrade
-//! sweep, and the schema types themselves — kept so an older build's file
-//! can still be parsed and, when the evidence supports it, undone.
+//! Persisted DNS state: a read-only escape hatch for a `bridge-dns.json` an
+//! older build left behind. The bridge does not write this file; DNS egress
+//! is confined by `tun_engine::dns_confine`, whose process-scoped session
+//! persists nothing. What remains is [`load`], [`clear`] and [`supersede`],
+//! used once per file by [`crate::dns::recovery`]'s upgrade sweep, and the
+//! schema types, kept so an older build's file can still be parsed and, when
+//! the evidence supports it, undone.
 //!
-//! Single-reader assumption: only one bridge starts at a time reads this
-//! file (the IPC socket bind's intended single-instance guarantee — see
-//! bindreams/hole#936 for why that guarantee does not fully hold today, and
-//! `crate::dns::recovery`'s doc for why this module's read-once bound makes
-//! that gap harmless here).
+//! Assumes one bridge at a time reads the file. The single-instance guarantee
+//! behind that is not airtight; what a second reader can and cannot do is in
+//! `docs/contributing/architecture/crash-recovery.md` (section DNS), which also
+//! describes the sweep.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -30,12 +27,10 @@ use util::versioned_file::{
 pub const STATE_FILE_NAME: &str = "bridge-dns.json";
 
 /// Filename a file is renamed to after the upgrade sweep has evaluated it
-/// once, whenever it wasn't deleted outright (some family lacked evidence).
-/// The bridge never reads this name — only ever the un-suffixed
-/// [`STATE_FILE_NAME`] — so the sweep can never re-evaluate the same file
-/// twice; `scripts/network-reset.py` reads both names, so the escape survives
-/// the rename. See `crate::dns::recovery`'s doc for why that bound is
-/// load-bearing.
+/// once without deleting it (some family lacked evidence). The bridge reads
+/// only [`STATE_FILE_NAME`], so the sweep never evaluates a file twice;
+/// `scripts/network-reset.py` reads both names. See `crate::dns::recovery`
+/// for why that bound is load-bearing.
 pub const SUPERSEDED_FILE_NAME: &str = "bridge-dns.superseded.json";
 
 // No `deny_unknown_fields`, here or in the types below: a v1 file from an older crashed run carries the obsolete
@@ -44,14 +39,11 @@ pub const SUPERSEDED_FILE_NAME: &str = "bridge-dns.superseded.json";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsState {
     /// The upstream resolver IPs the writing build advertised to its
-    /// adapters. NOT diagnostic-only: the upgrade sweep's ONLY evidence
-    /// that a live adapter's current DNS is still what that old build left
-    /// behind — see `crate::dns::recovery`'s doc for the exact gate.
-    /// `#[serde(default)]` so a file old enough to carry the obsolete
-    /// `chosen_loopback` key (never one that legitimately omits
-    /// `advertised` — the field has been declared and serialized since
-    /// schema version 1) still loads, defaulting to empty; an empty value
-    /// is treated as "no evidence", never as a match.
+    /// adapters. Not diagnostic-only: it is the upgrade sweep's only evidence
+    /// that a live adapter's DNS is still what that build left behind (the
+    /// gate is in `crate::dns::recovery`). A file carrying the obsolete
+    /// `chosen_loopback` key may omit it; it then loads as empty, which means
+    /// "no evidence", never a match.
     #[serde(default)]
     pub advertised: Vec<IpAddr>,
     pub adapters: Vec<DnsPriorAdapter>,
@@ -68,24 +60,19 @@ pub struct DnsPriorAdapter {
     pub v6: DnsPrior,
 }
 
-/// OS-stable adapter identifier. Tagged to keep the on-disk format
-/// self-describing so `scripts/network-reset.py` can dispatch on `kind`
-/// without inferring from platform. Inner field is named `value` in every
-/// variant so readers can extract it uniformly without branching on `kind`.
+/// OS-stable adapter identifier. Tagged so the on-disk format is
+/// self-describing and `scripts/network-reset.py` can dispatch on `kind`
+/// without inferring the platform. Every variant names its field `value`, so
+/// a reader can extract it without branching on `kind`.
 ///
-/// ## Why alias/name not LUID/GUID
-///
-/// `netsh` (Windows) and `networksetup` (macOS) both accept the adapter's
-/// friendly *name* as their identifier. Going through LUID (Windows) or
-/// service-GUID (macOS) would require an extra name-round-trip at restore
-/// time. Stability: interface aliases survive reboots; macOS service
-/// names survive reboots. Rename mid-session is the only failure mode,
-/// matching the plan's "skip silently on restore" semantics.
+/// It is the adapter's friendly name, not a LUID or GUID, because names
+/// survive reboots. Windows restore resolves the alias to a LUID, then a GUID,
+/// on every call; macOS passes the service name to `networksetup`. A renamed or
+/// removed adapter reads as `SkippedNotOurs` (see `crate::dns::recovery`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AdapterId {
     /// Windows adapter friendly name (alias), e.g. "Ethernet" or "Wi-Fi".
-    /// Passed directly to `netsh interface ... name="<value>"`.
     WindowsAlias { value: String },
     /// macOS network service name, e.g. "Wi-Fi" or "Ethernet". Passed
     /// directly to `networksetup -setdnsservers <value>`.
@@ -128,7 +115,7 @@ util::assert_contiguous!(DnsState);
 
 // I/O =================================================================================================================
 //
-// No `save` — the bridge no longer writes this file (see the module doc).
+// No `save`: the bridge does not write this file (see the module doc).
 // Only `load`, `clear`, and `supersede` remain, all for the upgrade sweep.
 
 /// The legacy DNS record's file.
@@ -160,12 +147,10 @@ pub fn clear(state_dir: &Path) -> Result<UpdateOutcome, StoreError> {
         .map(|((), outcome)| outcome)
 }
 
-/// Filename for the `n`th superseded file: [`SUPERSEDED_FILE_NAME`] for `n == 1`, else an ARCHIVE name, used only
-/// when every earlier one is occupied. Forensic only: nothing in this crate, and nothing in
-/// `scripts/network-reset.py`, ever reads an archived name back. The script's existing lookup order (un-suffixed,
-/// then [`SUPERSEDED_FILE_NAME`]) already lands on the OLDEST superseded evidence once the un-suffixed name is moved
-/// aside — which is the file this module keeps at the canonical name, never an archived one — so the script needs no
-/// changes to keep finding the right answer.
+/// Filename for the `n`th superseded file: [`SUPERSEDED_FILE_NAME`] for `n == 1`, else an archive name, used only
+/// when every earlier one is occupied. Archive names are forensic: neither this crate nor `scripts/network-reset.py`
+/// reads one back. The script's lookup order (un-suffixed, then [`SUPERSEDED_FILE_NAME`]) lands on the oldest
+/// superseded file, which this module keeps at the canonical name.
 fn superseded_file_name(n: u64) -> String {
     match n {
         1 => SUPERSEDED_FILE_NAME.to_owned(),
@@ -173,26 +158,22 @@ fn superseded_file_name(n: u64) -> String {
     }
 }
 
-/// Rename the state file to [`SUPERSEDED_FILE_NAME`]. The upgrade sweep's
-/// "evaluated once, not fully confirmed" outcome: the bridge never reads the
-/// superseded name again (so the value-equality gate cannot re-arm on a
-/// later, unrelated coincidence), but `scripts/network-reset.py` reads both
-/// names, so the escape survives the rename rather than being hidden by it.
-/// Tolerates a missing source file (returns `Ok`).
+/// Rename the state file to [`SUPERSEDED_FILE_NAME`]: the upgrade sweep's "evaluated once, not fully confirmed"
+/// outcome. The bridge never reads the superseded name, so the sweep's value-equality gate cannot re-arm on a later,
+/// unrelated coincidence; `scripts/network-reset.py` reads both names, so the escape survives the rename.
+/// A missing source file is `Ok`.
 ///
-/// **Never clobbers an existing superseded file.** The move is one rename that refuses to replace
-/// ([`util::dir::Dir::rename_noreplace`]), so a bare rename's silent destruction of an occupied
-/// [`SUPERSEDED_FILE_NAME`] is not expressible, and neither is a name that appears between a probe and the move
-/// (reachable whenever this runs twice without the first superseded file ever being cleared: reinstall, rollback to
-/// an older build, or a second crash). When the name is taken, the OLDER file keeps it and the newer one is archived
-/// under the first free [`superseded_file_name`] instead: a superseded file exists precisely because an earlier
-/// restore did not fully succeed, so the newer file's recorded priors may already be Hole's own (dead) resolver IPs
-/// — the older file is the one closer to the user's true original DNS, and is what a reader should keep finding at
-/// the canonical name.
+/// Never clobbers an existing superseded file. The move is one rename that refuses to replace
+/// ([`util::dir::Dir::rename_noreplace`]), so no probe-then-move race exists. When the canonical name is taken (this
+/// ran twice without the first file being cleared: reinstall, rollback, a second crash), the older file keeps it
+/// and the newer one goes to the first free [`superseded_file_name`]. A superseded file exists because an earlier
+/// restore did not fully succeed, so the newer file's recorded priors may already be Hole's own dead resolver IPs;
+/// the older one is closer to the user's original DNS. A volume with no no-replace rename answers `Unsupported` and
+/// nothing is moved.
 ///
-/// The directory is opened without following a symlink and the rename goes by name through the handle: the bridge
-/// runs this as root/SYSTEM in a folder the user may own. A volume with no no-replace rename answers `Unsupported`
-/// and nothing is moved, never a rename that could replace.
+/// The bridge runs this as root/SYSTEM in a folder the user may own, so the directory is opened without following a
+/// symlink and the rename goes by name through the handle
+/// (`docs/contributing/architecture/privileged-folders.md`).
 pub fn supersede(state_dir: &Path) -> std::io::Result<()> {
     use std::io::ErrorKind;
 

@@ -3,8 +3,8 @@
 //! Two impls live behind [`UpstreamConnector`]:
 //!
 //! - [`DirectConnector`] — plain direct connection to an upstream
-//!   resolver; used by tests.
-//! - `Socks5Connector` — production path; routes every outbound
+//!   resolver; used by the DoH bootstrap (no tunnel is up yet) and by tests.
+//! - `Socks5Connector` — the in-tunnel path; routes every outbound
 //!   connection through the local shadowsocks SOCKS5 listener so user
 //!   filter rules cannot strand the forwarder.
 //!
@@ -74,6 +74,7 @@ pub trait UpstreamUdp: Send + Sync {
     fn counters(&self) -> DatagramCounters;
 }
 
+/// How the forwarder reaches an upstream resolver.
 #[async_trait]
 pub trait UpstreamConnector: Send + Sync {
     /// Open a TCP connection to `target`. SOCKS5 impls route via the
@@ -91,7 +92,6 @@ pub trait UpstreamConnector: Send + Sync {
 // Direct ==============================================================================================================
 
 /// Opens connections straight to the target, with no SOCKS5 wrapping.
-/// Used by tests and as a fallback when no SOCKS5 listener is available.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DirectConnector;
 

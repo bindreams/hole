@@ -199,11 +199,10 @@ fn recover_dns_config_restores_a_pre_846_file() {
     assert!(!dir.path().join(dns_state::SUPERSEDED_FILE_NAME).exists());
 }
 
-/// `MockBackend::fail_restore` — the arm for `FamilyOutcome::Failed`, one
-/// of the two outcomes (with `SkippedNotOurs`) that must never settle — had
-/// zero coverage: nothing armed it. A restore that fails at the platform
-/// level must preserve the file (superseded), never delete it as if the
-/// restore had succeeded.
+/// `MockBackend::fail_restore` arms `FamilyOutcome::Failed`, one of the two
+/// outcomes (with `SkippedNotOurs`) that must never settle. A restore that
+/// fails at the platform level must preserve the file (superseded), never
+/// delete it as if the restore had succeeded.
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn recover_dns_config_supersedes_when_restore_family_fails() {

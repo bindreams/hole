@@ -18,9 +18,8 @@ use crate::proxy::ProxyError;
 /// targeting the just-started SS SOCKS5 listener, so user filter rules
 /// cannot strand our own queries.
 ///
-/// Returns the `forwarder` Arc alongside the endpoint so the blocking
-/// self-test gate in `start_inner` can call `forwarder.forward(...)` without
-/// re-plumbing.
+/// Returns the `forwarder` Arc alongside the endpoint so the self-test gate
+/// can drive the forwarder directly.
 ///
 /// Rejects the `dns.enabled && servers.is_empty()` config combination with
 /// `ForwarderSelfTestFailed { reason: "no DNS servers configured" }` because
@@ -90,11 +89,12 @@ pub(crate) const TAP_DISABLED_HINT: &str =
 /// `SelfTestOutcome::Ok` when any well-formed non-SERVFAIL reply comes back,
 /// else `Failed`.
 ///
-/// No retry: at the shipped default of two-or-more resolvers, a single walk
-/// already contains one independent dial per resolver, so a retry's only
-/// unique contribution is at a single-resolver config — while its cost would
-/// fall on tunnels that are slow but working, which is the cohort this gate
-/// exists to stop mis-reporting.
+/// No retry: with two or more resolvers a single walk already dials each
+/// independently, so a retry would only add cost, which falls on tunnels that
+/// are slow but working, the cohort this gate must not mis-report. With a
+/// single resolver a retry would be the only second independent dial; the gate
+/// forgoes it (see
+/// `docs/contributing/architecture/dns-forwarder.md#the-start-time-gate`).
 ///
 /// Also writes the canonical `"forwarder self-test ok"` / `"forwarder
 /// self-test failed"` log line at `info!`. On failure, additionally emits a
@@ -118,10 +118,9 @@ pub(crate) async fn run_forwarder_self_test(
     };
 
     let query = sample_self_test_query();
-    // A `tokio::time::Instant`, not `std::time::Instant`: `try_forward`'s own
-    // budget below is virtual-time, and mixing clocks made `elapsed_ms`
-    // unmeasurable under `tokio::time::pause()` in tests without affecting
-    // production.
+    // A `tokio::time::Instant`, not `std::time::Instant`: `try_forward`'s budget
+    // runs on tokio's clock, so `elapsed_ms` stays measurable under
+    // `tokio::time::pause()` in tests.
     let started = tokio::time::Instant::now();
     let before = forwarder.upstream_activity();
     // The gate is the forwarder's first user: `build_local_dns` constructs it
@@ -186,10 +185,9 @@ pub(crate) async fn run_forwarder_self_test(
                         describe_upstream_failure(cause)
                     }
                 };
-                // `answered` can only be set in the `Ok` arm above, mutually
-                // exclusive with this one, so the guard is unconditionally
-                // true for a single walk — kept structural, not collapsed,
-                // because it must reactivate the instant a retry returns.
+                // `answered` is set only in the `Ok` arm above, so for a single
+                // walk this guard is always true. It keeps a later failure from
+                // overwriting an answered reading if a walk is ever repeated.
                 if !answered {
                     last_err = Some(msg);
                 }
@@ -327,25 +325,20 @@ pub(crate) fn describe_upstream_failure(cause: crate::dns::forwarder::UpstreamCa
 /// Should the plugin's ring be quoted next to this failure? Two conditions
 /// both apply, checked independently rather than off one collapsed value:
 ///
-/// - The self-test's OWN reading implicates the transport —
-///   `NoConnection`/`TunnelSilent`/`TunnelSetupPending`, or
-///   `InconclusiveTransport` (a UDP ASSOCIATE that reached the local listener
-///   but proved nothing about the plugin either way). `TunnelSetupPending` is
-///   in that set because a connect still outstanding when its budget fired is
-///   precisely the plugin's own outer connection not being up yet — the case
-///   where the plugin's log IS the answer. `Other` means the transport is
-///   proven healthy (a reply arrived and was rejected) or was never exercised
-///   (nothing dialled) — quoting the plugin there would blame it for a failure
-///   that is not its own.
-/// - The out-of-band probe hasn't already reattributed the failure to the
-///   network path. `self_test_error_for` lets a `Blocked`/`TcpRefused`/
-///   `TcpTimeout` verdict replace the self-test's own reading entirely
-///   (`NetworkBlocked`, or a rewritten `ForwarderSelfTestFailed`); quoting
-///   the plugin beside a failure the code has attributed elsewhere would
-///   misattribute it. Checked directly against `verdict` rather than
-///   against `self_test_error_for`'s output, because `InconclusiveTransport`
-///   and `Other` both collapse to the same `ForwarderSelfTestFailed` shape
-///   there — the FINAL `ProxyError` alone can no longer tell them apart.
+/// - The self-test's own reading implicates the transport:
+///   `NoConnection`, `TunnelSilent`, `TunnelSetupPending` (a connect still
+///   outstanding is the plugin's outer connection not being up yet, where its
+///   log is the answer) or `InconclusiveTransport`. `Other` means the
+///   transport is proven healthy or was never exercised, so quoting the plugin
+///   would blame it for someone else's failure.
+/// - The out-of-band probe has not already reattributed the failure to the
+///   network path: a `Blocked`, `TcpRefused` or `TcpTimeout` verdict replaces
+///   the self-test's reading (see [`self_test_error_for`]). This is checked
+///   against `verdict` directly, not against that function's output, because
+///   `InconclusiveTransport` and `Other` collapse to the same
+///   `ForwarderSelfTestFailed` there.
+///
+/// The decision table is in `docs/contributing/architecture/dns-forwarder.md`.
 pub(crate) fn implicates_plugin_transport(
     reason: &SelfTestReason,
     verdict: Option<crate::reachability::ReachabilityVerdict>,
@@ -372,27 +365,23 @@ pub(crate) fn report_plugin_output(log: Option<&crate::proxy::plugin_log::Plugin
 }
 
 /// Turn a reading into the claim the report may make. Every claim rests on a
-/// positive observation, never on a cause code: a local hop that HANGS never
+/// positive observation, never on a cause code: a local hop that hangs never
 /// reaches `UpstreamLayer::Connect`, so its cause is `ConnectTimeout`, and
 /// splitting on `Unreachable` would file it under the tunnel sentence.
 ///
-/// The local-hop claim keys on `connects`, not on `written` — see
-/// [`crate::dns::forwarder::UpstreamActivity`] for why a reset before the first
-/// write still counts as a connection. A UDP ASSOCIATE (`associates`) is
-/// weaker evidence than a CONNECT and must not be read as either claim: it
-/// disproves `NoConnection` (the local SOCKS5 listener did accept something)
-/// without being strong enough to support `TunnelSilent` (it says nothing
-/// about the plugin), so it falls through to `Other`.
+/// The local-hop claim keys on `connects`, not on `written` (see
+/// [`crate::dns::forwarder::UpstreamActivity`]). A UDP ASSOCIATE
+/// (`associates`) is weaker evidence than a CONNECT: it disproves
+/// `NoConnection` but says nothing about the plugin, so it cannot support
+/// `TunnelSilent` and yields `InconclusiveTransport`.
 ///
-/// `last_err` is trustworthy verbatim only in the `answered` case — the
-/// `Ok(reply)` arm sets it in the same step it latches `answered`, and the
-/// loop pins it there so a later attempt's failure can't overwrite it (see
-/// `run_forwarder_self_test`). `moved.read` has no such message attached to
-/// it: it can be positive from an attempt whose own completion never
-/// reached `is_dns_reply_ok` (a peer that replies partially then resets),
-/// so `last_err` there could still be a DIFFERENT, later "no resolver
-/// answered" message — reporting it verbatim would contradict the very
-/// byte counts logged beside it, so a neutral phrase is used instead.
+/// `last_err` is trustworthy verbatim only in the `answered` case, where the
+/// `Ok(reply)` arm sets it in the same step it latches `answered`. When only
+/// `moved.read` is positive (a peer that replies partially then resets),
+/// `last_err` may be a later "no resolver answered" message that would
+/// contradict the byte counts logged beside it, so a neutral phrase is used.
+///
+/// The decision table is in `docs/contributing/architecture/dns-forwarder.md`.
 pub(crate) fn classify_failure(observed: Observed, last_err: String) -> SelfTestReason {
     if !observed.dialled {
         return SelfTestReason::Other(last_err);
@@ -485,10 +474,9 @@ pub(crate) fn is_dns_reply_ok(reply: &[u8]) -> bool {
     reply.len() >= 12 && (reply[3] & 0x0F) != 2
 }
 
-/// Build a minimal wire-format DNS query: `example.com A`. Used by
-/// [`run_forwarder_self_test`] — hardcoded hostname is acceptable
-/// because the forwarder self-test is an internal probe, never a user-
-/// visible config. NXDOMAIN on this name still proves the path works.
+/// Build a minimal wire-format DNS query: `example.com A`, for
+/// [`run_forwarder_self_test`]. The name is fixed because the probe is
+/// internal, and an NXDOMAIN reply still proves the path works.
 pub(crate) fn sample_self_test_query() -> Vec<u8> {
     let mut q = Vec::with_capacity(32);
     q.extend_from_slice(&0x0001_u16.to_be_bytes()); // id

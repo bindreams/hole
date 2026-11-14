@@ -6,13 +6,10 @@
 //! [`crate::dns::system::SystemDns::apply`]'s cancel/routed-family/error
 //! handling without touching configd or a real `SCDynamicStore` session.
 //!
-//! `routed_families_come_from_the_installed_routes` (the plan's 8th named
-//! test) is deferred to Task 5: `RoutedFamilies` is constructed directly by
-//! every test here rather than derived from a `Routing::Installed` guard —
-//! that accessor does not exist on the `Routing` trait until Task 5 adds
-//! it (see `crates/bridge/src/proxy_manager.rs`'s call site, and Task 5's
-//! own `routed_families_reports_only_the_splits_that_landed`, the natural
-//! home for this assertion once the accessor exists).
+//! `RoutedFamilies` is constructed directly by every test here rather than
+//! derived from a `Routing::Installed` guard. That the value reflects only the
+//! splits that landed is asserted where it is produced, in tun-engine, by
+//! `routed_families_reports_only_the_splits_that_landed`.
 
 // `CancellationToken::new` is the cancel-test harness root — sanctioned
 // for test files by clippy.toml's "Bridge cancellation contract" exception.
@@ -32,7 +29,7 @@ use super::{MacDnsBackend, MacDnsSteerer, SteeringHandle};
 use crate::dns::system::{Dns, DnsApplied, DnsError, RoutedFamilies, SystemDns};
 use crate::dns_state::{DnsPrior, DnsPriorAdapter};
 
-// MockBackend (flush only — apply never reaches get/set/restore any more) =============================================
+// MockBackend (flush only; apply never reaches get/set/restore) =======================================================
 
 struct MockBackend {
     flush_calls: AtomicUsize,
@@ -51,7 +48,7 @@ impl MacDnsBackend for MockBackend {
         unreachable!("apply never calls get_settings")
     }
     fn set_servers(&self, _service: &str, _servers: &[IpAddr]) -> io::Result<()> {
-        unreachable!("apply must not call set_servers any more — see macos.rs's module doc")
+        unreachable!("apply must not call set_servers (see macos.rs's module doc)")
     }
     fn restore(&self, _adapter: &DnsPriorAdapter) -> io::Result<()> {
         unreachable!("apply never calls restore")
@@ -280,7 +277,7 @@ async fn macos_apply_cancelled_before_steering_engages_nothing() {
 }
 
 /// A cancel that lands WHILE `engage` is in flight must still be honored:
-/// the post-engage cancel checkpoint (contract point 1) withdraws the
+/// the post-engage cancel checkpoint withdraws the
 /// just-published key before returning Cancelled, mirroring
 /// `dns_apply_cancelled_drops_the_confinement` on Windows.
 #[skuld::test]
@@ -365,8 +362,8 @@ async fn macos_shutdown_reports_a_failed_withdraw() {
     );
 }
 
-/// D4's narrow filter: a resolver whose family has no live split route
-/// must not be advertised, even when the raw configured list carries it.
+/// A resolver whose family has no live split route must not be advertised,
+/// even when the raw configured list carries it.
 #[skuld::test]
 async fn macos_apply_advertises_only_routed_families() {
     let backend = MockBackend::new();
