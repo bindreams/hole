@@ -42,7 +42,8 @@ an entered worker and panic, leaving nothing to join it.
 `std::thread::spawn` itself panics if the operating system refuses a new thread. There is deliberately no error arm
 for that: a failed spawn has already dropped the closure, and with it the runtime, on the calling thread, so recovering
 would need a channel handing the runtime to the thread only after it started, and the condition is a whole-process
-resource failure. That is the one exception to the guarantee that `stop()` releases the port.
+resource failure. That is the one exception to the guarantee that `stop()` releases the port
+([#1312](https://github.com/bindreams/hole/issues/1312)).
 
 **`stop` classifies before it joins.** It awaits the aborted task to tell a panic from a cancellation, and only then
 joins the runtime. Joining first would make every outcome look like a cancellation.
@@ -51,7 +52,7 @@ joins the runtime. Joining first would make every outcome look like a cancellati
 the proxy ran on before. This is unmeasured: a sustained single-tunnel throughput test on a machine with more than four
 cores that saturates all four workers, or a CPU profile showing the `hole-ss` threads pinned during a large transfer,
 would show it to be too low. The local server is expected to be I/O-bound (loopback accept, SOCKS5 framing, a copy loop),
-with the remote server and the plugin chain the practical ceiling.
+with the remote server and the plugin chain the practical ceiling ([#1312](https://github.com/bindreams/hole/issues/1312)).
 
 ## The no-hang property depends on the dependency version
 

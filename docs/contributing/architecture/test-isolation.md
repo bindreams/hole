@@ -50,7 +50,7 @@ the lint:
   `windows` crate paths. Only the `Win32Real` backend in {src}`crates/bridge/src/dns/system/windows.rs` calls them.
   `DnsFlushResolverCache` is the exception to the guarantee: `windows-rs` does not expose it, so `Win32Real` declares it
   with an inline `extern` block, and the ban names a path that this declaration does not have. Nothing makes the lint
-  fire on a second caller of that `extern` function.
+  fire on a second caller of that `extern` function ([#1308](https://github.com/bindreams/hole/issues/1308)).
 - The FWPM calls that install and remove firewall filters. The sanctioned callers are in
   [the kill switch](kill-switch-windows.md) and the DNS-egress confinement.
 - Spawning a process: the spawn of an OS tool goes through `util::system_tool::SystemTool`, and a spawn of anything else
@@ -66,8 +66,7 @@ routing subprocess, so a path that bypassed the `Routing` trait shows up there t
   (`diagnostics::wfp::log_snapshot`, `diagnostics::ndis::log_snapshot`), and the bridge's foreground startup calls the
   same two, outside any trait. They run `netsh` and `pnputil` through `SystemTool`, so the lint is satisfied, but they read
   the real host. A `ProxyManager` test on Windows that stops a session with every trait mocked still runs them.
-  They change nothing.
-- **A second caller of the DNS flush.** See the `DnsFlushResolverCache` item above.
+  They change nothing ([#1307](https://github.com/bindreams/hole/issues/1307)).
 
 ## `Dns` has two layers
 

@@ -1,9 +1,8 @@
 # Logging and diagnostics
 
 Hole's logs are what a developer or a user's bug report has to work with, and they are written by a process that is
-sometimes privileged and by dependencies nobody on the team controls. This page covers where the logs go, how to turn
-the volume up, how to log an error, what the plugin diagnostics add, and which parts of this must not be bypassed. The
-server address and the password have their own rules: see [server-address redaction](redaction.md).
+sometimes privileged and by dependencies nobody on the team controls. The server address and the password have their
+own rules: see [server-address redaction](redaction.md).
 
 ## Where the logs go
 
@@ -39,8 +38,9 @@ whatever the user swapped in for a component of the path, as root. A directory t
 with one line on the real stderr that carries no path; the bridge keeps running.
 
 **Blocking behaviour.** The file writer is non-blocking and **not lossy**: the burst of lines at the end of a teardown
-must reach the disk, at the price that a stalled disk applies back-pressure to the logging thread, bounded by the
-non-blocking writer's buffer. The stderr writer and the two stdio tees are lossy, so a wedged terminal can never block the
+must reach the disk, at the price that a stalled disk blocks the threads that log. The writer's buffer
+(`buffered_lines_limit`, tracing-appender's default) only delays when that starts: once it is full, every thread that
+emits an event, the panic hook's included, waits with no limit until the disk drains. The stderr writer and the two stdio tees are lossy, so a wedged terminal can never block the
 bridge or the panic hook.
 
 ## Turning the volume up

@@ -100,8 +100,7 @@ Resource guards are RAII: a `Routing::Installed` removes its routes on drop and 
 drop, with the one exception that a cover can be *disarmed*, which leaves the block in force while the process lets go
 of it (see [the kill switch](kill-switch.md)).
 
-Cancellation is cooperative: a start carries a token and checks it, and nothing cancels a start by dropping its future.
-See [cancellation and teardown](cancellation.md).
+Cancellation is cooperative; see [cancellation and teardown](cancellation.md).
 
 ## Where to read next
 

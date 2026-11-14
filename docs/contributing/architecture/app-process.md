@@ -2,9 +2,7 @@
 
 The app is the `hole` binary run with no arguments: a Tauri program with a tray icon, a settings and dashboard window,
 and the config file. It runs with the user's rights and does nothing to the network itself; it asks the {term}`bridge`
-to. This page covers the four contracts that decide how the app behaves as a process: what runs at build time and what
-at run time, how a second launch is handled, how the tray menu is rebuilt, and how the app and the bridge keep to one
-version. The [architecture overview](overview.md#two-modes-one-binary) says how the two modes share a binary.
+to. The [architecture overview](overview.md#two-modes-one-binary) says how the two modes share a binary.
 
 ## Node is a build tool
 
@@ -107,8 +105,3 @@ which a process id could be reused. `relaunch.rs` has no platform `#[cfg]` (only
 
 Self-heal is **inert** until an update produces a mismatch, and off for development and snapshot builds, which are built
 in lockstep. The swap that produces the mismatch is [the update cutover](update-cutover.md).
-
-## Where to read next
-
-- [The seams](test-isolation.md) and [cancellation](cancellation.md): the contracts the bridge half keeps.
-- [Logging and diagnostics](logging.md): where the app writes `gui.log`.

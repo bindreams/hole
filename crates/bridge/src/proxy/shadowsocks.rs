@@ -83,7 +83,7 @@ impl SsRuntime {
                 .on_thread_start(move || {
                     #[allow(
                         clippy::disallowed_methods,
-                        reason = "hands the constructing thread's global dispatcher to an SsRuntime test worker; not the per-test assertion target #302 guards against, see docs/contributing/architecture/proxy-shutdown.md"
+                        reason = "hands the constructing thread's global dispatcher to an SsRuntime test worker; not the per-test assertion target the subscriber helper guards, see docs/contributing/architecture/proxy-shutdown.md"
                     )]
                     let guard = tracing::dispatcher::set_default(&dispatcher);
                     SS_TEST_TRACING_GUARD.with_borrow_mut(|cell| *cell = Some(guard));

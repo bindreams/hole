@@ -165,9 +165,10 @@ This is not a total guarantee.
 
 1. **Nothing is armed before the first arm.** The sink redacts what the registry holds, and the registry starts empty. A
    line written before any arm is not redacted. [Crash recovery](crash-recovery.md) runs before any session exists and logs the recovered
-   routes' server IP (`recovering routes from crashed run`), and a bridge that reconnects at boot from its persisted
-   target arms the resolved IP only, not the configured host, until the app sends a request that arms it.
-1. **`dump!` is convention, not a compiler guarantee**, as above.
+   routes' server IP (`recovering routes from crashed run`;
+   [#1305](https://github.com/bindreams/hole/issues/1305)), and a bridge that reconnects at boot from its persisted
+   target arms the resolved IP only, not the configured host, until the app sends a request that arms it
+   ([#1306](https://github.com/bindreams/hole/issues/1306)).
 1. **An address in a form no armed literal is a byte-substring of is not redacted**: a percent-escaped form from a
    third-party process, a Unicode form that normalises differently from the configured one, or a non-canonical IPv6 text
    form from a peer that is not Rust's `std`.
@@ -176,7 +177,8 @@ This is not a total guarantee.
    `{:?}` of the whole config at `trace` when the local server is constructed. `expose()` hands upstream a `String` it is entitled to keep, no newtype
    on Hole's side can reach that, and the password has no sink-level cure. The directive is not obscure:
    `init_multi`'s own example in {src}`crates/common/src/logging.rs` is
-   `HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace`, and `bridge.log` is collected into the support bundle.
+   `HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace`, and `bridge.log` is collected into the support bundle
+   ([#1310](https://github.com/bindreams/hole/issues/1310)).
 
 ```{admonition} Do not enable shadowsocks_service=trace against a real server
 ---

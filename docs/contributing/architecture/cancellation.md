@@ -10,7 +10,9 @@ before adding a phase or a long-lived resource to a {term}`bridge` start. The re
 
 Cancellation is **cooperative**. A `CancellationToken` is threaded into the start, and every phase checks it. Dropping a
 future is not the way a cancel travels: a phase drops the future it is racing only when that future owns no cleanup (rule
-1 below), and any other drop is the net for a panic or a future dropped for some other reason.
+1 below), and any other drop is the net for a panic or a future dropped for some other reason. One such drop is
+live today: a client that disconnects mid-start drops the handler's future, which leaves the in-flight slot set and every
+later Start rejected until the bridge restarts ([#1309](https://github.com/bindreams/hole/issues/1309)).
 
 The token's root is the IPC `handle_start` handler in {src}`crates/bridge/src/ipc.rs`. A Cancel from the app names an
 attempt id; the handler cancels the in-flight start only if it is that attempt, and a cancel that arrives before the
@@ -68,7 +70,7 @@ class: warning
 `end` waits for garter's runner, not for the per-plugin tasks it spawned. A plugin that is being started at that instant
 may still spawn and record itself after `end` returns. Its own drop kills the process tree, and its record stays in the
 state file for the next reap to remove by identity. It happens only to a start that is cancelled, or fails its readiness
-check, in the middle of a spawn.
+check, in the middle of a spawn ([#1311](https://github.com/bindreams/hole/issues/1311)).
 ```
 
 ## Every exit of a start ends in one teardown
@@ -107,7 +109,8 @@ rather than shorten anything.
 The consequence reaches past this type. On the bridge's multi-thread runtime `Dispatcher::drop` blocks the same way, so
 **dropping a future that owns a `Dispatcher` does not cancel the wait; it turns it into a synchronous block on the
 dropping thread.** No caller may drop such a future to bound anything. The IPC router carries no timeout layer:
-its expiry would drop the handler's future.
+its expiry would drop the handler's future. A client disconnect drops it today
+([#1309](https://github.com/bindreams/hole/issues/1309)).
 
 ## Where to read next
 

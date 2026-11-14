@@ -137,11 +137,10 @@ pub fn describe_failure(failure: &ImportFailure) -> FailureMessage {
 ///
 /// `Serialize` derived and holding `ServerEntry`, so the ladder rule in
 /// `docs/contributing/architecture/redaction.md` reads as "this needs a `Dump` impl".
-/// It does not, and must not get
-/// one: `crates/hole` has no `dump` dependency, so no `dump!` can reach this
-/// type at all — adding the impl would mean adding the dependency, which
-/// creates the capability it would guard. `Debug` is the live sink here, and
-/// `ServerEntry`'s own is redacted.
+/// It does not, and must not get one: `crates/hole` has no `dump` dependency,
+/// so no `dump!` can reach this type at all — adding the impl would mean
+/// adding the dependency, which creates the capability it would guard.
+/// `Debug` is the live sink here, and `ServerEntry`'s own is redacted.
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportOutcome {
     pub appended: Vec<ServerEntry>,
