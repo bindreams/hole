@@ -150,8 +150,8 @@ pub async fn port_in_use(port: u16) -> bool {
 }
 
 /// Probe until something accepts on `port` via ANY address `localhost`
-/// resolves to (v4 and/or v6), or `budget` elapses. Class-2 exception
-/// (CLAUDE.md §sync invariant): the subprocess is out-of-process, the OS
+/// resolves to (v4 and/or v6), or `budget` elapses. External-event exception
+/// (docs/contributing/testing.md#no-synchronization-by-elapsed-time): the subprocess is out-of-process, the OS
 /// exposes no "process N bound port P" event, so we poll; the budget is the
 /// human-surfaced failure bound, and the caller's select! on child-exit
 /// short-circuits a dead Vite.

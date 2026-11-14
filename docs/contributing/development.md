@@ -142,6 +142,7 @@ The bridge's options are listed under [Bridge and proxy commands](bridge-cli.md)
   the installed one. If an installed Hole is running, the single-instance guard forwards your launch to it and the dev
   window never appears. Quit the installed Hole first.
 - **Use an absolute, short path for `--socket-path`.** Windows limits the length of an AF_UNIX socket path.
-- **If a crashed dev run breaks your network,** run {src}`scripts/network-reset.py` from an elevated shell.
+- **If a crashed dev run breaks your network,** run {src}`scripts/network-reset.py` from an elevated shell: `sudo python3 scripts/network-reset.py` on macOS, `python scripts/network-reset.py` in an elevated PowerShell on Windows. [Route
+  ownership](architecture/route-ownership.md#the-escape) says what it removes.
 - **The first `cargo xtask deps` is slow.** It compiles ex-ray and downloads `wintun.dll`; later runs reuse Go's build
   cache and the verified download.

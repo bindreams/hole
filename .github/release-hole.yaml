@@ -8,8 +8,8 @@
 # usual since-last-tag listing.
 initial_release: |
   Initial release of the `hole` track. See #291 for the four-track
-  release decoupling rationale and CLAUDE.md "Releases" for the
-  versioning scheme.
+  release decoupling rationale and docs/contributing/maintainers/releases.md
+  for the versioning scheme.
 
 # A commit is included in this track's notes if it modified any file
 # matching one of these globs. Globs use gitignore semantics via the
@@ -40,7 +40,6 @@ include_paths:
   - .github/release-hole.yaml
   - CLAUDE.md
   - docs/**
-  - CONTRIBUTING.md
   - README.md
   - Cargo.toml
   - Cargo.lock

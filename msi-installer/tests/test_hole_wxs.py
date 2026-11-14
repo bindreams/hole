@@ -1161,7 +1161,7 @@ _PRE_PR_LEAVE_NETWORK_BLOCKED_PARAGRAPH = """\
          LEAVE_NETWORK_BLOCKED is the escape from the escape: Return="check"
          means a release that can never succeed (BFE stopped, hole.exe
          quarantined) would otherwise make the product permanently
-         unremovable. Documented in RELEASE-OPS.md as a last resort; it
+         unremovable. Documented in the maintainers docs as a last resort; it
          leaves the block in place, so `netsh wfp` is the only thing left
          after it."""
 

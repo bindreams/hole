@@ -1,7 +1,7 @@
 //! Tripwire: per-variant [`StaleKeyPolicy`] policy lives on the type.
 //!
-//! CLAUDE.md's rule — *a decision keyed to an enum variant belongs in ONE
-//! exhaustive match on that type* — is already test-enforced for `SessionEvent`
+//! The rule — *a decision keyed to an enum variant belongs in ONE
+//! exhaustive match on that type* (docs/contributing/architecture/kill-switch.md#the-decisions) — is already test-enforced for `SessionEvent`
 //! and `CoverPresence` (`crates/bridge/src/reconciler_tests.rs`), after that
 //! shape produced four separate bugs in one change. `StaleKeyPolicy` is the
 //! third enum with the same exposure and the same consequence: a site that

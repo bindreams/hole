@@ -1,8 +1,8 @@
 # Hole build manifest — single source of truth for `cargo xtask build|run|list`.
 #
 # Schema and semantics live in xtask/src/manifest.rs (deserializers, validation)
-# and xtask/src/orchestrate.rs (DAG, execution). User-facing summary in CLAUDE.md
-# under "Build".
+# and xtask/src/orchestrate.rs (DAG, execution). User-facing summary in
+# docs/contributing/build.md.
 #
 # Platform shape: `<os>/<arch>` (Docker / GOOS-style), where
 #   os   ∈ {windows, darwin, linux}

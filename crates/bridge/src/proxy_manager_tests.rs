@@ -3746,7 +3746,7 @@ mod self_test {
                 // Paused AFTER the listener is bound: the gate's own
                 // TUNNEL_QUERY_TIMEOUT now bounds this hung handshake, and
                 // on real wall clock that would cost a full
-                // resolver bound in a suite CLAUDE.md flags as hang-prone.
+                // resolver bound in a suite that is prone to hang.
                 // The socket never becomes ready, so the runtime idles and
                 // auto-advance drives the budget deterministically instead —
                 // faster than before, not slower.

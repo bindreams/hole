@@ -300,7 +300,7 @@
          quarantined) would otherwise make the product permanently
          unremovable. Only the value "1" skips the release. Secure="yes" so
          the value survives into the server-side execute sequence under UAC.
-         Documented in RELEASE-OPS.md as a last resort; it leaves every cover
+         Documented in docs/contributing/maintainers/uninstall-gate.md as a last resort; it leaves every cover
          in place, and reinstalling Hole is the way back. -->
     <Property Id="LEAVE_NETWORK_BLOCKED" Secure="yes" />
 
