@@ -83,8 +83,9 @@ on either platform. It records the claim *a standing cover is live this run and 
   to an interface. A `NET_LUID` is a type and an index, and NDIS can hand a freed index to an unrelated wintun adapter,
   which would then inherit unconditional egress from the stale permit. A name that still resolves proves a bridge may be
   using the permit, so the reclaim cannot touch a running bridge's cover. It keys on this bridge's own last TUN name from
-  `bridge-routes.json`, with `WINDOWS_TUN_ALIAS` as the fallback; macOS has no analogue, because its permit names the
-  interface and not an index.
+  `bridge-routes.json`, with `WINDOWS_TUN_ALIAS` as the fallback; macOS has no reclaim. Its permit names the interface,
+  and the kernel reuses `utunN` names, so a stale permit can be inherited by another interface of the same name
+  ([#1315](https://github.com/bindreams/hole/issues/1315)).
 - **The claim carries two facts in two places.** "A cover is live now" is the in-process claim. "The kill switch is
   armed" is `bridge-lockdown.json`, which `promote_adopted_claim` writes (over `Unset` only) the moment a start honours the
   claim with a real `install_lockdown`. Keeping both in the claim once let an ordinary settings change disarm the switch,

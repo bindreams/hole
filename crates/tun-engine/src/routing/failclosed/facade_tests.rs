@@ -17,7 +17,7 @@ impl LuidResolver for RecordingResolver {
 #[skuld::test]
 fn engage_lockdown_reresolves_luid_every_call() {
     // The facade must call resolver.resolve() before building the spec — the
-    // LUID is never cached. We can't run real FWPM here (#165), so this test
+    // LUID is never cached. We can't run real FWPM here, so this test
     // pins the resolve-then-build ordering via the pure build path exposed for
     // tests.
     let r = RecordingResolver {

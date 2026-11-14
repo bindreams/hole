@@ -1,4 +1,4 @@
-//! Privileged-lane proof, on the real firewall, of the version-independent boot-time sweep (#1008): `release_all` and
+//! Privileged-lane proof, on the real firewall, of the version-independent boot-time sweep: `release_all` and
 //! `disengage_lockdown` remove a boot-time filter under Hole's provider that no key list in this build names, and
 //! nothing else.
 //!

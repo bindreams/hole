@@ -73,12 +73,10 @@ fn a_persistent_key_that_answered_not_found_is_proven_empty() {
 
 #[skuld::test]
 fn a_boot_time_key_that_answered_not_found_is_not_proven_empty() {
-    // The #1003 pre-BFE case, and the whole reason this type exists: a
-    // boot-time object is live only between kernel start and BFE start, so on
-    // a boot where the bridge never engaged the key answers "not found"
-    // whether or not a boot-time policy record is still provisioned behind
-    // it. The old code folded this into `Ok` and the MSI read that as "safe
-    // to delete hole.exe".
+    // The pre-BFE case, and the whole reason this type exists: a boot-time object is live only between kernel start and
+    // BFE start, so on a boot where the bridge never engaged the key answers "not found" whether or not a boot-time
+    // policy record is still provisioned behind it. A bare `Ok` would let the MSI read that as "safe to delete
+    // hole.exe".
     let c = fold(&[obs(
         "lockdown boot-time block-all V4",
         KeyLifetime::BootTime,
@@ -93,18 +91,11 @@ fn a_boot_time_key_that_answered_not_found_is_not_proven_empty() {
 
 #[skuld::test]
 fn a_boot_time_key_the_delete_removed_is_proven_by_the_watched_removal() {
-    // The asymmetry that makes the boot-time row two answers rather than one.
-    // A removal somebody watched happen is proof HERE, under the repo owner's
-    // assumption that `FwpmFilterDeleteByKey0` purges the boot-time policy
-    // record along with the runtime object it demonstrably removes
-    // (bindreams/hole#1043 tracks verifying that on real hardware — no lane
-    // reboots, so nothing in CI can settle it).
-    //
-    // It is NOT symmetric with a not-found, which stays proof of nothing: see
-    // `a_boot_time_key_that_answered_not_found_is_not_proven_empty`. The
-    // difference is what the sweep watched — a removal is an event it saw, an
-    // empty answer is the ordinary reading on every boot where no object is
-    // live.
+    // The asymmetry that makes the boot-time row two answers rather than one. A removal somebody watched happen is
+    // proof here, under the purge assumption on `KeyLifetime::BootTime` (no lane reboots, so nothing in CI can settle
+    // it). It is not symmetric with a not-found, which stays proof of nothing
+    // (`a_boot_time_key_that_answered_not_found_is_not_proven_empty`): a removal is an event the sweep saw, an empty
+    // answer is the ordinary reading on every boot where no object is live.
     let c = fold(&[obs(
         "lockdown boot-time block-all V4",
         KeyLifetime::BootTime,
@@ -116,11 +107,8 @@ fn a_boot_time_key_the_delete_removed_is_proven_by_the_watched_removal() {
 
 #[skuld::test]
 fn a_failing_sweep_outcome_carries_its_observations_beside_the_error() {
-    // bindreams/hole#1010 F1, at the type. The failure and the clearance
-    // travel together in one value, so no `?` can take the second away with
-    // the first — which is what happened while the sweeps returned a
-    // `Result`, on a codebase whose sweeps issue every delete before reading
-    // any code.
+    // At the type: the failure and the clearance travel together in one value, so no `?` can take the second away with
+    // the first, on a codebase whose sweeps issue every delete before reading any code.
     let outcome = SweepOutcome::per_kind(
         fold(&[sibling(KeyOutcome::Removed), unproven_twin()]),
         [(
@@ -195,14 +183,11 @@ fn a_delete_that_failed_proves_nothing_for_either_lifetime() {
 
 #[skuld::test]
 fn every_outcome_lifetime_pair_has_one_answer() {
-    // The whole table, so the rule is readable in one place and a new variant
-    // cannot be added without landing here. The two rows differ in exactly one
-    // cell, `NotFound`: a persistent key's only record is the one the by-key
-    // delete addresses, so an empty answer is proof, while a boot-time key
-    // answers empty on every boot where its runtime object is not live — on a
-    // host that armed the switch years ago and on one that never armed it.
-    // `Removed` is proof for both under bindreams/hole#1043's purge
-    // assumption, and `Failed` proves nothing anywhere.
+    // The whole table, so the rule is readable in one place and a new variant cannot be added without landing here. The
+    // two rows differ in exactly one cell, `NotFound`: a persistent key's only record is the one the by-key delete
+    // addresses, so an empty answer is proof, while a boot-time key answers empty on every boot where its runtime
+    // object is not live, on a host that armed the switch years ago and on one that never armed it. `Removed` is proof
+    // for both under the purge assumption, and `Failed` proves nothing anywhere.
     let table = [
         (KeyLifetime::Persistent, KeyOutcome::Removed, true),
         (KeyLifetime::Persistent, KeyOutcome::NotFound, true),
@@ -323,21 +308,10 @@ fn one_removed_sibling_outweighs_an_empty_one() {
 
 #[skuld::test]
 fn an_uninstall_on_the_boot_that_engaged_is_quiet_because_it_watched_the_twin_go() {
-    // The MSI stops the bridge and runs `release-covers` on the boot the kill
-    // switch was armed, so the sibling AND the twin are both live and both
-    // answer `ERROR_SUCCESS`.
-    //
-    // This case used to be the loud one and is now the quiet one, and the
-    // flip is the whole content of bindreams/hole#1043's assumption. The
-    // silence here is NOT the #1003 silence: that one came from a twin nobody
-    // measured (an empty answer read as proof), while this sweep watched both
-    // halves of the rule go. Under the assumption that the by-key delete
-    // purges the record with the object, a watched removal leaves nothing to
-    // report — and reporting it anyway would name two keys this very call
-    // deleted, on the host that has just been cleaned up.
-    //
-    // The evidence the report DOES fire on is untouched: a twin that answered
-    // empty beside a live sibling still reports
+    // The MSI stops the bridge and runs `release-covers` on the boot the kill switch was armed, so the sibling and the
+    // twin are both live and both answer `ERROR_SUCCESS`. This sweep watched both halves of the rule go, so under the
+    // purge assumption a watched removal leaves nothing to report, and reporting it anyway would name two keys this
+    // very call deleted. A twin that answered empty beside a live sibling still reports
     // (`a_twin_beside_a_cover_this_sweep_removed_is_reported`).
     let c = fold(&[
         sibling(KeyOutcome::Removed),
@@ -527,10 +501,8 @@ fn a_found_filter_that_was_removed_or_raced_away_says_nothing_about_the_host() {
 
 #[skuld::test]
 fn a_recorded_twin_reports_even_where_the_sibling_is_gone() {
-    // The #1010 F1 shape as a single fold: the sibling was deleted by an
-    // earlier sweep, so this one can only answer `Absent`. Before the record
-    // existed, that answer alone suppressed the report — forever, after one
-    // ordinary "turn the kill switch off".
+    // As a single fold: the sibling was deleted by an earlier sweep, so this one can only answer `Absent`. That answer
+    // alone must not suppress the report, which would go silent forever after one ordinary "turn the kill switch off".
     let c = Clearance::from_observations(&[sibling(KeyOutcome::NotFound), unproven_twin()], ArmingWitness::Armed);
     assert_eq!(
         pairs(c.leftover_keys()),
@@ -638,18 +610,11 @@ fn corroboration_moves_only_toward_reporting() {
 
 #[skuld::test]
 fn every_sighting_and_sibling_pair_has_one_write_answer() {
-    // What a sweep tells the record, as distinct from what it tells the
-    // operator. Three load-bearing properties. First: an unproven twin on a
-    // host whose siblings all answered empty writes NOTHING — `Arm` there
-    // would manufacture a report out of a host that never armed anything, and
-    // a retraction would re-create the consumed-witness defect one level down.
-    // Second: `Disarm` is reachable ONLY from a sweep that watched every
-    // boot-time key it touched go, which is the one observation
-    // bindreams/hole#1043's assumption makes conclusive — and it does not
-    // consult the sibling at all, because a watched removal is evidence about
-    // the twin itself and needs no corroboration. Third: the MIXED row still
-    // arms — one twin watched going says nothing about the other that answered
-    // empty.
+    // What a sweep tells the record, as distinct from what it tells the operator. Three properties. An unproven twin on
+    // a host whose siblings all answered empty writes nothing: `Arm` there would manufacture a report out of a host
+    // that never armed anything. `Disarm` is reachable only from a sweep that watched every boot-time key it touched
+    // go, and it does not consult the sibling, because a watched removal is evidence about the twin itself. The mixed
+    // row still arms: one twin watched going says nothing about the other that answered empty.
     use crate::routing::failclosed::boottime_witness::WitnessUpdate;
     let removed_twin = obs(
         "lockdown boot-time block-all V4",
