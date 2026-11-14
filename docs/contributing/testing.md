@@ -115,13 +115,13 @@ Cargo and Renovate cannot see it coming. Several semver-incompatible `schemars` 
 malformed or shadowed, the worst case is a reopened Renovate PR that `E0603` refuses, never a broken build. Beyond the
 `renovate-config` CI step's schema validation, nothing checks that Renovate applies it, and nothing should: a
 hand-rolled model of Renovate's rule resolution (which selectors reach `schemars`, name matching, negation, merging of
-nested rules) chases a moving upstream, and in practice it diverged from Renovate in three review rounds running. That
-machinery needed guarding as much as the rule it guarded.
+nested rules) chases a moving upstream, and the model would need guarding as much as the rule it guards.
 
-The checks split by lane, not by strength. `typify-impl`'s declared requirement could run in the archive lane: `Test tooling` has network, and a cold-`CARGO_HOME` `cargo metadata --locked` was measured there at 16.5 s, exit 0. It does
-not, because a conformance test is the wrong place for a registry round trip and this repo's tests never shell out to
-cargo (a prek hook enforces it). So the tracked-file checks run in the tests, and the registry check runs in the `Lint`
-job and the `check-schemars-pin` prek hook.
+The checks split by lane, not by strength. `typify-impl`'s declared requirement could run in the archive lane:
+`Test tooling` has network, and a cold-`CARGO_HOME` `cargo metadata --locked` was measured there at 16.5 s, exit 0. It
+does not, because a conformance test is the wrong place for a registry round trip and this repo's tests never shell out
+to cargo (a prek hook enforces it). So the tracked-file checks run in the tests, and the registry check runs in the
+`Lint` job and the `check-schemars-pin` prek hook.
 
 What the check ({src}`xtask/src/schemars_pin.rs`) guards is the upstream fact that `typify` still requires 0.8. A pin is
 correct only while that holds, and left as a comment it would outlive the fact silently: a suppressed update produces

@@ -1,10 +1,10 @@
 //! Unit tests for guard 2's structural building blocks:
 //! [`group_config`], [`job_list_template`], [`narrow_filter`],
 //! [`set_mismatch`], [`conformant_membership`], and [`verify_with`] itself —
-//! and guard 3's: [`junit_executed_tests`],
-//! [`merge_executed`], the recorded-expectation handoff, [`set_missing`], and
-//! [`verify_executed`] itself. Neither guard shells out to a real `cargo
-//! nextest list`/subprocess from a unit test — guard 3 only reads files, and
+//! and guard 3's: [`junit_executed_tests`], [`merge_executed`], the
+//! recorded-expectation handoff, [`set_missing`], and [`verify_executed`]
+//! itself. Neither guard shells out to a real `cargo nextest
+//! list`/subprocess from a unit test — guard 3 only reads files, and
 //! guard 2's `verify` takes its one subprocess call as a parameter
 //! ([`verify_with`]), so a fake `list` closure stands in for it against a
 //! fixtured `.github/workflows/ci.yaml` / `.config/nextest.toml` /
@@ -583,10 +583,10 @@ fn verify_executed_errs_when_the_recorded_expectation_is_vacuously_empty() {
 
 // ===== conformant_membership =========================================================================================
 
-/// Reaching `Ok` here must never carry a vacuously-empty membership, because `verify` writes
-/// this exact return value out via `--record` for guard 3 to diff against —
-/// an empty write would make that diff trivially pass no matter what actually
-/// ran.
+/// Reaching `Ok` here must never carry a vacuously-empty membership, because
+/// `verify` writes this exact return value out via `--record` for guard 3 to
+/// diff against — an empty write would make that diff trivially pass no matter
+/// what actually ran.
 #[skuld::test]
 fn conformant_membership_returns_the_agreed_membership_when_it_is_non_empty() {
     let matched = binmap(&[("hole-bridge", &["a", "b"])]);
@@ -594,10 +594,10 @@ fn conformant_membership_returns_the_agreed_membership_when_it_is_non_empty() {
     assert_eq!(out, binmap(&[("hole-bridge", &["a", "b"])]));
 }
 
-/// When the two sides disagree,
-/// `conformant_membership` must error rather than return either side — here
-/// the label side is empty, so returning `Ok` would let `verify` record an
-/// empty expectation that trivially passes guard 3's diff.
+/// When the two sides disagree, `conformant_membership` must error rather than
+/// return either side — here the label side is empty, so returning `Ok` would
+/// let `verify` record an empty expectation that trivially passes guard 3's
+/// diff.
 #[skuld::test]
 fn conformant_membership_errs_rather_than_recording_when_only_one_side_matched_anything() {
     let name_matched = binmap(&[("hole-bridge", &["a"])]);
@@ -660,11 +660,11 @@ jobs:
     std::fs::write(dir.join("build.yaml"), "targets: {}").expect("write build.yaml");
 }
 
-/// `verify`'s `--record` branch must write the *label*-matched set, not the name-matched one.
-/// `bin_b` here is label-only (an empty-set entry the name side never lists,
-/// which is not itself a conformance mismatch — see `set_mismatch`), so its
-/// presence in the recorded file is proof of which side was actually
-/// written.
+/// `verify`'s `--record` branch must write the *label*-matched set, not the
+/// name-matched one. `bin_b` here is label-only (an empty-set entry the name
+/// side never lists, which is not itself a conformance mismatch — see
+/// `set_mismatch`), so its presence in the recorded file is proof of which side
+/// was actually written.
 #[skuld::test]
 fn verify_with_records_the_label_matched_set_not_the_name_matched_one() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -708,9 +708,8 @@ fn verify_with_writes_nothing_when_record_is_none() {
     assert!(!dir.path().join("expected.json").exists());
 }
 
-/// A failed
-/// conformance check must not write a file either — the guard's whole point
-/// is that a rejected membership is never the one guard 3 reads back.
+/// A failed conformance check must not write a file either — the guard's whole
+/// point is that a rejected membership is never the one guard 3 reads back.
 #[skuld::test]
 fn verify_with_writes_nothing_when_the_conformance_check_fails() {
     let dir = tempfile::tempdir().expect("tempdir");

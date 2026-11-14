@@ -4,17 +4,6 @@
 //! `cargo xtask check-schemars-pin` prek hook. The reasoning is in
 //! `docs/contributing/testing.md` ("The schemars pin").
 //!
-//! `crates/common/build.rs` generates the wire types through `typify`, which takes
-//! `schemars` schemas without re-exporting `schemars`, so the version is not ours
-//! to choose: it must be the one typify speaks. A bump past 0.8 fails that build
-//! script with `E0603`. That compile error is the real protection; this module
-//! notices upstream moving before Renovate proposes the impossible bump.
-//!
-//! The Renovate `allowedVersions` rule is best-effort noise suppression, and this
-//! module does not check that Renovate applies it; `docs/contributing/testing.md`
-//! ("The schemars pin") says why. `.github/renovate.json` is still schema-validated
-//! by the `renovate-config` CI step.
-//!
 //! [`PINNED_SERIES`] is the canonical copy of the fact. `crates/common/Cargo.toml`'s
 //! `schemars = "0.8"` is checked against it ([`check_local_pin`]), and so is the
 //! literal boundary of the `allowedVersions` rule ([`check_renovate_boundary`]), so a
@@ -45,11 +34,6 @@
 //!   the `.github/renovate.json` boundary. It runs where a registry exists: the
 //!   `check-schemars-pin` prek hook, which `prek.toml` gates by `files`, and
 //!   unconditionally in the `lint` CI step, which runs prek `--all-files`.
-//!
-//! Not checked: that `crates/common/Cargo.toml` agrees with `typify`. A mismatch
-//! fails `crates/common/build.rs` with the `E0603` above, so any run of this test
-//! already proves the agreement, and an assertion that can only execute when it is
-//! already true detects nothing.
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 

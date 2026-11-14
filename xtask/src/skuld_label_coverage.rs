@@ -207,12 +207,11 @@ fn is_launcher_token(tok: &str) -> bool {
 /// combinations outright (`--no-run` with `--no-fail-fast` once broke the
 /// `hole-tests` target's build step). [`to_list_command`] strips them when it
 /// rewrites a run into a list; for a `build:` step, `manifest_tests.rs` rejects
-/// them. None
-/// of these narrow *which* tests a filter selects (that's `-E`'s job, always carried
-/// through), only how a `run` that actually executes tests
-/// schedules/reports the ones it already selected — so dropping them can
-/// change neither the test set [`to_list_command`] reports nor which
-/// binaries a `--no-run` compile produces.
+/// them. None of these narrow *which* tests a filter selects (that's `-E`'s job,
+/// always carried through), only how a `run` that actually executes tests
+/// schedules/reports the ones it already selected — so dropping them can change
+/// neither the test set [`to_list_command`] reports nor which binaries a
+/// `--no-run` compile produces.
 ///
 /// Shared with `manifest_tests.rs`'s `tests_targets_run_matches_build_minus_no_run`,
 /// which checks `build.yaml`'s own `*-tests` targets against this same set —
