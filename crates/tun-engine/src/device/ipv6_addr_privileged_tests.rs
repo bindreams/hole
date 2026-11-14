@@ -16,7 +16,8 @@
 //! provisions the elevation.
 //!
 //! Isolation is `serial = TUN` plus `.config/nextest.toml`'s `global_net_state`
-//! group, which serializes it across test binaries. The device NAME buys none
+//! group, which serializes it across test binaries: the test reads the host's whole AF_INET6 unicast address table, so
+//! a concurrent test's TUN would perturb it and be perturbed by it. The device NAME buys none
 //! of that: it is `ipv6t-hole` rather than anything under `hole-tun` only
 //! because `adapter_cleanup::remove_adapter` sweeps `hole-tun*`, so a
 //! production teardown running on the box would delete this test's adapter out
@@ -24,8 +25,8 @@
 //!
 //! COUPLED NAMES: the test name below contains the substring
 //! `tun_device_ipv6_`, which `.config/nextest.toml`'s `global_net_state` filter
-//! matches. Renaming it without updating that filter silently drops it from the
-//! group.
+//! matches; the `global_net_state` label and `cargo xtask verify-global-net-state-labels` catch a rename that leaves
+//! them apart.
 //!
 //! There is no teardown assertion. `GetUnicastIpAddressEntry` is keyed on
 //! `InterfaceIndex`, so after the interface departs it returns `ERROR_NOT_FOUND`

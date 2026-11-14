@@ -20,7 +20,7 @@ inputs:
 
 outputs:
   toolchain:
-    description: "The pinned toolchain channel, e.g. 1.90.0"
+    description: "The pinned toolchain channel"
     value: ${{ steps.rust-version.outputs.toolchain }}
   cachekey:
     description: "Cache-key fragment from dtolnay/rust-toolchain, for cache action keys"

@@ -7,8 +7,7 @@ export const config: WebdriverIO.Config = {
   runner: "local",
   // tauri-driver listens on 127.0.0.1:4444 (its default). wdio MUST know
   // this — without `hostname`+`port`, it tries to spawn a real browser
-  // session and fails with "No browserName defined in capabilities". See
-  // bindreams/hole#372.
+  // session and fails with "No browserName defined in capabilities".
   hostname: "127.0.0.1",
   port: 4444,
   specs: ["./specs/**/*.spec.ts"],
@@ -36,8 +35,8 @@ export const config: WebdriverIO.Config = {
 
   onPrepare() {
     // Discard tauri-driver's stdio — keeping the pipes open would block
-    // tauri-driver if it ever writes more than the pipe buffer (~64 KB
-    // on Windows) without anyone reading. The WDIO/Mocha output already
+    // tauri-driver if it ever writes more than the pipe buffer holds
+    // without anyone reading. The WDIO/Mocha output already
     // covers the test side; tauri-driver itself is rarely the failing
     // piece.
     tauriDriver = spawn("tauri-driver", [], { stdio: "ignore" });

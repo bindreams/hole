@@ -62,7 +62,7 @@ function Wait-ProcessReaped([int]$ProcessId, [string]$What, [int]$TimeoutSeconds
 # Reserves $ProcessId against reuse and returns the process object, or $null if
 # the process is gone or its handle cannot be opened.
 #
-# Everything in the wedge branch now acts on pids MINUTES after reading them --
+# Everything in the wedge branch acts on pids some time after reading them --
 # the capture sits in between -- and a pid is an identity only while its process
 # lives. Once it exits, the kernel may hand the number to something unrelated,
 # and a kill aimed at the wedged tree would land there instead. An open handle

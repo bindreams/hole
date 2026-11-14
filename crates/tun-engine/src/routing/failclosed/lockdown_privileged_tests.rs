@@ -319,6 +319,9 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
 /// `engage_lockdown` again after a REAL pf reset actually reopens a live,
 /// blocking ruleset on this host, not merely a decision table entry.
 ///
+/// The simulated reset is a real `pfctl -F all` plus `pfctl -d`, which clears the host's whole pf state, so this test
+/// must never run beside another that touches pf.
+///
 /// **Disclosed: this simulates a reboot's effect on pf, it does not perform
 /// one.** CI cannot reboot its runners; an unverifiable claim ("survives a
 /// real reboot") would be worse than this disclosed proxy for it.

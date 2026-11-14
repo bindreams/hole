@@ -12,7 +12,7 @@ jobs:
   fixup:
     name: Update WiX hash
     # The push below (nathan-blahaj token, not GITHUB_TOKEN) retriggers this
-    # same workflow, since it touches this file's own trigger path — this
+    # same workflow, since it touches the workflow's own trigger path — this
     # guard, matching vendor-bump.yaml's identical situation, makes the
     # no-loop property structural rather than resting on `upgrade-wix`
     # happening to stay idempotent on a repeat run.

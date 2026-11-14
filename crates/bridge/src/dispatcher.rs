@@ -160,9 +160,10 @@ impl Dispatcher {
         // prefers whatever resolver Hole advertises over the physical
         // adapter's (the confining half is `tun_engine::dns_confine`).
         // IPv4 absence is fatal: a v4 row must exist for an adapter that was
-        // just created. IPv6 absence is logged and accepted: `Device::build`
-        // already waited for the IPv6 half, so a missing row follows from
-        // `Assigned::Ipv6StackAbsent` (see `tun_engine::net::metric`'s module doc).
+        // just created. IPv6 absence is logged and accepted: the expected cause
+        // is the device's `Ipv6StackAbsent` verdict (see `tun_engine::net::metric`'s
+        // module doc); the other is a row that vanished after the address was
+        // assigned. The logged verdict tells them apart.
         #[cfg(target_os = "windows")]
         {
             use tun_engine::net::metric::{set_interface_metric, Family, MetricOutcome, TUNNEL_INTERFACE_METRIC};
@@ -183,9 +184,12 @@ impl Dispatcher {
             match set_interface_metric(luid, TUNNEL_INTERFACE_METRIC, Family::V6) {
                 Ok(MetricOutcome::Applied) => {}
                 Ok(MetricOutcome::NoInterfaceRow) => {
-                    // The device's wait for the row ended in its `Ipv6StackAbsent`
-                    // verdict, which bindreams/hole#1301 contests.
-                    warn!("hole-tun has no IPv6 interface row after the device's wait for it; IPv6 metric not set");
+                    // `Ipv6StackAbsent` (contested in bindreams/hole#1301) or a row
+                    // that vanished after assignment.
+                    warn!(
+                        verdict = ?device.ipv6_assigned(),
+                        "hole-tun has no IPv6 interface row; IPv6 metric not set"
+                    );
                 }
                 Err(e) => {
                     return Err(

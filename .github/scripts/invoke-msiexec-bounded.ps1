@@ -8,7 +8,7 @@
 #
 # Called for both the install and the uninstall by the installer harness
 # (msi-installer/tests/installed/support.py): they carry the same
-# unbounded-wait exposure, so the fix lives once here.
+# unbounded-wait exposure, so the bound lives once here.
 #
 # `-ExePath`/`-ExeArgs` are a test seam: they substitute the process actually
 # started, so the bound + diagnostic-capture path can be exercised against a
@@ -37,10 +37,10 @@ param(
     # budget costs the least-informative capture, not the decisive one.
     #
     # This budget covers the capture loop only, so the wedge branch's real
-    # worst case is the sum of every bound in it: two 15s CIM probes before
-    # the loop, this 60s, and a 5s reap per process killed (one cdb, at most
-    # one per target, at most one per msiexec-tree member) -- about 2min 10s
-    # for a plausible four targets.
+    # worst case is the sum of every bound in it: the two CIM probes before the
+    # loop (`$cimProbeTimeoutSeconds` each), this budget, and a reap
+    # (`$reapTimeoutSeconds`) per process killed (one cdb, at most one per
+    # target, at most one per msiexec-tree member).
     #
     # Measured cost is far under the cap: 33s for one process against a cold
     # symbol cache and 0.3s against a warm one (Windows 11 26100, SDK
@@ -187,7 +187,7 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     }
 
     # Pin each tree member against pid reuse for as long as this block holds the
-    # object. The capture below runs for up to a minute between reading these
+    # object. The capture below runs for up to its budget between reading these
     # pids and acting on them, and a descendant that exits in that window
     # releases its number to whatever the kernel hands it to next -- including
     # the bridge SCM restarts after a suspended target is terminated. `$proc` is
@@ -211,12 +211,12 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     # the instrument manufacturing the hang it exists to diagnose.
     #
     # Terminating it is not the end of the story, and the log says so: the
-    # service carries SCM restart-on-failure with a 1s delay
-    # (`restart_failure_actions` in crates/bridge/src/platform/windows.rs), and
-    # a force-kill counts as a failure, so a FRESH bridge appears about a
-    # second later. That is still strictly better than a frozen one -- a live
-    # bridge can be stopped, a suspended one can not -- but whatever reads the
-    # next steps needs to know the process it sees is not the wedged one.
+    # service carries SCM restart-on-failure (`restart_failure_actions` in
+    # crates/bridge/src/platform/windows.rs), and a force-kill counts as a
+    # failure, so a FRESH bridge appears once the restart delay passes. That is
+    # still strictly better than a frozen one -- a live bridge can be stopped, a
+    # suspended one can not -- but whatever reads the next steps needs to know
+    # the process it sees is not the wedged one.
     if ($suspendedTargetIds) {
         Write-Host "--- terminating targets the capture left suspended ---"
         foreach ($suspendedId in $suspendedTargetIds) {
