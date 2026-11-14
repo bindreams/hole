@@ -169,7 +169,6 @@ fn invalid_plugin_name_does_not_leak_input() {
 }
 
 // shadowsocks-rust v2 schema (top-level `servers` array, `address`/`port` aliases) ====================================
-// Triggered by bindreams/hole#385: real user file used this format and was rejected.
 
 /// User-reported `test.json` shape: `servers` array + `address`/`port`/
 /// `plugin`/`plugin_opts`/`local_port`/`local_address`. Reduced to the

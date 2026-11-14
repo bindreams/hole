@@ -29,8 +29,8 @@ pub enum ImportError {
     ///
     /// The "bundled list" in the error message is derived from
     /// [`crate::plugin::known_plugin_names_joined`], which lists only the
-    /// user-visible plugins from `crate::plugin::KNOWN_PLUGINS` (so the
-    /// `ex-ray` impl-detail entry is hidden) so it can't drift.
+    /// user-visible plugins from `crate::plugin::KNOWN_PLUGINS` (the `ex-ray`
+    /// impl-detail entry is hidden), so it cannot drift from that table.
     #[error(
         "plugin \"{name}\" is not bundled with Hole. Bundled plugins: {}",
         crate::plugin::known_plugin_names_joined()
@@ -59,8 +59,7 @@ impl From<serde_json::Error> for ImportError {
 ///
 /// 1. `{"configs": [ … ]}` — shadowsocks-android export format.
 /// 2. `{"servers": [ … ], "local_port": …, "local_address": …}` —
-///    shadowsocks-rust v2 multi-server JSON config. The user's
-///    [`test.json`][reproducer] (bindreams/hole#385) uses this shape.
+///    shadowsocks-rust v2 multi-server JSON config.
 /// 3. A single bare server object — shadowsocks-libev / legacy
 ///    single-server format.
 ///
@@ -78,8 +77,6 @@ impl From<serde_json::Error> for ImportError {
 /// helper (in `crates/hole/src/commands.rs`, not reachable from this
 /// crate); otherwise the first appended entry is selected. Cross-client
 /// selection-state import is tracked at bindreams/hole#387.
-///
-/// [reproducer]: https://github.com/bindreams/hole/issues/385
 pub fn import_servers(json: &str) -> Result<Vec<ServerEntry>, ImportError> {
     let value: serde_json::Value = serde_json::from_str(json)?;
 

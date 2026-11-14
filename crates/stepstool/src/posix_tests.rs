@@ -44,9 +44,8 @@ fn prime_reports_missing_sudo() {
     assert!(matches!(err, PrimeSudoError::SudoNotFound(_)));
 }
 
-/// Exact argv pin — ports dev_tests.py's preserve-env literal. The string is
-/// a contract (sudo scrubs env otherwise, silently changing dev logging;
-/// dev.py §5.9).
+/// Exact argv pin. The string is a contract: sudo scrubs the environment
+/// otherwise, silently changing dev logging.
 #[skuld::test]
 fn sudo_command_argv_shape() {
     let cmd = sudo_command("/stage/hole", &["RUST_LOG", "RUST_BACKTRACE", "HOLE_BRIDGE_LOG"]);
@@ -100,7 +99,7 @@ impl Drop for StdinGuard {
     }
 }
 
-/// #567: under `cargo xtask run hole` the orchestrator spawns dev-console with
+/// Under `cargo xtask run hole` the orchestrator spawns dev-console with
 /// stdin = /dev/null, so an `isatty(stdin)` check is always false even from an
 /// interactive shell. Priming must still reach the interactive `sudo -v`
 /// (sudo prompts on /dev/tty, not stdin). `serial` because fd 0 + PATH are
@@ -120,7 +119,7 @@ fn priming_does_not_require_a_tty_on_stdin(#[fixture] env: &skuld::EnvGuard) {
 
     let _stdin = StdinGuard::redirect_to_dev_null();
 
-    // Pre-fix this returned Err (stdin not a tty failed the isatty gate);
-    // post-fix it succeeds because sudo prompts on /dev/tty, not stdin.
+    // Succeeds because sudo prompts on /dev/tty, not stdin: an `isatty(stdin)`
+    // gate would fail here.
     prime_sudo().expect("priming must succeed even when stdin is not a tty");
 }

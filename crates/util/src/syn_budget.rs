@@ -29,8 +29,7 @@
 //! | 255 | `WSAECONNREFUSED` | 2041 ms | **default sentinel** |
 //!
 //! `0` and `255` are both documented "use the host default" sentinels in
-//! `mstcpip.h`, not a floor — sampling only those two values is what
-//! produced an earlier, false belief that 514 ms was a hard floor. `254`
+//! `mstcpip.h`, not a floor. `254`
 //! (`TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS`) is the only value that
 //! actually suppresses retransmission. `Rtt` was swept at 10, 50, 100, 200,
 //! 300, and 1000 ms and moved nothing — the interval is fixed at ~514 ms —
@@ -47,9 +46,9 @@ use tokio::net::TcpStream;
 /// reports a refused peer as a timeout — the verdict is then decided by
 /// which timer fired rather than by what the peer said.
 ///
-/// Windows: `MaxSynRetransmissions` (stock 4) × ~514 ms, measured at
-/// 2001–2070 ms across runs; 2100 ms is that with the spread folded in.
-/// POSIX surfaces the first RST, so there is nothing to wait for.
+/// Windows: `MaxSynRetransmissions` times the fixed SYN interval, taken at the
+/// top of the range measured across runs with the spread folded in (see the
+/// module doc). POSIX surfaces the first RST, so there is nothing to wait for.
 #[cfg(windows)]
 pub const REFUSAL_COST: Duration = Duration::from_millis(2100);
 #[cfg(not(windows))]
@@ -153,7 +152,7 @@ async fn connect_no_retransmit(addr: SocketAddr) -> io::Result<TcpStream> {
 /// socket. Extracted so its failure path is directly testable.
 ///
 /// An ioctl failure is returned, never swallowed — a silent fallback to
-/// the host default would resurrect the ~2 s cost this module exists to
+/// the host default would resurrect the refusal cost this module exists to
 /// remove without any signal that it happened.
 #[cfg(windows)]
 fn set_no_syn_retransmissions(socket: &tokio::net::TcpSocket) -> io::Result<()> {

@@ -19,7 +19,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 // Install the workspace test subscriber + panic hook. See
-// `crates/test-observability/` and bindreams/hole#301.
+// `crates/test-observability/`.
 hole_test_observability::register!();
 
 fn main() {
@@ -28,7 +28,7 @@ fn main() {
 
 /// Spawn `hold_file` and park until its stdout emits "ready", meaning
 /// the child has the file handle open. Deterministic — no sleep-based
-/// poll over `find_holders`. See bindreams/hole#383.
+/// poll over `find_holders`.
 fn spawn_holder_ready(path: &Path) -> (Child, BufReader<ChildStdout>) {
     let exe = std::env::var("CARGO_BIN_EXE_hold_file").unwrap_or_else(|_| env!("CARGO_BIN_EXE_hold_file").to_string());
     let mut child = Command::new(exe)

@@ -242,18 +242,18 @@ fn redirect_does_not_loop(#[fixture(temp_dir)] dir: &Path) {
 
 #[skuld::test]
 fn lossy_mode_drops_under_backpressure(#[fixture(temp_dir)] dir: &Path) {
-    // The child writes 10000 lines to stderr while the file appender is
-    // throttled to 100ms per write. Under non-lossy mode, this would block for
-    // hundreds of seconds. Under lossy mode, the child completes promptly and
-    // MANY events are dropped — the SlowWriter should see far fewer than
-    // 10000 writes (proving the lossy channel is actually dropping, not just
-    // queuing).
+    // The child writes many lines to stderr while the file appender is
+    // throttled by a slow writer. Under non-lossy mode, this would block for
+    // far longer than the deadline below. Under lossy mode, the child completes
+    // promptly and MANY events are dropped: the SlowWriter should see far
+    // fewer writes than lines (proving the lossy channel is actually dropping,
+    // not just queuing).
     let start = std::time::Instant::now();
     let result = run_child("lossy_backpressure", dir);
     let elapsed = start.elapsed();
-    // Generous deadline: child loop is 10k * a few microseconds per iteration
-    // plus a few seconds for process spawn/cleanup. The 100ms-per-write file
-    // sink would, without lossy mode, take 10000 * 100ms = 1000 seconds.
+    // Generous deadline: the child loop is microseconds per iteration plus
+    // process spawn/cleanup, while the throttled sink would, without lossy mode,
+    // take lines * its per-write sleep.
     assert!(
         elapsed < std::time::Duration::from_secs(20),
         "lossy backpressure test took {elapsed:?} — likely blocking on file writer"

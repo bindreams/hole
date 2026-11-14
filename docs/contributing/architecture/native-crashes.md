@@ -40,8 +40,8 @@ On Windows and Linux, `on_crash` returns `Handled(false)`, so the OS default pat
 calls `_exit(70)`, for every fault class, every `kind` and every build. A macOS crash therefore leaves the marker and neither
 an `.ips` report nor a minidump. That cost is a decision and not a gap: no part of Hole should hang the process, even
 sometimes. On macOS the handler runs on a separate thread while every other thread is suspended, and a thread suspended inside
-`malloc` never releases the allocator lock, so anything that allocates can block for ever; the dump writer allocates. The
-crate's module doc is the canonical record, with the measurements and the three alternatives that were tried. Read it before
+`malloc` never releases the allocator lock, so anything that allocates can block for ever; the dump writer allocates. [The
+section below](#the-macos-decision-in-detail) has the measurements and the three alternatives that were tried. Read it before
 changing either half.
 
 Two source-scanning tests in {src}`crates/tombstone/src/crash_tests.rs` hold the macOS callback's shape, because the deadlock
@@ -52,6 +52,70 @@ handler path transitively, since an allocation one frame down deadlocks as surel
 The `crash-dumps` feature reads as cross-platform and is not. `minidump-writer` is declared under `cfg(windows)`, so the
 feature links nothing on any other target. It is off by default and release builds never carry it, because process memory
 holds keys and traffic.
+
+### The macOS decision in detail
+
+This is the owner's ruling ([bindreams/hole#842](https://github.com/bindreams/hole/issues/842), closed). The cost, no `.ips`
+and no minidump on macOS, was put to her explicitly and accepted. The premise is that on macOS `tombstone` is
+observability only: it turns a silent process death into a logged event on the next start, so once the marker is on disk
+the process has nothing left to contribute.
+
+A hung bridge is far worse than a lost crash report: it still holds the TUN device, its routes and its pf rules, and never
+reaches its own cleanup, so the user loses the network. Detecting an unclean shutdown does not depend on the marker, because
+the bridge's `bridge-{routes,plugins,dns}.json` state files are swept on the next start and survive SIGKILL and power loss.
+So the macOS `on_crash` writes the marker and then ends the process with `_exit` instead of returning to `crash-handler`,
+because everything that runs after the callback returns is unbounded:
+
+- **The SIGABRT relay never detaches.** macOS has no exception for `abort()`, so `crash-handler` hooks SIGABRT with a
+  `sigaction` and relays it as a synthesized `EXC_SOFTWARE`/`EXC_SOFT_SIGNAL` (`mac/signal.rs`). A real fault's branch calls
+  `detach(true)` (`mac/state.rs`, `MessageIds::Exception`); the relay's branch (`MessageIds::SignalCrash`) contains no
+  `detach` at all, so the C-mandated re-raise of `abort()` fires with the task exception port still attached.
+- **Allocation in the callback can deadlock outright.** `on_crash` runs on `crash-handler`'s message-loop thread with every
+  other thread Mach-suspended (`ScopedSuspend` in `mac/state.rs`, constructed before `call_user_callback` on both the
+  exception and the relay branch), and a thread suspended inside `malloc` never releases the allocator lock.
+- **The system crash reporter's runtime** is not something this process can bound at all.
+
+The termination is unconditional: no fault-class predicate, no attach-`kind` discriminator (`kind` never identified a
+process; `hole-common`'s log-bridge test helpers attach as `"test"` too), and no cargo feature, because a shipped `hole`,
+`hole bridge` and `galoshes` must not hang either. `tests/crash_child.rs` pins each of those three separately. The marker
+still carries kind, pid, tid, exception code and fault address, which is what `sweep` reports; what is lost is the stack.
+
+```{dropdown} Measurements and the alternatives that were tried
+**The deadlock is observed, not predicted.** On darwin/arm64, with eight threads allocating 1 MiB blocks, an allocating
+`on_crash` hung 8 runs in 10, and `sample(1)` of a hung child shows the handler thread parked in `_xzm_malloc_large_huge`,
+`_os_unfair_lock_lock_slow` and `__ulock_wait2` while a suspended thread sits inside `_xzm_malloc_large_huge` holding that
+lock. It is the only causal theory for this hang that survived measurement. `write_minidump_best_effort` allocates three
+times over: a `PathBuf` for the dump path, a `CString` inside `File::create`, and `MinidumpWriter`'s own buffers. The marker
+write allocates not at all (the log directory's handle and the marker's name are pre-encoded at `attach`, the buffer is on
+the stack, and the calls are raw `openat`, `write` and `close`) and runs first, which is why it is what survives.
+
+**The `_exit` itself.** Three runs each of abort, segfault, stack overflow, bus error, illegal instruction and trap on
+darwin/arm64 all exit 70 in under 0.02 s. A stack overflow needs no special case: it arrives as a genuine `EXC_BAD_ACCESS`
+guard-page fault, and terminating on that first delivery means Rust's own stack-overflow handler, which responds by calling
+`abort()`, never runs.
+
+**Three alternatives were built and measured:**
+
+1. *Detach inside the callback, then let the OS reporter run.* Hangs, 2 of 2. `call_user_callback` holds `HANDLER.read()`
+   across `on_crash`, and `state::detach` takes `HANDLER.write()` on that same non-reentrant `parking_lot::RwLock`; under it,
+   `shutdown` would `handler_thread.join()` the very thread `on_crash` runs on. `CrashHandler::detach()` hardcodes
+   `is_handler_thread: false`, so that join is not avoidable from the callback.
+1. *Restore the task exception ports by hand*, which is `uninstall`'s effect without its lock. Measured to earn nothing: with
+   the ports restored the abort class terminates exactly as it does without them (3 of 3), and a fault raised inside
+   `on_crash` hangs either way (2 of 2 with, 2 of 2 without).
+1. *Stop allocating but keep returning `Handled(false)`*, which is the `cfg(windows)` gate on `write_minidump_best_effort`
+   without the `_exit`, and would keep the `.ips`. 20 of 20 clean terminations, all under 0.41 s, and nothing has falsified
+   it. But that was on an idle darwin/arm64, carrying none of the allocation pressure the deadlock needs, so it says nothing
+   yet about darwin/amd64 under CI load. `_exit` is preferred for a reason independent of the allocator: returning hands
+   control back to a process whose handler is still installed (the relay branch never detaches), and the system reporter's
+   runtime is not something this process can bound.
+
+**What would reopen this.** Two candidates. The clean one is a minidump path that is signal-safe and allocation-free end to
+end (buffers reserved at `attach` time, the dump file opened there too, a writer touching neither the allocator nor a lock),
+which removes the reason outright. The cheap one is the third alternative, the option measurement currently favours;
+reopening on it means answering the unbounded-return argument, not just re-running the 20. Neither is reopened by a change
+that merely makes the deadlock rarer: the decision is about hanging at all.
+```
 
 ## The sweep
 

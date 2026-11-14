@@ -381,7 +381,7 @@ fn scenario_no_loop() {
 }
 
 fn scenario_lossy_backpressure() {
-    // SlowWriter sleeps 100ms per write and counts the number of successful
+    // SlowWriter sleeps on every write and counts the number of successful
     // writes — used in place of the file appender to verify the relay/file
     // pipeline doesn't block AND that some events were actually dropped
     // (not just queued).
@@ -412,9 +412,9 @@ fn scenario_lossy_backpressure() {
     let (_relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
 
     // Write 10000 stderr lines in a tight loop. Without lossy mode this
-    // would take ~1000 seconds. With lossy mode it completes in well under
-    // a second, and the SlowWriter counter lands well below 10000 (proving
-    // events were dropped, not just queued).
+    // would take the line count times SlowWriter's sleep. With lossy mode it
+    // completes promptly, and the SlowWriter counter lands well below 10000
+    // (proving events were dropped, not just queued).
     for i in 0..10_000 {
         let _ = writeln!(std::io::stderr(), "lossy-line-{i}");
     }
