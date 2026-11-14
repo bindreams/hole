@@ -350,9 +350,10 @@ fn generate_tray_icons(icons_dir: &Path) {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
 
-    // Remove tray rgba files left under other names by a previous incremental
-    // build. include_bytes! cites only the current names, so stale files
-    // would silently bloat OUT_DIR.
+    // Delete every `tray-*.rgba` in OUT_DIR; the match arms below regenerate the
+    // current ones. include_bytes! cites only the current names, so files left
+    // under other names by a previous incremental build would silently bloat
+    // OUT_DIR.
     if let Ok(read) = std::fs::read_dir(&out_dir) {
         for entry in read.flatten() {
             let name = entry.file_name();

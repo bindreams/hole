@@ -8,7 +8,8 @@
 //
 // Windows process tokens are immutable snapshots of group memberships captured
 // at logon time. There is no Win32 API to refresh a process's token to pick up
-// new group memberships.
+// new group memberships, and `klist purge`/`nltest` only affect Kerberos/AD
+// tickets, not local group tokens.
 //
 // When the user is first added to the `hole` group (either at install time or
 // via `grant-access`), no running process will reflect that membership until

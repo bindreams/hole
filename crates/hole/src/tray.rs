@@ -138,8 +138,9 @@ pub(crate) enum ElevationDecision {
 ///   targets the default production socket, not this one. Checked first,
 ///   so it overrides the disconnect/prompts rules below.
 /// - Disconnect (when GUI-owned) is always interactive, so it may elevate.
-/// - Connect may elevate only when prompts are allowed; an unattended connect
-///   (the blocked-state Retry) fails passively instead of prompting.
+/// - Connect may elevate only when prompts are allowed; a no-prompt connect
+///   (the blocked-state Retry, `connect_silently`) fails passively instead of
+///   prompting.
 pub(crate) fn decide_elevation(
     externally_supervised: bool,
     prompts: Prompts,
@@ -354,8 +355,9 @@ fn tray_actions(running: bool, transition: Option<bool>, blocked: bool) -> TrayA
 /// while leaving the kill switch armed; `Unblock` clears that same cover
 /// *and* the standing one *and* disarms the intent. They read as distinct
 /// actions with distinct labels ("keeps Lockdown armed" vs "turns Lockdown
-/// off"), so both are shown when both apply: the menu favours more escapes
-/// over fewer, never fewer for the sake of a tidier menu.
+/// off"), so both are shown when both apply. A user must never be unable to
+/// release a cover, so the menu favours more escapes over fewer, never fewer
+/// for the sake of a tidier menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EscapeItems {
     go_offline: bool,
@@ -415,8 +417,9 @@ fn build_tray_menu(
         transition.is_none(),
         None::<&str>,
     )?;
-    // Shown whenever a cover is present (`escape_items`), whether or not
-    // anything is running.
+    // Shown whenever `CoverPresence::is_present` holds (`escape_items`) —
+    // which includes the uncertain `Indeterminate`/`Unreachable` readings —
+    // whether or not anything is running.
     let unblock = MenuItem::with_id(app, ID_UNBLOCK, UNBLOCK_ITEM_LABEL, transition.is_none(), None::<&str>)?;
     let autostart = CheckMenuItem::with_id(app, ID_AUTOSTART, "Start at Login", true, false, None::<&str>)?;
     // Checked tracks intent; the warning label covers the enabled-but-inactive
@@ -666,11 +669,11 @@ async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<
     }
 }
 
-/// Whether a connect attempt may surface UI that demands a human: the
+/// Whether a connect attempt may surface UI that demands a decision: the
 /// bridge-install prompt, the UAC/elevation prompt, an error modal.
-/// `Forbidden` is the unattended path (the blocked-state Retry): it must
-/// fail passively into the tray's Disconnected state, never block a login on a
-/// modal.
+/// `Forbidden` is the deliberate no-prompt retry (the blocked-state Retry, a
+/// tray click): it must fail passively into the tray's Disconnected state. The
+/// blocked state itself is not reachable today (bindreams/hole#1270).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Prompts {
     Allowed,
@@ -683,8 +686,9 @@ pub async fn set_proxy_enabled(app: &AppHandle, enable: bool, attempt_id: String
     set_proxy_enabled_inner(app, enable, Prompts::Allowed, attempt_id).await
 }
 
-/// The blocked-state Retry entry (`ID_BLOCKED_RETRY`): a background reattempt
-/// the tray fires without a prompt. Connect-only by construction.
+/// The blocked-state Retry entry (`ID_BLOCKED_RETRY`): a reattempt the tray
+/// fires on a click, deliberately without a prompt. Connect-only by
+/// construction.
 ///
 /// The retry is not covered: no wire signal makes an IPC-driven start covered
 /// (`handle_start` always uses `Coverage::Uncovered`), so a failed retry fails
@@ -709,8 +713,8 @@ async fn connect_silently(app: &AppHandle) -> Result<ToggleOutcome, String> {
 ///
 /// `prompts` is consulted only on the enable path's two prompt sites (the
 /// bridge-install gate and the elevation fallback): `Allowed` shows the UI;
-/// `Forbidden` (unattended) suppresses both and fails passively. The
-/// disconnect path is always interactive (startup never disconnects).
+/// `Forbidden` suppresses both and fails passively. The disconnect path is
+/// always interactive.
 async fn set_proxy_enabled_inner(
     app: &AppHandle,
     enable: bool,
@@ -735,7 +739,7 @@ async fn set_proxy_enabled_inner(
                         return Err(prompt.declined_error().into());
                     }
                 }
-                // An unattended connect must not throw an admin install wizard.
+                // A no-prompt connect must not throw an admin install wizard.
                 Prompts::Forbidden => return Err(prompt.unattended_error().into()),
             },
             InstallGate::ChangeInProgress => return Err(CHANGE_IN_PROGRESS_ERROR.into()),
@@ -781,8 +785,8 @@ async fn set_proxy_enabled_inner(
             StartDecision::NeedsElevation => {
                 match decide_elevation(state.bridge_is_externally_supervised(), prompts, false) {
                     ElevationDecision::Elevate => elevate_and_confirm(app, request).await,
-                    // Externally-supervised bridge or an unattended startup: no UAC;
-                    // fail into Disconnected.
+                    // Externally-supervised bridge, or a no-prompt Retry
+                    // (`connect_silently`): no UAC; fail into Disconnected.
                     ElevationDecision::Decline(msg) => {
                         debug!("proxy start needs elevation but declining: {msg}");
                         Err(msg)

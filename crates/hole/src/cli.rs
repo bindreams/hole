@@ -192,8 +192,11 @@ pub(crate) enum BridgeAction {
         /// leave every fail-closed cover engaged and the kill switch armed.
         /// The standing cover is what holds the update-cutover gap.
         ///
-        /// Hidden: hand-running it leaves the host blocked with no bridge left
-        /// to release the cover.
+        /// Hidden: it leaves an engaged cover in force with no service to
+        /// release it. A hand-run still has `hole` on disk, so `hole bridge
+        /// unlock` or `hole bridge release-covers` releases the cover; the
+        /// hazard is the MSI's uninstall path, which deletes the binary and
+        /// would leave the cover with nothing to release it.
         #[arg(long, hide = true)]
         keep_covers: bool,
         /// Override the log directory (the MSI passes the one directory every
@@ -1077,8 +1080,10 @@ fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
 /// The direct-DACL-update path is a workaround for the Windows
 /// token-snapshot limitation: process tokens are immutable snapshots of
 /// group memberships captured at logon time. There is no Win32 API to
-/// refresh a process's token to pick up new group memberships. Adding the user's own SID directly to the DACL provides
-/// immediate access — a user's own SID is always present in their token.
+/// refresh a process's token to pick up new group memberships, and
+/// `klist purge`/`nltest` only affect Kerberos/AD tickets, not local group
+/// tokens. Adding the user's own SID directly to the DACL provides immediate
+/// access — a user's own SID is always present in their token.
 fn handle_grant_access(
     then_send: Option<String>,
     then_send_file: Option<std::path::PathBuf>,

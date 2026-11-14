@@ -267,13 +267,8 @@ function setupEventListeners(): Promise<unknown> {
     seq: number;
     running: boolean;
     error: string | null;
-    // The backend also serializes lockdown/blocked fields; this listener uses only
-    // running/error. The blocked state is surfaced in the tray; the dashboard
-    // blocked state is deferred (#625).
-    lockdown_enabled?: boolean;
-    lockdown_active?: boolean;
-    blocked_until_connected?: boolean;
   }>("proxy-state-changed", (event) => {
+    // The dashboard has no blocked state (bindreams/hole#625).
     // Pass `error` so a death observed first (or only) via the event still
     // surfaces the exactly-once toast — the tray reconciler can be the poller
     // that commits the death.

@@ -678,9 +678,10 @@ fn absent_version_header_is_version_mismatch() {
 
 /// Mock serving GET /v1/status with a mismatched version header AND a body
 /// missing `cover_presence` — a field this client's `StatusResponse` requires.
-/// If body decoding ran before (or instead of) the version check, this would
-/// surface as `ClientError::Protocol` (a decode failure); this pins that the
-/// version check runs first.
+/// An older bridge's body can lack a required field, so if decoding ran before
+/// (or instead of) the version check it would surface as `ClientError::Protocol`
+/// (a decode failure) and never trigger the version-mismatch self-heal; this
+/// pins that the version check runs first.
 async fn spawn_version_skewed_incompatible_status_mock(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
     let listener = hole_bridge::socket::LocalListener::bind(path).unwrap();
     let router = axum::Router::new().route(
