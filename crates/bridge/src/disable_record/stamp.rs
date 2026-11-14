@@ -15,9 +15,9 @@
 //! listed, with a thread left, with no edge (measured for a reader that held
 //! a handle to it), so it decides only for a process that cannot be opened.
 //! There, read as a standard user holding no handle, right after a SYSTEM
-//! process stopped, it never listed the exited process with a thread left in
-//! about 6,500 rounds on the privileged CI runner (probe at 50d133c91, run
-//! 41817171754).
+//! process stopped, it was never measured to list the exited process with a
+//! thread left (see "The Disabled service and its record" in
+//! `docs/contributing/architecture/kill-switch-uninstall.md`).
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -40,9 +40,9 @@ const SYSTEM_PROCESS_INFORMATION_CLASS: SYSTEM_INFORMATION_CLASS = SYSTEM_INFORM
 
 /// Where the creation time sits in `SYSTEM_PROCESS_INFORMATION::Reserved1`
 /// (which `winternl.h` declares as opaque): after the 8-byte working-set size,
-/// the hard-fault count, the thread high-water mark and the 8-byte cycle time,
-/// 24 bytes in, an 8-byte `FILETIME` value. A test compares it with
-/// `GetProcessTimes`, so a layout that moved fails there.
+/// the hard-fault count, the thread high-water mark and the 8-byte cycle time
+/// comes the 8-byte `FILETIME` value. A test compares it with `GetProcessTimes`,
+/// so a layout that moved fails there.
 const CREATE_TIME_AT: usize = 24;
 
 /// The creation `FILETIME` of the process `process` is open on, 100 ns ticks

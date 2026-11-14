@@ -445,8 +445,8 @@ pub(crate) fn sweep_marker(log_dir: &Path) {
 /// Sweep the completed cutover's marker, verify it is gone, THEN report `Running`
 /// so the cutover child (which exits on the `Running` edge) exits only after the
 /// marker is gone. A healthy update therefore never presents "marker present plus
-/// driver dead" — before this the child is alive (Mask), after it the marker is
-/// already swept (PassThrough).
+/// driver dead": before this the child is alive (`CutoverDecision::Mask`), after
+/// it the marker is already swept (`CutoverDecision::PassThrough`).
 ///
 /// The `read().is_some()` re-check guards the reachable case of an external
 /// process holding the marker open without `FILE_SHARE_DELETE`: reporting
@@ -520,8 +520,8 @@ fn sweep_old_binaries_in_install_dir() {
 
 // Install/uninstall ===================================================================================================
 
-/// System log directory for the Windows service (`C:\ProgramData\hole\logs`).
-/// Deduped to the single cross-privilege resolver the GUI also reads from.
+/// System log directory for the Windows service (`C:\ProgramData\hole\logs`),
+/// from the one cross-privilege resolver the GUI also reads.
 fn service_log_dir() -> PathBuf {
     hole_common::update_marker::service_log_dir()
 }
@@ -531,13 +531,11 @@ fn service_log_dir() -> PathBuf {
 /// The service is registered to run
 /// `<binary_path> bridge run --service --log-dir <log> --state-dir <state>`
 /// with auto-start, then `apply_failure_actions` writes the restart-on-failure
-/// SCM config directly on the just-created handle — best-effort (warn-and-continue),
-/// since a SCM hiccup must not fail the install itself. This deliberately avoids
-/// `ensure_failure_actions` (which re-opens the service and propagates errors);
-/// that stricter re-open path is reserved for the cutover child's post-update
-/// refresh (see `cutover::run_detached`), which also brings an install base that
-/// predates this config up to date — so a bare `install()` is not the only path
-/// that provisions it.
+/// SCM config directly on the just-created handle. That write is best-effort
+/// (warn-and-continue): a SCM hiccup must not fail the install itself.
+/// [`ensure_failure_actions`] is the path that re-opens the service and
+/// propagates errors; the cutover child uses it, which also brings an install
+/// base that predates this config up to date.
 pub fn install(binary_path: &Path) -> std::io::Result<()> {
     install_as(binary_path, InstallStart::Automatic)
 }
@@ -637,7 +635,7 @@ impl registration::NewServiceSteps for NewService<'_> {
 
 /// Restart-on-failure SCM actions. Fires on a crash / non-zero exit, not a
 /// graceful `Stopped(0)`. `reset_period` is finite so a run of crashes keeps
-/// restarting (the counter resets after a day without a failure).
+/// restarting: the failure counter resets after that period without a failure.
 fn restart_failure_actions() -> ServiceFailureActions {
     ServiceFailureActions {
         reset_period: ServiceFailureResetPeriod::After(std::time::Duration::from_secs(86_400)),
@@ -715,12 +713,11 @@ fn hold_start_type_noting(lock: &StartTypeLock, on_busy: impl FnOnce()) -> std::
 /// uninstall retryable instead of terminal.
 ///
 /// The stop, the delete and the check after it are one SCM session
-/// ([`retire`](crate::service_scm::retire::retire)) under the start-type
-/// lock ([`StartTypeLock`]), because the service
-/// carries restart-on-failure: a service the SCM is about to restart reads
-/// STOPPED, and separate probes and acts each decided on a state the SCM could
-/// change under them. A service already
-/// marked for deletion still opens, and is stopped through its handle.
+/// ([`retire`](crate::service_scm::retire::retire)) under the start-type lock
+/// ([`StartTypeLock`]), because the service carries restart-on-failure: a
+/// service the SCM is about to restart reads STOPPED, so a decision from a state
+/// read before an act can be overtaken by the SCM. A service already marked for
+/// deletion still opens, and is stopped through its handle.
 pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     if retire_service(Disposition::Deregister)? {
         info!("Windows service uninstalled");
@@ -740,9 +737,9 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
 /// over. A service marked for deletion by a prior `DeleteService` still opens,
 /// so it is stopped like any other; with nothing to wait on it is looked at
 /// again, paced, until a look reads STOPPED or every process it showed has
-/// exited. The cover release that follows carries the real
-/// guarantee; it holds the bridge's own liveness lock and refuses outright if a
-/// bridge is still alive.
+/// exited. The cover release that follows carries the real guarantee: it holds
+/// the bridge's own liveness lock and refuses outright if a bridge is still
+/// alive.
 pub fn ensure_stopped() -> Result<(), Box<dyn std::error::Error>> {
     retire_service(Disposition::StopOnly).map(|_| ())
 }
@@ -806,8 +803,9 @@ pub fn disabled_by() -> std::io::Result<Option<DisabledBy>> {
 /// runs unprivileged). It never touches the start-type lock: a record whose
 /// writer is still running, or a change mark whose holder is, means a
 /// retirement, repair, enable or install is changing the start type, and the
-/// answer is [`DisabledState::InChange`], neither of the two it would give. A service it cannot open or read is "not disabled", and
-/// the reason is logged, the convention of [`is_installed`].
+/// answer is [`DisabledState::InChange`], neither of the two it would give. A
+/// service it cannot open or read is "not disabled", and the reason is logged,
+/// the convention of [`is_installed`].
 pub fn disabled_state() -> DisabledState {
     let mut session = match StatusSession::open() {
         Ok(Some(session)) => session,

@@ -1,8 +1,8 @@
 //! Event-driven SCM stop/start waits via `NotifyServiceStatusChangeW` — a real
 //! kernel rendezvous (an APC delivered on the actual state transition, awaited
-//! in `SleepEx(INFINITE, TRUE)`), replacing the windows.rs sleep-poll. The
-//! orchestration is a pure state machine over a `ScmActor`; the real impl drives
-//! the raw `windows`-crate SCM FFI behind it.
+//! in `SleepEx(INFINITE, TRUE)`), not a poll. The orchestration is a pure state
+//! machine over a `ScmActor`; the real impl drives the raw `windows`-crate SCM
+//! FFI behind it.
 
 pub mod call_error;
 pub mod hold;
@@ -245,9 +245,8 @@ mod system {
         status: LastStatus,
     }
 
-    // The notify record is 88 bytes on 64-bit Windows: the 80-byte
-    // `SERVICE_NOTIFY_2W` plus the 8-byte `LastStatus`. Every leak figure in
-    // these docs rests on it, so a layout change must fail the build.
+    // An unsettled record is leaked whole (see [`SystemScmActor`]), so a layout
+    // change must be a deliberate one: it fails the build.
     #[cfg(target_pointer_width = "64")]
     const _: () = assert!(std::mem::size_of::<NotifyRecord>() == 88);
 
@@ -414,9 +413,9 @@ mod system {
     /// callback from an earlier arm can never see a buffer a later arm is filling.
     /// A record is freed only after its callback has run, so an APC the SCM
     /// already queued still finds live memory at the thread's next alertable
-    /// wait. An unsettled record is leaked: one record
-    /// (88 bytes on 64-bit Windows) per `NotifyServiceStatusChangeW` call that
-    /// did not settle, i.e. that dropped pending, failed, or returned
+    /// wait. An unsettled record is leaked: one
+    /// [`NotifyRecord`] per `NotifyServiceStatusChangeW` call that did not
+    /// settle, i.e. that dropped pending, failed, or returned
     /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`. Nothing caps how many such calls
     /// are made (the LAGGING retry has no cap), so nothing caps the leak.
     pub struct SystemScmActor<H: Hooks = NoHooks> {

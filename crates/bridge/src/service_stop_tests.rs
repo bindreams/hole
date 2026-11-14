@@ -325,8 +325,8 @@ fn a_stop_control_does_not_wait_for_a_report_in_flight_on_another_thread() {
 
 #[skuld::test]
 fn a_stop_control_writes_no_log_line_on_the_control_handler_thread() {
-    // The SCM gives HandlerEx 30 s. The file appender is non-lossy, so a log
-    // write on the handler thread can block past that and fail the caller's
+    // The SCM gives HandlerEx a bounded time. The file appender is non-lossy, so
+    // a log write on the handler thread can block past it and fail the caller's
     // ControlService. The outcome is logged by the main task instead.
     let writer = VecWriter::new();
     let log = Log::default();
@@ -423,7 +423,6 @@ fn a_second_stop_control_does_not_replace_the_first_ones_unlogged_report() {
     // Stop then Shutdown (or Stop twice) can both reach the handler before the
     // first StopPending takes effect. The second is superseded, but the first
     // reported and failed, and its trail must survive.
-    // A second control can reach the handler (also true of the second-control tests below).
     let writer = VecWriter::new();
     let progress = StopProgress::new(refuse_stop_requested);
     request_stop(&progress, || {});
