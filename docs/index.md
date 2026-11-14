@@ -96,6 +96,12 @@ Update cutover <contributing/architecture/update-cutover.md>
 Native crashes and test panics <contributing/architecture/native-crashes.md>
 Windows service stop reporting <contributing/architecture/windows-service-stop.md>
 Spawn contention and port allocation <contributing/architecture/contention-and-ports.md>
+The app process <contributing/architecture/app-process.md>
+The seams: how tests stay off the machine <contributing/architecture/test-isolation.md>
+Cancellation and teardown <contributing/architecture/cancellation.md>
+The proxy shutdown contract <contributing/architecture/proxy-shutdown.md>
+Logging and diagnostics <contributing/architecture/logging.md>
+Server-address redaction <contributing/architecture/redaction.md>
 Development <contributing/development.md>
 Testing <contributing/testing.md>
 Continuous integration <contributing/ci.md>

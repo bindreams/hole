@@ -2,8 +2,8 @@
 //
 // `ProxyManager::start_inner` builds a `Session` and every exit of a start ends in `Session::teardown`: a failed
 // start, a stop, a health-check give-up. The release order is written once, here, as the field declaration order of
-// `Session`. `Drop` is only the net for a panic or a dropped future (CONTRIBUTING.md, "Every exit of a start ends in
-// one teardown").
+// `Session`. `Drop` is only the net for a panic or a dropped future
+// (`docs/contributing/architecture/cancellation.md`).
 
 use std::path::PathBuf;
 

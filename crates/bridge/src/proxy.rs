@@ -79,7 +79,7 @@ pub trait Proxy: Send + Sync {
 /// `stop().await` ([`crate::session::Session::teardown`]); `Drop` is what
 /// releases the sockets when a start future is dropped mid-start or a panic
 /// unwinds. Aborting the spawned task is necessary but not sufficient: see
-/// CONTRIBUTING.md#proxy-shutdown-contract for why the production
+/// docs/contributing/architecture/proxy-shutdown.md for why the production
 /// implementation also joins a dedicated runtime.
 pub trait RunningProxy: Send + Sync {
     /// Cheap, synchronous check: is the underlying task still running?
@@ -91,7 +91,7 @@ pub trait RunningProxy: Send + Sync {
 
     /// Graceful shutdown: abort the task and await its result so errors
     /// can be reported to the caller. When this returns, every socket the
-    /// proxy bound is closed — see CONTRIBUTING.md#proxy-shutdown-contract.
+    /// proxy bound is closed — see docs/contributing/architecture/proxy-shutdown.md.
     /// Idempotent with respect to subsequent `Drop` because `stop` consumes
     /// `self`.
     fn stop(self) -> impl std::future::Future<Output = Result<(), ProxyError>> + Send;

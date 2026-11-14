@@ -7,7 +7,7 @@
 //! `std::net` binds immediately after `stop()`/`drop`: `join_runtime`
 //! blocks until every task on the dedicated runtime has been dropped, and
 //! no `.await` separates that return from the probe, so nothing else can
-//! run in between. See CONTRIBUTING.md#proxy-shutdown-contract.
+//! run in between. See docs/contributing/architecture/proxy-shutdown.md.
 
 #![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
@@ -344,10 +344,10 @@ fn drop_releases_the_listener_ports_on_a_current_thread_runtime() {
 /// (requiring a re-audit that finds nothing wrong), and a trivial upstream
 /// rename/alias of either identifier can defeat the match and let a real
 /// regression through silently. It is a best-effort tripwire, not a proof;
-/// see CONTRIBUTING.md#proxy-shutdown-contract.
+/// see docs/contributing/architecture/proxy-shutdown.md.
 ///
 /// If `cargo metadata` is not resolvable in the test environment, this test
-/// cannot be expressed; see CONTRIBUTING.md#proxy-shutdown-contract before
+/// cannot be expressed; see docs/contributing/architecture/proxy-shutdown.md before
 /// weakening the assertion.
 #[skuld::test]
 fn upstream_has_no_blocking_calls_on_the_shutdown_path() {
@@ -416,13 +416,13 @@ fn upstream_has_no_blocking_calls_on_the_shutdown_path() {
                  occurrence(s)) — the no-hang property of `ShadowsocksRunning::stop` assumed upstream does no \
                  blocking work on the local-server path; this bump breaks that assumption. Re-audit whether \
                  Hole's config reaches the new call site, then update this test's expectation or the shutdown \
-                 contract. See CONTRIBUTING.md#proxy-shutdown-contract."
+                 contract. See docs/contributing/architecture/proxy-shutdown.md."
             );
 
             if pkg_name == "shadowsocks" {
                 // The one known site: `dns_resolver/resolver.rs`'s
                 // `DnsResolver::System` branch, live but unreached by Hole's
-                // config (see CONTRIBUTING.md#proxy-shutdown-contract). A count
+                // config (see docs/contributing/architecture/proxy-shutdown.md). A count
                 // other than 1, or a hit outside that file, means the call site
                 // moved or multiplied and needs the same re-audit as above.
                 assert_eq!(
@@ -430,7 +430,7 @@ fn upstream_has_no_blocking_calls_on_the_shutdown_path() {
                     "`{pkg_name}` {version} {src_dir:?} calls `lookup_host` {lookup_host_count} time(s) at \
                      {lookup_host_sites:?}, expected exactly 1 (dns_resolver/resolver.rs's DnsResolver::System \
                      branch) — the call site moved or multiplied. Re-audit whether Hole's config now reaches it. \
-                     See CONTRIBUTING.md#proxy-shutdown-contract."
+                     See docs/contributing/architecture/proxy-shutdown.md."
                 );
                 assert!(
                     lookup_host_sites.iter().all(|(path, _)| path
@@ -438,7 +438,7 @@ fn upstream_has_no_blocking_calls_on_the_shutdown_path() {
                         .replace('\\', "/")
                         .ends_with("dns_resolver/resolver.rs")),
                     "`{pkg_name}` {version} `lookup_host` call site(s) {lookup_host_sites:?} are not where \
-                     expected (dns_resolver/resolver.rs). See CONTRIBUTING.md#proxy-shutdown-contract."
+                     expected (dns_resolver/resolver.rs). See docs/contributing/architecture/proxy-shutdown.md."
                 );
             }
         }

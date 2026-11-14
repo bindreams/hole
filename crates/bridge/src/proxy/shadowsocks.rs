@@ -5,7 +5,7 @@
 // tears `Server::run` and its sub-servers down through three nested
 // `Drop` -> `abort()` layers with no handle Hole can join, so a runtime-level
 // join is what makes `stop()` (and `Drop`) actually release the listener
-// sockets before returning. See CONTRIBUTING.md#proxy-shutdown-contract.
+// sockets before returning. See docs/contributing/architecture/proxy-shutdown.md.
 
 use shadowsocks_service::config::Config;
 use shadowsocks_service::net::FlowStat;
@@ -21,7 +21,7 @@ use super::{Proxy, ProxyError, RunningProxy, TrafficTotals};
 /// that is not inside a runtime, so this always hops to a scratch thread; on
 /// a multi-thread worker, `block_in_place` releases the core first so the
 /// join does not starve the ambient runtime. See
-/// CONTRIBUTING.md#proxy-shutdown-contract for the full derivation.
+/// docs/contributing/architecture/proxy-shutdown.md for the full derivation.
 ///
 /// Accepted exception to the no-failure-path guarantee: the scratch-thread
 /// `std::thread::spawn` itself can panic if the OS refuses to create a new
@@ -61,7 +61,7 @@ thread_local! {
 ///
 /// `worker_threads(4)` is a reduction from the ambient runtime's
 /// `available_parallelism()` — unmeasured; see
-/// CONTRIBUTING.md#proxy-shutdown-contract for the tradeoff and the
+/// docs/contributing/architecture/proxy-shutdown.md for the tradeoff and the
 /// falsifier.
 struct SsRuntime(Option<tokio::runtime::Runtime>);
 
@@ -83,7 +83,7 @@ impl SsRuntime {
                 .on_thread_start(move || {
                     #[allow(
                         clippy::disallowed_methods,
-                        reason = "hands the constructing thread's global dispatcher to an SsRuntime test worker; not the per-test assertion target #302 guards against, see CONTRIBUTING.md#proxy-shutdown-contract"
+                        reason = "hands the constructing thread's global dispatcher to an SsRuntime test worker; not the per-test assertion target #302 guards against, see docs/contributing/architecture/proxy-shutdown.md"
                     )]
                     let guard = tracing::dispatcher::set_default(&dispatcher);
                     SS_TEST_TRACING_GUARD.with_borrow_mut(|cell| *cell = Some(guard));
@@ -112,7 +112,7 @@ impl SsRuntime {
 impl Drop for SsRuntime {
     fn drop(&mut self) {
         // Gives every Drop path (exposed paths 3-6, not just stop()) the
-        // same port-release guarantee — see CONTRIBUTING.md#proxy-shutdown-contract.
+        // same port-release guarantee — see docs/contributing/architecture/proxy-shutdown.md.
         if let Some(rt) = self.0.take() {
             join_runtime(rt);
         }
