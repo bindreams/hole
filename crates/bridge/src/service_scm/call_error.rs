@@ -56,9 +56,8 @@ impl ScmCall {
 
     /// Whether a failure of this call is the refusal to open the service's
     /// process, or to read its token or creation time to prove it is the
-    /// service's, which
-    /// belongs to no step of a retirement: the step that was running only
-    /// needed the process held.
+    /// service's. That belongs to no step of a retirement: the step that was
+    /// running only needed the process held.
     pub fn is_opening_the_service_process(self) -> bool {
         match self {
             ScmCall::OpenProcess => true,

@@ -254,9 +254,9 @@ impl ServiceProcesses {
 
     /// Terminates every held orphan that has not exited ([`ProcessHolds::orphans`]):
     /// a process only a scan found, or held only on an id the SCM named in a
-    /// pending state. A process named in a valid state is not one. Each is proven the service's by its token, and the held handle
-    /// keeps its id from being reused, so the id names the same process at the
-    /// second open.
+    /// pending state. A process named in a valid state is not one. Each is proven
+    /// the service's by its token, and the held handle keeps its id from being
+    /// reused, so the id names the same process at the second open.
     fn terminate_live(&self) -> io::Result<()> {
         let mut debug_enabled = false;
         for (pid, process) in self.holds.orphans() {

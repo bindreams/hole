@@ -132,15 +132,13 @@ fn run_launchctl(label: &str, args: &[&str]) -> std::io::Result<std::process::Ou
 /// judging it, for the one caller whose non-zero status is not yet a failure.
 /// `Ok(None)` is launchctl killed by a signal; `Err` is a spawn failure.
 ///
-/// The record is `info!`, which the bridge's default global `info` filter lets
-/// through, because on the one path that fails an uninstall loud —
-/// [`ensure_stopped_verdict`] over [`Registration::Loaded`] — launchd's own
-/// words ("Boot-out failed: 1: Operation not permitted") are the ONLY account
-/// of why, and the error this function's caller raises carries none of its own.
-/// One level for every outcome, not a severity keyed to the exit code: a
-/// non-zero bootout is a refusal or an absent job and the code does not say
-/// which — that is the entire reason this function does not judge. Severity is
-/// [`ensure_stopped_verdict`]'s, which knows the cause.
+/// The output is logged at `info`, which the bridge's default global `info`
+/// filter lets through: on the path that fails an uninstall,
+/// [`ensure_stopped_verdict`] over [`Registration::Loaded`], launchd's own words
+/// are the only account of why the stop was refused. The level is the same for
+/// every outcome, because a non-zero bootout is a refusal or an absent job and
+/// the code does not say which; severity is [`ensure_stopped_verdict`]'s, which
+/// knows the cause.
 fn launchctl_status(label: &str, args: &[&str]) -> std::io::Result<Option<i32>> {
     let output = util::system_tool::SystemTool::Launchctl
         .command()?
@@ -217,9 +215,7 @@ enum Registration {
 /// table-tested without spawning anything.
 ///
 /// `Ok(None)` is launchctl killed by a signal — an answer about launchctl, not
-/// about the job — and `Err` is a spawn failure. Both are [`Registration::Unknown`];
-/// the predecessor mapped both to `false` ("not running") via
-/// `is_running()`'s `.unwrap_or(false)`.
+/// about the job — and `Err` is a spawn failure. Both are [`Registration::Unknown`].
 fn classify_registration(status: std::io::Result<Option<i32>>) -> Registration {
     match status {
         Ok(Some(0)) => Registration::Loaded,
@@ -252,17 +248,10 @@ fn probe_registration() -> Registration {
 /// any registration record — see `setup::uninstall_bridge_with` for why the
 /// two are independent.
 ///
-/// Structurally identical to the Windows arm: issue the stop, then classify
-/// BY CAUSE what the stop left behind. Neither platform asks first — a probe
-/// answers about the moment it was taken, not about the instant the act lands,
-/// and the job can leave launchd in between (a concurrent `hole bridge
-/// uninstall`, an operator's own bootout, the daemon exiting and being
-/// reaped). Nor can the exit code stand in for the classification:
-/// `a_bootout_of_a_label_launchd_does_not_have_fails` measures that launchd
-/// answers a bootout of an absent label with neither 0 nor
-/// [`LAUNCHD_NO_SUCH_SERVICE`]. The question the caller actually has — does
-/// launchd still have this job? — has one answer, and only an answer taken
-/// after the act is about the world the act left.
+/// Issue the stop, then classify by cause what it left behind, as the Windows
+/// arm does. No probe first, and the bootout's exit code is not read as the
+/// answer; why is in the stop step of "The order of an uninstall" in
+/// `docs/contributing/architecture/kill-switch-uninstall.md`.
 ///
 /// `bootout`, not [`stop`]'s SIGTERM: the plist sets `KeepAlive`, so launchd
 /// relaunches a bare-signalled daemon.
@@ -291,9 +280,10 @@ fn ensure_stopped_with(
 /// that must never report it is testable without launchd.
 ///
 /// `Unknown` is an error, not a success: `setup::uninstall_bridge_with` gates
-/// deregistration on this call, and deleting the plist over a still-loaded job
-/// leaves a running bridge with no registration naming it, and a bridge left running holds the liveness lock, so the
-/// cover release refuses against it. The registration is the only handle a later attempt has on a job it could not
+/// deregistration on this call. Deleting the plist over a still-loaded job
+/// leaves a running bridge with no registration naming it, and a bridge left
+/// running holds the liveness lock, so the cover release refuses against it. The
+/// registration is the only handle a later attempt has on a job it could not
 /// confirm stopped.
 ///
 /// `Loaded` is reached whenever the bootout did not succeed and launchd still
@@ -442,10 +432,8 @@ pub fn enable() -> std::io::Result<()> {
 /// Check whether the bridge is currently running.
 ///
 /// Its one caller is `setup::bridge_install_status`, a cosmetic status
-/// readout, so an unanswerable probe has to collapse to *some* boolean. It
-/// collapses here, in an exhaustive match that names the uncertain case and
-/// logs it — never by a `.unwrap_or(false)` that also silently answered for
-/// [`ensure_stopped`], which acts on it.
+/// readout, so an unanswerable probe collapses to `false` here, with a warning.
+/// [`ensure_stopped`], which acts on the answer, does not come through here.
 pub fn is_running() -> bool {
     match probe_registration() {
         Registration::Loaded => true,
@@ -460,7 +448,7 @@ pub fn is_running() -> bool {
 /// Run the bridge directly (called by launchd).
 ///
 /// `log_dir` is the directory the crash-marker sweep reads (markers land
-/// next to `bridge.log`; see bindreams/hole#438).
+/// next to `bridge.log`).
 ///
 /// `plugins` are the plugin binaries `hole` carries; the service makes [`PLUGIN_DIR`] hold exactly those before it
 /// serves anything.
@@ -488,9 +476,9 @@ pub fn run(
         // Bind BEFORE the liveness acquire and BEFORE recovery — a second
         // instance's bind() fails before it can touch routing state or
         // contend on the liveness lock, matching crate::liveness's documented
-        // invariant. Route recovery is offloaded via spawn_blocking so a hung
-        // netsh/route command cannot wedge the runtime while the IPC socket
-        // is bound but not yet serving.
+        // invariant. Recovery that runs external commands is offloaded via
+        // spawn_blocking so a hung command cannot wedge the runtime while the IPC
+        // socket is bound but not yet serving.
         let server = crate::ipc::IpcServer::bind_with_log_dir(socket_path, proxy, version, log_dir.to_path_buf())?;
 
         // Held for this bridge's entire run — see crate::liveness's module
@@ -538,8 +526,7 @@ pub fn run(
         // Reconcile the persisted target before any client can connect (narrows,
         // does not close, the boot->first-connect gap).
         crate::boot::recover_then_reconcile(&proxy_shutdown, &shutdown).await;
-        // Native-crash observability (bindreams/hole#438): sweep crash
-        // markers left by a previously-crashed bridge. Offloaded to a
+        // Sweep crash markers left by a previously-crashed bridge. Offloaded to a
         // blocking thread to match the sibling recover_* calls.
         let log_dir_sweep = log_dir.to_path_buf();
         if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
