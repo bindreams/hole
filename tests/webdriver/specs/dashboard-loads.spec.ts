@@ -15,13 +15,13 @@
 
 describe("Dashboard window", () => {
   it("loads the bundled HTML (not the WebView2 error page)", async () => {
-    // ui/index.html line 6 sets <title>Hole Dashboard</title>. WebView2's
-    // error page title is something like "Hmm — can't reach this page".
+    // ui/index.html sets <title>Hole Dashboard</title>. WebView2's error
+    // page title is something like "Hmm — can't reach this page".
     expect(await browser.getTitle()).toBe("Hole Dashboard");
   });
 
   it("renders the server-list container from the bundled DOM", async () => {
-    // #server-list lives at ui/index.html:22 — present iff index.html was
+    // #server-list is in ui/index.html, so it is present iff index.html was
     // actually served from embedded assets.
     expect(await $("#server-list").isExisting()).toBe(true);
   });

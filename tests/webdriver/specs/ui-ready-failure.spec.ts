@@ -81,10 +81,10 @@ describe("UI-ready failure reporting", () => {
   });
 
   it("reports a malformed bridge result instead of hanging", async () => {
-    // The `error` -> `reason` rename reads properties off whatever the
-    // bridge resolves with. A shape it does not expect must still reach a
-    // disposition; otherwise the call runs out the framework timeout and
-    // the reason is lost.
+    // `assertUiReady` maps the bridge's `error` to `reason`, reading properties
+    // off whatever the bridge resolves with. A shape it does not expect must
+    // still reach a disposition; otherwise the call runs out the framework
+    // timeout and the reason is lost.
     await browser.execute(() => {
       const w = window as unknown as Probe;
       w.__holeUiReady = () => {

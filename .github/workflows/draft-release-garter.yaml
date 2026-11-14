@@ -2,7 +2,7 @@ name: Draft Release (garter)
 
 # Thin caller for the shared draft-release reusable, plus a garter-only
 # `cargo publish --dry-run` pre-check that runs before the reusable.
-# See .github/workflows/reusable-draft-release.yaml and #326.
+# See .github/workflows/reusable-draft-release.yaml.
 
 on:
   workflow_dispatch:

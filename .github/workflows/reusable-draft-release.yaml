@@ -113,7 +113,7 @@ jobs:
       # text-mode regardless of which per-matrix runner built each
       # artifact. Git-Bash sha256sum on Windows defaults to binary mode
       # (asterisk marker), macOS defaults to text mode; hashing here
-      # avoids that divergence entirely. See #355.
+      # avoids that divergence entirely.
       - name: Compute SHA256SUMS
         run: |
           sha256sum ${{ inputs.track }}-* > SHA256SUMS
@@ -140,7 +140,7 @@ jobs:
           echo "--- end ---"
 
       # --latest is pinned at draft-create time to avoid GitHub's
-      # legacy semver+date heuristic. See #308.
+      # legacy semver+date heuristic.
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -2,7 +2,8 @@ name: Reusable Publish Release
 
 # Common scaffolding for the publish-release workflows of every track.
 # Per-track callers pass inputs gating the optional steps:
-#   verify-signature  — hole only: require + verify SHA256SUMS.minisig
+#   verify-signature  — require + verify SHA256SUMS.minisig; no caller sets
+#                       it (hole publishes through publish-release-hole.yaml)
 #   crates-publish    — garter only: `cargo publish` with idempotent
 #                       skip-if-already-published
 #   dry-run           — garter only: `cargo publish --dry-run` then exit
@@ -18,7 +19,7 @@ on:
         required: true
         type: string
       version:
-        description: "Release version (e.g. 1.0.0 or 1.3.3-hole.1)"
+        description: "Release version (e.g. 1.0.0)"
         required: true
         type: string
       version-regex:
@@ -26,11 +27,11 @@ on:
         required: true
         type: string
       latest:
-        description: "Pass to `gh release edit --latest`. true for hole, false for others"
+        description: "Pass to `gh release edit --latest`"
         required: true
         type: boolean
       verify-signature:
-        description: "If true, require SHA256SUMS.minisig on the draft and verify it (hole only)"
+        description: "If true, require SHA256SUMS.minisig on the draft and verify it"
         required: false
         type: boolean
         default: false
@@ -149,7 +150,7 @@ jobs:
         id: crates_check
         env:
           # crates.io API requires a User-Agent header; without it the
-          # API responds with HTTP 403. See #346.
+          # API responds with HTTP 403.
           CRATES_UA: "hole-release-pipeline (https://github.com/bindreams/hole)"
         run: |
           VERSION="${{ steps.version.outputs.version }}"
@@ -205,13 +206,13 @@ jobs:
       - name: Wait for crates.io indexing
         if: ${{ !inputs.dry-run && inputs.crates-publish }}
         env:
-          # crates.io API requires User-Agent; see #346.
+          # crates.io API requires a User-Agent header.
           CRATES_UA: "hole-release-pipeline (https://github.com/bindreams/hole)"
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          # Unbounded poll — `timeout-minutes: 30` on the job is the
-          # only ceiling. crates.io indexing is well-behaved; only
-          # reason to time out is a real outage.
+          # Unbounded poll: this awaits crates.io's index, an external event,
+          # so the job's `timeout-minutes` is the only ceiling and the failure
+          # bound surfaced to a human.
           until [ "$(curl -sL -A "$CRATES_UA" -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/${{ inputs.crates-name }}/${VERSION}")" = "200" ]; do
             echo "Still indexing..."
             sleep 10
@@ -224,6 +225,6 @@ jobs:
           TAG="${{ steps.version.outputs.tag }}"
           # Belt-and-suspenders: --latest was pinned at draft creation;
           # re-assert here so the published state matches even if the
-          # draft was edited externally. See #308.
+          # draft was edited externally.
           gh release edit "$TAG" --draft=false --latest=${{ inputs.latest }}
           echo "Release published: https://github.com/${{ github.repository }}/releases/tag/$TAG"

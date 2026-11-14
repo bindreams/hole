@@ -1492,6 +1492,15 @@ fn recover_lockdown_noop_when_cover_absent() {
     assert_eq!(decided.get(), Some(CoverRecovery::Noop), "absent cover => Noop");
 }
 
+/// Recovery reconciles the standing lockdown cover BEFORE sweeping the
+/// transient one, and tells the sweep the standing cover is being adopted so it skips the
+/// `/etc/pf.conf` reload.
+///
+/// Pinned here, not by an egress test: on macOS the transient `engage`'s
+/// `pfctl -f -` replaces whatever ruleset is loaded with its own, and
+/// `recover_lockdown(Adopt)` deliberately does not reload the standing one, so
+/// after recovery the live ruleset is the transient leftover and, with a shared
+/// permit IP, the egress assertions pass whether or not standing-adopt works.
 #[skuld::test]
 fn recover_orders_lockdown_before_transient_sweep_and_passes_adopting() {
     let dir = tempfile::tempdir().unwrap();
