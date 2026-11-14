@@ -7,9 +7,9 @@
 //! the evidence supports it, undone.
 //!
 //! Assumes one bridge at a time reads the file. The single-instance guarantee
-//! behind that is not airtight; the read-once bound the sweep puts on this
-//! module is what makes a second reader harmless (see [`crate::dns::recovery`]).
-//! The sweep is described in `docs/contributing/architecture/crash-recovery.md`.
+//! behind that is not airtight; why a second reader is harmless is argued in
+//! `docs/contributing/architecture/crash-recovery.md` (section DNS), which also
+//! describes the sweep.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -65,15 +65,17 @@ pub struct DnsPriorAdapter {
 /// without inferring the platform. Every variant names its field `value`, so
 /// a reader can extract it without branching on `kind`.
 ///
-/// It is the adapter's friendly name, not a LUID or GUID: `netsh` and
-/// `networksetup` both take the name, so restore needs no lookup. Names
-/// survive reboots; a rename mid-session leaves the adapter unfound and
-/// restore skips it silently.
+/// It is the adapter's friendly name, not a LUID or GUID, because names
+/// survive reboots. Windows restore resolves the alias to a LUID and then a
+/// GUID on every call (no `netsh`); macOS passes the service name to
+/// `networksetup`. An adapter renamed or removed since the capture is not
+/// found, so its families read as `SkippedNotOurs`: nothing is written, the
+/// file is superseded rather than deleted, and the warn names
+/// `scripts/network-reset.py` (see `crate::dns::recovery`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AdapterId {
     /// Windows adapter friendly name (alias), e.g. "Ethernet" or "Wi-Fi".
-    /// Passed directly to `netsh interface ... name="<value>"`.
     WindowsAlias { value: String },
     /// macOS network service name, e.g. "Wi-Fi" or "Ethernet". Passed
     /// directly to `networksetup -setdnsservers <value>`.

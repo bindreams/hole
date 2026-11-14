@@ -30,7 +30,10 @@ pub enum ReachabilityVerdict {
     DnsFailed,
     /// The server refused the TCP connection (closed port).
     TcpRefused,
-    /// Nothing answered the TCP connect.
+    /// Nothing answered the TCP connect, or it failed with any error other than
+    /// a refusal: an unreachable host or network, a local firewall's denial and
+    /// a reset all map here too, so the toast reads "timed out" for them
+    /// (bindreams/hole#1319).
     TcpTimeout,
     /// The connect succeeded (or QUIC was sent) but no first-flight byte came back: reset, timeout or clean EOF.
     Blocked,

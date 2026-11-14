@@ -91,7 +91,10 @@ pub(crate) const TAP_DISABLED_HINT: &str =
 ///
 /// No retry: with two or more resolvers a single walk already dials each
 /// independently, so a retry would only add cost, which falls on tunnels that
-/// are slow but working, the cohort this gate must not mis-report.
+/// are slow but working, the cohort this gate must not mis-report. The
+/// considered trade-off: with a single resolver a retry would be the only
+/// second independent dial, and the gate forgoes it
+/// (`docs/contributing/architecture/dns-forwarder.md#the-start-time-gate`).
 ///
 /// Also writes the canonical `"forwarder self-test ok"` / `"forwarder
 /// self-test failed"` log line at `info!`. On failure, additionally emits a

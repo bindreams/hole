@@ -160,9 +160,11 @@ pub enum ForwardFailure {
 /// through five nested `async fn` frames, so unboxed it would widen every
 /// future on the DNS path to carry a failure that is almost never taken. `?`
 /// boxes on its own via `impl<T> From<T> for Box<T>`; only tail expressions
-/// wrap explicitly. [`ForwardResult`]'s size assertion is what keeps
-/// `clippy::result_large_err` quiet; the assertion below is a secondary
-/// budget so growth here stays deliberate.
+/// wrap explicitly. Boxing is also what keeps `clippy::result_large_err`
+/// quiet: this struct's size crosses that lint's fixed threshold on some
+/// targets only, so an unboxed `Err` made the lint's outcome depend on which
+/// target ran it. [`ForwardResult`]'s size assertion enforces the boxing; the
+/// assertion below is a secondary budget so growth here stays deliberate.
 #[derive(Debug)]
 pub struct UpstreamErr {
     pub layer: UpstreamLayer,
@@ -288,10 +290,11 @@ const _: () = assert!(
 );
 
 /// The `Result` every DNS-forward transport (`forward_one` and its four
-/// per-protocol callees) returns. Boxing the error here keeps
-/// `clippy::result_large_err` from firing, whose threshold a target platform
-/// can cross; the assertion enforces that on every compile instead of leaving
-/// it to whichever clippy a contributor runs.
+/// per-protocol callees) returns. Boxing the error here, rather than shrinking
+/// [`UpstreamErr`], keeps `clippy::result_large_err` from firing: its fixed
+/// threshold is crossed by the unboxed error on some targets only. The
+/// assertion enforces the boxing on every compile instead of leaving it to
+/// whichever target's clippy a contributor runs.
 pub(crate) type ForwardResult = Result<Vec<u8>, Box<UpstreamErr>>;
 const _: () = assert!(
     std::mem::size_of::<ForwardResult>() <= 128,
@@ -511,8 +514,10 @@ const DNS_PORT_HTTPS: u16 = 443;
 /// that then fails every query.
 ///
 /// A considered constant, not a derivation: one attempt on the shipped
-/// DoH-with-ECH configuration is a chain of serialized round trips, and the
-/// bound is sized to admit a link many times slower than a healthy one.
+/// DoH-with-ECH configuration is nine serialized round trips, and the bound
+/// leaves a margin for a link many times slower than a healthy one. The
+/// measurement behind it is in
+/// `docs/contributing/architecture/dns-forwarder.md#failure-reporting-and-budgets`.
 pub(crate) const TUNNEL_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Also a floor: a budget under the refusal cost cannot report a refusal at
@@ -1223,8 +1228,13 @@ pub(crate) fn answered_or_servfail(
 }
 
 /// Build a SERVFAIL response from an incoming query. Preserves the
-/// transaction ID, question section, and QDCOUNT; zeros all
+/// transaction ID and QDCOUNT, and copies the first question; zeros all
 /// answer/authority/additional counts; sets QR=1, RA=1, RCODE=2.
+///
+/// QDCOUNT is copied from the query but at most the first question is, and
+/// none when it cannot be delimited. A query with QDCOUNT above 1, or a
+/// malformed first question, therefore gets a header that promises more
+/// questions than the reply carries (bindreams/hole#1318).
 pub fn synthesize_servfail(query: &[u8]) -> Vec<u8> {
     // DNS header is 12 bytes: ID(2) | flags(2) | QDCOUNT(2) | ANCOUNT(2) |
     // NSCOUNT(2) | ARCOUNT(2). If the query is shorter than that, we can

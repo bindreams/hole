@@ -90,7 +90,9 @@ pub trait Dns: Send + Sync + 'static {
     /// synthetic supplemental-resolver key. OS UDP/53 to these IPs routes
     /// into `hole-tun` and is intercepted by the in-TUN `LocalDnsEndpoint`;
     /// OS TCP/53 takes the ordinary filter cascade to the real resolver, so
-    /// the user's rule for that address decides its path.
+    /// the user's rule for that address decides its path. On Windows a
+    /// `Bypass` rule fails: the confinement refuses the bypassed connect
+    /// (bindreams/hole#1317).
     ///
     /// `routed` is the address families the tunnel is actually carrying —
     /// see [`RoutedFamilies`]. Windows ignores it (the WFP confinement
@@ -137,14 +139,19 @@ pub trait DnsApplied: Send + 'static {
 /// Errors returned from [`Dns::apply`].
 #[derive(Debug, thiserror::Error)]
 pub enum DnsError {
-    /// The cancel token fired during `apply`. Whatever had engaged (the
-    /// confinement or steering key) has already been released.
+    /// The cancel token fired during `apply`. A Windows confinement has been
+    /// dropped. A macOS steering key has been withdrawn on a best-effort basis
+    /// (`Cosmetic`; the result is ignored), so a failed withdraw can leave it
+    /// published until the bridge exits.
     #[error("DNS apply cancelled")]
     Cancelled,
 
     /// Setting the resolver IPs on `hole-tun` failed (Windows), the steering
     /// key could not be published, or no advertised resolver's address
-    /// family is routed (macOS). Always fatal (see the module doc).
+    /// family is routed (macOS). Also a panicked or cancelled blocking step
+    /// (`phase::run`'s `JoinError`), the Windows confine engage included, which
+    /// surfaces here and not as [`DnsError::Confine`]. Always fatal (see the
+    /// module doc).
     #[error("DNS apply failed: {0}")]
     Io(#[from] io::Error),
 
@@ -179,8 +186,9 @@ pub struct SystemDns {
     /// [`Self::new_with_backend`].
     #[cfg(target_os = "windows")]
     confiner: Arc<dyn windows::DnsConfiner>,
-    /// macOS `networksetup` backend, used only for `flush`. Production: [`macos::Networksetup`]; tests: substitute
-    /// via [`Self::new_with_mac_backend`].
+    /// macOS `networksetup` backend, used only for `flush`. Production:
+    /// [`macos::Networksetup`]; tests: substitute via
+    /// [`Self::new_with_mac_backend`].
     #[cfg(target_os = "macos")]
     backend: Arc<dyn macos::MacDnsBackend>,
     /// The DNS-steering seam. Production: [`macos::RealMacDnsSteerer`];

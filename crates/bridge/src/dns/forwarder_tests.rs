@@ -457,8 +457,8 @@ fn a_pending_connect_survives_a_higher_ranked_failure_in_the_same_walk() {
     );
 }
 
-/// The two bounds price different questions (a chain of round trips through a
-/// tunnel versus a few on a direct hop), so the tunnel's must be the larger. A weak
+/// The two bounds price different questions (nine round trips through a tunnel
+/// versus three on a direct hop), so the tunnel's must be the larger. A weak
 /// test (two literals, one file), kept only because it catches an accidental
 /// equalisation, which would silently re-price the bootstrap as a tunnel walk.
 #[skuld::test]

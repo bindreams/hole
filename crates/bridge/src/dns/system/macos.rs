@@ -9,9 +9,9 @@
 //! [`Networksetup`]; unit tests substitute `MockMacBackend` via
 //! [`crate::dns::system::SystemDns::new_with_mac_backend`]. Its
 //! `get_settings` and `restore_family` serve only
-//! `crate::dns::recovery`'s upgrade sweep, and `flush` serves apply and
-//! shutdown; `set_servers` and `restore` have no production caller. Apply steers DNS via
-//! [`MacDnsSteerer`] instead (see [`crate::dns::system`]).
+//! `crate::dns::recovery`'s upgrade sweep, `flush` serves apply and shutdown,
+//! and `set_servers` and `restore` have no production caller. Apply steers DNS
+//! via [`MacDnsSteerer`] instead (see [`crate::dns::system`]).
 //!
 //! [`MacDnsSteerer`] / [`SteeringHandle`] are the apply-path seam. They
 //! mirror `super::windows::DnsConfiner` except that they do not erase the

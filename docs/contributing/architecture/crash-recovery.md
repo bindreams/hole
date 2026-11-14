@@ -68,6 +68,11 @@ archived under a numbered name that nothing reads. A superseded file exists beca
 succeed, so the newer file's recorded priors may already be Hole's own dead resolver addresses; the older file is closer
 to the user's original DNS.
 
+The sweep assumes one bridge reads `bridge-dns.json` at a time, and the single-instance guarantee behind that is not
+airtight, so a second reader must be harmless. It is: a family is written only while its live setting still equals what
+the old build advertised, and the write is to the recorded prior, so two readers cannot write conflicting values. Each
+reader ends by deleting or superseding the file, and both treat a file the other already moved as done.
+
 A confinement held by a bridge that is alive but unreachable has no file-based release. It ends only with its owning
 process, and the escape below stops that process.
 
