@@ -1,4 +1,4 @@
-//! POSIX `hole`-group session gate (dev.py §5.14): grant-access adds the
+//! POSIX `hole`-group session gate: grant-access adds the
 //! user to the group on disk, but a login session that predates the change
 //! lacks it — the GUI then cannot open the IPC socket. Check and instruct,
 //! never silently fail later.
@@ -44,8 +44,8 @@ pub fn hole_gid() -> Result<Option<u32>, String> {
     }
 }
 
-/// Effective + real + supplementary gids (the union dev.py builds —
-/// getgroups alone can omit the primary/effective gid).
+/// Effective + real + supplementary gids: `getgroups` alone can omit the
+/// primary/effective gid.
 pub fn current_gids() -> BTreeSet<u32> {
     let mut gids = BTreeSet::new();
     // SAFETY: getgid/getegid never fail; getgroups with a sized buffer is

@@ -1,8 +1,8 @@
 //! Proc-macro support crate for `tun-engine`.
 //!
-//! Provides `#[freeze]`: given a struct with `pub` fields, generates an
-//! immutable companion (field-syntax reads, mutation blocked at compile time)
-//! and a `MutXxx` builder companion with `.freeze()`.
+//! Provides `#[freeze]`: given a struct with `pub` fields, makes it immutable
+//! (field-syntax reads, mutation blocked at compile time) and generates a
+//! `MutXxx` builder companion with `.freeze()`.
 //!
 //! ```ignore
 //! #[freeze]

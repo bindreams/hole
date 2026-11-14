@@ -1,6 +1,6 @@
 use crate::policy::*;
 
-// Elevation matrix (ports dev_tests.py:50-86) =========================================================================
+// Elevation matrix ====================================================================================================
 
 #[skuld::test]
 fn windows_requires_admin_regardless_of_euid() {
@@ -20,7 +20,7 @@ fn posix_user_proceeds() {
     assert_eq!(elevation_action(Os::Posix, Some(501)), ElevationAction::PosixOk);
 }
 
-// argv builders (ports dev_tests.py:87-110, incl. the exact preserve-env literal) =====================================
+// argv builders (incl. the exact preserve-env literal) ================================================================
 
 #[skuld::test]
 fn grant_access_argv_posix() {
@@ -72,7 +72,7 @@ fn bridge_argv_posix_includes_ready_notify() {
     );
 }
 
-// Teardown policy (ports dev_tests.py:113-159 pins) ===================================================================
+// Teardown policy =====================================================================================================
 
 #[skuld::test]
 fn posix_bridge_is_never_force_killed() {
@@ -98,7 +98,7 @@ fn windows_bridge_and_all_others_are_force_killed() {
     );
 }
 
-// Exit codes (Delta 1 + dev.py clean-exit parity) =====================================================================
+// Exit codes ==========================================================================================================
 
 #[skuld::test]
 fn child_failure_exits_one_clean_paths_exit_zero() {
@@ -108,9 +108,9 @@ fn child_failure_exits_one_clean_paths_exit_zero() {
     assert_eq!(supervision_exit_code(ExitCause::Interrupted), 0);
 }
 
-// More dev_tests.py pins ==============================================================================================
+// Platform and label pins =============================================================================================
 
-/// dev_tests.py:54 — euid is IGNORED on Windows (even euid 0).
+/// euid is IGNORED on Windows (even euid 0).
 #[skuld::test]
 fn windows_ignores_posix_euid_values() {
     assert_eq!(
@@ -119,7 +119,7 @@ fn windows_ignores_posix_euid_values() {
     );
 }
 
-/// dev_tests.py:108-110 — the Windows bridge argv has no sudo prefix.
+/// The Windows bridge argv has no sudo prefix.
 #[skuld::test]
 fn bridge_argv_windows_has_no_sudo() {
     let argv = bridge_argv(
@@ -145,8 +145,7 @@ fn bridge_argv_windows_has_no_sudo() {
     );
 }
 
-/// Label/color/width pins (dev_tests strips ANSI and asserts exact labels;
-/// the width-aligned `[  vite]` is deliberate, dev.py:533).
+/// Label/color/width pins; the width-aligned `[  vite]` is deliberate.
 #[skuld::test]
 fn prefixes_are_colored_and_width_aligned() {
     assert_eq!(ChildRole::Bridge.prefix(), "\x1b[36m\x1b[1m[bridge]\x1b[0m ");
@@ -154,7 +153,7 @@ fn prefixes_are_colored_and_width_aligned() {
     assert_eq!(ChildRole::Vite.prefix(), "\x1b[33m\x1b[1m[  vite]\x1b[0m ");
 }
 
-/// Fidelity item 12: the recovery warning carries dev.py's exact content.
+/// The recovery warning text is pinned verbatim.
 #[skuld::test]
 fn network_reset_warning_is_verbatim() {
     assert!(NETWORK_RESET_WARNING.contains(
@@ -215,8 +214,6 @@ fn dev_run_subdir_name_is_filesystem_safe() {
 /// The POSIX bridge must never be force-killed, and the refusal has to survive
 /// a release build — a `debug_assert` alone compiles out and lets the caller
 /// fall through to a SIGKILL that kills `sudo` and orphans the root bridge.
-/// Table-driven so a future `grace_timeout_action` change cannot quietly
-/// re-enable it on POSIX.
 #[skuld::test]
 fn bridge_hard_kill_is_refused_on_posix() {
     assert!(!bridge_hard_kill_permitted(Os::Posix));

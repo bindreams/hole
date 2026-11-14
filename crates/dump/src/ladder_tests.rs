@@ -88,8 +88,7 @@ fn dump_beats_serialize_in_priority() {
 #[skuld::test]
 fn same_output_for_references_and_rvalues() {
     // Rvalue, value, reference, double reference — all produce identical
-    // output when the inner type implements Dump. (Box<T>: Dump ships in
-    // the impls commit.)
+    // output when the inner type implements Dump.
     let x = OnlyDump;
     let rx = &x;
     let rrx = &rx;

@@ -5,10 +5,8 @@ use super::DumpValue;
 
 #[skuld::test]
 fn int_and_uint_are_distinct_variants() {
-    // i64 and u64 at value 1 are the same number but carry different
-    // semantics: Int preserves signedness, UInt preserves range above
-    // i64::MAX. These must not compare equal — downstream formatters
-    // may emit them differently (e.g. with or without a sign-safe tag).
+    // Same number, different variants: the signed impls produce Int, the
+    // unsigned ones UInt. They must not compare equal.
     assert_ne!(DumpValue::Int(1), DumpValue::UInt(1));
 }
 

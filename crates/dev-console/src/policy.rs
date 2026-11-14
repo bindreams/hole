@@ -1,6 +1,8 @@
-//! Pure supervision policy: every decision dev.py made with platform
-//! branches, as data — testable on any host (the PR #456 strategy-as-data
-//! pattern).
+//! Pure supervision policy as data, testable on any host: the per-OS elevation
+//! verdict, the sudo-prefixed bridge and grant-access argv, child roles with
+//! their grace-timeout actions, exit causes and codes, and the dev-run log
+//! filtering and child env. The POSIX sudo preflight and the `hole`-group gate
+//! run in `supervise.rs`.
 
 /// Env vars carried across the sudo boundary into the elevated bridge — log
 /// filtering, backtraces, per-sink levels, and the dev-run log dir. sudo
@@ -36,7 +38,7 @@ pub enum ElevationAction {
     /// is dropped, all children inherit).
     WindowsRequireAdmin,
     /// POSIX as root: refuse — dev mode runs unprivileged and elevates only
-    /// the bridge; running as root re-poisons target/ (#452).
+    /// the bridge; running as root leaves root-owned files in target/.
     PosixErrorRoot,
     /// POSIX as a normal user: the supported path.
     PosixOk,
@@ -99,8 +101,8 @@ pub enum ChildRole {
 }
 
 impl ChildRole {
-    /// Colored, width-aligned display label (dev.py: `[bridge]` cyan,
-    /// `[client]` magenta, `[  vite]` yellow).
+    /// Colored, width-aligned display label: `[bridge]` cyan, `[client]`
+    /// magenta, `[  vite]` yellow.
     pub fn prefix(self) -> String {
         use crate::ansi::{BOLD, CYAN, MAGENTA, RESET, YELLOW};
         let (color, label) = match self {
@@ -118,7 +120,7 @@ pub enum GraceTimeoutAction {
     /// POSIX bridge only: an unprivileged parent cannot force-kill through
     /// sudo (pty/monitor mode on sudo >= 1.9.14 puts the bridge in its own
     /// session; sudo cannot relay SIGKILL). Print the network-reset recovery
-    /// pointer instead (dev.py §5.7).
+    /// pointer instead.
     WarnRecovery,
 }
 
@@ -144,13 +146,12 @@ pub fn bridge_hard_kill_permitted(os: Os) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitCause {
-    /// A supervised child exited with a FAILURE status (Delta 1: non-zero).
+    /// A supervised child exited with a FAILURE status (non-zero).
     ChildFailed,
     /// A supervised child exited cleanly (e.g. the user quit the GUI from
-    /// the tray — a normal way to end a dev session). dev.py exits 0 here.
+    /// the tray — a normal way to end a dev session).
     ChildExitedClean,
-    /// A readiness phase failed (bridge/vite died or timed out) — dev.py
-    /// exits 1 from these paths.
+    /// A readiness phase failed (bridge/vite died or timed out).
     StartupFailed,
     /// Ctrl+C / SIGTERM — orderly user stop.
     Interrupted,
@@ -163,17 +164,16 @@ pub fn supervision_exit_code(cause: ExitCause) -> u8 {
     }
 }
 
-/// The POSIX bridge-timeout recovery message, verbatim from dev.py:344-349
-/// (fidelity item 12 demands the exact text; pinned by a test).
+/// The POSIX bridge-timeout recovery message; a test pins the text. It names the
+/// grace period in seconds, so keep it in step with `GRACE_TIMEOUT`.
 pub const NETWORK_RESET_WARNING: &str = "\x1b[33mThe bridge did not exit within 10s and may still be running as root with routing changes in place.\nRun `sudo scripts/network-reset.py` to restore connectivity.\x1b[0m";
 
 // Dev-run log filtering ===============================================================================================
 
 /// First-party crates pinned to TRACE in the dev-run file logs. Deps stay at
-/// the `debug` default. Mirrors `hole_test_observability::DEFAULT_FILTER`'s
-/// crate list (kept separate: that crate is a dev-dep and `util` is
-/// deliberately Hole-agnostic, so there is no shared home without a heavyweight
-/// dep — a new first-party crate must be added to both lists).
+/// the `debug` default. Mirrors `hole_test_observability::DEFAULT_FILTER`, which
+/// also names `hole_test_observability` and omits `ex_ray`. There is no shared
+/// home (`util` is Hole-agnostic); add a new first-party crate to both lists.
 const DEV_RUN_TRACE_CRATES: &[&str] = &[
     "hole",
     "hole_common",
@@ -201,7 +201,7 @@ pub fn dev_run_file_directives() -> String {
     s
 }
 
-/// `HOLE_LOG_STDERR` for the bridge / GUI terminal view — today's info level.
+/// `HOLE_LOG_STDERR` for the bridge / GUI terminal view.
 pub const DEV_RUN_STDERR_BRIDGE: &str = "hole_bridge=info";
 pub const DEV_RUN_STDERR_GUI: &str = "hole=info";
 

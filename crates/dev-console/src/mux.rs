@@ -1,13 +1,12 @@
 //! Multiplexed child-log printing with atomic multi-line entries.
 //!
-//! Port of dev.py's `prefix_stream` (#393/#394): streams that emit
-//! ISO-timestamped tracing entries (bridge, GUI) are framed so a multi-line
-//! entry (panic backtrace, YAML body) is written as ONE block and can never
-//! be interleaved with another stream's lines; Vite (no timestamp anchor)
+//! Streams that emit ISO-timestamped tracing entries (bridge, GUI) are framed
+//! so a multi-line entry (panic backtrace, YAML body) is written as one block
+//! and can never be interleaved with another stream's lines; Vite (no timestamp anchor)
 //! prints per-line. Atomicity is structural: every stream pumps into one
 //! mpsc consumed by a single printer task — one writer, no lock.
 //!
-//! Shutdown ordering (issue #568): in steady state the most-recent entry of an
+//! Shutdown ordering: in steady state the most-recent entry of an
 //! EntryBuffered stream is deferred until its next anchor or pipe EOF, so the
 //! shutdown burst would otherwise print in pump-EOF order, not time order. The
 //! printer therefore switches to a collect-and-sort phase on `enter_drain`
@@ -87,8 +86,8 @@ impl EntryFramer {
             }
         } else if !self.buffer.is_empty() {
             // Continuation — including anchor-less panic-hook lines arriving
-            // mid-entry. PINNED TRADE-OFF (see mux_tests): appended, not
-            // emitted out-of-band.
+            // mid-entry. Appended, not emitted
+            // out-of-band (pinned in mux_tests).
             self.buffer.push(line);
             FramerOutput::None
         } else {
@@ -103,7 +102,7 @@ impl EntryFramer {
     }
 }
 
-/// Python-`text=True` line splitting: `\n`, `\r\n`, and lone `\r` all end a
+/// Universal-newline line splitting: `\n`, `\r\n`, and lone `\r` all end a
 /// line (children emitting `\r` progress would otherwise buffer forever). A
 /// trailing `\r` at a chunk boundary stays pending until the next chunk
 /// disambiguates `\r` vs `\r\n`.
@@ -165,8 +164,8 @@ pub async fn pump(mut stream: impl AsyncRead + Unpin, mode: StreamMode, prefix: 
     }
     // EOF: flush the trailing partial line, then the buffered entry. A
     // pending `\r` was waiting for a possible `\n`; EOF makes it final, so it
-    // terminates a line — emitted even when empty (Python text-mode parity:
-    // `b"x\n\r"` is ['x', '']).
+    // terminates a line — emitted even when empty (`b"x\n\r"` yields `x`, then
+    // an empty line).
     let terminated_by_cr = pending.last() == Some(&b'\r');
     if terminated_by_cr {
         pending.pop();
@@ -206,10 +205,9 @@ pub async fn pump(mut stream: impl AsyncRead + Unpin, mode: StreamMode, prefix: 
 /// block written to `out` (ANSI kept) and mirrored into `transcript` (ANSI
 /// stripped) for `dev-console.log`) until `enter_drain` fires. Phase 2 collects
 /// the trailing (deferred final) entries and emits them sorted by ISO timestamp
-/// — so the shutdown burst prints in time order, not pump-EOF order (issue
-/// #568) — bounded by `finalize` for the WarnRecovery case where a pump never
-/// EOFs and `rx` never closes. One writer == atomic entries (replaces dev.py's
-/// print lock).
+/// — so the shutdown burst prints in time order, not pump-EOF order —
+/// bounded by `finalize` for the WarnRecovery case where a pump never
+/// EOFs and `rx` never closes. One writer == atomic entries.
 pub async fn printer(
     mut rx: mpsc::Receiver<Entry>,
     mut out: impl AsyncWrite + Unpin,
