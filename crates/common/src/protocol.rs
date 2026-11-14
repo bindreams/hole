@@ -59,8 +59,7 @@ pub enum BridgeRequest {
         /// This is a preference the bridge persists, not a decision the GUI
         /// makes: whether THIS start is auto-connect-covered is for the
         /// bridge alone to know. Do not add a field that carries that decision
-        /// from the GUI: the removed `covered` field is deliberately not
-        /// replaced by an equivalent. Sent on the wire as the
+        /// from the GUI. Sent on the wire as the
         /// `X-Hole-On-Startup` header (like `attempt_id`), so it survives the
         /// elevation re-serialization path.
         ///

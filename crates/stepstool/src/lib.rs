@@ -4,7 +4,7 @@
 //!
 //! Deliberately NOT here: Windows `self_elevate` via `ShellExecuteExW(runas)`,
 //! `CommandLineToArgvW`-faithful arg quoting and linked-token queries. They are
-//! deferred until a consumer exists (bindreams/hole#453, open), not ruled out.
+//! deferred until a consumer exists, not ruled out.
 //! De-elevation is excluded by the model, not deferred.
 
 #[cfg(unix)]

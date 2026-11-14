@@ -56,9 +56,9 @@ holds keys and traffic.
 ### The macOS decision in detail
 
 This is the owner's ruling ([bindreams/hole#842](https://github.com/bindreams/hole/issues/842), closed). The cost, no `.ips`
-and no minidump on macOS, was put to her explicitly and accepted. The premise is that `tombstone` is observability only: it
-turns a silent process death into a logged event on the next start, so once the marker is on disk the process has nothing
-left to contribute, while everything that would run after the callback returns is unbounded.
+and no minidump on macOS, was put to her explicitly and accepted. The premise is that on macOS `tombstone` is
+observability only: it turns a silent process death into a logged event on the next start, so once the marker is on disk
+the process has nothing left to contribute.
 
 A hung bridge is far worse than a lost crash report: it still holds the TUN device, its routes and its pf rules, and never
 reaches its own cleanup, so the user loses the network. Detecting an unclean shutdown does not depend on the marker, because
