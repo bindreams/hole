@@ -2,8 +2,7 @@
 
 The {term}`bridge` runs with administrator rights, and a {term}`SIP003 plugin` it starts runs with the same rights. So the
 bridge runs only the plugins Hole ships, from one folder it can vouch for, and never one found on the `PATH`, which is
-writable by the user on a bridge elevated from the app. This page is for a developer changing how plugins are found,
-shipped or checked. For what the plugins are, read [Shadowsocks and its plugins](../../how-it-works/plugins.md).
+writable by the user on a bridge elevated from the app. For what the plugins are, read [Shadowsocks and its plugins](../../how-it-works/plugins.md).
 
 ## One owner of "where are the plugins"
 
@@ -90,7 +89,7 @@ failure is only logged.
 A start asks `resolve` for the configured plugin before anything else: before the DoH bootstrap, before any cover is
 engaged or released, before any dial. A refusal therefore touches nothing and reaches the user as the usual start
 error. Import already rejects plugins Hole does not ship, so only a hand-edited or old config, or a direct IPC call,
-gets here. The stamp of an unsound folder (`UnsoundDir`) is never read.
+gets here.
 
 ### The layout stamp
 

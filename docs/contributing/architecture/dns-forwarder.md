@@ -2,8 +2,7 @@
 
 A plugin that carries only TCP, such as {term}`ex-ray`, cannot carry ordinary DNS, which is UDP, and [the datapath drops
 UDP it cannot carry](datapath.md#udp-is-dropped-never-bypassed). So the {term}`bridge` runs a {term}`DNS forwarder` that carries DNS over the
-tunnel's TCP path. This page is for a developer changing the forwarder, the way the operating system is pointed at it, or
-the check that runs before a connection starts. The user-level story is [DNS through the tunnel](../../how-it-works/dns.md).
+tunnel's TCP path. The user-level story is [DNS through the tunnel](../../how-it-works/dns.md).
 
 ## The pieces
 
@@ -32,8 +31,8 @@ the Shadowsocks listener can only relay when the plugin carries UDP.
 rule for that address decides (`Proxy` goes over the tunnel, `Bypass` leaves from the real interface, `Block` drops). The
 endpoint refuses TCP by contract (`debug_assert!`), since port 53 over TCP is not necessarily DNS.
 
-`DnsConfig::default()` is enabled and uses DoH with its default resolvers. `AppConfig` is `#[serde(default)]`, so a
-config file written before the forwarder existed enables it silently on upgrade. With `enabled` and an empty `servers`,
+`DnsConfig::default()` is enabled and uses DoH with its default resolvers. A config with no DNS
+section gets the default, so the forwarder is enabled. With `enabled` and an empty `servers`,
 `build_local_dns` refuses the start with `ProxyError::ForwarderSelfTestFailed` ("no DNS servers configured"), because a
 live TUN with nothing to forward to would strand every DNS flow.
 
@@ -88,8 +87,7 @@ withdraw (after a cancel, and on shutdown) are `Cosmetic`.
 
 Residuals the design accepts: DoH to an on-link resolver is not caught by the port-53 confinement, which names no port
 but 53, so on both platforms it leaves as ordinary HTTPS to that host. On Windows DoT on port 853 is not confined. macOS has no per-port egress filter to evade, since the key only
-adds a resolver. An older build's own rewrite of another adapter's DNS after a crash is still undone by
-{src}`crates/bridge/src/dns/recovery.rs`; this build never writes `bridge-dns.json`.
+adds a resolver.
 
 ## The start-time gate
 
@@ -102,7 +100,7 @@ rest are in `bring_up_tunnel`, which begins at step 2:
 1. `Dispatcher::new` opens the TUN device; only now is `LocalDnsEndpoint` reachable.
 1. `routing.install` makes routes live, and later `Dns::apply` points the system at the resolvers.
 
-The gate sits before steps 4 to 5 so a dead tunnel never takes the machine's DNS with it. Reordering them brings back a
+The gate runs first so a dead tunnel never takes the machine's DNS with it. Reordering them brings back a
 DNS hijack into a dead tunnel with the GUI reporting *Running*; `start_blocks_on_forwarder_self_test_failure` asserts that
 `routing.install` was not called when the gate fails.
 
@@ -149,8 +147,3 @@ that something is intercepting TLS (a certificate chain that did not verify, dec
 resolver that simply did not answer. `is_trust_chain_rejection` is deliberately narrow: an expired certificate or a name
 mismatch is the user's configuration or clock, and switching resolvers would fix it. See
 [ECH and DoH](../../how-it-works/ech-and-doh.md) for the user-level view.
-
-## Read next
-
-- [The datapath](datapath.md): the cascade that diverts UDP/53.
-- [The kill switch on Windows](kill-switch-windows.md): the persistent filters the DNS confinement is contrasted with.

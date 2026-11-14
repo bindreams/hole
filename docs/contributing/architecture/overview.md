@@ -117,4 +117,4 @@ from the app, and the process shutdown token that boot passes to `reconcile_once
   - [TCP accept refusal](tcp-admission.md): admitting, refusing and retiring TCP connections.
   - [The DNS forwarder](dns-forwarder.md): carrying DNS over the tunnel, and the check before a connection starts.
 - Plugins: [where the plugin binaries come from](plugin-binaries.md) and [the galoshes transport](galoshes-transport.md).
-- The route and recovery rules, and the process model, are still in {src}`CONTRIBUTING.md`, under *Architecture*.
+- The route and recovery rules and the process model are in {src}`CONTRIBUTING.md`, under *Architecture*.

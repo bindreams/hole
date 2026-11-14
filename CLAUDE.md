@@ -10,7 +10,8 @@ This file is the agent-facing architecture map. Product and install live in
 [docs/contributing/](docs/contributing/index.md) (setup, build, development,
 testing, and the architecture under
 [docs/contributing/architecture/](docs/contributing/architecture/overview.md)).
-What has not moved yet stays in [CONTRIBUTING.md](CONTRIBUTING.md). Read them
+[CONTRIBUTING.md](CONTRIBUTING.md) holds the route and recovery rules, the process
+model and releases. Read them
 before editing; the sections linked below are the authoritative source.
 
 **IMPORTANT:** NEVER PIPE TESTS TO `tail`! ALWAYS SET A TIMEOUT FOR THE SHELL COMMAND! Tests are known to hang, you WILL get stuck and WILL not have information to debug why if you tail.
@@ -261,7 +262,7 @@ what is open before starting more.
   [dev/admin CLI](docs/contributing/bridge-cli.md))
 - Architecture →
   [docs/contributing/architecture/](docs/contributing/architecture/overview.md)
-- The rest of the architecture still in CONTRIBUTING.md, releases →
+- The route and recovery rules, the process model, releases →
   [CONTRIBUTING.md](CONTRIBUTING.md)
   ([releases](CONTRIBUTING.md#releases))
 - Release ops (rollback, minisign key rotation) →

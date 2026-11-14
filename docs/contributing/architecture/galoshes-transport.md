@@ -3,8 +3,7 @@
 {term}`galoshes` puts every TCP connection and UDP exchange of a client onto streams of one {term}`yamux` connection to
 the server, and the embedded {term}`ex-ray` carries that one connection. One connection means one point of failure, so
 the yamux client in {src}`crates/galoshes/src/yamux.rs` has to notice when the connection is dead and replace it, and the
-tunnel must not hang meanwhile. This page covers how it does that, and the one option galoshes sets on ex-ray. It is for a
-developer changing the galoshes client or server. The user-level summary is in [Shadowsocks and its
+tunnel must not hang meanwhile. This page covers how it does that, and the one option galoshes sets on ex-ray. The user-level summary is in [Shadowsocks and its
 plugins](../../how-it-works/plugins.md#galoshes).
 
 ## A session and its listeners
@@ -50,19 +49,15 @@ them apart, and a panic ends the client with an error rather than reconnecting.
   keeps a healthy but slow server off the fatal path. A `const` assertion pins each relation at the constants, and
   `Cadence::new` is the only way to build another pair; production never does.
 
-The keepalive's `KEEPALIVE_TIMEOUT` is a failure bound on an external event, a peer that may never answer, and not a
-synchronisation delay between our own code.
-
 ## Reconnecting
 
 When a session ends with `TransportDied`, `run_client` aborts the driver, then waits and connects again. The wait has a
 floor and an escalation:
 
 - `next_failures` counts consecutive failed sessions. A session is **productive** when the tap counted at least one inbound
-  read (`was_productive`), which resets the count; an unproductive one increments it.
+  read (`was_productive`; a bare ping counts), which resets the count; an unproductive one increments it.
 - `session_reconnect_backoff(failures)` is at least `REMOTE_BACKOFF_BASE` and doubles with each failure up to
   `REMOTE_BACKOFF_MAX`. The floor bounds a peer that flaps right after delivering one byte.
-- "Productive" is **transport-level**, not application-level, for the reason above: a bare ping counts.
 - Connecting itself, `connect_retrying`, retries with no limit until it succeeds or the client is told to stop, since the
   peer is expected to come up. A loopback peer (a sibling ex-ray) is retried at the fixed `LOOPBACK_CONNECT_RETRY`, and a
   routable one backs off on the same exponential curve, warning each attempt. Work sent to the client's local listener
@@ -75,8 +70,10 @@ handful of interrupted flows for a bounded teardown instead of waiting on the ch
 has no shutdown hook to ask it to finish.
 
 A local error does not tear the tunnel down. A failed accept or receive on the client's loopback listener, or a failed
-accept on the server's inbound listener, is logged and the loop continues: reconnecting the transport would not fix a local
-socket error, and these are transient (a stray `ECONNABORTED`, a momentary `EMFILE`).
+accept on the server's inbound listener, is logged at debug and the loop continues: reconnecting the transport would not fix a local
+socket error. The loop yields and retries at once, with no backoff, so a persistent error such as `EMFILE` spins it at
+full CPU, one debug line per iteration, until the condition clears
+([#1302](https://github.com/bindreams/hole/issues/1302)).
 
 ## The mux default
 
@@ -89,13 +86,12 @@ v2ray-core would only add framing and a second connection lifecycle that can fai
 - `mux` also selects the server's dokodemo destination. With multiplexing on (`mux` nonzero in WebSocket mode), the server's inbound targets the address
   `v1.mux.cool` and expects Mux.Cool frames (`connectionReuse` in {src}`crates/ex-ray/config.go`). A client with `mux=0`
   therefore cannot talk to a server whose ex-ray has `mux` on, and both ends must run a galoshes that agrees. Pinning `mux=1`
-  in the plugin options on both ends restores the earlier wire format.
+  on both ends gives a matching pair.
 - A mismatched pair fails to tunnel, and slowly. `galoshes_ws_mux_default_cannot_reach_a_mux1_server`
   ({src}`crates/plugin-e2e/tests/roundtrip.rs`) shows the break against a control with `mux=1` on both ends. On a frame it cannot parse,
   the server's Mux.Cool worker (`ServerWorker.run` in the vendored v2ray-core, `common/mux/server.go`) interrupts its
-  input and returns. Whether that tears the underlying connection down promptly is not shown; the test's comment and
-  its read budget fit a client that learns of the failure only when the yamux keepalive declares the transport dead,
-  but nothing here proves that mechanism.
+  input and returns. Whether the server then closes the connection promptly is unproven; the test's read budget assumes
+  the client only learns of the failure from the keepalive.
 - The append goes through `garter::{split_plugin_options, join_plugin_options}`, so the escaping cannot drift from the
   parser's. A naive strip-and-append turns `path=/a\;` into `path=/a\;mux=0`, which ex-ray reads as one pair with no `mux`
   key. Two shapes have no correct output and are refused at startup: a dangling final escape, and a segment with an empty

@@ -4,8 +4,7 @@ The packet loop of the {term}`TUN` device answers every application's TCP connec
 ([smoltcp](https://github.com/smoltcp-rs/smoltcp)) that plays the remote server, and only then hands the connection to
 [the router](datapath.md). That puts three problems in the loop's hands: refusing a connection cleanly when Hole is at
 its limit, freeing sockets without confusing a peer that is still talking, and not holding a slot for ever for a client
-that has gone. This page is for a developer changing `SocketStack` or `Driver`
-({src}`crates/tun-engine/src/engine/socket_stack.rs`, {src}`crates/tun-engine/src/engine/driver.rs`).
+that has gone. The code is {src}`crates/tun-engine/src/engine/socket_stack.rs` and {src}`crates/tun-engine/src/engine/driver.rs`.
 
 ## The verdict comes before the handshake
 
@@ -49,10 +48,10 @@ socket whose peer is still live stays in the set.
 
 `TimeWait` can be removed at once because every socket the stack creates has its delayed ACK disabled
 (`set_ack_delay(None)`, in `ensure_listener`). smoltcp therefore sends any ACK it owes on the poll that ingests the
-segment, and a socket removed at `TimeWait` owes nothing. With a delayed ACK, the ACK for the peer's last data and FIN would still be owed when the socket went, and the peer's
-retransmission would be answered with a reset; that consequence is smoltcp's behaviour as read, not measured here.
-`SocketStack::remove` asserts the property in debug builds. The `Listen` case matters because a reverted socket keeps its listen endpoint and would take every later SYN on
-its port (`a_reverted_socket_would_hijack_a_later_syn`).
+segment, and a socket removed at `TimeWait` owes nothing. `SocketStack::remove` asserts in debug builds that the socket owes no ACK.
+
+A `Listen` socket is retired because a reverted socket keeps its listen endpoint and would take every later SYN on its
+port (`a_reverted_socket_would_hijack_a_later_syn`).
 
 ### One call per packet
 
@@ -97,5 +96,4 @@ transitory connection, and the interval is a quarter of it.
 
 ## Read next
 
-- [The datapath](datapath.md): what happens to an admitted connection.
 - [The TUN device](tun-device.md): the device the packet loop reads.

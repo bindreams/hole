@@ -1,7 +1,7 @@
 # The TUN device: its name and its IPv6 address
 
-`Device::build` ({src}`crates/tun-engine/src/device.rs`) opens the {term}`TUN` device the datapath reads. This page
-covers two things a change to it has to respect: where the device's name comes from, and why the device holds an IPv6
+`Device::build` ({src}`crates/tun-engine/src/device.rs`) opens the {term}`TUN` device the datapath reads. A change to it
+has to respect two things: where the device's name comes from, and why the device holds an IPv6
 address on the operating system's interface as well as inside Hole's own network stack. For the routes that point
 traffic at the device, and what a user sees, read [the TUN device and the
 routes](../../how-it-works/tun.md) first.
@@ -82,9 +82,12 @@ whether the interface already exists, then blocks on the callback. `MibInitialNo
 and carries no row, so an interface the kernel published during `tun`'s own wait emits no later `MibAddInstance`; a
 register-and-block would wait out the whole budget and report a present IPv6 half as absent.
 
-The budget, `IPV6_INTERFACE_BUDGET`, is a failure bound on an external event, not a synchronisation delay: when IPv6 is
-unbound on the host the interface never appears, and the elapsed budget is the answer. The wait blocks on the callback
-and does not poll.
+The wait blocks on the callback and does not poll, up to `IPV6_INTERFACE_BUDGET`. When the budget expires the code
+treats the interface as having no IPv6 half and returns `Assigned::Ipv6StackAbsent`, so it takes elapsed time as proof of
+absence: an interface the kernel publishes after the budget gets no address, and the start only warns. Route
+installation reads a [different measurement](#what-is-fatal) and can still find IPv6 usable, installing the two fatal IPv6
+splits into a TUN with no IPv6 source address. This is a defect, tracked in
+[#1301](https://github.com/bindreams/hole/issues/1301).
 
 The address is then created with `CreateUnicastIpAddressEntry` and `DadState = IpDadStatePreferred`, which skips duplicate
 address detection for this address alone, as the `tun` crate does for the IPv4 address. IP Helper is used and not
@@ -107,7 +110,7 @@ address tentative, and whether the alias creates a prefix route in every case.
 
 ### What is fatal
 
-On Windows, IPv6 never appearing on the interface (the stack is unbound) and a missing IPv6 stack reported by
+On Windows, the IPv6 wait expiring (see [above](#windows-wait-for-the-ipv6-half-then-assign)) and a missing IPv6 stack reported by
 `CreateUnicastIpAddressEntry` (`ERROR_NOT_SUPPORTED`) both give `Assigned::Ipv6StackAbsent`, which only warns. Any other
 IP Helper failure, in the registration, the existence query, the LUID lookup or the create, is
 `DeviceError::Ipv6Assign` and fails the start. On macOS every `ifconfig` failure is `Ipv6StackAbsent`. On both
@@ -136,5 +139,4 @@ its own `Device` on its own thread, which releases the adapter.
 
 ## Read next
 
-- [The datapath](datapath.md): what reads the device.
 - [TCP accept refusal](tcp-admission.md): the TCP side of the packet loop.
