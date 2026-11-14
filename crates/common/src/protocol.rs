@@ -49,23 +49,22 @@ pub enum BridgeRequest {
         config: ProxyConfig,
         /// Per-attempt idempotency key minted by the GUI (a UUID). Sent on the
         /// wire as the `X-Hole-Attempt-Id` header; the bridge scopes
-        /// start-cancellation to it (#465). A struct field, not a
+        /// start-cancellation to it. A struct field, not a
         /// client-side-only header, so it survives the elevation
         /// re-serialization path (`encode_request` / `write_request_file`).
         attempt_id: String,
         /// The GUI's current startup preference, pushed on every connect so
         /// the bridge can apply it at its own next boot with no GUI running
-        /// (#979, #617) — see `hole_bridge::target::resolve_startup_target`.
+        /// — see `hole_bridge::target::resolve_startup_target`.
         /// This is a preference the bridge persists, not a decision the GUI
         /// makes: whether THIS start is auto-connect-covered is for the
-        /// bridge alone to know, which is why the removed `covered`
-        /// field is not replaced by an equivalent. Sent on the wire as the
+        /// bridge alone to know. Sent on the wire as the
         /// `X-Hole-On-Startup` header (like `attempt_id`), so it survives the
         /// elevation re-serialization path.
         ///
         /// `None` when the caller has no preference to push — the CLI's
         /// case, which must leave whatever the bridge already has persisted
-        /// untouched rather than stomping it with the wire default (#979).
+        /// untouched rather than stomping it with the wire default.
         #[serde(default)]
         on_startup: Option<crate::config::StartupBehavior>,
     },
@@ -214,9 +213,7 @@ pub enum BridgeResponse {
         ipv6_bypass_available: bool,
         lockdown_enabled: bool,
         /// What the bridge measured about a standing lockdown cover on the
-        /// host — replaces the old `lockdown_active: bool`, which answered
-        /// the host question with a process-ownership answer instead of a
-        /// measurement (bindreams/hole#825).
+        /// host, as opposed to whether this process owns one.
         cover_presence: CoverPresence,
         /// Whether a covered start failed and left the host fail-closed (blocked,
         /// not leaked) while not running. Drives the GUI's distinct blocked state
@@ -275,8 +272,8 @@ pub enum TunnelMode {
 pub struct ProxyConfig {
     pub server: ServerEntry,
     pub local_port: u16,
-    /// Defaults to [`TunnelMode::Full`] when absent — older clients (the
-    /// current GUI) that don't send this field keep their existing behavior.
+    /// Defaults to [`TunnelMode::Full`] when absent, so a client that doesn't
+    /// send this field keeps the full-tunnel behavior.
     #[serde(default)]
     pub tunnel_mode: TunnelMode,
     /// Filter rules applied by the bridge dispatcher. Defaults to empty
@@ -284,16 +281,15 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub filters: Vec<FilterRule>,
     /// Built-in DNS forwarder configuration. Defaults to
-    /// `DnsConfig::default()` (enabled, DoH to Cloudflare). Older clients
-    /// that don't send this field get the default, which silently enables
-    /// the forwarder on upgrade.
+    /// `DnsConfig::default()`. Older clients that don't send this field get
+    /// the default, which silently enables the forwarder on upgrade.
     #[serde(default)]
     pub dns: crate::config::DnsConfig,
     /// Whether to bind a user-facing SOCKS5 listener on
     /// `127.0.0.1:{local_port}`. Defaults to `true` so older clients that
     /// omit the field keep their existing behaviour. In
     /// `tunnel_mode == Full`, `false` is only valid together with
-    /// `proxy_http == false` — the pure-VPN start (#459), where the TUN
+    /// `proxy_http == false` — the pure-VPN start, where the TUN
     /// data plane binds an internal SOCKS5 instance on an ephemeral
     /// loopback port and nothing listens on `local_port`; `false` with
     /// `proxy_http == true` is rejected (`TunnelRequiresSocks5`).
@@ -306,8 +302,9 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub proxy_http: bool,
     /// Port for the HTTP CONNECT listener when `proxy_http` is enabled.
-    /// Defaults to `4074`. Must differ from `local_port` when both
-    /// listeners are enabled (enforced at bridge start).
+    /// Defaults to the same port as [`crate::config::AppConfig::local_port_http`].
+    /// Must differ from `local_port` when both listeners are enabled
+    /// (enforced at bridge start).
     #[serde(default = "proxy_config_defaults::local_port_http")]
     pub local_port_http: u16,
     /// Enable per-TCP-connection plugin tap diagnostics in `bridge.log`.
@@ -429,8 +426,8 @@ pub enum ServerTestOutcome {
     /// causing it to close our tunnel side cleanly (EOF on the client).
     ServerCannotReachInternet,
     /// Bytes flowed back from the sentinel but did not start with the
-    /// ASCII bytes "HTTP". `detail` carries the hex of the first ~32 bytes
-    /// for diagnostics.
+    /// ASCII bytes "HTTP". `detail` carries the hex of the first bytes of the
+    /// reply, for diagnostics.
     SentinelMismatch { detail: String },
     /// Bug in the test runner; should not normally happen. `detail` carries
     /// the underlying message.

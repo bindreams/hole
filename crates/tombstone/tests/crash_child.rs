@@ -24,12 +24,12 @@
 //! references `CARGO_BIN_EXE_crash_child`, which only exists when the
 //! crash_child bin is built (its `required-features = ["crash-child"]`).
 //! Under a plain `cargo build --workspace` (no crash-child) the bin is skipped
-//! and this target compiles down to a bare test runner. See review M1/M2.
+//! and this target compiles down to a bare test runner.
 
 #![allow(clippy::disallowed_methods)] // test spawns its own test binaries (attended)
 
 // Install the workspace test subscriber + panic hook. See
-// `crates/test-observability/` and bindreams/hole#301.
+// `crates/test-observability/`.
 hole_test_observability::register!();
 
 fn main() {
@@ -47,19 +47,18 @@ fn crash_child_bin() -> std::path::PathBuf {
     )
 }
 
-// Production bound for waiting on a crash_child to exit. 60s is ~2 orders
-// of magnitude above every observed passing run (<1s) and exists ONLY as
-// the failure bound surfaced to a human when a child genuinely never exits
-// (the sanctioned no-sleep exception: "awaiting … a child-process exit …
-// where the timeout is the failure bound surfaced to a human," never a bet
-// that N is long enough for the happy path). It is a SAFETY NET, not the
-// fix for the underlying hang: that is addressed structurally in
-// `crash::on_crash`, which on macOS terminates the process itself rather
-// than returning into machinery this process cannot bound. This bound
-// still earns its keep independently: it turns ANY future test-child stall,
-// for ANY reason (a new fault class, a reporter regression, a platform
-// change), into one test failing loudly in ~60s instead of silently
-// consuming the entire darwin/amd64 job's 90-minute wall.
+// Production bound for waiting on a crash_child to exit. It is far above every
+// passing run and exists ONLY as the failure bound surfaced to a human when a
+// child genuinely never exits (the sanctioned no-sleep exception: "awaiting …
+// a child-process exit … where the timeout is the failure bound surfaced to a
+// human," never a bet that N is long enough for the happy path). It is a SAFETY
+// NET, not the fix for the underlying hang: that is addressed structurally in
+// `crash::on_crash`, which on macOS terminates the process itself rather than
+// returning into machinery this process cannot bound. This bound still earns
+// its keep independently: it turns ANY future test-child stall, for ANY reason
+// (a new fault class, a reporter regression, a platform change), into one test
+// failing loudly instead of silently consuming the entire darwin/amd64 job's
+// time limit.
 #[cfg(feature = "crash-child")]
 const CHILD_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -356,7 +355,7 @@ fn marker_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 
 // Every generated test is gated `#[cfg(feature = "crash-child")]` (it spawns
 // the crash_child bin, which only exists under that feature). The optional
-// `$cfg` adds the per-class platform gate on top. See review M1/M2.
+// `$cfg` adds the per-class platform gate on top.
 macro_rules! crash_class_test {
     ($name:ident, $class:literal $(, $cfg:meta)?) => {
         #[cfg(feature = "crash-child")]
@@ -553,7 +552,7 @@ crash_class_test!(crash_marker_bus, "bus", unix);
 // Gated on BOTH features (crash-dumps = the .dmp branch under test;
 // crash-child = it spawns the crash_child bin via run_crash_child) AND on
 // Windows — the only platform with an in-process dump branch left. Linux
-// never had one (the carve-out); macOS gave its up so that `on_crash` can
+// never had one (the carve-out); macOS gave it up so that `on_crash` can
 // terminate without ever allocating (see `crash.rs`).
 #[cfg(all(feature = "crash-dumps", feature = "crash-child", windows))]
 #[skuld::test]

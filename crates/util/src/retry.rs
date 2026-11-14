@@ -13,8 +13,7 @@
 //! wall-clock seconds on exponential backoff.
 //!
 //! Neither [`retry_if`] nor [`retry_if_async`] imposes a `Send` bound on
-//! the operation or its return types — both are awaited inline at all
-//! current call sites, not spawned. A caller who needs a spawnable future
+//! the operation or its return types. A caller who needs a spawnable future
 //! can wrap the call themselves.
 
 use std::future::Future;

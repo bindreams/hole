@@ -16,73 +16,32 @@
 //!
 //! # macOS: marker only, by decision
 //!
-//! Owner ruling on bindreams/hole#842, and the whole of the rationale: **no
-//! part of Hole should hang the process even sometimes — not a diagnostics
-//! crate, not anything else.** The cost was put explicitly and accepted: on
-//! macOS a native crash leaves the marker and produces neither an `.ips` nor
-//! a minidump. That is a decision, not a gap and not a TODO. Two sites
-//! implement it — `MarkerCrashEvent`'s macOS `on_crash`, which `_exit`s
-//! instead of returning, so the system reporter never runs; and the
-//! `cfg(windows)` on `write_minidump_best_effort`.
+//! No part of Hole should hang the process, even sometimes: not a diagnostics
+//! crate, not anything else. On macOS a native crash therefore leaves the
+//! marker and produces neither an `.ips` nor a minidump. That is a decision,
+//! not a gap and not a TODO. Two sites implement it: `MarkerCrashEvent`'s macOS
+//! `on_crash`, which `_exit`s instead of returning, so the system reporter
+//! never runs; and the `cfg(windows)` on `write_minidump_best_effort`.
 //!
 //! ## Why the callback cannot allocate
 //!
 //! `on_crash` runs on crash-handler's message-loop thread with every other
-//! thread Mach-suspended — `mac/state.rs`'s `ScopedSuspend`, constructed
-//! before `call_user_callback` on both the exception and the SIGABRT-relay
-//! branch. A thread suspended inside `malloc` never releases the allocator
-//! lock, so anything in the callback that allocates can block forever.
-//! `write_minidump_best_effort` allocates three times over: a `PathBuf` for
-//! the dump path, a `CString` inside `File::create`, and `MinidumpWriter`'s
-//! own buffers. The marker write allocates not at all — the log directory's
-//! handle and the marker's name pre-encoded at `attach`, stack scratch buffer,
-//! raw `openat`/`write`/`close` — and runs first, which is why it is what
-//! survives.
+//! thread Mach-suspended (`mac/state.rs`'s `ScopedSuspend`, constructed before
+//! `call_user_callback` on both the exception and the SIGABRT-relay branch). A
+//! thread suspended inside `malloc` never releases the allocator lock, so
+//! anything in the callback that allocates can block forever.
+//! `write_minidump_best_effort` allocates (a `PathBuf`, a `CString` inside
+//! `File::create`, `MinidumpWriter`'s buffers). The marker write allocates not
+//! at all (the log directory's handle and the marker's name are pre-encoded at
+//! `attach`, the buffer is on the stack, the calls are raw
+//! `openat`/`write`/`close`) and runs first, which is why it is what survives.
 //!
-//! ## The deadlock is observed, not predicted
+//! ## Reopening
 //!
-//! MEASURED on darwin/arm64: with eight threads allocating 1 MiB blocks, an
-//! allocating `on_crash` hung 8 runs in 10, and `sample(1)` of a hung child
-//! shows the handler thread parked in `_xzm_malloc_large_huge` →
-//! `_os_unfair_lock_lock_slow` → `__ulock_wait2` while a suspended thread
-//! sits inside `_xzm_malloc_large_huge` holding that lock.
-//!
-//! The allocator deadlock is measured, not argued — it is the only causal
-//! theory for this hang that survived measurement.
-//!
-//! ## Three alternatives were built and measured
-//!
-//! - **Detach inside the callback, then let the OS reporter run.** Hangs,
-//!   2/2. `call_user_callback` holds `HANDLER.read()` across `on_crash` and
-//!   `state::detach` takes `HANDLER.write()` on that same non-reentrant
-//!   `parking_lot::RwLock`; under it, `shutdown` would `handler_thread.join()`
-//!   the very thread `on_crash` runs on. `CrashHandler::detach()` hardcodes
-//!   `is_handler_thread: false`, so that join is not avoidable from here.
-//! - **Restore the task exception ports by hand** — `uninstall`'s effect
-//!   without its lock. Measured to earn nothing: with the ports restored the
-//!   abort class terminates exactly as it does without them (3/3), and a
-//!   fault raised inside `on_crash` hangs either way (2/2 with, 2/2 without).
-//! - **Stop allocating but keep returning `Handled(false)`** — the
-//!   `cfg(windows)` gate on `write_minidump_best_effort` WITHOUT the `_exit`,
-//!   which would keep the `.ips`. 20/20 clean terminations, all under 0.41s,
-//!   and nothing has falsified it — but on an idle darwin/arm64, carrying
-//!   none of the allocation pressure the deadlock needs, so it says nothing
-//!   yet about darwin/amd64 under CI load. `_exit` is preferred for a reason
-//!   independent of the allocator: returning hands control back to a process
-//!   whose handler is still installed (the `SignalCrash` relay branch never
-//!   detaches — `on_crash`'s comment has the detail), and the system
-//!   reporter's runtime is not something this process can bound.
-//!
-//! ## What would reopen this
-//!
-//! Two candidates. The clean one is a minidump path that is signal-safe and
-//! allocation-free end to end — buffers reserved at `attach` time, the dump
-//! fd opened there too, a writer touching neither the allocator nor a lock —
-//! which removes the reason outright. The cheap one is the third alternative
-//! above, the option measurement currently favours; reopening on it means
-//! answering the unbounded-return argument, not just re-running the 20.
-//! Neither is reopened by a change that merely makes the deadlock rarer: the
-//! ruling is about hanging at all.
+//! A change that merely makes the deadlock rarer does not reopen the decision:
+//! it is about hanging at all. The measurements, the three alternatives that
+//! were tried and what would reopen it are in
+//! `docs/contributing/architecture/native-crashes.md`.
 
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
@@ -113,7 +72,7 @@ static CRASH_HANDLER: OnceLock<crash_handler::CrashHandler> = OnceLock::new();
 /// (Windows: UTF-16 without a terminator, as `UNICODE_STRING` counts it; Unix: NUL-terminated bytes) so `on_crash`
 /// creates the file with zero allocation — no `encode_wide`, no `as_bytes`, no `to_vec`. We also keep `kind` so
 /// on_crash can write it without re-deriving. Stored in a static so the &'static reference the CrashEvent impl
-/// needs outlives the handler. See bindreams/hole#438 (review S3 — signal-safe marker path).
+/// needs outlives the handler.
 static HANDLER_STATE: OnceLock<HandlerState> = OnceLock::new();
 
 struct HandlerState {
@@ -356,7 +315,7 @@ fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashCont
                 // ExceptionInformation[1] = accessed address for AV
                 // (EXCEPTION_ACCESS_VIOLATION = 0xC0000005).
                 // ExceptionCode is NTSTATUS = a plain i32 alias (NO `.0`
-                // tuple field). See review M3.
+                // tuple field).
                 if r.ExceptionCode as u32 == 0xC0000005u32 && r.NumberParameters >= 2 {
                     r.ExceptionInformation[1] as u64
                 } else {
@@ -386,7 +345,7 @@ fn write_record_signal_safe(state: &HandlerState, rec: &MarkerRecord) {
     let n = format_marker_into(rec, &mut buf);
 
     // Create + write via NtCreateFile/WriteFile, relative to the directory handle and with the marker name
-    // PRE-ENCODED at attach time. NO encode_wide / alloc here — this runs in a compromised context. See review S3.
+    // PRE-ENCODED at attach time. NO encode_wide / alloc here — this runs in a compromised context.
     unsafe {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::Storage::FileSystem::WriteFile;
@@ -473,7 +432,7 @@ fn create_new_in_dir(state: &HandlerState, name: &[u16]) -> Option<windows::Win3
 fn win_time() -> u64 {
     // GetSystemTimeAsFileTime: 100ns intervals since 1601-01-01. Opaque to
     // sweep; surfaced verbatim. Signal-safe (no alloc). In windows 0.62 it
-    // takes ZERO args and RETURNS a FILETIME. See review M5.
+    // takes ZERO args and RETURNS a FILETIME.
     unsafe {
         use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
         let ft = GetSystemTimeAsFileTime();
@@ -486,9 +445,7 @@ fn win_time() -> u64 {
 // on every Unix. Only the CrashContext FIELD EXTRACTION differs per OS
 // (macOS reads ctx.exception: Option<ExceptionInfo>; Linux reads
 // ctx.siginfo: signalfd_siginfo + ctx.pid/ctx.tid), so that is the one
-// per-OS helper; the writer dispatches through it. See the Linux verification
-// (crash-context 0.6.3: CrashContext { context, float_state, siginfo, pid,
-// tid } — bindreams/hole#438).
+// per-OS helper; the writer dispatches through it.
 
 /// Best-effort and infallible by design: every failure mode here (disk full,
 /// permission, a name taken by the user) costs a breadcrumb and
@@ -519,7 +476,7 @@ fn write_record_signal_safe(state: &HandlerState, rec: &MarkerRecord) {
 
     // openat(O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW) + write + close — all async-signal-safe. The directory is the
     // descriptor held since attach and the name the one PRE-ENCODED then (state.marker_name_c, already
-    // NUL-terminated). NO as_bytes / to_vec / alloc here. See review S3. `O_EXCL` fails on any entry at the name
+    // NUL-terminated). NO as_bytes / to_vec / alloc here. `O_EXCL` fails on any entry at the name
     // (a symlink included, which it never follows) and never opens a FIFO, so nothing already there is written
     // through, truncated or waited for.
     unsafe {
@@ -641,8 +598,9 @@ fn unix_time() -> u64 {
 // Mach-suspended, where allocating deadlocked 8 runs in 10 under measurement.
 // Deleting the gate reinstates a hang that was directly observed, and macOS
 // producing no dump is a decision, not an omission — the module doc's "macOS:
-// marker only, by decision" carries the evidence, the alternatives already
-// tried, and the one thing that would reopen it. Linux never had an
+// marker only, by decision" states it, and
+// `docs/contributing/architecture/native-crashes.md` carries the evidence, the
+// alternatives already tried and what would reopen it. Linux never had an
 // in-process dump branch at all.
 //
 // Windows is a different shape: `on_crash` runs on the faulting thread via a
@@ -724,7 +682,7 @@ pub fn attach(kind: &'static str, log_dir: &Path) {
     // the handler. OnceLock pins the first kind/log_dir, which is correct:
     // attach is always called with the same process's kind + log_dir. The
     // directory is opened and the marker's name chosen NOW (allocation is fine
-    // on the happy path) so on_crash does ZERO allocation. See review S3.
+    // on the happy path) so on_crash does ZERO allocation.
     let state_ref: &'static HandlerState = HANDLER_STATE.get_or_init(|| HandlerState::open_or_none(kind, log_dir));
 
     let event = Box::new(MarkerCrashEvent { state: state_ref });
@@ -755,7 +713,7 @@ struct MarkerCrashEvent {
 // write is therefore allocation-free and lock-free on all three platforms —
 // a raw file open/write from a stack buffer plus the marker path pre-encoded
 // at attach time — with no `format!`, no locks, and no tracing. That is not
-// a nicety; module doc has the measured deadlock it avoids.
+// a nicety; the page on native crashes has the measured deadlock it avoids.
 
 /// macOS: end the process here, without returning to `crash-handler`.
 ///
@@ -773,52 +731,19 @@ fn terminate_without_returning() -> ! {
     unsafe { libc::_exit(EX_SOFTWARE) }
 }
 
-// macOS: `on_crash` writes the marker and then never returns.
-//
-// tombstone is observability only — "turn a silent process death into a
-// logged event on the next start". Once the marker is on disk the process
-// has nothing left to contribute, while everything that would run after
-// this callback returns is unbounded. A hung bridge is far worse than a
-// lost crash report: it still holds the TUN device, its routes and its pf
-// rules, and never reaches its own cleanup, so the user loses the network.
-// Detection of unclean shutdown does not depend on any of this — the
-// bridge's `bridge-{routes,plugins,dns}.json` state files are swept on the
-// next start and survive SIGKILL and power loss.
-//
-// What is unbounded, specifically:
-//
-//  * The SIGABRT relay never detaches. macOS has no exception for `abort()`,
-//    so crash-handler hooks SIGABRT with a `sigaction` and relays it as a
-//    synthesized `EXC_SOFTWARE`/`EXC_SOFT_SIGNAL` (`mac/signal.rs`). A real
-//    fault's branch calls `detach(true)` (`mac/state.rs`,
-//    `MessageIds::Exception`); the relay's branch (`MessageIds::SignalCrash`)
-//    contains no `detach` at all, so `abort()`'s C-mandated re-raise fires
-//    with the task exception port still attached.
-//  * Allocation in this callback can deadlock outright, against a thread
-//    Mach-suspended mid-`malloc`. Observed, not predicted — module doc.
-//  * The system crash reporter's involvement is not something this process
-//    can bound at all.
-//
-// Three alternatives to `_exit` were built and measured; module doc has them,
-// their caveats and their verdicts. Do not re-derive them here.
-//
-// MEASURED, 3 runs each of abort, segfault, stack_overflow, bus,
-// illegal_instruction and trap on darwin/arm64: every one exits 70 in under
-// 0.02s. `stack_overflow` is covered by the same call and needs no special
-// case — it arrives as a genuine `EXC_BAD_ACCESS` guard-page fault, and
-// terminating on that first delivery means Rust's own stack-overflow
-// handler, which responds by calling `abort()`, never runs at all.
+// macOS: `on_crash` writes the marker and then never returns, because what runs
+// after a return is unbounded (the SIGABRT relay never detaches, a suspended
+// thread can hold the allocator lock, the system crash reporter has no bound).
+// `docs/contributing/architecture/native-crashes.md` has that reasoning, the
+// measurements and the three alternatives that were tried.
 //
 // Unconditional by construction: no fault-class predicate, no attach-`kind`
-// discriminator (`kind` never identified a process — `hole-common`'s
-// log-bridge test helpers attach as `"test"` too), and no cargo feature,
-// because a shipped `hole`, `hole bridge` and `galoshes` must not hang
-// either. `tests/crash_child.rs` pins each of those three separately.
+// discriminator, and no cargo feature, because a shipped `hole`, `hole bridge`
+// and `galoshes` must not hang either. `tests/crash_child.rs` pins each of those
+// three separately.
 //
-// The cost — no `.ips` and no minidump on macOS — is an owner decision, not
-// a limitation; module doc, "macOS: marker only, by decision". The marker
-// still carries kind, pid, tid, exception code and fault address, which is
-// what `sweep` reports; what is lost is the stack.
+// The marker still carries kind, pid, tid, exception code and fault address,
+// which is what `sweep` reports; what is lost is the stack.
 #[cfg(target_os = "macos")]
 unsafe impl crash_handler::CrashEvent for MarkerCrashEvent {
     fn on_crash(&self, context: &crash_handler::CrashContext) -> crash_handler::CrashEventResult {

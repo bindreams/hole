@@ -82,8 +82,8 @@ pub enum StartupBehavior {
 }
 
 impl StartupBehavior {
-    /// Wire representation for the `X-Hole-On-Startup` header (#979) — a
-    /// header value isn't run through serde, so this spells out the same
+    /// Wire representation for the `X-Hole-On-Startup` header. A header value
+    /// isn't run through serde, so this spells out the same
     /// `rename_all = "snake_case"` strings by hand. Single source of truth for
     /// both the client's header emission and the bridge's header parsing.
     pub fn as_header_value(self) -> &'static str {
@@ -96,7 +96,7 @@ impl StartupBehavior {
 
     /// Parse a `X-Hole-On-Startup` header value. `None` (the header is
     /// genuinely absent — an older client, or one with no preference to
-    /// push, like the CLI, #979) is distinguished from a present-but-garbled
+    /// push, like the CLI) is distinguished from a present-but-garbled
     /// value, which fails safe to the wire default rather than being treated
     /// as absent: only a caller that says nothing gets nothing pushed.
     pub fn from_header_value(value: Option<&str>) -> Option<Self> {
@@ -123,11 +123,12 @@ pub enum Theme {
 /// Transport used by the built-in DNS forwarder when talking upstream to
 /// [`DnsConfig::servers`].
 ///
-/// `PlainUdp` works only when the configured plugin can carry UDP (galoshes)
-/// OR the upstream IP is covered by a bypass rule — otherwise the
-/// forwarder's own UDP/53 queries are dropped by the HoleRouter the same way
-/// the original bug drops OS queries. `PlainTcp`, `Tls`, `Https` all go over
-/// TCP and ride through any plugin.
+/// The forwarder dials through the local SOCKS5 listener, not through the TUN,
+/// so no filter rule applies to its queries. `PlainTcp`, `Tls` and `Https` go
+/// over TCP and ride through any plugin. `PlainUdp` needs a SOCKS5 UDP
+/// ASSOCIATE, which the listener relays only when the configured plugin carries
+/// UDP (galoshes); with a TCP-only plugin the ASSOCIATE fails and that upstream
+/// is reported as failed. See `docs/contributing/architecture/dns-forwarder.md`.
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DnsProtocol {
@@ -147,8 +148,7 @@ pub enum DnsProtocol {
 /// TCP tunnel even when the plugin is TCP-only. There is no loopback server.
 ///
 /// `servers` is ordered: the first entry is primary, subsequent entries are
-/// tried on failure. The UI currently renders exactly two rows
-/// (primary + secondary), but the model accepts any number.
+/// tried on failure. The model accepts any number.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DnsConfig {
     pub enabled: bool,

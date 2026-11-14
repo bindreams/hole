@@ -44,8 +44,8 @@ pub enum Marker {
     Present(MarkerInfo),
 }
 
-/// The marker's payload. The file is `{"version": 3, "driver": ...}`: the version is the framing's, and the previous
-/// release (which declares `deny_unknown_fields`) reads exactly these two keys.
+/// The marker's payload. The file is `{"version": <VERSION>, "driver": ...}`: the version is the framing's, and the
+/// previous release (which declares `deny_unknown_fields`) reads exactly these two keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarkerInfo {
     /// The cutover DRIVER's persisted identity — the process whose death means
@@ -104,8 +104,7 @@ impl Placement for MarkerPlacement {
 }
 
 /// The SERVICE log directory (where the privileged bridge writes its logs and
-/// the marker). Deduped from the per-platform literals previously hardcoded in
-/// `platform/windows.rs`, `platform/macos.rs`, and `log_collector.rs`.
+/// the marker). The one place its per-platform location is spelled.
 pub fn service_log_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {

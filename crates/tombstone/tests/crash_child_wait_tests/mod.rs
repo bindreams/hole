@@ -1,8 +1,7 @@
 //! Unit tests for `wait_bounded`. Uses `crash_child`'s
 //! `TOMBSTONE_TEST_HANG_FOREVER`/`TOMBSTONE_TEST_EXIT_FAST` test doubles
 //! instead of a real native fault, so these tests are deterministic and fast
-//! (bounds here are small — a few hundred ms — unlike `CHILD_WAIT_BOUND`'s
-//! production 60s).
+//! (bounds here are small, unlike `CHILD_WAIT_BOUND`'s production bound).
 
 #![allow(clippy::disallowed_methods)] // test spawns its own test binaries (attended)
 

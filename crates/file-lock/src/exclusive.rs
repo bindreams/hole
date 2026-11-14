@@ -75,11 +75,11 @@ use windows as platform;
 
 // Hooks ===============================================================================================================
 
-/// Empty seam at the start of every acquisition attempt, for a caller-side depth guard.
+/// Called at the start of every acquisition attempt. Empty: nothing hooks it.
 #[inline]
 fn on_acquire_entry() {}
 
-/// Empty seam when a held token's lock is released, for the same guard.
+/// Called when a held token's lock is released. Empty: nothing hooks it.
 #[inline]
 fn on_token_drop() {}
 

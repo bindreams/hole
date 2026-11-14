@@ -1,13 +1,10 @@
 //! Elevation primitives for the "unprivileged parent, one elevated child"
-//! model (bindreams/hole#452/#455): the parent process never gains or sheds
-//! privilege; exactly the children that need root are wrapped.
+//! model: the parent process never gains or sheds privilege; exactly the
+//! children that need root are wrapped.
 //!
-//! Salvaged from the reusable half of the abandoned `elevated:`-flag work
-//! (bindreams/hole PR #456). Deliberately NOT here (YAGNI until a consumer
-//! exists; see PR #456 for ready references): Windows `self_elevate` via
-//! `ShellExecuteExW(runas)`, `CommandLineToArgvW`-faithful arg quoting,
-//! linked-token queries, and everything de-elevation — the latter is dead by
-//! design, not deferred.
+//! Deliberately NOT here: Windows `self_elevate` via `ShellExecuteExW(runas)`,
+//! `CommandLineToArgvW`-faithful arg quoting, linked-token queries, and
+//! everything de-elevation, which the model excludes by design.
 
 #[cfg(unix)]
 pub mod posix;

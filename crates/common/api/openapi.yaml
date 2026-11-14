@@ -381,7 +381,7 @@ components:
           $ref: "#/components/schemas/CoverPresence"
           description: >-
             What the bridge measured about a standing lockdown cover on the
-            host, replacing `lockdown_active: bool`. A required field, not
+            host, rather than whether this process owns one. A required field, not
             defaulted: a version-skewed reply is caught by the
             `x-hole-bridge-version` header before this body is ever parsed
             (see `check_version`), so an older/newer client never reaches a
@@ -657,8 +657,8 @@ components:
             Sourced from AppConfig.diagnostic_plugin_tap; the bridge can
             also be opted in via the HOLE_BRIDGE_PLUGIN_TAP=1 env var
             (dev-shell only — env vars don't survive into SCM/launchd
-            contexts). Added in bindreams/hole#388 to give service-mode
-            reproductions a knob the env var can't reach.
+            contexts). The config flag gives service-mode reproductions a
+            knob the env var can't reach.
 
     TunnelMode:
       type: string

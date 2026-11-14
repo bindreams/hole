@@ -4,7 +4,8 @@
 //! a logged event on the next start.
 //!
 //! Apache-2.0 (NOT GPL): galoshes is released standalone and depends on this
-//! crate, so it must stay permissive. See bindreams/hole#438.
+//! crate, so it must stay permissive. See
+//! `docs/contributing/architecture/native-crashes.md`.
 
 pub mod crash;
 

@@ -64,7 +64,8 @@ pub enum UnreadableKind {
     Unprobed,
 }
 
-/// The owner's two causes for a file a release cannot read.
+/// The two reasons a release cannot read a file that exists: it is newer than
+/// this release, or it is corrupt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CannotRead {
     Newer,
