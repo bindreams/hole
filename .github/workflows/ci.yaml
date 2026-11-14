@@ -701,10 +701,10 @@ jobs:
       # service would share WFP, routes and the adapter with the TUN tests and confound their
       # verdicts. A failed lifecycle with a clean cleanup does not hide the TUN lane.
       #
-      # Last-resort kill: the harness bounds each phase itself (msiexec, gsudo self-test,
-      # dashboard E2E and each diagnostics dump), so a wedged phase fails by name and the
-      # fixture still uninstalls first. This budget leaves margin over the sum of those bounds for
-      # the unbounded phases (tool provisioning, the build, process listing).
+      # Last-resort kill: the harness bounds each phase itself (msiexec 3 min; gsudo self-test,
+      # dashboard E2E and each diagnostics dump 5 min), so a wedged phase fails by name and the
+      # fixture still uninstalls first. Those bounds sum to about 25 min; 75 leaves margin for the
+      # unbounded phases (tool provisioning, the build, process listing).
       - id: installer-tests
         name: Install, E2E and uninstall the MSI
         if: ${{ !cancelled() && steps.installer-build-msi.outcome == 'success' }}
@@ -755,7 +755,8 @@ jobs:
       # bridge.log (C:\ProgramData\hole\logs) has the only record of what the
       # HoleBridge SERVICE process itself was doing -- SCM start/stop/restart,
       # the liveness lock, IPC bind -- none of which appears in the MSI logs. On
-      # failure only. Named apart from the test lane's
+      # failure only: it is the evidence path for the installer's intermittent msiexec uninstall
+      # hang, whose cause is not found (open candidate: bindreams/hole#978). Named apart from the test lane's
       # `bridge-logs-windows-amd64`: both run in one job and an artifact name
       # is unique per run.
       - id: installer-upload-bridge-logs

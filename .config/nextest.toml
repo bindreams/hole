@@ -3,171 +3,17 @@
 # crates/garter/tests/common/mod.rs.
 nextest-version = "0.9.130"
 
-# Cross-binary serialization for tests that mutate GLOBAL OS network state
-# (real WFP filters / pf rules / TUN routes). skuld's coordination DB is
-# workspace-shared, so `serial = TUN` does reach across binaries — but skuld
-# does not own nextest's thread budget, and the Windows TUN lane runs the
-# `hole-bridge` and `tun-engine` binaries concurrently. The bridge's `mod tun`
-# e2es drive live egress and install real split routes while the tun-engine
-# `windows_lockdown_permits_server_ip_and_blocks_other_egress` test holds a
-# system-wide block-all WFP cover. `max-threads = 1` makes nextest run the
-# whole group on one thread across binaries. `mod tun`'s own Full-mode
-# roundtrip e2es stay `cfg(windows)`, but the `live_tun_permit_`
-# session-level composition guard below also runs on macOS, engaging a
-# real standing lockdown cover there — so the `macos_lockdown_permits_server_ip_...`
-# pf test has a real macOS bridge partner in this group.
+# Cross-binary serialization for tests that mutate GLOBAL OS network state (WFP filters, pf rules, TUN routes).
+# skuld's `serial = TUN` reaches across binaries too, but skuld does not own nextest's thread budget, and the TUN lane
+# runs the `hole-bridge` and `tun-engine` binaries concurrently. `max-threads = 1` runs the whole group on one thread.
 #
-# COUPLED NAMES — the filter below matches tests BY NAME ONLY. A module-path
-# anchor is not available: skuld hands libtest-mimic the bare function name
-# (`skuld::TestDef::name`), keeping `module_path!()` for `default_labels!`
-# matching alone, so no test in this workspace has a module-qualified name for
-# nextest to select on. These names are load-bearing and must change in
-# lockstep with the filter:
-#   - `^e2e_…full_tunnel…` — EVERY test in either of the bridge's two `mod tun`
-#     blocks, plus the macOS-only OS-effects smoke test below. All set
-#     `TunnelMode::Full` and install real split routes, and every member must
-#     carry this naming shape or it silently leaves the group and loses the
-#     thread budget (mutual exclusion comes from `serial = TUN` on every
-#     member, not from group membership):
-#     crates/bridge/src/proxy_manager_e2e_tests.rs (4: the `_captures_
-#       unowned_destination` pair and the `_local_networking_intact` pair)
-#     crates/bridge/src/proxy_manager_listener_e2e_tests.rs (1:
-#       e2e_full_tunnel_local_udp_intact)
-#     crates/bridge/src/proxy_manager_macos_full_tunnel_privileged_tests.rs (1:
-#       e2e_macos_full_tunnel_installs_the_os_state_it_claims ; reads the OS's own interface list, routing table and
-#       resolver configuration back rather than round-tripping traffic)
-#     The `^e2e_` anchor is what keeps the unlabelled in-process unit test
-#     `forward_gives_every_resolver_the_full_tunnel_bound`
-#     (crates/bridge/src/dns/forwarder_tests.rs — same binary, name carries
-#     `full_tunnel`, no `e2e_` prefix) out of the group.
-#   - `windows_lockdown_permits_server_ip_` / `macos_lockdown_permits_server_ip_`:
-#     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
-#   - `failclosed_permits_` (transient block-until-connected cover real engage):
-#     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
-#   - `macos_lockdown_failed_engage_` (a real pf engage whose load fails, then a
-#     release; touches the host-wide pf ruleset):
-#     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
-#   - `simulated_reboot_rearms_the_cover` substring (real pf engage,
-#     then a real `pfctl -F all` + `pfctl -d` standing in for what a reboot
-#     does to pf, then a real re-engage; must not run beside another test
-#     touching pf state):
-#     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
-#   - `failclosed_cover_transition_` (repeated real transient
-#     re-engages with no intervening disengage, plus a continuous background
-#     prober pool, proving a cover transition never admits a flow the old
-#     cover blocked):
-#     crates/tun-engine/src/routing/failclosed/macos_transition_tests.rs
-#   - `failclosed_cover_state_purge_` (bindreams/hole#1015 — enables pf itself
-#     under a permissive keep-state ruleset, establishes a real flow, then
-#     engages a real transient cover and reads `pfctl -s state` back; it also
-#     issues a HOST-WIDE `pfctl -F states`, so it must never run beside
-#     anything holding pf state):
-#     crates/tun-engine/src/routing/failclosed/macos_transition_tests.rs
-#   - `failclosed_cover_engage_does_not_sever_` (the other half of that purge:
-#     a real established loopback flow must survive a real engage, which is
-#     what `set skip on lo0` buys over a state-bearing `pass` rule):
-#     crates/tun-engine/src/routing/failclosed/macos_transition_tests.rs
-#   - `failclosed_cover_load_` (the window `set skip on lo0` cannot cover for
-#     itself — pfctl clears interface skip flags OUTSIDE the rule ticket, so a
-#     real `pfctl -f -` replacing a live cover is probed with a lock-step
-#     loopback UDP round trip, twice: once against the pre-fix ruleset shape as
-#     a positive control, once against the production one):
-#     crates/tun-engine/src/routing/failclosed/macos_transition_tests.rs
-#   - `macos_recover_cover_` prefix (the crash-recovery sweep's own real
-#     engage: a stranded transient cover whose state file an older bridge
-#     cannot parse must still be cleared). The `macos_` prefix is what keeps
-#     the unprivileged `recover_cover_with_*` unit tests in macos_tests.rs out
-#     of this group; they need no serialization:
-#     crates/tun-engine/src/routing/failclosed/release_privileged_tests.rs
-#   - `release_all_` substring (privileged AND unprivileged — the unprivileged
-#     macos_tests/windows_tests cases join for free; a name-based filter must
-#     not silently miss a privileged test):
-#     crates/tun-engine/src/routing/failclosed/release_privileged_tests.rs
-#     crates/tun-engine/src/routing/failclosed/macos_tests.rs
-#     crates/tun-engine/src/routing/failclosed/windows_tests.rs
-#   - `boottime_global_net_state_` prefix (adds a real BOOT-TIME WFP
-#     filter under the covers' own provider/sublayer and deletes it again, so
-#     it must not run beside a cover test whose `delete_all` drops that shared
-#     sublayer; the twin re-arm test additionally engages the REAL standing
-#     lockdown twice, so it blocks host egress for its duration):
-#     crates/tun-engine/src/routing/failclosed/boottime_privileged_tests.rs
-#   - `cutover_global_net_state_` prefix:
-#     crates/bridge/tests/cutover_privileged.rs (real cutover swap + SCM restart)
-#     crates/bridge/tests/cutover_leak_privileged.rs (fail-open + both-covers)
-#     crates/bridge/tests/cutover_nic_capture_privileged.rs (Windows pktmon NIC
-#       wire-capture no-UDP-leak proof)
-#   - `live_tun_permit_` substring (two real TUN devices + the real
-#     standing lockdown cover, proving the tunnel-permit rule is sensitive to
-#     the interface it names, not merely present; the mid-stream proof, which
-#     completes a TCP handshake by hand over one of those devices and engages
-#     the real TRANSIENT cover to show its permit survives the engage's own
-#     host-wide `pfctl -F states` purge; and the session-level composition
-#     guard, which starts a real Full-mode session with the kill switch armed
-#     — each engages a system-wide block-all cover, so they must never run
-#     beside each other):
-#     crates/tun-engine/src/routing/failclosed/live_tun_permit_privileged_tests.rs
-#     crates/bridge/src/proxy_manager_live_tun_permit_e2e_tests.rs
-#   - `dns_confine_global_net_state_` prefix (real wintun devices + a
-#     real, process-scoped WFP DNS-egress confinement, reusing the
-#     `routing::failclosed::TUN` serial token; see that module's doc):
-#     crates/tun-engine/src/dns_confine/privileged_tests.rs
-#   - `tun_device_ipv6_` substring (creates a real wintun adapter and reads the
-#     host's whole AF_INET6 unicast address table, so a concurrent bridge e2e's
-#     TUN would both perturb it and be perturbed by it):
-#     crates/tun-engine/src/device/ipv6_addr_privileged_tests.rs
-#   - `gateway_global_net_state_` prefix (creates a real wintun adapter to
-#     prove the upstream-route lookup can see an IfType 53 adapter):
-#     crates/tun-engine/tests/gateway_privileged.rs
-#   - `opens_a_kernel_assigned` substring (creates a real `utun`
-#     adapter with no requested name and reads the kernel-assigned one back
-#     via the OS's own interface-name table; NOT the bare `kernel_assigned`
-#     substring, which also matches the unlabelled unprivileged unit tests
-#     `kernel_assigned_alias_is_read_back` and
-#     `kernel_assigned_build_fails_when_the_device_cannot_report_its_name` in
-#     the same binary):
-#     crates/tun-engine/src/device/privileged_tests.rs
-#   - `dns_steer_global_net_state_` prefix (points the WHOLE
-#     MACHINE's DNS at a black-hole resolver for the test's duration via a
-#     real `SCDynamicStore` session, so it must never run beside another test
-#     that resolves a name):
-#     crates/tun-engine/src/dns_steer/privileged_tests.rs
-#   - `macos_dns_global_net_state_` prefix (the
-#     raw session-key-lifetime probe and the SIGKILL crash-path probe; both
-#     publish a real synthetic-service DNS key, same reasoning as the prefix
-#     above):
-#     crates/tun-engine/tests/macos_session_key_lifetime_probe.rs
-#     crates/bridge/src/dns/system/macos_tests.rs (the real steerer's
-#     engage/withdraw round trip through the trait objects)
-#   - `dispatcher_opens_tun_` prefix (the production
-#     `Dispatcher::new` opens a real TUN device, and on macOS it is a
-#     kernel-assigned `utun` adapter with no fixed name):
-#     crates/bridge/src/dispatcher_privileged_tests.rs
-#   - `e2e_full_tunnel_local_udp_intact` — matched by the `^e2e_…full_tunnel…`
-#     anchor above, not by a term of its own. It carries
-#     `labels = [DIST_BIN, TUN], serial = TUN` in
-#     crates/bridge/src/proxy_manager_listener_e2e_tests.rs, but lives in a
-#     DIFFERENT test binary from the tun-engine tests above, so skuld's
-#     per-binary `serial = TUN` alone never serialized it against them; it
-#     drives live UDP through a real TUN adapter (the `hole-tun*` wildcard
-#     teardown sweep included), so a system-wide block-all beside it breaks it.
-#     NOT added: the nine ETW tests in
-#     crates/bridge/src/diagnostics/etw_live_privileged_tests.rs — that
-#     module's TUN label means "the elevated Windows lane", not "touches a
-#     TUN adapter"; every one of them starts or stops a real ETW session and
-#     mutates no network state.
-# Renaming any of them WITHOUT updating this filter silently drops it from the
-# group → cross-binary data race. Verify with `cargo nextest show-config
-# test-groups`. Add any new real-engage/real-TUN test (and its substring) here.
+# The filter selects by test name: skuld hands nextest the bare function name, so there is no module path to anchor
+# on. Membership is declared by the `global_net_state` skuld label at each test's definition site, and
+# `cargo xtask verify-global-net-state-labels` (bindreams/hole#894) fails, by test name, when the filter and the labels
+# disagree in either direction or when `max-threads` is not `1`. A new real-engage or real-TUN test takes the label and a filter term.
 #
-# `cargo xtask verify-global-net-state-labels` (bindreams/hole#894) checks this
-# group's *membership* live, by binding it to the `global_net_state` skuld
-# label attached at each test's own definition site — a rename applied to a
-# test but not this filter (or vice versa) fails loud, by exact test name,
-# instead of silently degrading into the cross-binary race described above.
-# It also asserts `max-threads` below stays `1`. It does NOT catch a
-# higher-precedence `[[profile.default.overrides]]` entry (inserted above this
-# one) that matches these same tests and steals them into a different group —
-# that residual is unverified; see the guard's own module doc.
+# Not caught: a higher-priority `[[profile.default.overrides]]` entry (placed above this one) that matches these tests
+# and moves them into another group.
 [test-groups.global_net_state]
 max-threads = 1
 
@@ -286,7 +132,7 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 # `tun-engine` driver tests above, for the identical reason: the wait has no
 # happens-before edge to bound any other way. Every test in the file that
 # reaches `run_with_tap`, `failed_start`, `run` or the inline twin is listed;
-# the full file runs in well under 1s here, so the period is a large multiple
+# the full file runs in well under 1s on the measuring host, so the period is a large multiple
 # of that. The inner-port-pick and connect-retry tests start no tap but loop forever on a
 # regression, so they are listed too.
 # `crates/garter/tests/tap_integration.rs` is listed too: it spawns a real

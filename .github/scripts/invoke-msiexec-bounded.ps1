@@ -25,7 +25,8 @@ param(
     [Parameter(Mandatory)]
     [string]$LogPath,
 
-    # A failure bound, not an expected duration.
+    # A failure bound, not an expected duration: install and uninstall
+    # normally complete in 2-4 seconds.
     [ValidateRange(0.0, 60.0)]
     [double]$BoundMinutes = 3,
 

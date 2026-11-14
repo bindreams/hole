@@ -401,6 +401,9 @@ fn e2e_start_rejects_full_mode_without_socks5(
 /// anchor on. That selection buys nextest's cross-binary thread budget; what
 /// keeps this test off the tun-engine WFP tests is its `serial = TUN`. See the
 /// note on `proxy_manager_e2e_tests.rs`'s `mod tun`.
+///
+/// The test drives live UDP through a real TUN adapter (its teardown sweeps every `hole-tun*` adapter), so a
+/// system-wide block-all cover beside it breaks it.
 #[cfg(target_os = "windows")]
 mod tun {
     use super::*;

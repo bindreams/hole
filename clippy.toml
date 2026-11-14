@@ -13,11 +13,11 @@ reason = "Must call sender.ready().await before send_request() (tower::Service c
 
 [[disallowed-methods]]
 path = "tun_engine::routing::setup_routes"
-reason = "Route setup must go through `Routing::install`. Only `SystemRouting::install` in tun-engine may call this."
+reason = "Route setup must go through `Routing::install`, so unit tests mock it instead of shelling out to real `netsh` (see the Bridge trait-contract enforcement comment above and docs/contributing/architecture/test-isolation.md). Only `SystemRouting::install` in tun-engine may call this."
 
 [[disallowed-methods]]
 path = "tun_engine::routing::teardown_routes"
-reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `SystemRoutes::drop` in tun-engine and `recover_routes` may call this."
+reason = "Route teardown must go through `Routing::Installed`'s Drop, so unit tests mock it instead of shelling out to real `netsh` (see the Bridge trait-contract enforcement comment above and docs/contributing/architecture/test-isolation.md). Only `SystemRoutes::drop` in tun-engine and `recover_routes` may call this."
 
 # System tools — spawn by absolute path --------------------------------------------------------------------------------
 #
@@ -34,91 +34,91 @@ reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `Syst
 
 [[disallowed-methods]]
 path = "std::process::Command::new"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md)."
 
 [[disallowed-methods]]
 path = "tokio::process::Command::new"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md)."
 allow-invalid = true  # only crates with tokio's `process` feature can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::Command::new"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md)."
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async ones) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::run"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md)."
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async ones) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::run_line"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md)."
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async ones) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::tokio::Command::new"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md)."
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async ones) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::tokio::run"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md)."
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async ones) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::tokio::run_line"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason."
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md)."
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async ones) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::Command::executable"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md). (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::Command::raw_executable"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md). (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::Command::arg"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md). (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::Command::args"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md). (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::Command::commandline"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md). (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::tokio::Command::executable"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md). (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::tokio::Command::raw_executable"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md). (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::tokio::Command::arg"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md). (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::tokio::Command::args"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md). (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
 
 [[disallowed-methods]]
 path = "cosca::tokio::Command::commandline"
-reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
+reason = "Use `SystemTool::command` for an OS tool (`SystemPowershell::command` for PowerShell); a non-OS-tool spawn takes a per-site `#[allow]` with a reason. A bare program name is resolved through a path a lower-privileged user can influence, and the bridge runs as root/SYSTEM (see the System tools comment above and docs/contributing/architecture/system-tools.md). (A cosca `Command` is also constructible through `Default`, which no path can ban, so the methods that name its program are banned too.)"
 allow-invalid = true  # only crates that depend on cosca (with its `tokio` feature, for the async one) can resolve the path.
 
 # Port allocation — enforce bind_ephemeral over raw free_port ----------------------------------------------------------
@@ -159,7 +159,8 @@ reason = "Use `garter::tracing_test::set_default_in_current_thread` — `tracing
 # Test-time subscriber install — only hole-test-observability and the
 # production logging::init_multi / binary-main sites may install global
 # tracing subscribers via the `try_init` family. Direct callers in tests
-# trigger the LogTracer perf regression that times out
+# trigger the LogTracer perf regression (`LogTracer` sets `log::max_level` to Trace and
+# allocates a tracing `Event` for every `log::*!` record) that times out
 # `server_test_tests` on Windows CI. Sanctioned sites carry a per-site
 # `#[allow]` with a citation.
 
@@ -169,7 +170,7 @@ reason = "Use hole_test_observability::register!() at lib.rs level for tests. Di
 
 [[disallowed-methods]]
 path = "tracing_subscriber::util::SubscriberInitExt::try_init"
-reason = "Use hole_test_observability::register!() at lib.rs level for tests; the production caller in crates/common/src/logging.rs is sanctioned via #[allow]."
+reason = "Use hole_test_observability::register!() at lib.rs level for tests; the production caller in crates/common/src/logging.rs is sanctioned via #[allow]. A direct `try_init` installs the LogTracer perf trap described in the Test-time subscriber install comment above."
 
 # `fmt::SubscriberBuilder::{init,try_init}` are the `tracing_subscriber::fmt().init()`
 # entry points; they forward to `SubscriberInitExt::try_init` internally, so the
@@ -180,11 +181,11 @@ reason = "Use hole_test_observability::register!() at lib.rs level for tests; th
 
 [[disallowed-methods]]
 path = "tracing_subscriber::fmt::SubscriberBuilder::init"
-reason = "Use hole_test_observability::register!() at lib.rs level for tests. Production main.rs callers in galoshes/garter-bin are sanctioned via #[allow]."
+reason = "Use hole_test_observability::register!() at lib.rs level for tests. Production main.rs callers in galoshes/garter-bin are sanctioned via #[allow]. A direct `init` installs the LogTracer perf trap described in the Test-time subscriber install comment above."
 
 [[disallowed-methods]]
 path = "tracing_subscriber::fmt::SubscriberBuilder::try_init"
-reason = "Use hole_test_observability::register!() at lib.rs level for tests."
+reason = "Use hole_test_observability::register!() at lib.rs level for tests. A direct `try_init` installs the LogTracer perf trap described in the Test-time subscriber install comment above."
 
 # Bridge Dns trait — Win32 native DNS FFI ------------------------------------------------------------------------------
 #
@@ -347,72 +348,72 @@ reason = "Go through `ConfigStore::save` — direct saves bypass the `save_block
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineOpen0"
-reason = "WFP must go through `routing::failclosed::engage`/`recover_cover` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "WFP must go through `routing::failclosed::engage`/`recover_cover` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM, which keeps unit tests off the host firewall (see the WFP/FWPM native FFI comment above)."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterAdd0"
-reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM, which keeps unit tests off the host firewall (see the WFP/FWPM native FFI comment above)."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmProviderAdd0"
-reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM, which keeps unit tests off the host firewall (see the WFP/FWPM native FFI comment above)."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmSubLayerAdd0"
-reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM, which keeps unit tests off the host firewall (see the WFP/FWPM native FFI comment above)."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterDeleteByKey0"
-reason = "WFP teardown must go through `routing::failclosed` (Drop / recover_cover) — the confinement's dynamic session needs no by-key delete at all (closing the engine handle deletes everything in it), which is exactly why it has the opposite lifetime from the persistent cover. Only `failclosed/windows.rs` may call this."
+reason = "WFP teardown must go through `routing::failclosed` (Drop / recover_cover) — the confinement's dynamic session needs no by-key delete at all (closing the engine handle deletes everything in it), which is exactly why it has the opposite lifetime from the persistent cover. Only `failclosed/windows.rs` may call this, which keeps unit tests off the host firewall (see the WFP/FWPM native FFI comment above)."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmSubLayerDeleteByKey0"
-reason = "WFP teardown must go through `routing::failclosed` — the confinement's dynamic session needs no by-key delete at all (closing the engine handle deletes everything in it), which is exactly why it has the opposite lifetime from the persistent cover. Only `failclosed/windows.rs` may call this."
+reason = "WFP teardown must go through `routing::failclosed` — the confinement's dynamic session needs no by-key delete at all (closing the engine handle deletes everything in it), which is exactly why it has the opposite lifetime from the persistent cover. Only `failclosed/windows.rs` may call this, which keeps unit tests off the host firewall (see the WFP/FWPM native FFI comment above)."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmProviderDeleteByKey0"
-reason = "WFP teardown must go through `routing::failclosed` — the confinement's dynamic session needs no by-key delete at all (closing the engine handle deletes everything in it), which is exactly why it has the opposite lifetime from the persistent cover. Only `failclosed/windows.rs` may call this."
+reason = "WFP teardown must go through `routing::failclosed` — the confinement's dynamic session needs no by-key delete at all (closing the engine handle deletes everything in it), which is exactly why it has the opposite lifetime from the persistent cover. Only `failclosed/windows.rs` may call this, which keeps unit tests off the host firewall (see the WFP/FWPM native FFI comment above)."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineClose0"
-reason = "WFP must go through `routing::failclosed` or `dns_confine::DnsConfinement`'s Drop — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement, whose entire disengage IS this close call). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "WFP must go through `routing::failclosed` or `dns_confine::DnsConfinement`'s Drop — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement, whose entire disengage IS this close call). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM, which keeps unit tests off the host firewall (see the WFP/FWPM native FFI comment above)."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionBegin0"
-reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM, which keeps unit tests off the host firewall (see the WFP/FWPM native FFI comment above)."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionCommit0"
-reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM, which keeps unit tests off the host firewall (see the WFP/FWPM native FFI comment above)."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionAbort0"
-reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "WFP must go through `routing::failclosed::engage` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM, which keeps unit tests off the host firewall (see the WFP/FWPM native FFI comment above)."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmGetAppIdFromFileName0"
-reason = "App-ID permit construction must go through `routing::failclosed` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "App-ID permit construction must go through `routing::failclosed` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM, which keeps unit tests off the host firewall (see the WFP/FWPM native FFI comment above)."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFreeMemory0"
-reason = "App-ID blob free must go through `routing::failclosed` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "App-ID blob free must go through `routing::failclosed` or `dns_confine::engage` — the two sanctioned sites, with deliberately opposite object lifetimes (persistent cover vs process-scoped confinement). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM, which keeps unit tests off the host firewall (see the WFP/FWPM native FFI comment above)."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterGetByKey0"
-reason = "Lockdown cover presence probe must go through `routing::failclosed::lockdown_cover_presence`. Only `failclosed/windows.rs` may call FWPM."
+reason = "Lockdown cover presence probe must go through `routing::failclosed::lockdown_cover_presence`: only the literal not-found code means no cover, and a failed or denied read is `Indeterminate`, never absent. Only `failclosed/windows.rs` may call FWPM."
 allow-invalid = true
 
 # The enumeration family is the ONLY read that can see a BOOT-TIME filter:
@@ -428,30 +429,30 @@ allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterCreateEnumHandle0"
-reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. It is the only read that can see a boot-time filter (see the comment on the enumeration family above). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterEnum0"
-reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. It is the only read that can see a boot-time filter (see the comment on the enumeration family above). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterDestroyEnumHandle0"
-reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. It is the only read that can see a boot-time filter (see the comment on the enumeration family above). Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmLayerCreateEnumHandle0"
-reason = "The layers the provider sweep reads boot-time views of must be listed through `routing::failclosed`'s `enum_layers`, not hardcoded. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "The layers the provider sweep reads boot-time views of must be listed through `routing::failclosed`'s `enum_layers`, not hardcoded, so a layer a later build installs at is still swept. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmLayerEnum0"
-reason = "The layers the provider sweep reads boot-time views of must be listed through `routing::failclosed`'s `enum_layers`, not hardcoded. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "The layers the provider sweep reads boot-time views of must be listed through `routing::failclosed`'s `enum_layers`, not hardcoded, so a layer a later build installs at is still swept. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmLayerDestroyEnumHandle0"
-reason = "The layers the provider sweep reads boot-time views of must be listed through `routing::failclosed`'s `enum_layers`, not hardcoded. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
+reason = "The layers the provider sweep reads boot-time views of must be listed through `routing::failclosed`'s `enum_layers`, not hardcoded, so a layer a later build installs at is still swept. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM."
 allow-invalid = true
