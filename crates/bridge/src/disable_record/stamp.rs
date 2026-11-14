@@ -10,7 +10,7 @@
 //! for `PROCESS_QUERY_LIMITED_INFORMATION`).
 //!
 //! A process that can be opened is running when its object is not signalled
-//! ([`has_exited`]), which is an edge at exit. The system process list
+//! ([`has_exited`]); the object is signalled at exit, an edge. The system process list
 //! (`NtQuerySystemInformation`) decides only for a process that cannot be
 //! opened. Why that is sound, with its measurements, is in "The Disabled
 //! service and its record" in

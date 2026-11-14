@@ -325,9 +325,9 @@ fn a_stop_control_does_not_wait_for_a_report_in_flight_on_another_thread() {
 
 #[skuld::test]
 fn a_stop_control_writes_no_log_line_on_the_control_handler_thread() {
-    // The SCM gives HandlerEx a bounded time. The file appender is non-lossy, so
-    // a log write on the handler thread can block past it and fail the caller's
-    // ControlService. The outcome is logged by the main task instead.
+    // The SCM fails a ControlService whose HandlerEx does not return promptly.
+    // The file appender is non-lossy, so a log write on the handler thread can
+    // block and fail it. The outcome is logged by the main task instead.
     let writer = VecWriter::new();
     let log = Log::default();
     let progress = Arc::new(log.progress());

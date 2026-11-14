@@ -15,9 +15,9 @@
 //! [`StopProgress`] serializes the reports and drops an entry that would not
 //! advance the checkpoint. A status report is the only thing done under that
 //! lock. The control handler does no log I/O of its own (a panic still passes
-//! through the process-wide panic hook first): the SCM gives `HandlerEx` a
-//! bounded time, and the file appender back-pressures, so a log write there
-//! could fail the caller's `ControlService`. It hands the outcome over, and the
+//! through the process-wide panic hook first): the SCM fails a
+//! `ControlService` whose `HandlerEx` does not return promptly, and the file
+//! appender back-pressures, so a log write there could fail it. It hands the outcome over, and the
 //! shutdown forwarder task logs it when it wakes from the shutdown signal
 //! ([`forward_stop`]). A report that panics is caught on the handler thread:
 //! the handler runs inside `service_ctrl`'s `extern "system"` entry point,

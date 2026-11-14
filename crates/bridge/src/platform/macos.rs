@@ -248,13 +248,9 @@ fn probe_registration() -> Registration {
 /// any registration record — see `setup::uninstall_bridge_with` for why the
 /// two are independent.
 ///
-/// The same shape as the Windows arm: issue the stop, then classify by cause
-/// what the stop left behind. It does not probe first, and it does not read the
-/// bootout's exit code as the answer: the job can leave launchd between a probe
-/// and the act, and launchd answers a bootout of an absent label with neither 0
-/// nor [`LAUNCHD_NO_SUCH_SERVICE`]
-/// (`a_bootout_of_a_label_launchd_does_not_have_fails` measures it). Only a probe taken after the act is about
-/// the world the act left. See the stop step of "The order of an uninstall" in
+/// Issue the stop, then classify by cause what it left behind, as the Windows
+/// arm does. No probe first, and the bootout's exit code is not read as the
+/// answer; why is in the stop step of "The order of an uninstall" in
 /// `docs/contributing/architecture/kill-switch-uninstall.md`.
 ///
 /// `bootout`, not [`stop`]'s SIGTERM: the plist sets `KeepAlive`, so launchd

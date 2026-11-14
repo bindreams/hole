@@ -536,8 +536,7 @@ fn service_log_dir() -> PathBuf {
 /// (warn-and-continue): a SCM hiccup must not fail the install itself.
 /// [`ensure_failure_actions`] is the path that re-opens the service and
 /// propagates errors; the cutover child uses it, which also brings an install
-/// base that predates this config up to date. `install` must not call it: the
-/// re-open would race the SCM's propagation of the just-created service, and its
+/// base that predates this config up to date. `install` does not call it: its
 /// errors would fail the install.
 pub fn install(binary_path: &Path) -> std::io::Result<()> {
     install_as(binary_path, InstallStart::Automatic)

@@ -373,7 +373,8 @@ impl<P> ProcessHolds<P> {
     ///
     /// The id is a claim, not an identity. Microsoft documents it valid in
     /// RUNNING, PAUSE_PENDING, PAUSED and CONTINUE_PENDING, "may not be valid" in
-    /// START_PENDING and STOP_PENDING, and "never valid" in STOPPED ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks);
+    /// START_PENDING and STOP_PENDING, and "never valid" in STOPPED
+    /// ([`QueryServiceStatusEx`, Remarks][qsse-remarks];
     /// [`Observed::reported_pid`]). START_PENDING and STOP_PENDING are states
     /// this code acts on, so a pid read in either may name a process that is not
     /// the service's, and an id may be reused. What makes a hold safe is not the
@@ -391,6 +392,8 @@ impl<P> ProcessHolds<P> {
     /// that keeps changing is followed, one pass per real change, with no count.
     /// A process that fails the SID check is dropped the same way and reported
     /// as [`Named::NotTheService`]; it is never held. Returns the last look.
+    ///
+    /// [qsse-remarks]: https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks
     pub fn hold_current<S: ProcessSource<Process = P>>(&mut self, source: &mut S) -> io::Result<Hold> {
         let mut reading = source.read()?;
         loop {

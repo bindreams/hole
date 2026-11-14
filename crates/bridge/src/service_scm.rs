@@ -1,8 +1,9 @@
 //! Event-driven SCM stop/start waits via `NotifyServiceStatusChangeW` — a real
 //! kernel rendezvous (an APC delivered on the actual state transition, awaited
 //! in `SleepEx(INFINITE, TRUE)`), not a poll. The one paced wait is
-//! [`settle::ExitWait::OnTheirOwn`]: a re-query at an interval, for a service
-//! marked for deletion, which no notification reports. The orchestration is a
+//! [`settle::ExitWait::OnTheirOwn`]: a re-query at an interval while the
+//! service is not STOPPED. A service marked for deletion gets no notification,
+//! so it relies on this wait. The orchestration is a
 //! pure state machine over a `ScmActor`; the real impl drives the raw
 //! `windows`-crate SCM FFI behind it.
 
@@ -247,8 +248,7 @@ mod system {
         status: LastStatus,
     }
 
-    // An unsettled record is leaked whole (see [`SystemScmActor`]), so a layout
-    // change must be a deliberate one: it fails the build. The leak figure in
+    // A layout change fails the build: the leak figure in
     // `docs/contributing/architecture/update-cutover.md` ("The notify record is
     // leaked on purpose") rests on this size; update that page with it.
     #[cfg(target_pointer_width = "64")]
@@ -419,8 +419,9 @@ mod system {
     /// already queued still finds live memory at the thread's next alertable
     /// wait. An unsettled record is leaked: one [`NotifyRecord`] per
     /// `NotifyServiceStatusChangeW` call that did not settle, i.e. that dropped
-    /// pending, failed, or returned `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`. Nothing caps how many such calls
-    /// are made (the LAGGING retry has no cap), so nothing caps the leak.
+    /// pending, failed, or returned `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`.
+    /// Nothing caps how many such calls are made (the LAGGING retry has no
+    /// cap), so nothing caps the leak.
     pub struct SystemScmActor<H: Hooks = NoHooks> {
         /// The handles of the latest arm. The next arm closes them, which cancels
         /// what is outstanding on them. Declared before `arming` so they close
