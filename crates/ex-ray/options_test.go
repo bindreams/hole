@@ -632,7 +632,7 @@ func TestGenerateConfigRejectsOutOfRangeRemotePort(t *testing.T) {
 	}
 }
 
-// remotePort=0 passes validPort, but the vendored freedom outbound applies its
+// remotePort=0 passes net.PortFromString, but the vendored freedom outbound applies its
 // destination-port override only `if server.Port != 0`, so it would forward to
 // port 0.
 func TestGenerateConfigRejectsZeroRemotePort(t *testing.T) {
@@ -651,7 +651,7 @@ func TestGenerateConfigRejectsZeroRemotePort(t *testing.T) {
 	}
 }
 
-// generateConfig must reject localPort=0 itself, not rely on main's guard:
+// generateConfig must reject localPort=0 itself, not rely on main's listenAddr call:
 // PortRange{0,0} would bind an OS-assigned port that v2ray-core does not report.
 func TestGenerateConfigRejectsZeroLocalPort(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
@@ -669,7 +669,7 @@ func TestGenerateConfigRejectsZeroLocalPort(t *testing.T) {
 	}
 }
 
-// generateConfig must validate localAddr itself, not rely on main's guard: a
+// generateConfig must validate localAddr itself, not rely on main's listenAddr call: a
 // `|`-joined list or a non-IP hostname must fail when it is called directly.
 func TestGenerateConfigRejectsMultiAddressOrNonIPLocalAddr(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)

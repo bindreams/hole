@@ -103,6 +103,105 @@ func withFlags(t *testing.T, muxV, fwmarkV int, serverV bool) func() {
 	return func() { *mux, *fwmark, *server = origMux, origFwmark, origServer }
 }
 
+// listenAddr returns the host:port v2ray-core binds, in canonical form (the one
+// `ready.listen` reports), for exactly one IP literal and a non-zero port.
+func TestListenAddrReturnsCanonicalBoundAddress(t *testing.T) {
+	origAddr, origPort := *localAddr, *localPort
+	defer func() { *localAddr, *localPort = origAddr, origPort }()
+
+	cases := []struct{ addr, port, want string }{
+		{"127.0.0.1", "1984", "127.0.0.1:1984"},
+		{"::1", "1984", "[::1]:1984"},
+		{"[::1]", "1984", "[::1]:1984"},
+		// v2ray-core folds an IPv4-mapped IPv6 literal to plain IPv4 before binding.
+		{"::ffff:127.0.0.1", "1984", "127.0.0.1:1984"},
+	}
+	for _, c := range cases {
+		*localAddr, *localPort = c.addr, c.port
+		got, err := listenAddr()
+		if err != nil {
+			t.Errorf("listenAddr() with localAddr=%q localPort=%q: unexpected error %v", c.addr, c.port, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("listenAddr() with localAddr=%q localPort=%q = %q, want %q", c.addr, c.port, got, c.want)
+		}
+	}
+}
+
+// Every rejection names the option at fault and never echoes its value.
+func TestListenAddrRejectsAndNeverEchoesValue(t *testing.T) {
+	origAddr, origPort := *localAddr, *localPort
+	defer func() { *localAddr, *localPort = origAddr, origPort }()
+
+	cases := []struct{ desc, addr, port, wantOpt, secret string }{
+		{"port 0", "127.0.0.1", "0", "localPort", ""},
+		{"non-canonical port 0", "127.0.0.1", "00", "localPort", ""},
+		{"non-numeric port", "127.0.0.1", "SECRETPORT", "localPort", "SECRETPORT"},
+		{"port out of range", "127.0.0.1", "70000", "localPort", "70000"},
+		{"empty port", "127.0.0.1", "", "localPort", ""},
+		{"address list", "127.0.0.1|127.0.0.2", "1984", "localAddr", "127.0.0.2"},
+		{"localhost", "localhost", "1984", "localAddr", ""},
+		{"other hostname", "secret.invalid", "1984", "localAddr", "secret.invalid"},
+		{"empty address", "", "1984", "localAddr", ""},
+	}
+	for _, c := range cases {
+		*localAddr, *localPort = c.addr, c.port
+		got, err := listenAddr()
+		if err == nil {
+			t.Errorf("%s: listenAddr() = %q, nil error, want an error", c.desc, got)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.wantOpt) {
+			t.Errorf("%s: error %q does not name %s", c.desc, err.Error(), c.wantOpt)
+		}
+		if c.secret != "" && strings.Contains(err.Error(), c.secret) {
+			t.Errorf("%s: error %q echoes the rejected value %q", c.desc, err.Error(), c.secret)
+		}
+	}
+}
+
+// The inbound listens on the address listenAddr validated: in both modes the
+// receiver's Listen is the canonical host (the folded IPv4 form for an
+// IPv4-mapped IPv6 literal) and its port range is the validated port.
+func TestGenerateConfigInboundListensOnTheValidatedAddress(t *testing.T) {
+	origAddr, origPort := *localAddr, *localPort
+	defer func() { *localAddr, *localPort = origAddr, origPort }()
+
+	for _, c := range []struct {
+		addr, wantListen string
+		serverMode       bool
+	}{
+		{"::ffff:127.0.0.1", "127.0.0.1", false},
+		{"::ffff:127.0.0.1", "127.0.0.1", true},
+		{"::1", "[::1]", false},
+		{"::1", "[::1]", true},
+	} {
+		serverMode := c.serverMode
+		*localAddr, *localPort = c.addr, "1984"
+		restore := withFlags(t, 1, 0, serverMode)
+		cfg, err := generateConfig()
+		restore()
+		if err != nil {
+			t.Fatalf("server=%v localAddr=%q: generateConfig() error: %v", serverMode, c.addr, err)
+		}
+		recv, err := cfg.Inbound[0].GetReceiverSettings().UnmarshalNew()
+		if err != nil {
+			t.Fatalf("server=%v: unmarshal receiver settings: %v", serverMode, err)
+		}
+		rc, ok := recv.(*proxyman.ReceiverConfig)
+		if !ok {
+			t.Fatalf("server=%v: receiver settings are %T, want *proxyman.ReceiverConfig", serverMode, recv)
+		}
+		if got := rc.Listen.AsAddress().String(); got != c.wantListen {
+			t.Errorf("server=%v localAddr=%q: inbound Listen = %q, want %q", serverMode, c.addr, got, c.wantListen)
+		}
+		if rc.PortRange.From != 1984 || rc.PortRange.To != 1984 {
+			t.Errorf("server=%v: inbound PortRange = %d-%d, want 1984-1984", serverMode, rc.PortRange.From, rc.PortRange.To)
+		}
+	}
+}
+
 // generateConfig validates mux and fwmark before the server/client split, so an
 // out-of-range value must be rejected identically in both modes. Validation moved
 // into the client-only cast site would regress server mode, where a negative mux

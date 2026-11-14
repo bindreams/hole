@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	stdnet "net"
 	"os/user"
 	"runtime"
 	"slices"
@@ -140,35 +141,29 @@ func logConfig(logLevel string) (*vlog.Config, error) {
 	return config, nil
 }
 
-// parseLocalAddr splits a localAddr value on `|` into its listen addresses.
-func parseLocalAddr(localAddr string) []string {
-	return strings.Split(localAddr, "|")
-}
-
-// canonicalLocalAddr validates s as a single IP literal and returns v2ray-core's
-// canonical string for it, the address v2ray-core will bind. It is the one
-// definition shared by main's pre-bind guard and generateConfig. The canonical
-// form can differ from the input: an IPv4-mapped IPv6 literal
-// ("::ffff:127.0.0.1") is folded to plain IPv4 ("127.0.0.1"). ok is false when s
-// is a `|`-joined list or resolves to a domain.
-func canonicalLocalAddr(s string) (canonical string, ok bool) {
-	addrs := parseLocalAddr(s)
-	if len(addrs) != 1 {
-		return "", false
+// listenAddr returns the host:port of the inbound listener, from *localAddr and
+// *localPort: the address v2ray-core binds and the one `ready` reports as
+// `listen`. v2ray-core exposes no API for the bound port, so port 0 (OS
+// assignment, in any spelling such as "00") cannot be reported and is refused. A
+// host parses `listen` as one socket address, so anything that is not exactly one
+// IP literal is refused too: a `|`-joined list, "localhost" (v2ray-core's
+// listener would bind 127.0.0.1) and every other hostname. The host part is
+// v2ray-core's canonical string for the literal, so an IPv4-mapped IPv6 one
+// ("::ffff:127.0.0.1") comes back as plain IPv4. An error names the option and
+// never contains its value.
+func listenAddr() (string, error) {
+	port, err := net.PortFromString(*localPort)
+	if err != nil {
+		return "", newError("invalid localPort: not a valid port")
 	}
-	addr := net.ParseAddress(addrs[0])
+	if port == 0 {
+		return "", newError("invalid localPort: must not be 0")
+	}
+	addr := net.ParseAddress(*localAddr)
 	if !addr.Family().IsIP() {
-		return "", false
+		return "", newError("invalid localAddr: must be a single IP literal")
 	}
-	return addr.IP().String(), true
-}
-
-// validPort parses a port string, 0 included. It is the one parser shared by
-// main's port-0 guard and generateConfig, so both accept exactly the same
-// spellings (net.PortFromString rejects some, like a leading "+", that
-// strconv.Atoi accepts).
-func validPort(s string) (net.Port, error) {
-	return net.PortFromString(s)
+	return stdnet.JoinHostPort(addr.IP().String(), *localPort), nil
 }
 
 // uint32Opt converts an integer option to uint32, returning an error that
@@ -360,26 +355,22 @@ func securitySettings(tlsConfig *tls.Config) proto.Message {
 // remoteAddr:remotePort.
 //
 // It validates for itself, whatever main has already checked, because tests call
-// it directly: the local and remote ports and addresses, mux, fwmark, mode, ech
+// it directly: the listen address (listenAddr), the remote port and address, mux, fwmark, mode, ech
 // and the tls it needs, cert, certRaw and key against tls, tcp-keepalive and
 // loglevel. host, path, fastOpen and ech-doh get no check here: only
 // parseOptsIntoFlags guards an empty host or path, and ech-doh's form is checked
 // there too (parseURLOption). Error text never contains an option value.
 func generateConfig() (*core.Config, error) {
-	lport, err := validPort(*localPort)
+	listen, err := listenAddr()
 	if err != nil {
-		return nil, newError("invalid localPort: not a valid port")
+		return nil, err
 	}
-	// Port 0 would bind an OS-assigned port that v2ray-core does not report (see main).
-	if lport == 0 {
-		return nil, newError("invalid localPort: must not be 0")
+	// listen is canonical host:port, so this parse cannot fail.
+	bound, err := net.ParseDestination(listen)
+	if err != nil {
+		panic("unreachable: listenAddr returned an address that does not parse")
 	}
-	// Rejects a `|`-joined list and any hostname: ParseAddress would take either
-	// as one domain address.
-	if _, ok := canonicalLocalAddr(*localAddr); !ok {
-		return nil, newError("invalid localAddr: must be a single IP literal")
-	}
-	rport, err := validPort(*remotePort)
+	rport, err := net.PortFromString(*remotePort)
 	if err != nil {
 		return nil, newError("invalid remotePort: not a valid port")
 	}
@@ -523,13 +514,12 @@ func generateConfig() (*core.Config, error) {
 			// dokodemo is not aware of mux connections by itself.
 			proxyAddress = net.ParseAddress("v1.mux.cool")
 		}
-		// Exactly one inbound: main rejects a `|`-joined localAddr, since `ready`
-		// reports one listen address.
+		// Exactly one inbound: listenAddr refuses a `|`-joined list.
 		return &core.Config{
 			Inbound: []*core.InboundHandlerConfig{{
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortRange:      net.SinglePortRange(lport),
-					Listen:         net.NewIPOrDomain(net.ParseAddress(*localAddr)),
+					PortRange:      net.SinglePortRange(bound.Port),
+					Listen:         net.NewIPOrDomain(bound.Address),
 					StreamSettings: &streamConfig,
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
@@ -551,8 +541,8 @@ func generateConfig() (*core.Config, error) {
 	return &core.Config{
 		Inbound: []*core.InboundHandlerConfig{{
 			ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-				PortRange: net.SinglePortRange(lport),
-				Listen:    net.NewIPOrDomain(net.ParseAddress(*localAddr)),
+				PortRange: net.SinglePortRange(bound.Port),
+				Listen:    net.NewIPOrDomain(bound.Address),
 			}),
 			ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
 				Address:  net.NewIPOrDomain(net.LocalHostIP),

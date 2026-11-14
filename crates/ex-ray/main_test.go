@@ -231,8 +231,8 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 		{"invalid_cert_raw_not_pem", "tls;host=example.com;certRaw=not-a-real-certificate", false},
 		{"invalid_host_empty", "host=;path=/", false},
 		{"invalid_cert_material_without_tls", "certRaw=some-cert-content;host=example.com;path=/", false},
-		// "00" is port 0 to validPort. A raw compare against "0" would miss it, and
-		// ex-ray would bind an OS-assigned port while ready.listen reported "00".
+		// "00" is port 0 to net.PortFromString. A raw compare against "0" would miss
+		// it, and ex-ray would bind an OS-assigned port while ready.listen reported "00".
 		{"invalid_local_port_non_canonical_zero", "localPort=00", false},
 		{"malformed_options_never_echo_secret", `certRaw=SUPERSECRETVALUE;;path=/`, true},
 		// No-echo for localPort, remotePort and mode through the whole pipeline
@@ -315,7 +315,7 @@ func TestInvalidCertPathSitrepNeverEchoesSecret(t *testing.T) {
 
 // A non-IP localAddr such as "nosuchhost.invalid" is fatal before the process
 // tries to bind, with a message that never interpolates the rejected value
-// (main's canonicalLocalAddr guard). The generic Start-failure `fatal` is a fixed
+// (listenAddr). The generic Start-failure `fatal` is a fixed
 // string too; no test drives that branch.
 func TestInvalidLocalAddrSitrepNeverEchoesValue(t *testing.T) {
 	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
@@ -343,9 +343,9 @@ func TestInvalidLocalAddrSitrepNeverEchoesValue(t *testing.T) {
 	}
 }
 
-// A `|`-separated multi-address localAddr (parseLocalAddr's grammar, from
-// upstream v2ray-plugin's server-mode multi-listen) is fatal: `ready` carries one
-// `listen` address, so main rejects it before generateConfig runs. Server mode
+// A `|`-separated multi-address localAddr (the grammar of upstream
+// v2ray-plugin's server-mode multi-listen) is fatal: `ready` carries one
+// `listen` address, so listenAddr rejects it in main before buildV2Ray. Server mode
 // is used because the `|` grammar is server-only, and there the `remoteAddr`
 // option, not `localAddr`, becomes *localAddr (see parseOptsIntoFlags).
 func TestMultiAddressLocalAddrSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
@@ -474,7 +474,7 @@ func TestReadySitrepReachesParentOnValidOptions(t *testing.T) {
 	}
 }
 
-// An IPv4-mapped IPv6 literal ("::ffff:127.0.0.1") passes main's guard, but
+// An IPv4-mapped IPv6 literal ("::ffff:127.0.0.1") passes listenAddr, but
 // v2ray-core folds it to plain IPv4 before binding (IPAddress in
 // third_party/v2ray-core/common/net/address.go). ready.listen must report the
 // folded form v2ray-core bound, or a host cannot tell where ex-ray listens.

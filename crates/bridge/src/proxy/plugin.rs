@@ -751,7 +751,7 @@ fn ex_ray_fatal_config_error(
     {
         return Some("tcp-keepalive");
     }
-    // main.go validPort (`net.PortFromString`, nonzero) for `localPort`; under `server` the `remotePort` key is
+    // config.go listenAddr (`net.PortFromString`, nonzero) for `localPort`; under `server` the `remotePort` key is
     // cross-assigned here, but both share this rule.
     if segments
         .iter()
@@ -761,7 +761,7 @@ fn ex_ray_fatal_config_error(
         return Some("localPort");
     }
     // main.go's cross-assign: under `*server` the `remoteAddr` KEY feeds `*localAddr`, so the two address keys swap
-    // rules. (The port pair shares one rule, so it needs no swap.) `localAddr` rule: canonicalLocalAddr.
+    // rules. (The port pair shares one rule, so it needs no swap.) `localAddr` rule: listenAddr.
     let (local_addr_key, remote_addr_key) = if server_present {
         ("remoteAddr", "localAddr")
     } else {
@@ -1012,13 +1012,13 @@ fn v2ray_core_parses_as_a_domain(value: &str) -> bool {
 
 /// Whether `value` parses as a v2ray-core IP-family address once normalized
 /// as [`v2ray_core_normalize`] — used by [`ex_ray_fatal_config_error`] for
-/// `localAddr`'s `canonicalLocalAddr` check, which requires an IP literal.
+/// `localAddr`'s `listenAddr` check, which requires an IP literal.
 fn v2ray_core_parses_as_an_ip(value: &str) -> bool {
     v2ray_core_normalize(value).parse::<std::net::IpAddr>().is_ok()
 }
 
-/// Whether ex-ray's `canonicalLocalAddr` (config.go, reachable from main()'s
-/// pre-bind guard) would reject `value` for `localAddr`: not exactly one
+/// Whether ex-ray's `listenAddr` (config.go, called from main() before the
+/// bind) would reject `value` for `localAddr`: not exactly one
 /// (`|`-free) address, or not an IP literal once normalized.
 fn ex_ray_local_addr_is_invalid(value: &str) -> bool {
     value.contains('|') || !v2ray_core_parses_as_an_ip(value)
@@ -2060,7 +2060,7 @@ mod inject_tests {
         );
     }
 
-    // `remotePort` routes through the SAME `validPort` as `localPort`
+    // `remotePort` parses with the SAME `net.PortFromString` as `localPort`
     // (config.go), so it shares localPort's tighter 65535 ceiling and its
     // `0` rejection, not a bare `strconv.ParseUint(_, 10, 32)` with no
     // upper bound beyond u32::MAX and no zero check.
@@ -2081,7 +2081,7 @@ mod inject_tests {
     }
 
     // Non-canonical-zero coverage: `"00"` is valid `strconv.ParseUint`
-    // syntax (parses to `0`), so it is caught by `validPort`'s `== 0`
+    // syntax (parses to `0`), so it is caught by `listenAddr`'s `== 0`
     // rejection, not by a parse failure — a check that only compared
     // against the LITERAL string `"0"` would miss it.
     #[skuld::test]
@@ -2120,7 +2120,7 @@ mod inject_tests {
         assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("path"));
     }
 
-    // `localAddr` (main.go's cross-assign + `canonicalLocalAddr`) must be a
+    // `localAddr` (main.go's cross-assign + `listenAddr`) must be a
     // single IP literal — a domain or a `|`-joined multi-address list is
     // fatal.
     #[skuld::test]
@@ -2151,7 +2151,7 @@ mod inject_tests {
     fn server_mode_swaps_which_key_the_address_rules_apply_to() {
         let e = pinned("https://9.9.9.9/dns-query");
         // Over-permit repro: under `server`, the `remoteAddr` OPTION lands
-        // in `*localAddr`, so this domain value fails `canonicalLocalAddr`
+        // in `*localAddr`, so this domain value fails `listenAddr`
         // and the whole process exits 23 — never reachable.
         let segments = garter::split_plugin_options("server;tls;host=cdn.example;remoteAddr=cdn.example").unwrap();
         assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("remoteAddr"));
@@ -2836,7 +2836,7 @@ mod inject_tests {
 
         // The numeric bounds `ex_ray_fatal_config_error` hardcodes for
         // mux/fwmark (`uint32Opt`), tcp-keepalive (`keepAliveMaxSeconds`),
-        // and localPort/remotePort (`validPort`) — same drift risk, same
+        // and localPort/remotePort (`net.PortFromString`) — same drift risk, same
         // pin. Pinned on the COMPARISON itself, not `uint32Opt`'s error
         // message: the message is free to change for reasons that have
         // nothing to do with the bound it protects (e.g. to stop a
@@ -2854,9 +2854,9 @@ mod inject_tests {
              config.go's `keepAliveMaxSeconds` — update the range to the vendored source"
         );
         assert!(
-            source.contains("rport, err := validPort(*remotePort)"),
+            source.contains("rport, err := net.PortFromString(*remotePort)"),
             "ex_ray_fatal_config_error's remotePort ceiling (65535, shared with localPort) no \
-             longer matches config.go — remotePort must still route through the same `validPort` \
+             longer matches config.go — remotePort must still parse with the same `net.PortFromString` \
              as localPort, not a bare `strconv.ParseUint`"
         );
         assert!(
@@ -2865,9 +2865,9 @@ mod inject_tests {
              config.go — update ex_ray_remote_addr_is_invalid to the vendored source"
         );
         assert!(
-            source.contains("func canonicalLocalAddr"),
+            source.contains("func listenAddr"),
             "ex_ray_fatal_config_error's localAddr IP-literal check no longer matches config.go's \
-             `canonicalLocalAddr` — update ex_ray_local_addr_is_invalid to the vendored source"
+             `listenAddr` — update ex_ray_local_addr_is_invalid to the vendored source"
         );
         assert!(
             source.contains("if *echMode == \"always\" && !*tlsEnabled {"),

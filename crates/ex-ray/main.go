@@ -5,10 +5,8 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
-	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -100,7 +98,8 @@ func parseOptsIntoFlags() error {
 		return err
 	}
 	// These four are assigned raw, with no parse*Option validation; the checks
-	// on them are in main and generateConfig. A bare key (no `=`) reads as "1"
+	// on them are listenAddr (localAddr, localPort) and generateConfig (remoteAddr,
+	// remotePort). A bare key (no `=`) reads as "1"
 	// (see parsePluginOptions), so a bare `remoteAddr` sets the upstream
 	// destination to the domain "1" and a bare `localPort` or `remotePort` sets
 	// port 1; none of those checks rejects that.
@@ -228,46 +227,12 @@ func main() {
 		failFatal(err)
 	}
 
-	// ex-ray requires a concrete local port: v2ray-core exposes no public API for
-	// the bound port of an inbound listener, so a port-0 (OS-assigned) request
-	// could not be reported honestly as `ready.listen` (SITREP.md requires it to
-	// be the bound address). Port 0 is therefore fatal. A host must pass a
-	// pre-allocated port. validPort is the parser generateConfig uses too, so a
-	// non-canonical spelling of zero ("00") is caught here as well. A parse
-	// failure or out-of-range value gets its own message, so it is not mistaken
-	// for a port-0 request.
-	localPortNum, portErr := validPort(*localPort)
-	switch {
-	case portErr != nil:
-		failFatal(errors.New("invalid localPort: not a valid port"))
-	case localPortNum == 0:
-		failFatal(errors.New("ex-ray requires a concrete local port; port-0 OS-assignment is not supported (v2ray-core does not expose the bound port)"))
-	}
-
-	// localAddr must be exactly one IP literal, because the `ready` event carries
-	// one `listen` address (SITREP.md) that a host parses as a socket address.
-	// Two shapes would otherwise be reported unparseably:
-	//   - A `|`-joined list: parseLocalAddr splits localAddr on `|` for a
-	//     multi-address listen, but `ready` cannot report more than one.
-	//   - "localhost": v2ray-core's listener rewrites it to 127.0.0.1, so
-	//     reporting the raw value would print "localhost:<port>".
-	// canonicalLocalAddr below rejects every non-IP hostname, not only that one;
-	// v2ray-core's listener would refuse any other with its own "domain address is
-	// not allowed for listening" error.
-	if len(parseLocalAddr(*localAddr)) != 1 {
-		failFatal(errors.New("invalid localAddr: a single listen address is required (the ready sitrep cannot report more than one)"))
-	}
-	// canonicalLocalAddr folds IP spellings the way v2ray-core does before binding;
-	// the guard and localListenAddr below both use it, so the reported address is
-	// the bound one.
-	canonicalAddr, ok := canonicalLocalAddr(*localAddr)
-	if !ok {
-		failFatal(errors.New("invalid localAddr: must be an IP literal"))
-	}
-
 	// The address v2ray-core binds and that emitReady reports (see
 	// parseOptsIntoFlags for the client/server mapping).
-	localListenAddr := net.JoinHostPort(canonicalAddr, *localPort)
+	localListenAddr, err := listenAddr()
+	if err != nil {
+		failFatal(err)
+	}
 
 	// The transport the inbound listener binds, reported as the sitrep transports.
 	network := listenerNetwork()
@@ -307,7 +272,7 @@ func main() {
 	}()
 
 	// Start is synchronous through the listener bind, so the listener is accepting
-	// once it returns nil. Port 0 was rejected above, so the requested port is the
+	// once it returns nil. listenAddr refuses port 0, so the requested port is the
 	// bound port.
 	emitReady(localListenAddr, []string{network})
 
