@@ -23,10 +23,8 @@
 //! `client_body`, and the `plugin_handle.await` after `shutdown.cancel()`
 //! (the only park of
 //! `shutdown_cancels_in_flight_connection_without_panic`). Each waits on a
-//! task this test spawns and controls, not an out-of-process op, so
-//! testing.md's no-synchronization-by-elapsed-time rule does not sanction a
-//! per-await `tokio::time::timeout` (that exception is scoped to a remote or
-//! child-process op that might never succeed). The close wait is raced
+//! task this test spawns and controls, not an out-of-process op, so no
+//! per-await `tokio::time::timeout` bounds it. The close wait is raced
 //! against the plugin task, so a tap that exits first fails the test. The
 //! rest are bounded at the nextest-config level: `.config/nextest.toml`'s
 //! override names every test in this file that calls `run_with_tap` or
@@ -350,7 +348,7 @@ async fn silent_drop_records_zero_bytes_and_no_ttfb() {
 }
 
 #[skuld::test]
-async fn silent_after_read_matches_248_shape() {
+async fn silent_after_read_records_bytes_to_and_no_ttfb() {
     // The silent-then-FIN shape: client writes some bytes, upstream reads them,
     // upstream NEVER replies, then closes. Tap must record bytes_to=N,
     // bytes_from=0, ttfb=None.

@@ -13,8 +13,7 @@ pub enum Error {
     #[error("plugin '{name}' was killed by signal")]
     PluginKilled { name: String },
 
-    /// A failure with no more specific variant, as a message: a plugin that failed to spawn, a plugin task that
-    /// panicked, the drain timeout.
+    /// Any other failure, carried as a message.
     #[error("{0}")]
     Chain(String),
 
@@ -26,7 +25,7 @@ pub enum Error {
         cause: crate::sitrep::StartError,
     },
 
-    /// A SIP003 environment variable is unset, not Unicode, or does not parse.
+    /// A SIP003 environment variable is missing or invalid.
     #[error("environment variable '{var}' missing or invalid: {reason}")]
     Env { var: String, reason: String },
 

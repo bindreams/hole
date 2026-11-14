@@ -75,12 +75,9 @@ pub(crate) async fn pick_with(
     }
 }
 
-/// Whether a failed `bind((ip, 0))` is a race that a later pick can win.
-///
-/// Mirrors `util::retry::is_bind_race` in the Hole workspace, which garter
-/// (published) cannot depend on; keep the two in step. On Windows a `bind(:0)`
-/// fails with `PermissionDenied` or `AddrNotAvailable` when the excluded-port-range
-/// tables disagree about the port it was handed.
+// Keep in step with `util::retry::is_bind_race` (Hole workspace), which this published crate cannot depend on.
+/// Whether a failed `bind((ip, 0))` is a race that a later pick can win. On Windows a `bind(:0)` fails with
+/// `PermissionDenied` or `AddrNotAvailable` when the excluded-port-range tables disagree about the port it was handed.
 pub(crate) fn is_port_race(err: &io::Error) -> bool {
     matches!(
         err.kind(),

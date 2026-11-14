@@ -1051,7 +1051,7 @@ async fn record_exit_logs_structured_exit_code() {
 }
 
 /// `record_exit` must emit `killed=true` and no numeric `exit_code` on a
-/// `PluginKilled` error (signal death / SIGKILL / TerminateProcess).
+/// `PluginKilled` error (signal death on Unix; the test builds the error directly).
 #[skuld::test]
 async fn record_exit_logs_killed_for_signal_death() {
     use crate::test_utils::WaitableWriter;

@@ -143,8 +143,7 @@ pub enum ProtocolSupport {
 ///   Note: a `{`-prefixed line whose `event` matches a known variant but
 ///   contains a malformed field (e.g. an unparseable `listen` address) is
 ///   also swallowed to `Ok(None)`.
-/// - `Err(_)` — never returned today (unknown events are ignored, not
-///   errors); the signature reserves it for surfacing malformed envelopes.
+/// - `Err(_)` — never returned; reserved for malformed envelopes.
 pub fn parse_event(line: &str) -> Result<Option<SitrepEvent>, serde_json::Error> {
     let trimmed = line.trim();
     if !trimmed.starts_with('{') {

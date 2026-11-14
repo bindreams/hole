@@ -88,9 +88,8 @@ async fn main() -> anyhow::Result<()> {
     // Host-facing readiness: galoshes' OWN ChainRunner folds the
     // per-plugin readiness of [yamux, ex-ray] and fires this channel with
     // the chain-level outcome. We map that to a PROCESS-stdout sitrep event
-    // (overriding the inner-chain transport intersection with galoshes'
-    // true TCP|UDP capability — see `sitrep_out`) so the host sees a
-    // structured `ready`/`bind_conflict`/`fatal` on galoshes' stdout.
+    // (see `sitrep_out`) so the host sees a structured
+    // `ready`/`bind_conflict`/`fatal` on galoshes' stdout.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<ChainReady, StartError>>();
 
     // The emitter must run concurrently with `runner.run`: the plugins

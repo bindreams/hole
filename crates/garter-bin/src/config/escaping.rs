@@ -93,11 +93,9 @@ fn mangled_spellings(segment: &garter::OptionSegment<'_>) -> MangledPath {
 ///
 /// A `\` before one of the three [`is_sip003_metacharacter`]
 /// bytes decodes as usual (consumed) — the operator escaped correctly
-/// there. A `\` before any OTHER byte is instead kept as BOTH characters
-/// rather than consumed: the actual defect, treated as a literal `\` the
-/// operator forgot to double, so a caller re-serializing `intended` escapes it
-/// exactly once and leaves an already-correct escape alone. Returns whether
-/// any such defect was found.
+/// there. A `\` before any other byte is kept as both characters (a literal `\`
+/// the operator forgot to double), so re-serializing `intended` escapes it
+/// exactly once. Returns whether any such defect was found.
 ///
 /// A value starting with exactly two backslashes (not four or more) is a
 /// special case: a Windows UNC (`\\server\share\...`) or extended-length
@@ -167,12 +165,10 @@ pub(crate) fn escape_sip003(s: &str) -> String {
 /// If the path came from a `config=` value `value_was_mangled_by_unescaping`
 /// flagged (an unescaped literal backslash silently dropped) and the load then
 /// fails with ANY IO-layer error, the error names the escaping as the cause and
-/// offers corrected spellings, rather than a bare IO error that gives no
-/// hint the real cause was SIP003 escaping. Windows offers two (the doubled
-/// backslashes and the forward-slash form); other platforms offer the doubled
-/// one only. The check is on any IO error, not only `NotFound`: a dropped
-/// backslash can also collapse the path into a protected location
-/// (`PermissionDenied`).
+/// offers the corrected spellings of [`MangledPath`], rather than a bare IO
+/// error that gives no hint the real cause was SIP003 escaping. The check is
+/// on any IO error, not only `NotFound`: a dropped backslash can also collapse
+/// the path into a protected location (`PermissionDenied`).
 ///
 /// A path with no `mangled_from` never gets this text. Neither does a
 /// YAML-parse failure on a path that DID resolve to a real file: `yaml_serde`

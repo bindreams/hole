@@ -196,12 +196,11 @@ impl ChainRunner {
     /// was already captured, in which case that error takes precedence, and a start
     /// failure ([`Error::StartFailed`](crate::Error::StartFailed)) outranks both.
     ///
-    /// The default is [`DEFAULT_DRAIN_TIMEOUT`]. It must outlast the longest
-    /// take-down a plugin may need after a shutdown: a `BinaryPlugin` gives its
-    /// child a grace period to exit and a bound to close its output, and a
-    /// `TapPlugin` waits for that plus headroom for its inner, so a plugin that
-    /// needs all of those is waited for, not aborted mid-take-down. The default
-    /// is that wait plus headroom. A smaller value cuts such a plugin off
+    /// It must outlast the longest take-down a plugin may need after a
+    /// shutdown. The default, [`DEFAULT_DRAIN_TIMEOUT`], covers a
+    /// `BinaryPlugin`'s take-down (a grace period for its child to exit, then a
+    /// bound for its output to close) and a `TapPlugin`'s wait for that of its
+    /// inner, with headroom. A smaller value can cut such a plugin off
     /// mid-take-down, and its last output is lost.
     ///
     /// It is also the bound on the wait that precedes the caller's release

@@ -1,7 +1,7 @@
 //! Process-stdout sitrep emission for the galoshes binary.
 //!
-//! galoshes is spawned by its host as a `BinaryPlugin` (Hole's bridge is
-//! one) and the host reads sitrep events from galoshes' **process stdout**. Internally
+//! galoshes is spawned by its host as a `BinaryPlugin` and the host reads sitrep
+//! events from galoshes' **process stdout**. Internally
 //! galoshes builds its own `garter::ChainRunner` over a 2-plugin chain
 //! (`YamuxPlugin` outer + embedded `ex-ray` inner); that runner's
 //! `on_ready` channel fires the chain-level outcome. This module maps that

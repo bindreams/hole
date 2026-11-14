@@ -229,10 +229,9 @@ fn split_on_unescaped_borrowed(s: &str, delimiter: char) -> Result<Vec<&str>, Ma
 /// rather than each re-implementing it — they differ only in what
 /// `on_escaped` does with the escaped byte.
 ///
-/// `pub` and `#[doc(hidden)]` because its one other caller is a sibling crate
-/// and Rust has no visibility narrower than `pub` that reaches it. It is NOT
-/// general public API: it exists for `garter-bin::config::escaping`'s single
-/// call site, which is why it is hidden from the rendered docs.
+/// `pub` and `#[doc(hidden)]` only because `garter-bin::config::escaping`, a
+/// sibling crate, calls it and Rust has no narrower visibility that reaches it.
+/// Not public API.
 ///
 /// `Err` only on a dangling trailing `\` that escapes nothing.
 #[doc(hidden)]

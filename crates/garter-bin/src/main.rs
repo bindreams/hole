@@ -18,10 +18,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = garter_bin::config::resolve_chain_config(env.plugin_options.as_deref())?;
 
-    // Contract, not input validation: `resolve_chain_config` above already
-    // ran the same string through the same parser
-    // (`config_path_from_plugin_options` → `split_plugin_options`) and
-    // returned `Ok`, so this cannot fail on any real input.
+    // `resolve_chain_config` already parsed this string, so this cannot fail.
     let mode = Mode::from_plugin_options(env.plugin_options.as_deref())
         .expect("well-formed by construction: already validated by resolve_chain_config above");
     let mut runner = ChainRunner::new().mode(mode);

@@ -40,12 +40,11 @@ pub const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(300);
 /// on every datagram for the process's whole lifetime, so a `udp_timeout`
 /// that fit `Instant::now()` at parse time (`parse_udp_timeout`'s own
 /// `checked_add` probe) is not guaranteed to still fit once the process has
-/// been up for a while — the margin shrinks as uptime grows. Falls back to
-/// the margin `tokio::time::Instant::far_future` uses, which is `pub(crate)`
-/// upstream.
+/// been up for a while — the margin shrinks as uptime grows. Falls back to a
+/// far-future deadline when the sum overflows.
 pub(crate) fn saturating_deadline(udp_timeout: Duration) -> Instant {
     Instant::now().checked_add(udp_timeout).unwrap_or_else(|| {
-        // tokio's own `far_future` margin: a longer one overflows on macOS or FreeBSD.
+        // The margin tokio's own `far_future` uses: a longer one overflows on macOS or FreeBSD.
         Instant::now() + Duration::from_secs(86_400 * 365 * 30)
     })
 }
@@ -629,8 +628,7 @@ async fn run_udp_association(
     let mut acc = FrameAccumulator::new();
 
     // NAT idle-eviction timer. The delay IS the behavior under management
-    // (conntrack-style idle expiry of a UDP association), not a wait for some
-    // other code of ours.
+    // (conntrack-style idle expiry of a UDP association).
     let idle = tokio::time::sleep(udp_timeout);
     tokio::pin!(idle);
 
@@ -682,7 +680,6 @@ async fn run_udp_association(
     // NAT teardown. An `evicted` flow was idle for `udp_timeout`, so such a
     // datagram is the first of a resumed flow that the app will retransmit
     // (DNS and QUIC do); on an error teardown the stream is already dead.
-    // Conntrack and shadowsocks-rust drop the same boundary packet.
     outbound_rx.close();
 
     tracing::debug!(peer = %peer, reason, "udp association closed");
@@ -1292,11 +1289,9 @@ async fn echo_keepalive(mut stream: yamux::Stream) -> Result<()> {
 /// `config_path_from_plugin_options`), even though `udp_timeout` is
 /// galoshes' own key that ex-ray never reads.
 ///
-/// EVERY occurrence is validated, not just the winning first one: a value
-/// that is not a positive integer is a hard error on ANY occurrence (`0`
-/// would evict every association immediately, breaking all UDP), so a
-/// self-contradictory duplicate refuses the start rather than silently
-/// keeping the first value and discarding the rest unchecked.
+/// Every occurrence is validated, not only the first: a value that is not a
+/// positive integer (`0` would evict every association at once) is an error on
+/// any occurrence.
 pub fn parse_udp_timeout(plugin_options: Option<&str>) -> Result<Duration> {
     let Some(opts) = plugin_options else {
         return Ok(DEFAULT_UDP_TIMEOUT);

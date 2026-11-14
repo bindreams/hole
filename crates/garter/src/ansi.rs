@@ -1,11 +1,8 @@
 //! Strips ANSI SGR (Select Graphic Rendition - color/style) escape
 //! sequences from plugin log lines before they reach a display sink
-//! (`LogSink` / `tracing`). Never applied ahead of a parser: a well-formed
-//! sitrep line can never contain a raw ESC byte, so stripping ahead of
-//! `sitrep::parse_event` buys nothing for valid input and can turn
-//! malformed input (illegal per RFC 8259, correctly rejected) into
-//! syntactically valid JSON with corrupted content. The sitrep reader in
-//! `binary.rs` parses the original line and strips only its display copy.
+//! (`LogSink` / `tracing`). Applied only to the display copy of a line, never
+//! ahead of the sitrep parser: stripping could turn malformed JSON (a raw ESC
+//! is illegal per RFC 8259) into valid JSON with corrupted content.
 //!
 //! Deliberately narrower than a general CSI stripper: matching only the
 //! `m`-terminated SGR form (what `tracing-subscriber`'s `fmt` layer

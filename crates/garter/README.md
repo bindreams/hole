@@ -5,8 +5,7 @@
 
 garter is a Rust library that runs a chain of [SIP003](https://shadowsocks.org/doc/sip003.html) Shadowsocks plugins as
 if they were one. Shadowsocks starts a plugin and hands it an address to listen on and an address to forward to; garter
-starts several plugins, wires each one's output to the next one's input, waits until the whole chain is ready, and shuts
-it down together.
+starts several plugins and wires each one's output to the next one's input.
 
 It is part of [Hole](https://github.com/bindreams/hole), a Shadowsocks client, which uses it to run its plugins.
 
@@ -48,10 +47,8 @@ async fn main() -> garter::Result<()> {
 }
 ```
 
-Plugins are added from the Shadowsocks side outward, in both modes: the first one added sits next to Shadowsocks and the
-last one added faces the network. In `Mode::Client` (the default) data flows from the Shadowsocks client through the
-chain to the server, and the last plugin talks to the server; in `Mode::Server` it flows the other way, and the last
-plugin listens for clients and the first forwards to a local Shadowsocks server.
+Plugins are added from the Shadowsocks side outward in both modes. In `Mode::Client` (the default) the last plugin talks
+to the server; in `Mode::Server` it listens for clients and the first forwards to a local Shadowsocks server.
 
 A `BinaryPlugin` decides it is ready by connecting to the port it was given, unless `.readiness(ReadinessMode::ExpectSitrep)`
 says the plugin speaks sitrep (below), which also lets the chain restart a hop that loses its port.

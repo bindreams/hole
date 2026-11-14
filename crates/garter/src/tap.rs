@@ -60,24 +60,17 @@
 //!
 //! # Failed starts
 //!
-//! Every failed start after step 2 stops the inner before it is reported: the
-//! readiness timeout, a listener outside the given address, a failure the
-//! inner reports while running, and the step-4 bind. The tap cancels the
-//! inner's token (a child of `shutdown`) and waits for the inner task, so the
-//! output the inner is still relaying is drained first.
+//! Where the inner is still running, a failed start after step 2 stops it before the failure is reported: the
+//! readiness timeout, a listener outside the given address, a failure the inner reports while running, and the
+//! step-4 bind. The tap cancels the inner's token (a child of `shutdown`) and waits for the inner task, so the
+//! output the inner is still relaying is drained first. An inner that ended on its own is only joined.
 //!
-//! The wait is bounded by [`INNER_STOP_BOUND`], which an inner that honours its
-//! token never reaches. On expiry the tap warns, naming the plugin, and aborts
-//! the inner.
+//! The wait is bounded by [`INNER_STOP_BOUND`]. On expiry the tap warns, naming the plugin, and aborts the inner.
 //!
-//! How the inner ended is logged (an exit status at debug, a panic at warn) and
-//! otherwise dropped: the failure reported is the tap's, unless the inner
-//! delivered a typed start failure by the time it stopped (a `BinaryPlugin`
-//! delivers one it decided at the end of its take-down), which is reported
-//! instead. The readiness timeout and a shutdown before readiness read the
-//! inner's delivery this way; the latter then also fails `run` instead of only
-//! dropping `ready`. The other failed starts follow a report the inner has
-//! already made, its one readiness message.
+//! How the inner ended is logged (an exit status at debug, a panic at warn) and otherwise dropped. The failure
+//! reported is the tap's, except that a typed start failure the inner delivered is reported instead when the
+//! readiness timeout expired, a shutdown came before readiness, or the inner ended before it was ready (a
+//! `BinaryPlugin` delivers one it decided at the end of its take-down).
 //!
 //! A start failure the tap has reported is also its `run` error, so a runner
 //! with no `on_ready` sees the chain fail. That error is an
@@ -118,11 +111,12 @@ static NEXT_TAP_CONN_ID: AtomicU64 = AtomicU64::new(1);
 pub const INNER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Failure bound on the wait for the inner to return after the tap cancelled its token: to report a failed start, or
-/// after an accept failure while serving. An inner must return once its token fires, so this expires only on an inner
-/// that does not: the tap then warns and aborts it.
+/// after an accept failure while serving. On expiry the tap warns, naming the plugin, and aborts the inner.
 ///
-/// It is the whole take-down of a [`BinaryPlugin`](crate::BinaryPlugin) inner (its root's grace period to exit, then
-/// the bound on its output closing) plus headroom, so that inner is never cut off.
+/// It covers a [`BinaryPlugin`](crate::BinaryPlugin) inner's own bounded waits in its take-down (its root's grace
+/// period to exit, then the bound on its output closing) plus headroom for the OS steps between and after them (the
+/// kills, the tree's drain, the reap). An OS that takes longer than the headroom gets the inner aborted mid-take-down,
+/// and its last output is lost.
 pub const INNER_STOP_BOUND: Duration =
     Duration::from_secs(crate::binary::TAKEDOWN_BOUND.as_secs() + crate::binary::TAKEDOWN_TAIL.as_secs());
 
@@ -499,8 +493,7 @@ async fn accept_next(
 /// Stops a still-running inner through its own token and waits for it, so the output it is still
 /// relaying reaches the log before the caller hears of the failure.
 ///
-/// The wait is bounded by [`INNER_STOP_BOUND`], a failure bound on external code: an inner must return once
-/// its token fires, and one that does not is warned about by name and aborted. The failure being reported is the
+/// The wait is bounded by [`INNER_STOP_BOUND`], a failure bound on external code. The failure being reported is the
 /// tap's; how the inner ended is only logged.
 async fn stop_inner(
     plugin_name: &str,

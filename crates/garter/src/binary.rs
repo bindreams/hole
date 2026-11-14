@@ -47,10 +47,9 @@ pub enum ReadinessMode {
     /// stood it down: it reports ready for the other process's listener and the
     /// plugin's `BindConflict` is lost. Only when nothing listens on the port
     /// can the probe not win. On success either path may win; both report the
-    /// same listen address, so the sitrep-preference (better transports) is
-    /// best-effort, not guaranteed. Prefer explicit `ExpectSitrep` when the plugin is known to
-    /// speak sitrep AND authoritative transports or a deterministic `BindConflict`
-    /// matter.
+    /// same listen address. Prefer explicit `ExpectSitrep` when the plugin is
+    /// known to speak sitrep AND authoritative transports or a deterministic
+    /// `BindConflict` matter.
     ///
     /// The concurrent probe is a TCP connect (as in `Probe`), so it cannot ready
     /// a UDP-only listener; a UDP-only plugin must therefore speak sitrep.
@@ -312,13 +311,13 @@ impl ChainPlugin for BinaryPlugin {
         // galoshes inside the bridge's chain) joins this tree instead of creating
         // one Unix pgids could escape from.
         //
-        // Only ONE marker name is recognised, so the outer garter (Hole's bridge,
-        // `garter-bin`, or any embedder) and galoshes' inner garter must agree on
-        // it. Pairing the garter crate at one version with a galoshes built on
-        // another can mismatch the marker. The nested garter then does not see
-        // this tree's marker and, on Unix, makes its own process group, which the
-        // kill of this tree does not reach (Windows jobs nest, so a job kill still
-        // reaches it). Mixed pre-1.0 binaries are not supported.
+        // The marker is cosca's, and only one name is recognised, so the outer
+        // garter (Hole's bridge, `garter-bin`, or any embedder) and galoshes'
+        // inner garter must be built with cosca versions that agree on it.
+        // Otherwise the nested garter makes its own group. Where this tree is a
+        // Unix process group (macOS, Linux without a delegated cgroup) the kill
+        // of this tree does not reach that group; a Linux cgroup or a Windows
+        // job still contains it. Mixed pre-1.0 binaries are not supported.
         cmd.contain();
         cmd.nesting(cosca::containment::Nesting::Mark);
         let mut child = cmd.spawn().map_err(|e| {
@@ -643,8 +642,7 @@ impl Drop for FailureHold {
 /// On an unknown protocol major (`FallBackToTier2`) the reader hands readiness to a self-probe, sharing the single
 /// sender via [`SharedReady`] so at most one send ever happens. When `auto` is true ([`ReadinessMode::Auto`]) a
 /// concurrent self-probe is ALSO started up front and stood down on a supported `hello`, so a non-sitrep plugin
-/// (including one silent on stdout) is still readied by the probe. The probes are `probes`, which end with
-/// `shutdown` or when the plugin's `run` ends them.
+/// (including one silent on stdout) is still readied by the probe.
 ///
 /// A `ready` is sent at once. A failure (`fatal`, `bind_conflict`, an empty `ready`, or stdout closing where no
 /// probe owns readiness: a sitrep plugin's readiness travels on stdout, so it can never become ready) is held in
@@ -1384,8 +1382,7 @@ pub(crate) async fn drain_readers_after_exit(
             if exit_edge_proves_the_tree_gone(containment) {
                 match tree.wait_tree_drained().await {
                     Ok(()) => {}
-                    // `Unsupported` is the expected answer on Windows (see `wait_tree_drained`), where every
-                    // take-down lands here, so it is not worth a warning.
+                    // `Unsupported` is the expected answer on Windows, so it is only a debug line.
                     Err(e @ cosca::error::Error::Unsupported { .. }) => tracing::debug!(
                         plugin = %plugin,
                         error = &e as &dyn std::error::Error,
