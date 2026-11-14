@@ -1,5 +1,5 @@
 //! Unit tests for the token extractors plus the `every_workspace_crate_runs_in_ci`
-//! structural conformance test (the anti-orphan gate, #526).
+//! structural conformance test (the anti-orphan gate).
 
 use std::collections::BTreeSet;
 use std::fs;

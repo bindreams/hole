@@ -8,9 +8,7 @@ versions line carries the real manifest versions and that no substitution was
 left unrendered. Also checks every `{src}` link in `docs/`: its path must be
 tracked in the repository and, for a Markdown target, its `#anchor` must match a
 heading there (GitHub's slug rules). A code fence that is never closed is
-reported in a page, a target, the README and CLAUDE.md. Pages are read as MyST reads them,
-targets and the README as GitHub does, with parsers pinned in
-`docs/requirements.txt` rather than in this script.
+reported in a page, a target, the README and CLAUDE.md.
 
 Every link in a tracked README (the root's and each crate's) that starts with
 `https://hole.readthedocs.io/en/latest/` must be the site root or `<page>.html`,

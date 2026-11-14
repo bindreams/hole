@@ -1,7 +1,7 @@
 //! Tauri ships each plugin as an npm/crate pair, and `npx tauri build` refuses
 //! to build when the two sides disagree on major.minor. Both are floating
 //! requirements resolved by different lockfiles, so a bump on one side alone is
-//! invisible until a bundle build runs — see the DMG break in #679.
+//! invisible until a bundle build runs.
 
 use std::collections::BTreeMap;
 

@@ -39,7 +39,7 @@ import _lib
 # so a newer release's file still works.
 STATE_FILE_NAME = "bridge-routes.json"
 # Keep in sync with `crates/bridge/src/dns_state.rs::STATE_FILE_NAME` /
-# `SUPERSEDED_FILE_NAME`. The bridge's own upgrade sweep (bindreams/hole#846)
+# `SUPERSEDED_FILE_NAME`. The bridge's own upgrade sweep
 # evaluates `DNS_STATE_FILE_NAME` at most once: on full success it deletes
 # the file, otherwise it renames it to `DNS_STATE_SUPERSEDED_FILE_NAME` and
 # never reads that name again. This script reads BOTH so the escape survives

@@ -388,7 +388,7 @@ jobs:
 // ===== steps_without_literal_timeout =================================================================================
 
 /// A step with no bound runs to the job wall, and a wall that fires destroys
-/// the step's log (#989), so every step — `uses:` ones included — declares one.
+/// the step's log, so every step — `uses:` ones included — declares one.
 #[skuld::test]
 fn steps_without_a_literal_timeout_are_named() {
     let ci = r#"

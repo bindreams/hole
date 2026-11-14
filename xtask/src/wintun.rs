@@ -52,7 +52,7 @@ fn ensure_windows(repo_root: &Path) -> Result<PathBuf> {
         // to re-download.
     }
 
-    // Ceiling against a runaway server; the zip is ~0.4 MiB.
+    // Size ceiling against a runaway server.
     let zip_data = crate::download::fetch_verified("wintun.dll", WINTUN_URL, 16 * 1024 * 1024, WINTUN_ZIP_SHA256)?;
 
     // Extract wintun.dll from zip — the layout inside the zip is

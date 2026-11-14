@@ -17,10 +17,6 @@
 //! that is a destination that is a running image (`ERROR_ACCESS_DENIED`), open without
 //! share-delete access (`ERROR_SHARING_VIOLATION`) or delete-pending (`ERROR_ACCESS_DENIED`);
 //! a read-only destination is replaced.
-//!
-//! This logic was previously duplicated in
-//! `msi-installer/src/msi_installer/__init__.py:link_or_copy()` and (via
-//! `shutil.copy2`) in the late `scripts/dev.py`. See issue #143.
 
 use std::io::{self, ErrorKind};
 use std::path::Path;

@@ -4,7 +4,7 @@ Reads the mounted volume's `.DS_Store`. dmgbuild writes it directly (no Finder),
 so this is deterministic: any drift means the builder or the shared `layout`
 constants regressed. Expected values come from `dmg_installer.layout` — the same
 module the builder used — so this proves "artifact matches config", not "matches
-a number typed twice". Guards issue #609.
+a number typed twice".
 """
 
 import re

@@ -120,25 +120,17 @@ pub(super) fn handle_conflict(
         unresolved.push(path.clone());
     }
 
-    // Final safety net for a go.sum that never itself appeared in
-    // `conflicted` at all — `resolve_to_theirs`'s own go.sum/go.mod
-    // coupling check (inside the loop above) only runs when go.sum is
-    // itself a conflict this module resolves. If go.mod WAS a conflict
-    // this run and this module explicitly resolved it to upstream's exact
-    // content (`auto_resolved`, not merely "happens to match upstream" —
-    // a go.mod this run never touched at all is not this module's
-    // business to second-guess), while go.sum never conflicted at all
-    // (git's own clean 3-way merge silently kept downstream's now-stale
-    // content) and no longer matches upstream, nothing else here would
-    // catch the resulting inconsistent pair. Unlike go.mod's `replace`
-    // directives, go.sum has no independently meaningful downstream
-    // content to preserve — it's purely a derived artifact of go.mod's
-    // requirements — so it's realigned to upstream directly (the same
-    // "take theirs" resolution a real conflict on it would get) rather
-    // than reported as `unresolved` — there's no conflict-marker state for
-    // a human to act on, and `force_commit_conflicted`'s own hard guard
-    // (real unmerged paths required) would refuse a worktree whose only
-    // flagged problem is this.
+    // Safety net for a go.sum that never appeared in `conflicted`:
+    // `resolve_to_theirs`'s go.sum/go.mod coupling check only runs when go.sum
+    // itself conflicts. If this run resolved go.mod to upstream's content
+    // (`auto_resolved`; a go.mod this run never touched is not this module's
+    // business) while git's clean merge kept a stale downstream go.sum, nothing
+    // else would catch the inconsistent pair. go.sum is a derived artifact of
+    // go.mod with no downstream content worth preserving, so it is realigned to
+    // upstream (the "take theirs" a real conflict on it would get) rather than
+    // reported as `unresolved`: there is no conflict-marker state for a human to
+    // act on, and `force_commit_conflicted`'s guard (real unmerged paths
+    // required) would refuse a worktree whose only problem is this.
     if auto_resolved.iter().any(|p| p.as_str() == "go.mod")
         && !auto_resolved.iter().any(|p| p.as_str() == "go.sum")
         && !unresolved.iter().any(|p| p.as_str() == "go.sum")

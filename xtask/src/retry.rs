@@ -76,7 +76,7 @@ pub fn requested_wait(err: &anyhow::Error) -> Option<Duration> {
     err.downcast_ref::<RetryAfter>().map(|r| r.0)
 }
 
-/// Backoff between attempts: 1 s, doubling to a 30 s ceiling, with jitter.
+/// Exponential backoff between attempts, with a delay ceiling and jitter, and no attempt limit.
 fn backoff() -> ExponentialBuilder {
     ExponentialBuilder::default()
         .with_max_delay(Duration::from_secs(30))
