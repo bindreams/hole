@@ -7,8 +7,8 @@ pub const RECOVERY_DIALOG_TITLE: &str = "Settings could not be loaded";
 
 /// Native-dialog body for a config-recovery event. Paths are allowed here:
 /// this is a local native dialog, not a toast (CONTRIBUTING.md "Console relay
-/// and toasts"); the user needs to know where the backup is. The underlying
-/// parse/IO error text stays in `gui.log`.
+/// and toasts"); the user needs to know where the backup is. `gui.log` gets a
+/// parse error's kind, line and column, and an I/O error's text.
 pub fn recovery_dialog_message(recovery: &ConfigRecovery) -> String {
     match &recovery.backup {
         Ok(bak) => format!(

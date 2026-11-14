@@ -29,8 +29,9 @@
 //! Install is fatal ([`routing::setup_routes`] returns `Err` on the first
 //! command that does not exit zero and is marked fatal — see
 //! [`routing::SetupCommand`]); teardown and crash recovery are best-effort
-//! (`routing::teardown_routes` returns a `routing::CleanupReport` and has
-//! no error channel at all). See the "Execution" section of [`routing`].
+//! (`routing::teardown_routes` returns the ids still believed installed and has
+//! no error channel at all). See the "Execution" section of [`routing`] and
+//! `docs/contributing/architecture/route-failure-policy.md`.
 //! Reporting routes that were never installed is a leak; stopping cleanup at
 //! the first failure strands routes.
 
