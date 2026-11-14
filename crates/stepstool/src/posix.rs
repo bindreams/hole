@@ -1,5 +1,4 @@
 //! POSIX side: sudo credential priming and sudo-wrapped command construction.
-//! Adapted from PR #456's `xtask/src/privilege/posix.rs` (`prime_sudo`).
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -30,7 +29,7 @@ pub enum PrimeSudoError {
 /// is available). We deliberately do NOT gate on `isatty(stdin)`: under
 /// `cargo xtask run hole` the orchestrator spawns dev-console with
 /// stdin = /dev/null, so a stdin check is always false even from an
-/// interactive shell (bindreams/hole#567).
+/// interactive shell.
 pub fn prime_sudo() -> Result<(), PrimeSudoError> {
     prime_sudo_with(Path::new("sudo"))
 }
@@ -69,10 +68,9 @@ pub fn prime_sudo_with(sudo: &Path) -> Result<(), PrimeSudoError> {
 /// stdin does not prevent that, since sudo reads the password from the
 /// terminal and not from stdin.
 ///
-/// Library surface: no in-repo consumer exercises this yet (dev-console
-/// builds its argv via its own policy layer for exact-pin testability);
-/// it exists for external consumers and the planned `elevated:`-flag
-/// revival (bindreams/hole#453).
+/// Library surface: no in-repo consumer uses this (dev-console builds its
+/// argv via its own policy layer, for exact-pin testability); it exists for
+/// external consumers and the `elevated:` flag tracked at bindreams/hole#453.
 pub fn sudo_command(program: impl AsRef<OsStr>, preserve_env: &[&str]) -> Command {
     #[allow(clippy::disallowed_methods)]
     // runs as the invoking developer, who elevates via their own `sudo` on PATH; no privilege gain

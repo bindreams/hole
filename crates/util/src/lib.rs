@@ -5,7 +5,7 @@
 //!   another principal can write.
 //! - [`error`] — walks over an error's causes (`chain`, `links`) and
 //!   predicates over them (`find`, `raw_os_error`).
-//! - [`ownership`] — generic `chown(2)` primitive (macOS; a no-op elsewhere).
+//! - [`ownership`] — generic `lchown(2)` primitive (macOS; a no-op elsewhere).
 //! - [`parse_error`] — content-safe classification of a `serde_json` parse
 //!   failure, so an error that quotes its input never reaches a log.
 //! - [`port_alloc`] — ephemeral port allocation with multi-transport
@@ -19,7 +19,7 @@
 //!   directory.
 //! - [`syn_budget`] — a TCP connect whose SYN-retransmission budget is
 //!   chosen deliberately, so a refusal-vs-timeout verdict is observable on
-//!   Windows without racing the OS's own ~2 s refusal cost.
+//!   Windows without racing the OS's own refusal cost.
 //! - [`versioned_file`] — one type for every state file read back across a
 //!   restart: ordered migration chain, one rule for a file it cannot read.
 //!

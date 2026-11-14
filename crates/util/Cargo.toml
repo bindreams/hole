@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 license = "Apache-2.0"
-description = "Small cross-platform workspace utilities (ephemeral port allocation, retry-with-backoff). Apache-2.0 so both Hole's GPL crates and the Apache plugin world (garter/galoshes/plugin-e2e) can depend on it without license friction."
+description = "Small cross-platform workspace utilities (directory handles, versioned state files, redaction, port allocation, retry). Apache-2.0 so both Hole's GPL crates and the Apache plugin world (garter/galoshes/plugin-e2e) can depend on it without license friction."
 
 [lints]
 workspace = true

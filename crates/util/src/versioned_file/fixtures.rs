@@ -349,8 +349,8 @@ impl VersionedState for MaxVersionFile {
     const ROLE: Role = Role::Config;
 }
 
-/// The calls the older tests spell, each as one `update` or `observe`, so they keep asserting the same behaviours on
-/// the single write path.
+/// One-call shorthands for a single `update` or `observe`, so a test states the behaviour it checks without the
+/// closure.
 pub(crate) trait UpdateShortcuts<S: VersionedState> {
     fn store(&self, value: &S, place: &dyn Placement) -> Result<(), StoreError>;
     fn remove(&self) -> std::io::Result<UpdateOutcome>;

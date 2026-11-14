@@ -26,22 +26,18 @@
 //!   itself so it can be judged and read (`FSCTL_GET_REPARSE_POINT`). Present in
 //!   every NT version; any other kind of reparse point is refused.
 //!
-//! A link is followed under the ownership-transition rule (see `trail` and
-//! `docs/contributing/architecture/privileged-folders.md`): the walk never
-//! moves from a folder an unprivileged user owns into one somebody else owns.
-//! Links the system owns (unix: root; Windows: SYSTEM, Administrators,
+//! A link is followed under the ownership-transition rule (see `trail`): the walk
+//! never moves from a folder an unprivileged user owns into one somebody else
+//! owns. Links the system owns (unix: root; Windows: SYSTEM, Administrators,
 //! TrustedInstaller) stay trusted, which keeps macOS's `/var`, `/tmp` and `/etc`
 //! (and with them `temp_dir()`) working; a user's link to a folder that user owns
 //! is followed (a profile moved to another disk); a user's link to a folder the
-//! system or another account owns is refused. A walk follows at most as many links
-//! as the OS itself follows in one path (Linux 40, macOS 32, Windows 63), which
-//! also refuses a loop; a link met again after its target was walked counts again.
-//! A folder the walk makes below a user's link is given to that user, so the next walk
-//! through the link finds it theirs. Unix opens the made name once, requires the
-//! handle to be a directory the process itself owns (the user can swap the name
-//! after the `mkdirat`) and `fchown`s that handle; Windows sets the owner, which needs
-//! the restore privilege an elevated token holds. The final name of a file operation
-//! is never followed.
+//! system or another account owns is refused. The walk follows at most as many
+//! links as the OS itself does in one path (`MAX_LINKS`), which also refuses a
+//! loop; a link met again after its target was walked counts again (`Trail`'s
+//! `followed`). A folder it makes below a user's link is given to that user. The
+//! final name of a file operation is never followed. The rule, the bound and the
+//! hand-over are in `docs/contributing/architecture/privileged-folders.md`.
 //!
 //! Given an `owner` (unix ids), the final directory must be owned by it or by
 //! this process; any other owner is refused. Windows has no unix ids and does not

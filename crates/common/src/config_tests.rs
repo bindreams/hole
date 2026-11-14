@@ -6,8 +6,7 @@ use super::*;
 use skuld::temp_dir;
 use std::path::Path;
 
-/// Load via the production loader (`ConfigStore`), asserting a clean load —
-/// `AppConfig::load` was removed in #467 (quarantine made it production-dead).
+/// Load via the production loader (`ConfigStore`), asserting a clean load.
 fn load(path: &Path) -> AppConfig {
     let now = time::macros::datetime!(2026-06-10 14:23:05 UTC);
     let (_, config, recovery) = crate::config_store::ConfigStore::load(path.to_path_buf(), now);
@@ -49,7 +48,7 @@ fn load_valid_json_roundtrips(#[fixture(temp_dir)] dir: &Path) {
     assert_eq!(original, loaded);
 }
 
-// Corrupt-input behavior now lives in `config_store_tests.rs`
+// Corrupt-input behavior is tested in `config_store_tests.rs`
 // (`corrupt_json_is_quarantined_to_timestamped_bak` and friends).
 
 // Error labeling + redaction ------------------------------------------------------------------------------------------
@@ -426,7 +425,7 @@ fn deserialize_old_config_without_new_fields_uses_defaults() {
 fn deserialize_ignores_removed_start_on_login_key() {
     // An on-disk config written by an older build still carries start_on_login.
     // AppConfig has no deny_unknown_fields, so the now-unknown key is ignored
-    // rather than failing the load (#457 removed the field).
+    // rather than failing the load.
     let json = r#"{"servers": [], "local_port": 4073, "enabled": false, "start_on_login": true}"#;
     let config: AppConfig = serde_json::from_str(json).unwrap();
     assert_eq!(config.local_port, 4073);
@@ -753,10 +752,9 @@ fn password_dump_renders_as_a_secret() {
     assert!(rendered.contains("REDACTED"), "{rendered}");
 }
 
-/// `#[serde(transparent)]` is what makes the newtype a pure refactor: the
-/// config file and the IPC wire keep the bare string they carried before, so
-/// this step needs no migration and a bridge of either vintage still parses
-/// the other's `ProxyConfig`.
+/// `#[serde(transparent)]` keeps the on-disk and on-the-wire form a bare
+/// string, so a bridge of either vintage still parses the other's
+/// `ProxyConfig`.
 #[skuld::test]
 fn password_json_form_is_a_bare_string() {
     let entry = secret_entry();

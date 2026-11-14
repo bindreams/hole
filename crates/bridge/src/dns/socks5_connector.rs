@@ -6,12 +6,10 @@
 //! SOCKS5 CONNECT, then treat the resulting stream as a bare TCP pipe.
 //!
 //! UDP (PlainUdp) uses a hand-rolled SOCKS5 UDP ASSOCIATE per RFC 1928,
-//! since `tokio-socks` has no UDP helper. The shadowsocks listener can only
-//! relay UDP when the configured plugin supports it (e.g. galoshes, not
-//! plain v2ray-plugin). For TCP-only plugins the ASSOCIATE command fails at
-//! the SS listener; the forwarder surfaces this as an [`io::Error`] and
-//! logs it through its per-server throttle
-//! ([`super::forwarder::DnsForwarder`]).
+//! since `tokio-socks` has no UDP helper. The listener always answers the
+//! ASSOCIATE (its SOCKS5 instance is `TcpAndUdp`). With a TCP-only plugin the
+//! datagrams are lost, so the query goes unanswered until the attempt's budget
+//! fires ([`super::forwarder::DnsForwarder`]).
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

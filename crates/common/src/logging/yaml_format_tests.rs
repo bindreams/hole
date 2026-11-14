@@ -82,7 +82,7 @@ fn smoke_demo_visual() {
     }
 }
 
-// Spike ===============================================================================================================
+// yaml_serde multi-line scalars =======================================================================================
 
 // Confirm yaml_serde emits a `|` block scalar for multi-line strings (instead
 // of a quoted string with escaped `\n`). This assumption underpins the whole

@@ -22,7 +22,6 @@ impl Drop for OwnedHandle {
 }
 
 #[derive(Debug, thiserror::Error)]
-// Verbatim scripts/_lib.py require_elevation message (exact strings preserved).
 #[error("this script must run from an elevated PowerShell/terminal.")]
 pub struct NotElevated;
 

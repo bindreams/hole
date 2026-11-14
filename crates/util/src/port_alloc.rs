@@ -8,10 +8,8 @@
 //! port in the same loop iteration, retrying the whole (allocate, bind)
 //! cycle on [`is_bind_race`] errors. The retry is unbounded — the only
 //! terminations are success or a non-bind-race error. There is no
-//! "attempts budget"; the OS allocator covers ~28K ephemeral ports and
-//! a fixed retry cap would either mask real saturation (if too high) or
-//! flake on transient excluded-range pressure (if too low). See
-//! bindreams/hole#300.
+//! "attempts budget": a fixed retry cap would either mask real saturation
+//! (if too high) or flake on transient excluded-range pressure (if too low).
 //!
 //! Consumers across the workspace route through `bind_ephemeral`:
 //!
@@ -215,10 +213,9 @@ async fn probe_bind(addr: SocketAddr, transport: Protocols) -> io::Result<u16> {
 /// independently and per-call state should be created inside the
 /// closure rather than carried across attempts.
 ///
-/// Logging: per-iteration `debug!`; `info!` at adaptive milestones (10,
-/// 20, 50, 100, 200, 500, 1000, then every 1000 attempts). Total log
-/// volume is O(log n) regardless of how long the loop runs. No
-/// exhaustion warn — there is no exhaustion.
+/// Logging: per-iteration `debug!`; `info!` at the milestones
+/// [`is_log_milestone`] names. Total log volume is O(log n) regardless of how
+/// long the loop runs. No exhaustion warn — there is no exhaustion.
 pub async fn bind_ephemeral<T, F, Fut>(ip: IpAddr, protocols: Protocols, op: F) -> io::Result<(u16, T)>
 where
     F: Fn(u16) -> Fut,
@@ -287,12 +284,7 @@ where
 /// should expect proportional volume. `info!` volume is O(log n) by
 /// construction via [`is_log_milestone`], so default-log-level
 /// observability stays bounded regardless of loop length.
-///
-/// Milestones: 10, 20, 50, 100, 200, 500, 1000, then every 1000.
 fn emit_retry_log(attempt: u64, ip: IpAddr, protocols: Protocols, err: &io::Error, msg: &'static str) {
-    // The first attempt is the happy path entry; we only enter this
-    // function on retries (attempt >= 1 after a failure), so the
-    // smallest value we ever see is 1.
     debug!(
         target: "util::port_alloc",
         attempt = attempt,
