@@ -489,7 +489,7 @@ fn stopping_a_session_that_does_not_exist_is_not_a_warning() {
 /// Exercises [`abandon_session_on_thread_spawn_failure`], the exact cleanup
 /// `start_consumer_named` runs on a processing-thread spawn failure — the
 /// only other `UserTrace` lifetime site in this file, with no `EtwGuard` to
-/// own the by-name backstop (module doc "Drain on Drop", and see the
+/// own the by-name backstop (`EtwGuard`'s "Drain on Drop", and see the
 /// function's own doc comment).
 ///
 /// A real `std::thread::Builder::spawn` failure needs OS-level resource
