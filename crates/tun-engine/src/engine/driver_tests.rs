@@ -322,9 +322,10 @@ async fn a_half_closing_router_still_receives_the_clients_final_bytes() {
     assert_eq!(out[0].ack, Some(TcpSeqNumber(1001 + 100 + 1)));
 }
 
-/// The router task ended and dropped its flow, so nothing can be delivered.
-/// Bytes still in `rx_buffer` at removal are acknowledged and then dropped,
-/// which this test does not cover.
+/// The router task ended and dropped its flow, so the client's final bytes cannot
+/// be delivered. Pins that they stay in `rx_buffer` through `relay_tcp_data`, and
+/// that `cleanup_finished_connections` still emits the ACK covering them and the
+/// FIN before removing the socket: they are acknowledged, then dropped.
 #[skuld::test]
 async fn a_dropped_router_leaves_the_clients_final_bytes_undelivered() {
     let (dropped_tx, dropped_rx) = oneshot::channel();
@@ -363,7 +364,7 @@ async fn a_dropped_router_leaves_the_clients_final_bytes_undelivered() {
     assert_eq!(
         out.len(),
         1,
-        "the ACK still leaves — this fix's remaining cost, confined to route B"
+        "the ACK covering the undelivered bytes and the FIN still reached the wire before removal"
     );
     assert_eq!(out[0].ack, Some(TcpSeqNumber(1001 + 100 + 1)));
 }

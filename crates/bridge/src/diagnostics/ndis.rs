@@ -33,7 +33,7 @@
 //! (Get-NetAdapter*), Hyper-V WMI (Get-VMSwitchExtension), and PnP
 //! (pnputil). Direct Win32 bindings would require pulling in multiple
 //! COM / WMI / IOCTL surfaces. Shelling PowerShell gives structured
-//! string output that is easy to grep for the watch-list strings. Performance is not a concern — snapshots fire
+//! string output that is easy to grep for the watch-list strings. Snapshots fire
 //! once per bridge lifecycle event, not in a hot path.
 //!
 //! [`Get-NetAdapter -IncludeHidden`]: https://learn.microsoft.com/en-us/powershell/module/netadapter/get-netadapter

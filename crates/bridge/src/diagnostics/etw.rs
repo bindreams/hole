@@ -15,15 +15,12 @@
 //! # Architecture
 //!
 //! 1. [`start_consumer`] runs once at bridge startup, after the crash-recovery
-//!    snapshots. It sweeps stale `hole-bridge-etw-*` sessions a crashed bridge
-//!    left ([`sweep_stale_sessions`]); builds three `ferrisetw::Provider`s with
-//!    every keyword enabled (high-volume events are dropped in userspace by
-//!    [`HIGH_VOLUME_TCPIP_EVENTS`], because a kernel keyword mask would also hide
-//!    events 1004 and 1077; see [`TCPIP_KEYWORDS`]); starts a
-//!    [`ferrisetw::UserTrace`] session named `hole-bridge-etw-<pid>` with a
-//!    widened buffer to absorb the event volume; spawns a thread that runs
-//!    `process_from_handle` and the per-event callback; and returns an
-//!    [`EtwGuard`] owning the session and the thread.
+//!    snapshots, and returns an [`EtwGuard`] owning the `hole-bridge-etw-<pid>`
+//!    session and its processing thread. Every provider keyword is enabled and
+//!    high-volume events are dropped in userspace by [`HIGH_VOLUME_TCPIP_EVENTS`],
+//!    because a kernel keyword mask would also hide events 1004 and 1077 (see
+//!    [`TCPIP_KEYWORDS`]); the session buffer is widened to absorb the event
+//!    volume.
 //! 2. The callback ([`handle_event`]) filters by `process_id`, extracts a
 //!    shape-only [`ParsedFields`], calls the pure [`dispatch`], and translates
 //!    the returned [`Emission`] into a `tracing::event!`.
@@ -35,12 +32,9 @@
 //!    evidence the session is gone, quiet enough not to re-flood.
 //! 4. [`EtwGuard::drop`] stops and joins the timer thread, reads the statistics
 //!    one last time, then stops the session ([`EtwGuard::stop_session`]). If the
-//!    kernel confirmed the session reclaimed, `Drop` joins the processing thread
-//!    so the callback drains its queue. If not, it logs a `warn!` and detaches
-//!    the thread (see [Drain on Drop](#drain-on-drop)). Stopping the timer thread
-//!    first guarantees no periodic query is in flight when the session stops, so
-//!    the two `query_session_stats` callers never race the teardown and need no
-//!    lock.
+//!    kernel confirmed the session reclaimed, it joins the processing thread so
+//!    the callback drains its queue; otherwise it detaches the thread (see
+//!    [Drain on Drop](#drain-on-drop)).
 //!
 //! Each stats query reports `EventsLost`, `BuffersWritten`, `LogBuffersLost` and
 //! `RealTimeBuffersLost`. Nonzero loss in any of the three loss counters
@@ -476,15 +470,15 @@ fn start_consumer_named(
     start_consumer_named_with_spawn(session_name, interval, on_tick, |builder, body| builder.spawn(body))
 }
 
-/// Same as [`start_consumer_named`], with the processing-thread spawn call
-/// itself substitutable. Production goes through `start_consumer_named`,
-/// which fills `spawn_processor` with `std::thread::Builder::spawn`; a test
-/// fills it with a closure that returns `Err`, so it can drive
-/// `start_consumer_named`'s own thread-spawn failure arm — the `drop(trace)`
-/// ordering plus [`abandon_session_on_thread_spawn_failure`] below — at the
-/// real call site, rather than calling `abandon_session_on_thread_spawn_failure`
-/// directly (see `thread_spawn_failure_stops_the_orphaned_session`'s doc
-/// comment for why that alone doesn't pin this call site).
+/// Same as [`start_consumer_named`], with the processing-thread spawn call itself
+/// substitutable. Production goes through `start_consumer_named`, which fills
+/// `spawn_processor` with `std::thread::Builder::spawn`; a test fills it with a
+/// closure that returns `Err`, so it can drive `start_consumer_named`'s own
+/// thread-spawn failure arm (the `drop(trace)` ordering plus
+/// [`abandon_session_on_thread_spawn_failure`]) at the real call site, rather than
+/// calling `abandon_session_on_thread_spawn_failure` directly (see
+/// `thread_spawn_failure_stops_the_orphaned_session`'s doc comment for why that
+/// alone doesn't pin this call site).
 fn start_consumer_named_with_spawn(
     session_name: String,
     interval: Duration,

@@ -183,7 +183,9 @@ impl Dispatcher {
             match set_interface_metric(luid, TUNNEL_INTERFACE_METRIC, Family::V6) {
                 Ok(MetricOutcome::Applied) => {}
                 Ok(MetricOutcome::NoInterfaceRow) => {
-                    warn!("hole-tun has no IPv6 interface row after the device's wait for it; IPv6 metric not set (the device's Ipv6StackAbsent verdict, contested: bindreams/hole#1301)");
+                    // The device's wait for the row ended in its `Ipv6StackAbsent`
+                    // verdict, which bindreams/hole#1301 contests.
+                    warn!("hole-tun has no IPv6 interface row after the device's wait for it; IPv6 metric not set");
                 }
                 Err(e) => {
                     return Err(

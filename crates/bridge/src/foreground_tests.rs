@@ -16,12 +16,11 @@ use tun_engine::{RoutingError, TunIdentity};
 
 #[skuld::test]
 fn sweep_wiring_reports_and_deletes_bridge_marker() {
-    // This test asserts that
-    // the bridge crate can reach `tombstone::sweep` and that the sweep
-    // CONTRACT (breadcrumb + marker deletion) holds in the bridge's tracing
-    // context. It does NOT assert that foreground.rs / macos.rs / windows.rs
-    // actually CALL sweep at the right point in the startup sequence — that
-    // PLACEMENT is verified by code review, exactly as the sibling
+    // This test asserts that the bridge crate can reach `tombstone::sweep` and that
+    // the sweep CONTRACT (breadcrumb + marker deletion) holds in the bridge's
+    // tracing context. It does NOT assert that foreground.rs / macos.rs /
+    // windows.rs actually CALL sweep at the right point in the startup sequence;
+    // that PLACEMENT is verified by code review, exactly as the sibling
     // recover_dns_config call placement is likewise untested (the entry-point
     // bodies block on server.run()).
     //

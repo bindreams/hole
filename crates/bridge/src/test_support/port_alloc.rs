@@ -29,14 +29,11 @@ use util::port_alloc::{self, Protocols};
 /// `PORT_ALLOC`-serialized fixtures don't race each other for the same
 /// port.
 ///
-/// Callers must declare the right `protocols` set: a TCP-only probe
-/// followed by a TCP+UDP bind invites the Windows independent
-/// excluded-port-range race: `util::port_alloc` verifies a port against every
-/// transport in `protocols` (the check `free_port` shares with
-/// `bind_ephemeral`), and only those. For SOCKS5
-/// listener ports use `Protocols::TCP | Protocols::UDP` (the bridge
-/// SOCKS5 listener is structurally `Mode::TcpAndUdp`); for HTTP CONNECT
-/// listener ports use `Protocols::TCP`.
+/// Callers must declare the right `protocols` set: only the transports named are
+/// checked for a free port, so a TCP-only probe followed by a TCP+UDP bind can hit
+/// the Windows excluded-port-range race. For SOCKS5 listener ports use
+/// `Protocols::TCP | Protocols::UDP` (the bridge SOCKS5 listener is structurally
+/// `Mode::TcpAndUdp`); for HTTP CONNECT listener ports use `Protocols::TCP`.
 ///
 /// Direct delegation to `free_port` is suppressed-disallowed (see
 /// workspace `clippy.toml`) — this helper is the explicit exception

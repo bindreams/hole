@@ -213,18 +213,18 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 /// Disengage a standing lockdown cover and clear the persisted intent, with no
 /// running bridge required.
 ///
-/// The escape hatch must disengage or FAIL LOUD. In order, it records the target
-/// off, disengages, clears the auto-connect candidate and records the intent
-/// off; the first failure returns. A failed disengage therefore leaves the
-/// target off, the cover engaged and the intent on. A swallowed failure (e.g.
-/// run unprivileged) would instead leave the cover engaged, egress still
-/// blocked, while the intent reads "off".
+/// The escape hatch must disengage or FAIL LOUD. A failed disengage returns the
+/// error and leaves the target off, the cover engaged and the intent on; a
+/// swallowed failure (e.g. run unprivileged) would instead leave the cover
+/// engaged, egress still blocked, while the intent reads "off".
 ///
-/// Refuses against a live bridge instance: a running bridge reconciles the target
-/// itself, and the state files' own locks are in-process only, so racing it from
-/// a CLI invocation would be a two-writer hazard. The exclusion is structural,
-/// not a point-in-time probe (see [`unlock_with`]). The refusal names the in-app
-/// "Unblock Network" action, the live-bridge equivalent.
+/// Refuses while a bridge is running on the service state dir
+/// ([`service_state_dir`]): a running bridge reconciles the target itself, and the
+/// state files' own locks are in-process only, so racing it from a CLI invocation
+/// would be a two-writer hazard. The refusal names the in-app "Unblock Network"
+/// action, the live-bridge equivalent. A foreground `hole bridge run` on another
+/// state dir (its default is the per-user one) is not seen:
+/// bindreams/hole#1214.
 ///
 /// **`Ok` is qualified, and the caller must surface it.** The returned
 /// [`Clearance`] is what the disengage could not prove (on Windows, the two
@@ -241,12 +241,12 @@ pub fn unlock() -> std::io::Result<Clearance> {
 /// the cannot-disengage path without touching the host firewall.
 ///
 /// Liveness check, target off, disengage, clear the auto-connect candidate,
-/// intent off. The target is recorded off before the release call, so a
-/// reconciler reading it mid-unlock never sees a stale `Connected`; the intent
-/// flips off only after the disengage confirms success.
+/// intent off; the first failure returns. The target is recorded off before the
+/// release call, so a reconciler reading it mid-unlock never sees a stale
+/// `Connected`; the intent flips off only after the disengage confirms success.
 ///
 /// The liveness check is [`crate::liveness::BridgeLiveness::try_acquire`] on the
-/// lock a running bridge holds for its whole lifetime, and it is held across the
+/// lock a bridge on `state_dir` holds for its whole lifetime, and it is held across the
 /// whole sequence rather than released after the check. A point-in-time probe
 /// could go stale before the first mutation, letting a bridge that starts
 /// mid-unlock have its live cover restored away and its intent flipped off
@@ -283,9 +283,11 @@ fn unlock_with(
 /// Wider than [`unlock`], which disengages only the standing cover. Like
 /// [`unlock`] it REFUSES against a live bridge instance, so no in-process posture
 /// is left claiming a cover that no longer exists (`release_covers_with` names
-/// which state dirs it probes). Any running bridge, the service or a foreground
-/// `hole bridge run`, makes the call refuse, so a caller stops the service
-/// first: the MSI runs `bridge uninstall --keep-covers` before its separate
+/// which state dirs it probes). The refusal is best-effort: a peer state dir whose
+/// lock cannot be probed is warned about and skipped, and other accounts' dirs
+/// are not probed when enumerating profiles or looking up the real user fails
+/// (bindreams/hole#1326). A caller therefore stops the service first: the MSI
+/// runs `bridge uninstall --keep-covers` before its separate
 /// `bridge release-covers` action.
 ///
 /// Only the target write and the release itself abort the call: the MSI runs it

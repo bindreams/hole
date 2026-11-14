@@ -63,7 +63,7 @@ const ON_STARTUP_HEADER: &str = "x-hole-on-startup";
 
 /// Read the startup preference from a request's `X-Hole-On-Startup` header.
 /// A genuinely absent header — an older client that doesn't know about it,
-/// or the CLI, which has no preference to push (#979) — reads `None`: the
+/// or the CLI, which has no preference to push — reads `None`: the
 /// bridge keeps whatever preference (if any) it already has, rather than
 /// stomping it with the wire default. A present-but-garbled value still
 /// fails safe to the default.
@@ -491,11 +491,11 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     hole_common::logging::redact_arm::arm_server(&config.server);
     let attempt_id = attempt_id_from(&headers);
     let on_startup = on_startup_from(&headers);
-    // No wire signal for "covered" reaches this handler (bindreams/hole#979;
-    // see `hole_common::protocol::BridgeRequest::Start`'s doc for why the GUI
-    // stopped asserting it). Every start this HTTP handler sees is
-    // client-initiated (a manual connect, or the elevation re-exec of one). The
-    // bridge's boot-time reconciliation (`reconcile_once`) calls `ProxyManager`
+    // No wire signal for "covered" reaches this handler (see
+    // `hole_common::protocol::BridgeRequest::Start`'s doc for why the GUI stopped
+    // asserting it). Every start this HTTP handler sees is client-initiated (a
+    // manual connect, or the elevation re-exec of one). The bridge's boot-time
+    // reconciliation (`reconcile_once`) calls `ProxyManager`
     // directly and starts `Uncovered` too, so no production path builds
     // `Coverage::Covered`.
     let coverage = Coverage::Uncovered;
@@ -584,9 +584,9 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
 /// - `on_startup` is a GUI-pushed preference, not a record of what happened —
 ///   when `Some`, it is written on every attempt regardless of `succeeded`,
 ///   same as the GUI would push a Settings change whether or not the tunnel
-///   is up. `None` means the caller (the CLI, which has no Settings to push,
-///   #979) pushed nothing: the persisted preference is left exactly as it
-///   was, never stomped down to the wire default.
+///   is up. `None` means the caller (the CLI, which has no Settings to push)
+///   pushed nothing: the persisted preference is left exactly as it was, never
+///   stomped down to the wire default.
 /// - The target and the preference's `candidate` (the config
 ///   `resolve_startup_target`'s `AlwaysConnect` arm falls back on) both
 ///   record what actually happened, so they are gated on `succeeded`
@@ -1606,12 +1606,8 @@ pub(crate) fn write_installer_user_sid(dir: &Path, sid: &str) -> std::io::Result
 /// Windows: detects error code 1379) and `group::add_user_to_group`
 /// is idempotent (macOS: `dseditgroup -o edit -a` is naturally
 /// idempotent; Windows: detects error code 1378). The SID file write
-/// unconditionally replaces the file. No test asserts its effects (the group
-/// membership, the SID file's creation by this call). It does run end to end in
-/// the installer lanes (the MSI's `bridge install` custom action, and `hole bridge
-/// install` in the macOS DMG install test). The MSI lane checks only that the
-/// service is registered, the DMG lane also that the bridge answers; neither
-/// checks the group or the SID file.
+/// unconditionally replaces the file. No unit test asserts its effects; it runs
+/// only end to end in the installer lanes.
 pub fn prepare_ipc_access() -> std::io::Result<()> {
     crate::group::create_group()?;
     let user = crate::group::installing_username()?;
