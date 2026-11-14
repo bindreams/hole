@@ -5,11 +5,9 @@ import (
 	"testing"
 )
 
-// flagSnapshot captures every package-level flag parseOptsIntoFlags can
-// write, so a test can restore the exact pre-call state regardless of which
-// keys its SS_PLUGIN_OPTIONS happens to touch. `version` is the only
-// declared flag (config.go) parseOptsIntoFlags never writes, so it is
-// excluded.
+// flagSnapshot captures every package-level flag parseOptsIntoFlags can write, so
+// a test can restore the pre-call state whichever keys it touches. `version` is
+// the only declared flag it never writes.
 type flagSnapshot struct {
 	mode, host, path, cert, certRaw, key, logLevel, echMode, echDoh string
 	localAddrV, localPortV, remoteAddrV, remotePortV                string
@@ -35,11 +33,10 @@ func (s flagSnapshot) restore() {
 	*tlsEnabled, *server, *fastOpen, *vpn = s.tlsEnabledV, s.serverV, s.fastOpenV, s.vpnV
 }
 
-// withEnv snapshots every flag, THEN sets env; t.Cleanup restores the
-// snapshot. t.Cleanup callbacks run after the calling test function's own
-// defers, so a caller that also mutates a flag manually must do so AFTER
-// this call and rely on this snapshot's restore rather than a separate
-// defer -- two independent restore mechanisms race, and this one runs last.
+// withEnv snapshots every flag, then sets the SS_* env; t.Cleanup restores the
+// snapshot. Cleanups run after the test function's own defers, so a caller that
+// also changes a flag must do so after this call and rely on this restore, not a
+// separate defer.
 func withEnv(t *testing.T, pluginOptions string) {
 	t.Helper()
 	snap := snapshotFlags()
@@ -55,10 +52,9 @@ func withEnv(t *testing.T, pluginOptions string) {
 	}
 }
 
-// withDistinctEnv sets the four SS_* vars to values that differ from every
-// flag default (127.0.0.1/1984 local, 127.0.0.1/1080 remote), so a test
-// cannot pass by silently falling back to defaults instead of actually
-// wiring the SS_*-derived values.
+// withDistinctEnv sets the four SS_* vars to values that differ from every flag
+// default, so a test cannot pass by falling back to defaults instead of wiring
+// the SS_*-derived values.
 func withDistinctEnv(t *testing.T, pluginOptions string) {
 	t.Helper()
 	snap := snapshotFlags()
@@ -89,7 +85,7 @@ func TestParseOptsIntoFlagsRejectsMalformedOptions(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			before := snapshotFlags() // captured pre-call, compared below -- proves "untouched", not just "equals a hardcoded literal"
+			before := snapshotFlags() // compared below, so "untouched" is shown against the pre-call state
 			withDistinctEnv(t, c.opts)
 			err := parseOptsIntoFlags()
 			if err == nil {
@@ -108,11 +104,9 @@ func TestParseOptsIntoFlagsRejectsMalformedOptions(t *testing.T) {
 	}
 }
 
-// A malformed SS_PLUGIN_OPTIONS must be fatal even when the SS_* chain-
-// handoff vars are incomplete -- parseEnv validates the options string
-// independently of that completeness check. t.Setenv("SS_REMOTE_PORT", "")
-// makes the absence explicit rather than relying on the ambient
-// environment happening not to export it.
+// A malformed SS_PLUGIN_OPTIONS must be fatal even when the SS_* chain-handoff
+// vars are incomplete, since parseEnv validates the options string independently
+// of that check.
 func TestParseOptsIntoFlagsRejectsMalformedOptionsWithPartialSSEnv(t *testing.T) {
 	snap := snapshotFlags()
 	t.Cleanup(snap.restore)
@@ -134,9 +128,8 @@ func TestParseOptsIntoFlagsRejectsMalformedOptionsWithPartialSSEnv(t *testing.T)
 	}
 }
 
-// The control row: a valid options string must still wire all four
-// SS_*-derived addresses through (withDistinctEnv's values differ from
-// every flag default, so a default-fallback wouldn't pass).
+// The control: a valid options string must wire all four SS_*-derived addresses
+// through.
 func TestParseOptsIntoFlagsAcceptsControlOptions(t *testing.T) {
 	withDistinctEnv(t, "host=example.com;path=/")
 	if err := parseOptsIntoFlags(); err != nil {
@@ -150,15 +143,10 @@ func TestParseOptsIntoFlagsAcceptsControlOptions(t *testing.T) {
 	}
 }
 
-// An unrecognized SS_PLUGIN_OPTIONS key must NOT be fatal -- ex-ray's
-// SS_PLUGIN_OPTIONS string is shared with other first-party tools in the
-// same process chain: this is galoshes' actual udp_timeout key
-// (crates/galoshes/src/yamux.rs reads it, but crates/galoshes/src/
-// exray_options.rs forwards the rest of the string verbatim, appending
-// only its own `mux=0`), which ex-ray is documented to ignore so galoshes
-// can share the same options string with its embedded ex-ray instead of
-// composing a second, ex-ray-only string. Reintroducing an allowlist/
-// rejectUnrecognizedKeys check here would break that real contract.
+// An unrecognized SS_PLUGIN_OPTIONS key must not be fatal. This one is galoshes'
+// own `udp_timeout`, which galoshes reads and forwards to its embedded ex-ray
+// with the rest of the string (see the rules at the top of options.go). An
+// allowlist of keys would break that.
 func TestParseOptsIntoFlagsToleratesUnrecognizedKey(t *testing.T) {
 	withEnv(t, "udp_timeout=300;host=example.com;path=/")
 	if err := parseOptsIntoFlags(); err != nil {
@@ -169,17 +157,11 @@ func TestParseOptsIntoFlagsToleratesUnrecognizedKey(t *testing.T) {
 	}
 }
 
-// SS_PLUGIN_OPTIONS applies even with no SS_* env at all (the
-// fully-standalone case). A CLI flag set first must still survive
-// SS_PLUGIN_OPTIONS being empty for that key.
+// SS_PLUGIN_OPTIONS applies even with no SS_* env at all (standalone).
 func TestParseOptsIntoFlagsAppliesOptionsWithNoSSEnvAtAll(t *testing.T) {
 	snap := snapshotFlags()
 	t.Cleanup(snap.restore)
-	// unsetEnv (args_test.go), not t.Setenv(v, ""): parseEnv distinguishes
-	// a genuinely-unset var from one exported empty (see
-	// TestParseEnvRejectsOnlyGenuinePartialSSEnv), and this test means to
-	// cover true standalone absence, not "all four present but empty"
-	// (which is itself fatal).
+	// unsetEnv, not t.Setenv(v, ""): all four set but empty is itself fatal.
 	for _, v := range []string{"SS_REMOTE_HOST", "SS_REMOTE_PORT", "SS_LOCAL_HOST", "SS_LOCAL_PORT"} {
 		unsetEnv(t, v)
 	}
@@ -193,9 +175,8 @@ func TestParseOptsIntoFlagsAppliesOptionsWithNoSSEnvAtAll(t *testing.T) {
 	}
 }
 
-// An explicit empty value ("ech=") is rejected like any other value
-// outside allowedEchModes -- not a no-op, matching parseIntOption/
-// parseBoolOption's rule that only an absent key is a no-op.
+// An explicit empty value ("ech=") is rejected like any other value outside
+// allowedEchModes; only an absent key is a no-op.
 func TestParseOptsIntoFlagsEchRejectsExplicitEmptyValue(t *testing.T) {
 	withEnv(t, "ech=")
 	withEchFlags(t, "auto", "")
@@ -211,11 +192,10 @@ func TestParseOptsIntoFlagsEchRejectsExplicitEmptyValue(t *testing.T) {
 	}
 }
 
-// ech-doh is the DoH URL ECH's own config fetch uses; a malformed value is
-// otherwise never caught before ready -- v2ray-core's own ApplyECH only
-// logs a dohQuery failure, so ech=auto silently never arms ECH (cleartext
-// SNI) and ech=always silently arms RequireEch with no way to ever satisfy
-// it, in both cases with ex-ray already having reported ready.
+// A malformed ech-doh value must be fatal: v2ray-core's ApplyECH only logs a
+// failed DoH query, so ech=auto would silently never arm ECH (cleartext SNI) and
+// ech=always would arm RequireEch with no way to satisfy it, both after ex-ray
+// reported ready.
 func TestParseOptsIntoFlagsEchDohRejectsNonHTTPSValue(t *testing.T) {
 	for _, bad := range []string{"not a url", "http://1.1.1.1/dns-query", "ftp://1.1.1.1/dns-query", "https://"} {
 		t.Run(bad, func(t *testing.T) {
@@ -235,9 +215,8 @@ func TestParseOptsIntoFlagsEchDohRejectsNonHTTPSValue(t *testing.T) {
 	}
 }
 
-// An explicit empty ech-doh value is a documented, legitimate spelling
-// (the flag's own description: "Empty disables ECH"), not rejected --
-// unlike every other option's empty-value handling in this file.
+// An explicit empty ech-doh clears it ("Empty disables ECH", the flag's own
+// description), unlike the empty value of the other options here.
 func TestParseOptsIntoFlagsEchDohAcceptsExplicitEmptyValue(t *testing.T) {
 	withEnv(t, "ech-doh=")
 	restoreEch := withEchFlags(t, "auto", "https://1.1.1.1/dns-query")
@@ -250,9 +229,8 @@ func TestParseOptsIntoFlagsEchDohAcceptsExplicitEmptyValue(t *testing.T) {
 	}
 }
 
-// The rejected value must never appear in the error text, checked with a
-// distinctive value via the same backslash-absorption exploit used
-// throughout this file.
+// The rejected ech-doh value must not appear in the error text, checked with a
+// backslash-absorbed secret as throughout this file.
 func TestParseOptsIntoFlagsEchDohErrorNeverEchoesAbsorbedSecret(t *testing.T) {
 	withEnv(t, `ech-doh=abc\;certRaw=SUPERSECRETVALUE`)
 	withEchFlags(t, "auto", "")
@@ -265,12 +243,9 @@ func TestParseOptsIntoFlagsEchDohErrorNeverEchoesAbsorbedSecret(t *testing.T) {
 	}
 }
 
-// ech=always is a fail-closed promise ("refusing to start without a DoH
-// source for fail-closed ECH" is buildTLSConfig's own reasoning for the
-// missing-ech-doh case); without tls set at all, buildTLSConfig never
-// runs, so this must be validated in generateConfig itself or the promise
-// silently applies nothing -- the operator asked for concealed SNI and
-// gets a fully plaintext transport instead, with no diagnostic.
+// ech=always is a fail-closed promise. Without tls, buildTLSConfig never runs, so
+// generateConfig must reject the combination itself or the operator gets a
+// plaintext transport with no diagnostic.
 func TestGenerateConfigRejectsEchAlwaysWithoutTLS(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()
@@ -289,11 +264,8 @@ func TestGenerateConfigRejectsEchAlwaysWithoutTLS(t *testing.T) {
 	}
 }
 
-// mode=quic sets *tlsEnabled = true itself (config.go's mode switch), a
-// side effect the ech=always/tls gate must observe -- the gate runs after
-// the mode switch specifically so a quic config with ech=always and no
-// separately-set tls flag is accepted, not rejected as "tls not enabled"
-// when quic enforces TLS unconditionally.
+// mode=quic sets *tlsEnabled itself, and the ech=always/tls check runs after
+// that, so a quic config with ech=always and no separate tls flag is accepted.
 func TestGenerateConfigAcceptsEchAlwaysWithQuicMode(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()
@@ -308,11 +280,8 @@ func TestGenerateConfigAcceptsEchAlwaysWithQuicMode(t *testing.T) {
 	}
 }
 
-// ech=auto/never make no fail-closed promise, so they must NOT require
-// tls -- opportunistic ECH with no TLS at all is simply a no-op, not a
-// broken guarantee. Guards against a future edit widening the
-// always-requires-tls check to every non-"never" value, which would
-// reject the flag's own registered default (echMode=auto, tlsEnabled=false).
+// ech=auto and never make no fail-closed promise, so they must not require tls.
+// Widening the check to every non-"never" value would reject the flag defaults.
 func TestGenerateConfigAcceptsEchAutoAndNeverWithoutTLS(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()
@@ -330,16 +299,13 @@ func TestGenerateConfigAcceptsEchAutoAndNeverWithoutTLS(t *testing.T) {
 	}
 }
 
-// intOptionSeedSentinel never equals any want value in this file's tables
-// (0, 1, 8, muxDefault, tcpKeepAliveDefault, fwmarkDefault are all small
-// non-negative ints), so every subtest can tell "correctly computed" apart
-// from "never touched, still the seed".
+// intOptionSeedSentinel equals no value any table in this file expects, so a
+// subtest can tell a correctly parsed value from one never touched.
 const intOptionSeedSentinel = -999
 
-// mux-specific coverage beyond the shared intOptions table below:
-// first-wins override and the escape/absorption edge cases from args.go's
-// grammar. galoshes' ex_ray_options relies on exactly these shapes to
-// decide what it must refuse to emit.
+// mux-specific coverage beyond the shared intOptions table below: first-wins
+// override, and the escape and absorption edge cases of args.go's grammar that
+// galoshes' ex_ray_options has to handle when it appends `mux=0`.
 func TestParseOptsIntoFlagsMux(t *testing.T) {
 	// The mux key is present in the parsed options; its value (or absence
 	// of a usable one) determines *mux.
@@ -368,20 +334,17 @@ func TestParseOptsIntoFlagsMux(t *testing.T) {
 		})
 	}
 
-	// The mux key never reaches parseIntOption for these inputs -- *mux
-	// must be left completely untouched (stays the seed), not reset to any
-	// default.
+	// The mux key never reaches parseIntOption for these inputs, so *mux must
+	// stay at the seed, not be reset to a default.
 	absentCases := []struct {
 		desc string
 		opts string
 	}{
 		{"no mux key at all", "host=cloudfront.com;path=/"},
-		// A single backslash before ';' escapes the semicolon, so "mux=0" is
-		// absorbed into the preceding value instead of becoming its own
-		// directive -- no mux key is ever produced.
+		// A backslash before ';' escapes it, so "mux=0" is absorbed into the
+		// preceding value and no mux key is produced.
 		{"one backslash before ';' absorbs the rest into the value, no mux key", `path=b\;mux=0`},
-		// Three backslashes: one literal backslash + one more escaping the
-		// ';' the same way -- absorbs the rest identically.
+		// Three backslashes: a literal backslash, then an escaped ';' as above.
 		{"three backslashes: one literal backslash + escaped ';', absorbs the rest", `path=b\\\;mux=0`},
 	}
 	for _, c := range absentCases {
@@ -414,15 +377,10 @@ func intOptions() []intOption {
 	}
 }
 
-// Unlike an absent key, an explicit empty value ("key=") is rejected, not
-// a no-op -- mirrors TestParseOptsIntoFlagsBoolOptionsRejectsExplicitEmptyValue's
-// reasoning: for mux specifically, galoshes' ex_ray_options appends
-// `mux=0` and ex-ray is first-wins, so a no-op on an operator's earlier
-// `mux=` would let it win over the append while leaving Mux.Cool at
-// whatever default it already held (often ON), defeating the append's
-// whole purpose. Seeded with the sentinel (a value parseIntOption could
-// never legitimately produce) so the assertion can tell "correctly
-// rejected" apart from "silently applied anyway".
+// An explicit empty value ("key=") is rejected, not a no-op. For mux, an empty
+// `mux=` that was ignored would win under first-wins over the `mux=0` galoshes
+// appends and leave Mux.Cool on. The sentinel seed tells "rejected" apart from
+// "applied anyway".
 func TestParseOptsIntoFlagsIntOptionsRejectsExplicitEmptyValue(t *testing.T) {
 	for _, o := range intOptions() {
 		t.Run(o.key, func(t *testing.T) {
@@ -442,11 +400,8 @@ func TestParseOptsIntoFlagsIntOptionsRejectsExplicitEmptyValue(t *testing.T) {
 	}
 }
 
-// Documents a known, tested mismatch, not a silent one: a bare key
-// resolves to the parser's literal "1", which equals muxDefault but not
-// tcpKeepAliveDefault/fwmarkDefault. Fixing this needs args.go's Args type
-// to distinguish a bare key from an explicit "=1", a grammar change not
-// attempted here.
+// Pins that a bare key reads as the literal 1 for every integer option, which
+// equals muxDefault but not tcpKeepAliveDefault or fwmarkDefault.
 func TestParseOptsIntoFlagsBareKeyResolvesToLiteralOne(t *testing.T) {
 	for _, o := range intOptions() {
 		t.Run(o.key, func(t *testing.T) {
@@ -462,12 +417,9 @@ func TestParseOptsIntoFlagsBareKeyResolvesToLiteralOne(t *testing.T) {
 	}
 }
 
-// A partial SS_* env is fatal independent of what SS_PLUGIN_OPTIONS
-// contains: parseEnv's SS_*-completeness check runs before parseIntOption
-// ever sees the option, so even a syntactically-valid but semantically-bad
-// value (mux=off) never reaches its own validation -- the error names the
-// incomplete env, not the option. Loops over all three int options like
-// every sibling test in this file.
+// A partial SS_* env is fatal whatever SS_PLUGIN_OPTIONS holds: parseEnv's
+// completeness check runs before any option is validated, so even a bad value
+// (mux=off) produces the incomplete-env error, not the option's own.
 func TestParseOptsIntoFlagsIntOptionsNeverReachedWithPartialSSEnv(t *testing.T) {
 	for _, o := range intOptions() {
 		t.Run(o.key, func(t *testing.T) {
@@ -494,9 +446,8 @@ func TestParseOptsIntoFlagsIntOptionsNeverReachedWithPartialSSEnv(t *testing.T) 
 	}
 }
 
-// A non-empty, non-numeric value must be rejected, not silently kept as the
-// default -- mux=off must not leave Mux.Cool ON; the identical shape
-// applies to tcp-keepalive and fwmark. The error must name the option.
+// A non-numeric value must be rejected, not silently left at the default:
+// mux=off must not leave Mux.Cool on. The error must name the option.
 func TestParseOptsIntoFlagsIntOptionsRejectNonNumericValue(t *testing.T) {
 	for _, o := range intOptions() {
 		for _, bad := range []string{"off", "false", "no"} {
@@ -518,12 +469,9 @@ func TestParseOptsIntoFlagsIntOptionsRejectNonNumericValue(t *testing.T) {
 	}
 }
 
-// The rejected value must never appear in the error text. Checked with a
-// distinctive, secret-shaped value via the same backslash-absorption
-// exploit as TestMalformedOptionsErrorsNeverEchoSegmentContent, rather than
-// substring-checking against short English words like "off"/"no" -- "no" is
-// a substring of "not" (as in "value is not an integer"), which would make
-// that check fail on the correct, non-leaking message.
+// The rejected value must not appear in the error text. It is checked with a
+// secret-shaped value, absorbed as in TestMalformedOptionsErrorsNeverEchoSegmentContent,
+// not a short word like "no", which is a substring of the message's "not".
 func TestParseOptsIntoFlagsIntOptionsErrorNeverEchoesAbsorbedSecret(t *testing.T) {
 	for _, o := range intOptions() {
 		t.Run(o.key, func(t *testing.T) {
@@ -540,8 +488,8 @@ func TestParseOptsIntoFlagsIntOptionsErrorNeverEchoesAbsorbedSecret(t *testing.T
 	}
 }
 
-// A malformed SS_PLUGIN_OPTIONS string is fatal before any of these
-// per-option blocks run, and must leave every one of them untouched.
+// A malformed SS_PLUGIN_OPTIONS string is fatal before any option is applied and
+// must leave every integer option untouched.
 func TestParseOptsIntoFlagsIntOptionsUntouchedByMalformedOptions(t *testing.T) {
 	const malformed = "host=h;=v;mux=0;tcp-keepalive=0;fwmark=1"
 	for _, o := range intOptions() {
@@ -576,10 +524,7 @@ func boolOptions() []boolOption {
 	}
 }
 
-// Bare key or explicit "key=1" enables the flag -- the only two spellings
-// args.go's grammar can produce for "the operator wrote this key with no
-// value" and "the operator wrote this key with the parser's own bare-key
-// literal", respectively.
+// A bare key or an explicit "key=1" enables the flag; a bare key reads as "1".
 func TestParseOptsIntoFlagsBoolOptionsBareKeyOrExplicitOneEnables(t *testing.T) {
 	for _, o := range boolOptions() {
 		for _, opts := range []string{o.key, o.key + "=1"} {
@@ -597,12 +542,9 @@ func TestParseOptsIntoFlagsBoolOptionsBareKeyOrExplicitOneEnables(t *testing.T) 
 	}
 }
 
-// An explicit empty value is rejected for a presence-only boolean too,
-// not just for the int/enum options -- it is rejected like any other
-// unrecognized value (parseBoolOption's doc comment explains why: garter
-// mirrors ex-ray's old "presence regardless of value" semantics for
-// `server`, and a silent no-op here would let ex-ray and garter disagree
-// about mode without either side erroring).
+// An explicit empty value is rejected for a presence option as for any other
+// unrecognized value (parseBoolOption explains why: a no-op `server=` would let
+// ex-ray and garter disagree about the mode).
 func TestParseOptsIntoFlagsBoolOptionsRejectsExplicitEmptyValue(t *testing.T) {
 	for _, o := range boolOptions() {
 		t.Run(o.key, func(t *testing.T) {
@@ -622,17 +564,12 @@ func TestParseOptsIntoFlagsBoolOptionsRejectsExplicitEmptyValue(t *testing.T) {
 	}
 }
 
-// tls=false must not enable TLS; server=no must not flip into server
-// mode -- any unrecognized value is rejected, not silently treated as
-// enable. No value-echo check here: "no" is a substring of "not" (as in
-// "value is not recognized"), which would make that check fail on the
-// correct, non-leaking message -- the same trap the int-option tests
-// document. The dedicated no-echo test below covers that property with a
-// value the message text can't accidentally contain. Seeded false (not
-// true, the value parseBoolOption ever writes): true would never
-// distinguish "correctly rejected" from "the rejection silently enabled
-// the flag anyway" -- mirrors the int-option tests' use of a sentinel the
-// implementation could never legitimately produce.
+// tls=false must not enable TLS and server=no must not enable server mode: an
+// unrecognized value is rejected, never treated as enable. There is no no-echo
+// check here, because "no" is a substring of the message's "not"; the dedicated
+// no-echo test below uses a value the message cannot contain. The flag is seeded
+// false because parseBoolOption only ever writes true, so a seed of true could not
+// show that a rejection did not enable it anyway.
 func TestParseOptsIntoFlagsBoolOptionsRejectUnrecognizedValue(t *testing.T) {
 	for _, o := range boolOptions() {
 		for _, bad := range []string{"false", "0", "no", "true", "yes"} {
@@ -654,8 +591,7 @@ func TestParseOptsIntoFlagsBoolOptionsRejectUnrecognizedValue(t *testing.T) {
 	}
 }
 
-// The rejected value must never appear in the error text, checked with a
-// distinctive value via the same backslash-absorption exploit, mirroring
+// The rejected value must not appear in the error text, checked as in
 // TestParseOptsIntoFlagsIntOptionsErrorNeverEchoesAbsorbedSecret.
 func TestParseOptsIntoFlagsBoolOptionsErrorNeverEchoesAbsorbedSecret(t *testing.T) {
 	for _, o := range boolOptions() {
@@ -673,10 +609,9 @@ func TestParseOptsIntoFlagsBoolOptionsErrorNeverEchoesAbsorbedSecret(t *testing.
 	}
 }
 
-// remotePort must reject the same out-of-range shape localPort already
-// does (net.PortFromString range-checks to 0..65535); the freedom
-// outbound's own uint32->uint16 cast otherwise truncates a too-large value
-// to a silently different port instead of failing loudly.
+// remotePort must reject an out-of-range value as localPort does
+// (net.PortFromString range-checks it); the freedom outbound's uint32-to-uint16
+// cast would otherwise truncate it to a different port.
 func TestGenerateConfigRejectsOutOfRangeRemotePort(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()
@@ -697,10 +632,9 @@ func TestGenerateConfigRejectsOutOfRangeRemotePort(t *testing.T) {
 	}
 }
 
-// remotePort=0 is in validPort's accepted range (0..65535) but the
-// vendored freedom outbound only applies its destination-port override
-// `if server.Port != 0` -- silently dropping it and forwarding to a
-// zero port instead of failing loudly.
+// remotePort=0 passes net.PortFromString, but the vendored freedom outbound applies its
+// destination-port override only `if server.Port != 0`, so it would forward to
+// port 0.
 func TestGenerateConfigRejectsZeroRemotePort(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()
@@ -717,11 +651,8 @@ func TestGenerateConfigRejectsZeroRemotePort(t *testing.T) {
 	}
 }
 
-// generateConfig is independently reachable from this file's own unit tests,
-// bypassing main()'s own localPort==0 guard entirely -- without its own
-// guard, a direct caller could build a Config with PortRange{0,0}, which
-// binds an OS-assigned ephemeral port v2ray-core exposes through no public
-// API, mirroring remotePort's own ==0 guard above.
+// generateConfig must reject localPort=0 itself, not rely on main's listenAddr call:
+// PortRange{0,0} would bind an OS-assigned port that v2ray-core does not report.
 func TestGenerateConfigRejectsZeroLocalPort(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()
@@ -738,14 +669,8 @@ func TestGenerateConfigRejectsZeroLocalPort(t *testing.T) {
 	}
 }
 
-// remoteAddr must be rejected when empty (freedom/dokodemo silently
-// forward every dial to a broken destination and never fail) or when it
-// is the unspecified address 0.0.0.0/:: (net.AnyIP): freedom's own
-// isValidAddress rejects that address for the destination override,
-// generateConfig validates localAddr itself (not just main()): a
-// multi-address `|`-list or a non-IP-literal hostname must fail loudly
-// even when generateConfig is called directly, bypassing main()'s own
-// guard entirely -- exactly how this file's own tests call it.
+// generateConfig must validate localAddr itself, not rely on main's listenAddr call: a
+// `|`-joined list or a non-IP hostname must fail when it is called directly.
 func TestGenerateConfigRejectsMultiAddressOrNonIPLocalAddr(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()
@@ -765,11 +690,9 @@ func TestGenerateConfigRejectsMultiAddressOrNonIPLocalAddr(t *testing.T) {
 	}
 }
 
-// A non-empty cert/certRaw/key without tls set is otherwise never read,
-// validated, or applied at all: buildTLSConfig only runs `if
-// *tlsEnabled`. ex-ray would silently build a plaintext transport and
-// report ready while the operator believes they configured a pinned CA
-// or server certificate.
+// A cert, certRaw or key without tls must be rejected: buildTLSConfig runs only
+// `if *tlsEnabled`, so ex-ray would build a plaintext transport and report ready
+// while the operator believes a pinned CA or server certificate is in use.
 func TestGenerateConfigRejectsCertMaterialWithoutTLS(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()
@@ -798,13 +721,10 @@ func TestGenerateConfigRejectsCertMaterialWithoutTLS(t *testing.T) {
 	}
 }
 
-// A client-mode `key` value is deliberately tolerated, not rejected: real
-// client-side plugin_opts strings in this monorepo carry a harmless,
-// unused `key=<path>` alongside `cert=<path>` (crates/bridge/src/
-// test_support/skuld_fixtures.rs's ws_tls/quic client fixtures), so this
-// must keep building successfully -- a regression here would break those
-// real e2e fixtures the same way TestParseOptsIntoFlagsToleratesUnrecognizedKey
-// guards against re-rejecting a shared SS_PLUGIN_OPTIONS key.
+// A client-mode `key` is deliberately tolerated: real client options carry an
+// unused `key=<path>` beside `cert=<path>` (the ws_tls and quic client fixtures in
+// crates/bridge/src/test_support/skuld_fixtures.rs), and rejecting it would break
+// them.
 func TestGenerateConfigToleratesClientModeKey(t *testing.T) {
 	restore := withFlags(t, 1, 0, false) // client mode
 	defer restore()
@@ -819,12 +739,10 @@ func TestGenerateConfigToleratesClientModeKey(t *testing.T) {
 	}
 }
 
-// host/path have no legitimate "explicitly nothing" spelling (unlike
-// cert/certRaw/key, where empty means "use the default"), so an explicit
-// empty value is rejected the same way mux=/tls= are. loglevel joins them
-// here too: its documented default spelling is "warning" (or an absent
-// key), not the empty string, so a silent revert-to-default (discarding a
-// CLI-set -loglevel=debug, say) is fatal instead of invisible.
+// host, path and loglevel have no "explicitly nothing" spelling (unlike cert,
+// certRaw and key, where empty means "use the default"), so an explicit empty
+// value is rejected. For loglevel the default is "warning" or an absent key, and
+// an empty value would silently discard a CLI-set -loglevel=debug.
 func TestParseOptsIntoFlagsStringOptionsRejectExplicitEmptyValue(t *testing.T) {
 	for _, key := range []string{"host", "path", "loglevel"} {
 		t.Run(key, func(t *testing.T) {
@@ -840,9 +758,8 @@ func TestParseOptsIntoFlagsStringOptionsRejectExplicitEmptyValue(t *testing.T) {
 	}
 }
 
-// cert/certRaw/key accept an explicit empty value as a documented no-op
-// (config.go falls back to the ~/.acme.sh default when both cert and
-// certRaw are empty in server mode) -- unlike host/path above.
+// cert, certRaw and key accept an explicit empty value and clear the flag
+// (server mode then falls back to the ~/.acme.sh default), unlike host and path.
 func TestParseOptsIntoFlagsCertKeyAcceptExplicitEmptyValue(t *testing.T) {
 	fields := []struct {
 		key string
@@ -856,12 +773,8 @@ func TestParseOptsIntoFlagsCertKeyAcceptExplicitEmptyValue(t *testing.T) {
 	for _, f := range fields {
 		t.Run(f.key, func(t *testing.T) {
 			withEnv(t, f.key+"=")
-			// Pre-seeded with a non-empty sentinel: proves the empty
-			// value is actually APPLIED (parseStringOption's emptyOK
-			// path explicitly clears dest, unlike parseIntOption/
-			// parseBoolOption's "absent key" no-op), not merely that
-			// the flag's own zero-value default happened to already be
-			// empty.
+			// Seeded non-empty, so this shows the empty value is applied, not that
+			// the flag was already empty.
 			f.set("non-empty-sentinel")
 			if err := parseOptsIntoFlags(); err != nil {
 				t.Fatalf("parseOptsIntoFlags(): %v, want nil", err)
@@ -873,10 +786,9 @@ func TestParseOptsIntoFlagsCertKeyAcceptExplicitEmptyValue(t *testing.T) {
 	}
 }
 
-// 0.0.0.0 as remoteAddr is silently discarded by freedom's isValidAddress,
-// falling back to dokodemo's net.LocalHostIP -- traffic goes somewhere
-// real and wrong, worse than the empty-remoteAddr case (which fails every
-// dial).
+// An empty or unspecified remoteAddr must be rejected. freedom discards a 0.0.0.0
+// override (isValidAddress) and dokodemo falls back to net.LocalHostIP, so traffic
+// goes to the wrong place instead of failing every dial.
 func TestGenerateConfigRejectsEmptyOrAnyIPRemoteAddr(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()
@@ -884,11 +796,9 @@ func TestGenerateConfigRejectsEmptyOrAnyIPRemoteAddr(t *testing.T) {
 	defer func() { *localPort, *remotePort, *remoteAddr = origLocalPort, origRemotePort, origRemoteAddr }()
 	*localPort, *remotePort = "1984", "443"
 
-	// "::"/"[::]" cover the IPv6 unspecified address (net.AnyIPv6) --
-	// distinct from "0.0.0.0" (net.AnyIP), a different constant/type in
-	// v2ray-core's net package. " " covers a whitespace-only value:
-	// net.ParseAddress trims surrounding whitespace, so a raw non-empty
-	// string can still parse to an empty domain.
+	// "::" and "[::]" are the IPv6 unspecified address, a different constant from
+	// "0.0.0.0" in v2ray-core's net package. " " is whitespace-only:
+	// net.ParseAddress trims it, so it parses to an empty domain.
 	for _, bad := range []string{"", " ", "0.0.0.0", "::", "[::]"} {
 		*remoteAddr = bad
 		_, err := generateConfig()
@@ -902,11 +812,9 @@ func TestGenerateConfigRejectsEmptyOrAnyIPRemoteAddr(t *testing.T) {
 	}
 }
 
-// The same never-echo property args.go's parse errors and parseIntOption
-// already have, extended to generateConfig/buildTLSConfig's own fatal
-// paths -- these are reachable from SS_PLUGIN_OPTIONS too (localPort,
-// remotePort, mode, ech all come straight from parsed options), and the
-// same backslash-absorption trick applies to any of them.
+// generateConfig's errors for localPort, remotePort and mode must not embed the
+// option value, since each comes straight from SS_PLUGIN_OPTIONS and a
+// backslash-absorbed secret can reach it.
 func TestGenerateConfigErrorsNeverEchoOptionValues(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()
@@ -929,8 +837,8 @@ func TestGenerateConfigErrorsNeverEchoOptionValues(t *testing.T) {
 	}
 }
 
-// An unrecognized ech value must be fatal even WITHOUT tls set, where
-// buildTLSConfig's own check is never reached at all.
+// An unrecognized ech value must be fatal even without tls, where
+// buildTLSConfig's own check is never reached.
 func TestParseOptsIntoFlagsRejectsUnrecognizedEchWithoutTLS(t *testing.T) {
 	withEnv(t, "ech=alwyas") //nolint:misspell // deliberate typo: a plausible operator mistake, not a real word
 	origEchMode := *echMode
@@ -949,10 +857,8 @@ func TestParseOptsIntoFlagsRejectsUnrecognizedEchWithoutTLS(t *testing.T) {
 	}
 }
 
-// Every documented loglevel value (the flag's own help text: "debug, info,
-// warning (default), error, none") must still build without error,
-// including the empty string (no option given) and the explicit "warning"
-// spelling -- both resolve to the same Warning default.
+// Every loglevel value in the flag's help text must build, including the empty
+// string (no option) and "warning", which both mean the default.
 func TestGenerateConfigAcceptsAllDocumentedLogLevels(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()
@@ -966,8 +872,7 @@ func TestGenerateConfigAcceptsAllDocumentedLogLevels(t *testing.T) {
 	}
 }
 
-// A typo'd loglevel must not silently resolve to Warning and look
-// identical to a correctly-set one.
+// A typo'd loglevel must be rejected, not resolved to the default.
 func TestGenerateConfigRejectsUnrecognizedLogLevel(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()
@@ -983,11 +888,8 @@ func TestGenerateConfigRejectsUnrecognizedLogLevel(t *testing.T) {
 	}
 }
 
-// The rejected value must never appear in the error text. A literal check
-// for "warn" would only catch a %q-formatted echo (e.g. `invalid loglevel:
-// "warn"`) and pass on a plain-concatenation echo (`invalid loglevel: warn`,
-// exactly how every other config.go site was written) -- checked instead
-// with a distinctive value via the same backslash-absorption exploit.
+// The rejected loglevel must not appear in the error text, checked with a
+// backslash-absorbed secret as elsewhere in this file.
 func TestGenerateConfigLogLevelErrorNeverEchoesValue(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()

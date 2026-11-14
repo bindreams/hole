@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"math"
+	stdnet "net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -19,20 +20,17 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
-// sentinelTestError is a distinct, named error type (unlike errors.New's
-// unexported concrete type) so errors.As below can prove it retrieves
-// this SPECIFIC underlying cause, not just any error in the chain --
-// errors.As against a bare `error`-typed target would trivially match
-// err itself without ever exercising Unwrap().
+// sentinelTestError is a named error type so errors.As can show it retrieves
+// this specific cause: a bare `error` target would match err itself without
+// calling Unwrap.
 type sentinelTestError struct{ msg string }
 
 func (e *sentinelTestError) Error() string { return e.msg }
 
-// redactedError exists specifically to let errors.Is/errors.As see through
-// to cause (needed by TestBuildV2RayMissingCertIsNotBindConflict's
-// fs.ErrNotExist check) while keeping Error() limited to msg. Both halves
-// of that contract are pinned directly here, not just exercised
-// incidentally through the sites that use it.
+// TestRedactedErrorUnwrapsToCauseWithoutEchoingItsText pins both halves of
+// redactedError's contract: Unwrap exposes the cause (which
+// TestBuildV2RayMissingCertIsNotBindConflict relies on for its fs.ErrNotExist
+// check) and Error() returns only msg.
 func TestRedactedErrorUnwrapsToCauseWithoutEchoingItsText(t *testing.T) {
 	cause := &sentinelTestError{msg: "cause text: SUPERSECRETVALUE"}
 	err := &redactedError{msg: "redacted", cause: cause}
@@ -74,10 +72,8 @@ func TestUint32OptInRange(t *testing.T) {
 }
 
 func TestUint32OptOutOfRange(t *testing.T) {
-	// tooBig is evaluated in int context; this relies on int being 64-bit (true
-	// for all six CI targets). A hypothetical 32-bit port would make this
-	// constant overflow int at compile time — an intentional tripwire, not a
-	// silent bug.
+	// tooBig is evaluated as an int, so this relies on int being 64-bit. A 32-bit
+	// port would fail to compile here, deliberately.
 	const tooBig = math.MaxUint32 + 1
 	cases := []struct {
 		name string
@@ -108,11 +104,118 @@ func withFlags(t *testing.T, muxV, fwmarkV int, serverV bool) func() {
 	return func() { *mux, *fwmark, *server = origMux, origFwmark, origServer }
 }
 
-// generateConfig validates mux/fwmark *before* the server/client split, so an
-// out-of-range value must be rejected identically in BOTH modes — the "uniform
-// validation" invariant. A future refactor that pushed validation back down
-// into the client-only cast site would silently regress server mode (where a
-// negative mux still flips connectionReuse); this test guards against that.
+// listenAddr returns the address and port v2ray-core binds, in canonical form
+// (what `ready.listen` reports once formatted), for exactly one IP literal and a
+// non-zero port. The cases past the first four pin what ParseAddress and
+// net.PortFromString accept today; the Rust mirror in the bridge copies them.
+func TestListenAddrReturnsCanonicalBoundAddress(t *testing.T) {
+	origAddr, origPort := *localAddr, *localPort
+	defer func() { *localAddr, *localPort = origAddr, origPort }()
+
+	cases := []struct{ addr, port, want string }{
+		{"127.0.0.1", "1984", "127.0.0.1:1984"},
+		{"::1", "1984", "[::1]:1984"},
+		{"[::1]", "1984", "[::1]:1984"},
+		// v2ray-core folds an IPv4-mapped IPv6 literal to plain IPv4 before binding.
+		{"::ffff:127.0.0.1", "1984", "127.0.0.1:1984"},
+		// The port is the parsed number, never the operator's spelling of it.
+		{"127.0.0.1", "01984", "127.0.0.1:1984"},
+		// ParseAddress trims surrounding whitespace off an address.
+		{" 127.0.0.1", "1984", "127.0.0.1:1984"},
+	}
+	for _, c := range cases {
+		*localAddr, *localPort = c.addr, c.port
+		host, port, err := listenAddr()
+		if err != nil {
+			t.Errorf("listenAddr() with localAddr=%q localPort=%q: unexpected error %v", c.addr, c.port, err)
+			continue
+		}
+		if got := stdnet.JoinHostPort(host.IP().String(), port.String()); got != c.want {
+			t.Errorf("listenAddr() with localAddr=%q localPort=%q = %q, want %q", c.addr, c.port, got, c.want)
+		}
+	}
+}
+
+// Every rejection names the option at fault and never echoes its value.
+func TestListenAddrRejectsAndNeverEchoesValue(t *testing.T) {
+	origAddr, origPort := *localAddr, *localPort
+	defer func() { *localAddr, *localPort = origAddr, origPort }()
+
+	cases := []struct{ desc, addr, port, wantOpt, secret string }{
+		{"port 0", "127.0.0.1", "0", "localPort", ""},
+		{"non-canonical port 0", "127.0.0.1", "00", "localPort", ""},
+		{"non-numeric port", "127.0.0.1", "SECRETPORT", "localPort", "SECRETPORT"},
+		{"port out of range", "127.0.0.1", "70000", "localPort", "70000"},
+		{"empty port", "127.0.0.1", "", "localPort", ""},
+		// strconv.ParseUint takes neither a sign nor whitespace in a port.
+		{"signed port", "127.0.0.1", "+1984", "localPort", ""},
+		{"port with leading space", "127.0.0.1", " 1984", "localPort", ""},
+		{"address list", "127.0.0.1|127.0.0.2", "1984", "localAddr", "127.0.0.2"},
+		{"localhost", "localhost", "1984", "localAddr", ""},
+		{"other hostname", "secret.invalid", "1984", "localAddr", "secret.invalid"},
+		{"empty address", "", "1984", "localAddr", ""},
+	}
+	for _, c := range cases {
+		*localAddr, *localPort = c.addr, c.port
+		host, port, err := listenAddr()
+		if err == nil {
+			t.Errorf("%s: listenAddr() = %v:%v, nil error, want an error", c.desc, host, port)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.wantOpt) {
+			t.Errorf("%s: error %q does not name %s", c.desc, err.Error(), c.wantOpt)
+		}
+		if c.secret != "" && strings.Contains(err.Error(), c.secret) {
+			t.Errorf("%s: error %q echoes the rejected value %q", c.desc, err.Error(), c.secret)
+		}
+	}
+}
+
+// The inbound listens on the address listenAddr validated: in both modes the
+// receiver's Listen is the canonical host (the folded IPv4 form for an
+// IPv4-mapped IPv6 literal) and its port range is the validated port.
+func TestGenerateConfigInboundListensOnTheValidatedAddress(t *testing.T) {
+	origAddr, origPort := *localAddr, *localPort
+	defer func() { *localAddr, *localPort = origAddr, origPort }()
+
+	for _, c := range []struct {
+		addr, wantListen string
+		serverMode       bool
+	}{
+		{"::ffff:127.0.0.1", "127.0.0.1", false},
+		{"::ffff:127.0.0.1", "127.0.0.1", true},
+		{"::1", "[::1]", false},
+		{"::1", "[::1]", true},
+	} {
+		serverMode := c.serverMode
+		*localAddr, *localPort = c.addr, "1984"
+		restore := withFlags(t, 1, 0, serverMode)
+		cfg, err := generateConfig()
+		restore()
+		if err != nil {
+			t.Fatalf("server=%v localAddr=%q: generateConfig() error: %v", serverMode, c.addr, err)
+		}
+		recv, err := cfg.Inbound[0].GetReceiverSettings().UnmarshalNew()
+		if err != nil {
+			t.Fatalf("server=%v: unmarshal receiver settings: %v", serverMode, err)
+		}
+		rc, ok := recv.(*proxyman.ReceiverConfig)
+		if !ok {
+			t.Fatalf("server=%v: receiver settings are %T, want *proxyman.ReceiverConfig", serverMode, recv)
+		}
+		if got := rc.Listen.AsAddress().String(); got != c.wantListen {
+			t.Errorf("server=%v localAddr=%q: inbound Listen = %q, want %q", serverMode, c.addr, got, c.wantListen)
+		}
+		if rc.PortRange.From != 1984 || rc.PortRange.To != 1984 {
+			t.Errorf("server=%v: inbound PortRange = %d-%d, want 1984-1984", serverMode, rc.PortRange.From, rc.PortRange.To)
+		}
+	}
+}
+
+// generateConfig validates mux and fwmark before the server/client split, so an
+// out-of-range value must be rejected identically in both modes. Validation moved
+// into the client-only cast site would regress server mode, where a negative mux
+// still flips connectionReuse.
 func TestGenerateConfigRejectsOutOfRange(t *testing.T) {
 	cases := []struct {
 		desc      string
@@ -141,8 +244,8 @@ func TestGenerateConfigRejectsOutOfRange(t *testing.T) {
 	}
 }
 
-// The Hole default (mux=1, fwmark=0) and any in-range value must build a config
-// without error in both modes — proves the hardening adds no false rejections.
+// The flag defaults must build a config without error in both modes, so the
+// range validation adds no false rejections.
 func TestGenerateConfigAcceptsValidDefaults(t *testing.T) {
 	for _, srv := range []bool{false, true} {
 		restore := withFlags(t, 1, 0, srv)
@@ -154,9 +257,8 @@ func TestGenerateConfigAcceptsValidDefaults(t *testing.T) {
 	}
 }
 
-// withEchFlags saves the ech/ech-doh globals, applies values, returns a restore
-// func for defer. parseOptsIntoFlags + generateConfig read these pointers, so
-// tests must leave them as they found them. Mirrors withFlags.
+// withEchFlags saves the ech and ech-doh globals, applies values, and returns a
+// restore func for defer. Mirrors withFlags.
 func withEchFlags(t *testing.T, modeV, dohV string) func() {
 	t.Helper()
 	origMode, origDoh := *echMode, *echDoh
@@ -187,11 +289,8 @@ func TestParseOptsIntoFlagsEch(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.desc, func(t *testing.T) {
-			// withEnv's snapshot must run before withEchFlags mutates
-			// echMode/echDoh, so its t.Cleanup restore (which runs after
-			// this func's own defers) captures the true pre-subtest state.
-			// withEchFlags's own returned restore func is deliberately left
-			// undeferred for the same reason.
+			// withEnv snapshots first, so its t.Cleanup restores the true pre-subtest
+			// state; withEchFlags's restore func is deliberately not deferred.
 			withEnv(t, c.opts)
 			withEchFlags(t, "auto", "")
 			if err := parseOptsIntoFlags(); err != nil {
@@ -254,22 +353,18 @@ func TestBuildTLSConfigEch(t *testing.T) {
 	}
 }
 
-// A client-side pinned CA (certRaw, here) must set DisableSystemRoot on
-// Windows -- otherwise config_windows.go's getCertPool never applies the
-// pin at all and verification silently falls back to the system root
-// pool. Portable across CI platforms: asserts true on Windows, false
-// elsewhere (config_other.go already applies a supplied cert without the
-// flag, so setting it there is a separate, not-made-here decision).
+// A client-side pinned CA (certRaw, here) must set DisableSystemRoot on Windows,
+// where config_windows.go's getCertPool would otherwise ignore the pin. The
+// assertion is true on Windows and false elsewhere, where config_other.go
+// applies the cert without the flag.
 func TestBuildTLSConfigClientPinnedCADisablesSystemRootOnWindows(t *testing.T) {
 	restore := withFlags(t, 1, 0, false) // client mode
 	defer restore()
 	origCert, origCertRaw, origHost, origTLS := *cert, *certRaw, *host, *tlsEnabled
 	defer func() { *cert, *certRaw, *host, *tlsEnabled = origCert, origCertRaw, origHost, origTLS }()
 	*tlsEnabled = true
-	// readCertificate checks *cert first and only falls through to
-	// *certRaw when *cert is empty -- must be cleared explicitly so this
-	// test exercises the certRaw path it claims to, regardless of what an
-	// earlier test in the same binary left *cert holding.
+	// readCertificate prefers *cert, so clear it to exercise the certRaw path
+	// whatever an earlier test left there.
 	*cert = ""
 
 	certPath, _ := writeSelfSignedCertKey(t, "example.com")
@@ -414,8 +509,7 @@ func TestGenerateConfigKeepsPlainTLSForQuicClient(t *testing.T) {
 }
 
 // withKeepAliveFlag saves the tcp-keepalive global, applies a value, and returns
-// a restore func. Mirrors withFlags/withEchFlags: generateConfig and
-// registerTCPKeepAlive read this package-level pointer.
+// a restore func. Mirrors withFlags and withEchFlags.
 func withKeepAliveFlag(t *testing.T, v int) func() {
 	t.Helper()
 	orig := *tcpKeepAlive
@@ -583,10 +677,10 @@ func TestMuxFlagDefault(t *testing.T) {
 	}
 }
 
-// The same property for buildTLSConfig's cert/key read-failure sites --
-// cert, key, and host (via the ~/.acme.sh/{host}/... default path
-// construction) are all reachable from SS_PLUGIN_OPTIONS, and a missing
-// file's os.PathError text would otherwise embed the raw path verbatim.
+// buildTLSConfig's cert and key read failures must not embed option values. cert,
+// key and host (through the ~/.acme.sh/{host}/... default path) all come from
+// SS_PLUGIN_OPTIONS, and a missing file's os.PathError text would carry the raw
+// path.
 func TestBuildTLSConfigCertKeyErrorsNeverEchoOptionValues(t *testing.T) {
 	restore := withFlags(t, 1, 0, true) // server mode
 	defer restore()
@@ -616,11 +710,10 @@ func TestBuildTLSConfigCertKeyErrorsNeverEchoOptionValues(t *testing.T) {
 	}
 }
 
-// A readable cert/key pair that isn't a valid X509 key pair is otherwise
-// never caught before ready: v2ray-core's own BuildCertificates logs
-// "ignoring invalid X509 key pair" at Warning and silently drops it,
-// leaving zero certificates configured (TLS handshakes then fail with no
-// diagnostic ever reaching the sitrep) rather than failing to start.
+// A readable cert/key pair that is not a valid X509 key pair must fail
+// buildTLSConfig. v2ray-core's BuildCertificates only logs a warning and drops it,
+// leaving no certificate configured and TLS handshakes failing with no sitrep
+// diagnostic.
 func TestBuildTLSConfigServerRejectsInvalidX509KeyPair(t *testing.T) {
 	restore := withFlags(t, 1, 0, true) // server mode
 	defer restore()
@@ -651,11 +744,9 @@ func TestBuildTLSConfigServerRejectsInvalidX509KeyPair(t *testing.T) {
 	}
 }
 
-// The client-side pinned-CA equivalent: an unparseable PEM cert is
-// otherwise never caught before ready either -- v2ray-core's GetTLSConfig
-// only logs AppendCertsFromPEM's failure and leaves RootCAs nil, silently
-// falling back to the system root pool instead of the operator's pinned
-// CA.
+// A client's pinned CA that is not valid PEM must fail buildTLSConfig.
+// v2ray-core's GetTLSConfig only logs the failure and falls back to the system
+// root pool instead of the pinned CA.
 func TestBuildTLSConfigClientRejectsInvalidPEMCert(t *testing.T) {
 	restore := withFlags(t, 1, 0, false) // client mode
 	defer restore()
@@ -678,8 +769,8 @@ func TestBuildTLSConfigClientRejectsInvalidPEMCert(t *testing.T) {
 	}
 }
 
-// The same property for buildTLSConfig's invalid-ech-mode site, which
-// needs tlsEnabled=true to reach (TestBuildTLSConfigEch's own precondition).
+// buildTLSConfig's invalid-ech-mode error must not embed the value. It needs
+// tlsEnabled=true to be reached.
 func TestBuildTLSConfigEchErrorNeverEchoesValue(t *testing.T) {
 	restore := withEchFlags(t, `abc\;certRaw=SUPERSECRETVALUE`, "")
 	defer restore()
@@ -692,10 +783,10 @@ func TestBuildTLSConfigEchErrorNeverEchoesValue(t *testing.T) {
 	}
 }
 
-// mux=0 must disable Mux.Cool on BOTH ends of a websocket chain: the client
-// stops attaching MultiplexSettings, and the server stops pointing dokodemo at
-// the v1.mux.cool sentinel. The server half is why a mux=0 client cannot talk
-// to a mux=1 server.
+// mux=0 must disable Mux.Cool on both ends of a websocket chain: the client
+// stops attaching MultiplexSettings, and the server stops pointing dokodemo at the
+// v1.mux.cool address. The server half is why a mux=0 client cannot talk to a
+// mux=1 server.
 func TestGenerateConfigMuxDisablesMultiplexing(t *testing.T) {
 	cases := []struct {
 		desc          string

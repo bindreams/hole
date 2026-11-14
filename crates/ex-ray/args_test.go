@@ -173,19 +173,14 @@ func TestDualFaultReportsFirstReachedNotWholeStringPrepass(t *testing.T) {
 	}
 }
 
-// A malformed options string reaches the fatal sitrep verbatim (main.go
-// emits err.Error() as the `detail` field), so the error must never echo
-// segment content -- a segment can carry a per-connection secret (a
-// password, a cert). Mirrors crates/bridge/src/proxy/plugin.rs's own test
-// of the same property one layer up.
+// A malformed options string reaches the `fatal` sitrep as `detail` (see
+// failFatal), so the error must never echo segment content: a segment can carry
+// a secret such as a password or certificate.
 //
-// Only the dangling-escape shape can leak at all: the empty-key error
-// names only the segment index (TestEmptyKeyErrorNamesSegmentIndex pins
-// its exact wording), so there is no substring to probe there. The secret
-// must be placed IN the segment whose value triggers the dangling escape
-// (the LAST segment, ending in the unpaired backslash) -- an earlier,
-// successfully-parsed segment would never reach the scan that produces
-// this error.
+// Only the dangling-escape shape can leak: the empty-key error names just the
+// segment index (TestEmptyKeyErrorNamesSegmentIndex). The secret therefore sits in
+// the last segment, the one ending in the unpaired backslash, since an earlier
+// parsed segment never reaches the scan that produces this error.
 func TestMalformedOptionsErrorsNeverEchoSegmentContent(t *testing.T) {
 	cases := []struct {
 		desc string
@@ -206,10 +201,9 @@ func TestMalformedOptionsErrorsNeverEchoSegmentContent(t *testing.T) {
 	}
 }
 
-// unsetEnv genuinely removes an env var (restored via t.Cleanup), unlike
-// t.Setenv(key, "") which exports it as present-but-empty -- a
-// meaningfully different state parseEnv distinguishes (see
-// TestParseEnvRejectsOnlyGenuinePartialSSEnv's "present but empty" case).
+// unsetEnv removes an env var for the test (restored by t.Cleanup), unlike
+// t.Setenv(key, ""), which leaves it set but empty: parseEnv treats the two
+// differently.
 func unsetEnv(t *testing.T, key string) {
 	t.Helper()
 	orig, wasSet := os.LookupEnv(key)
@@ -219,13 +213,11 @@ func unsetEnv(t *testing.T, key string) {
 	_ = os.Unsetenv(key)
 }
 
-// A partial SS_* set (some but not all four of SS_REMOTE_HOST/
-// SS_REMOTE_PORT/SS_LOCAL_HOST/SS_LOCAL_PORT) is fatal -- it is never a
-// legitimate invocation shape, and letting it fall back to
-// SS_PLUGIN_OPTIONS/flag defaults for all four addresses at once is
-// exactly the "silently broken but reports ready" class this file
-// otherwise fails loud on. A fully-absent set (the standalone case) and a
-// fully-complete set are both legitimate and must not error.
+// A partial SS_* set (some but not all of SS_REMOTE_HOST, SS_REMOTE_PORT,
+// SS_LOCAL_HOST and SS_LOCAL_PORT) is an error: falling back to the options and
+// flag defaults for all four addresses would give a plugin that reports ready on
+// the wrong addresses. A fully absent set (standalone) and a complete set are
+// legitimate and must not error.
 func TestParseEnvRejectsOnlyGenuinePartialSSEnv(t *testing.T) {
 	const wantErrSubstr = "SS_* chain-handoff env is incomplete"
 
@@ -259,11 +251,9 @@ func TestParseEnvRejectsOnlyGenuinePartialSSEnv(t *testing.T) {
 		}
 	})
 
-	// The one var that IS present is exported empty, not unset -- presence
-	// (os.LookupEnv's ok), not value-emptiness, is what parseEnv keys the
-	// partial-set determination on. Using os.Getenv (which can't tell an
-	// unset var from one exported empty) would read this as fully
-	// standalone and silently pass, exactly the gap this case pins.
+	// The one var that is present is set but empty. parseEnv keys on presence
+	// (os.LookupEnv), not emptiness: os.Getenv would read this as fully
+	// standalone and pass.
 	t.Run("one var present but empty, rest genuinely unset, errors", func(t *testing.T) {
 		unsetEnv(t, "SS_REMOTE_HOST")
 		t.Setenv("SS_REMOTE_PORT", "")
@@ -277,10 +267,7 @@ func TestParseEnvRejectsOnlyGenuinePartialSSEnv(t *testing.T) {
 		if !strings.Contains(err.Error(), wantErrSubstr) {
 			t.Errorf("error = %q, want it to contain %q", err.Error(), wantErrSubstr)
 		}
-		// SS_REMOTE_HOST/SS_LOCAL_HOST/SS_LOCAL_PORT are genuinely unset;
-		// SS_REMOTE_PORT is exported but blank -- the message must say so
-		// accurately (not blanket "some but not all are set", which would
-		// be true here but imprecise about which var is in which state).
+		// The message must say which vars are unset and which are set but blank.
 		if !strings.Contains(err.Error(), "unset: SS_REMOTE_HOST, SS_LOCAL_HOST, SS_LOCAL_PORT") {
 			t.Errorf("error = %q, want it to list the three unset vars", err.Error())
 		}
@@ -289,9 +276,8 @@ func TestParseEnvRejectsOnlyGenuinePartialSSEnv(t *testing.T) {
 		}
 	})
 
-	// All four ARE set (LookupEnv ok=true for each) -- "some but not all
-	// … are set" would be a false statement here, since all of them are.
-	// The message must instead say all four are present but blank.
+	// All four are set, so a "some are unset" message would be false: it must say
+	// all four are set but blank.
 	t.Run("all four present but empty errors, with an accurate message", func(t *testing.T) {
 		for _, v := range []string{"SS_REMOTE_HOST", "SS_REMOTE_PORT", "SS_LOCAL_HOST", "SS_LOCAL_PORT"} {
 			t.Setenv(v, "")

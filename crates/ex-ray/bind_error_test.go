@@ -190,9 +190,8 @@ func TestServerStartBindConflictClassifiesTCP(t *testing.T) {
 	assertStartClassifiesAsConflict(t, "127.0.0.1 TCP", "tcp", addr)
 }
 
-// Pins the same guarantee for the server+quic UDP listener (binds a UDP socket
-// via tcpWorker.Start → internet.ListenTCP → the quic transport listener). On a
-// held UDP port the conflict must classify identically to the TCP case.
+// Pins the same guarantee for the server+quic UDP listener: on a held UDP port
+// the conflict must classify identically to the TCP case.
 func TestServerStartBindConflictClassifiesQUIC(t *testing.T) {
 	pc, addr := reserveUDPPort(t)
 	defer func() { _ = pc.Close() }()
@@ -237,7 +236,8 @@ func TestBuildV2RayMissingCertIsNotBindConflict(t *testing.T) {
 		t.Fatal("buildV2Ray() = nil, want the absent-cert config error")
 	}
 	// Structural, not message-text: the absent cert surfaces as fs.ErrNotExist
-	// through v5.52.0's Unwrap, proving buildV2Ray failed on the intended read.
+	// through the vendored v2ray-core's Unwrap, proving buildV2Ray failed on the
+	// intended read.
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("buildV2Ray() error = %v, want it to wrap fs.ErrNotExist (the absent cert)", err)
 	}
