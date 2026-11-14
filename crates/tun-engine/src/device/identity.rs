@@ -1,53 +1,39 @@
-//! Adapter identity — makes `hole-tun` self-identifying so a pre-existing
-//! adapter left by a crashed run can be told apart from one belonging to
-//! something else, WITHOUT a startup sweep (which would rest on the false
-//! single-instance belief, bindreams/hole#936) and WITHOUT verifying after
-//! the adapter is created (which would judge the create path too, and turn
-//! a single Windows GUID-assignment quirk into a permanent, unbreakable
-//! refusal to connect).
+//! Adapter identity: how `hole-tun` is told apart from an adapter that belongs
+//! to something else.
 //!
-//! **The read happens BEFORE `create_as_async`, on the incumbent only.**
-//! `tun` 0.8.13's `platform/windows/device.rs` does `Adapter::open(name)`
-//! first and only falls back to `Adapter::create` when that fails, so
-//! [`super::Device::build`] silently adopts any pre-existing adapter named
-//! `hole-tun`. `probe_incumbent` resolves the alias to a LUID then a GUID
-//! — pure reads, no handle opened, no adapter touched — and the result
-//! decides whether `Device::build` proceeds:
+//! `tun` adopts an existing adapter of the requested name instead of creating
+//! one, so on Windows [`super::Device::build`] reads the incumbent's GUID
+//! **before** `create_as_async`, with `probe_incumbent` (pure reads: no handle
+//! opened, no adapter touched):
 //!
-//! - Alias does not resolve → [`Incumbent::None`] → no incumbent exists →
-//!   `Device::build` is about to mint one → proceed, unchecked.
-//! - Alias resolves and the GUID equals [`HOLE_ADAPTER_GUID`] →
-//!   [`Incumbent::Ours`] → the incumbent is ours, from this run or an
-//!   earlier one → proceed; adopting our own leftover is correct.
-//! - Alias resolves and the GUID differs → [`Incumbent::Foreign`] → refuse
-//!   with [`crate::error::DeviceError::ForeignAdapter`], having written and
-//!   engaged nothing.
-//! - The read itself fails → `Err`, which the caller maps to
-//!   `DeviceError::TunOpen` — **never** `ForeignAdapter`. "Cannot read the
-//!   GUID" and "the GUID is not ours" are different facts, and only the
-//!   second may refuse on ownership grounds.
+//! - Alias does not resolve: [`Incumbent::None`]. Proceed; a create follows.
+//! - GUID equals [`HOLE_ADAPTER_GUID`]: [`Incumbent::Ours`]. Proceed and adopt
+//!   the leftover.
+//! - GUID differs: [`Incumbent::Foreign`]. Refuse with
+//!   [`crate::error::DeviceError::ForeignAdapter`], having written and engaged
+//!   nothing.
+//! - The read itself fails: `Err`, which the caller maps to
+//!   `DeviceError::TunOpen`, never `ForeignAdapter`. "Cannot read the GUID" and
+//!   "the GUID is not ours" are different facts, and only the second may refuse
+//!   on ownership grounds.
 //!
-//! **Never probe via `wintun_bindings::Adapter::open`** — its `Drop` calls
-//! `WintunCloseAdapter`, which would destroy a live sibling bridge's
-//! adapter (exactly the hazard the deleted startup sweep existed to avoid).
-//! **Never route through `Adapter::get_guid()`** — it is unreachable from
-//! this crate anyway (`tun::platform::windows::Device` holds
-//! `pub(crate) tun`), and its error path returns a sentinel
-//! (`Err(_) => self.requested_guid.unwrap_or(0)`) that is vacuous on a
-//! create.
+//! Nothing is verified after the create, and there is no startup sweep of
+//! adapters: a post-create GUID check would judge the create path too, turning
+//! one Windows GUID-assignment quirk into a permanent refusal to connect, and a
+//! sweep would rest on the false belief that only one bridge runs.
 //!
-//! **No retry.** `wintun-bindings` wraps its own `ConvertInterfaceAliasToLuid`
-//! use in a 3 × 25 ms `resolve_with_retry` because the call can transiently
-//! return "not found" on a live machine. This module deliberately does not
-//! copy that: a retry loop with a chosen delay is barred by the no-time-sync
-//! rule. The consequence is bounded and in the safe direction — a raced
-//! probe reads as [`Incumbent::None`], so an existing adapter is adopted
-//! **unverified**. A missed check, never a refusal.
+//! The probe does not retry, so a probe that raced the alias lookup reads as
+//! [`Incumbent::None`] and an existing adapter is adopted unverified: a missed
+//! check, never a refusal.
+//!
+//! Do not probe with `wintun_bindings::Adapter::open` (its `Drop` closes the
+//! adapter, which would destroy a live sibling bridge's) or `Adapter::get_guid`
+//! (unreachable from this crate, and its error path returns a sentinel). The
+//! reasoning is in `docs/contributing/architecture/tun-device.md`.
 
 /// The GUID Hole requests for every adapter it mints, and the value
-/// `probe_incumbent` compares an incumbent's GUID against. A compile-time
-/// constant compared against the live OS object — not a name pattern.
-/// Minted once; never reuse for anything else.
+/// `probe_incumbent` compares an incumbent's GUID against. Never reuse it for
+/// anything else.
 pub const HOLE_ADAPTER_GUID: u128 = 0x8a3d1e6c_2f47_4b9a_9c1d_5e7f2a3b4c5d;
 
 /// What a pre-create probe of the `hole-tun` alias found.
@@ -72,11 +58,8 @@ pub enum Incumbent {
 /// `Some` only when BOTH FFI reads (alias→LUID, then LUID→GUID) already
 /// succeeded; `None` whenever the alias didn't resolve at all.
 ///
-/// `cfg`-gated to Windows-or-test rather than bare `windows`: production has
-/// exactly one caller, [`probe_incumbent`] (Windows-only), but the pure
-/// classification logic is also exercised directly by `identity_tests.rs` on
-/// every platform — without `test` in the gate this would be flagged dead
-/// code on a non-Windows, non-test build.
+/// Gated on Windows-or-test: its one production caller is [`probe_incumbent`],
+/// and `identity_tests.rs` exercises it on every platform.
 #[cfg(any(target_os = "windows", test))]
 fn classify_incumbent(status: u32, guid: Option<u128>, expect: u128) -> std::io::Result<Incumbent> {
     // ERROR_INVALID_PARAMETER — what `ConvertInterfaceAliasToLuid` returns
@@ -132,16 +115,12 @@ pub fn probe_incumbent(alias: &str, expect: u128) -> std::io::Result<Incumbent> 
 }
 
 /// The identity of an opened TUN adapter — its LUID and the alias it was
-/// opened under. Carried through to `Dns::apply` (bindreams/hole#846) and
-/// (Windows) to `dns_confine::engage`, so both key on the concrete OS object
-/// this process opened rather than a name it merely requested.
+/// opened under. Carried through to `Dns::apply` and (Windows) to
+/// `dns_confine::engage`, so both key on the concrete OS object this process
+/// opened rather than a name it merely requested.
 ///
-/// The private field plus the `cfg`-gated `TunIdentity::synthetic`
-/// constructor is what lets a `#[cfg(test)]` production call site exercise
-/// downstream logic without fabricating OS state in production code: **no
-/// value of this type can be produced from anything but an opened
-/// [`super::Device`]** (or, under test, `synthetic`) — the type itself is
-/// the guarantee.
+/// No value of this type can be produced from anything but an opened
+/// [`super::Device`] (or, under test, `synthetic`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunIdentity {
     luid: u64,
@@ -168,9 +147,7 @@ impl TunIdentity {
         &self.alias
     }
 
-    /// Test-only. Production callers must go through
-    /// [`super::Device::identity`] — see the struct doc for why that's the
-    /// whole safety argument.
+    /// Test-only. Production callers go through [`super::Device::identity`].
     #[cfg(any(test, feature = "test-utils"))]
     pub fn synthetic(luid: u64, alias: &str) -> Self {
         Self::from_open_device(alias, luid)

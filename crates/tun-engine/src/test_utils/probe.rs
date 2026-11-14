@@ -11,10 +11,9 @@
 //! [`classify_send`]/[`SendFate`] is for that shape, and has no
 //! `Delivered`-equivalent variant to reach for: the wire is the only oracle
 //! an unconnected UDP send has (`test_utils::pktmon`'s capture-based one).
-//! Calling [`classify`] on a `send_to` result would compile — `T` is
-//! unconstrained — but every such call site in this tree now goes through
-//! [`classify_send`] instead, so `ProbeFate::Delivered` is never actually
-//! reached from one.
+//! Calling [`classify`] on a `send_to` result would compile (`T` is
+//! unconstrained) but would report `Delivered` for a datagram a cover may have
+//! dropped; use [`classify_send`] for that shape.
 
 use std::io;
 

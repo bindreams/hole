@@ -5,8 +5,8 @@
 //! `IPV6_BOUND_IF` on macOS). Kept here rather than in `device` because
 //! gateway discovery needs them but has no other device coupling.
 //!
-//! The `metric` submodule (Windows-only — see its module doc) sets
-//! `hole-tun`'s interface metric, the #846 positive half.
+//! The `metric` submodule (Windows-only; see its module doc) sets
+//! `hole-tun`'s interface metric.
 
 use socket2::Socket;
 

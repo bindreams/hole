@@ -1,19 +1,19 @@
 //! Windows upstream-route lookup.
 //!
 //! Asks the OS routing table via [`GetBestRoute2`], which performs the full
-//! next-hop selection itself. The `default-net` crate this replaced did not read
-//! the routing table at all: it UDP-`connect()`ed to a public address to learn
-//! the OS-chosen source address, then scanned `GetAdaptersAddresses` for an
-//! adapter carrying it — **skipping every adapter whose `IfType` was not in its
-//! own hard-coded allowlist**. Wintun reports `IF_TYPE_PROP_VIRTUAL` (53), which
-//! is absent from that list, so a WireGuard/wintun adapter holding the default
-//! route (and Hole's own `hole-tun`) was invisible and the scan returned
-//! `"Default Interface not found"`. See bindreams/hole#798.
+//! next-hop selection itself. It does not use the `default-net` crate, which
+//! UDP-`connect()`s to a public address to learn the OS-chosen source address,
+//! then scans `GetAdaptersAddresses` for an adapter carrying it, **skipping
+//! every adapter whose `IfType` is not in its own hard-coded allowlist**.
+//! Wintun reports `IF_TYPE_PROP_VIRTUAL` (53), which is absent from that list,
+//! so a WireGuard/wintun adapter holding the default route (and Hole's own
+//! `hole-tun`) would be invisible and the scan would return `"Default Interface
+//! not found"`.
 //!
-//! Two properties follow from asking the routing table instead of a socket: no
-//! adapter class can be filtered out, and no socket is opened — so the lookup is
-//! unaffected by the fail-closed WFP cover that is already engaged by the time
-//! the bridge asks (`proxy_manager::start` engages it before `start_inner`).
+//! Asking the routing table instead means no adapter class can be filtered out
+//! and no socket is opened, so the lookup is unaffected by the fail-closed WFP
+//! cover that is already engaged by the time the bridge asks
+//! (`proxy_manager::start` engages it before `start_inner`).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

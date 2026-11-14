@@ -1,15 +1,8 @@
-//! Privileged-lane live proof for [`super::engage`] (Task 2, refs #868).
+//! Privileged-lane live proof for [`super::engage`].
 //!
-//!
-//! (`macos_dns_supplemental_spike.rs`), which proved the underlying mechanism
-//! . This
-//! test is that spike's mechanism, minus the hand-rolled `SCDynamicStore`
-//! calls the spike used to explore the shape: it drives the real
-//! [`super::engage`]/[`super::Steering`] production API instead, so what is
-//! proven here is that the PRODUCTION guard — its session-scoped key (D3),
-//! its dedicated store thread, its confirmable `withdraw` — steers the OS
-//! resolver the same way the spike's raw calls did, not merely that the
-//! mechanism exists in the abstract.
+//! It drives the real [`super::engage`]/[`super::Steering`] production API, so
+//! what is proven is that the production guard (its session-scoped key, its
+//! dedicated store thread, its confirmable `withdraw`) steers the OS resolver.
 //!
 //! **Assertions are on the wire and on `scutil --dns`, never on elapsed
 //! time.** Every wait below rendezvous on configd's own
@@ -201,9 +194,9 @@ fn spawn_os_lookup(name: String) {
 /// full of the assertions this test exists to report, so leaking on failure
 /// is the common case, not the rare one.
 ///
-/// The explicit delete below still runs where it always did, so the observed
-/// ordering against the `scutil --dns` read is unchanged; `Drop` only covers
-/// the paths that never reach it.
+/// The explicit delete below runs at its fixed point in the test, which orders
+/// it against the `scutil --dns` read; `Drop` only covers the paths that never
+/// reach it.
 struct RouteGuard {
     net: &'static str,
     armed: bool,
@@ -226,19 +219,16 @@ impl Drop for RouteGuard {
     }
 }
 
-/// SHIP GATE . If this fails, `engage` does not steer macOS DNS
-/// as designed — the module doc's cross-reference to
-/// spike is what justifies treating that as a stop-and-escalate rather than
-/// a routine regression: the underlying mechanism is proven, so a failure
-/// here means the production wiring around it (the session-scoped key, the
-/// store thread, `Steering`) — not the mechanism itself — regressed.
+/// Ship gate: if this fails, `engage` does not steer macOS DNS as designed.
+/// The mechanism is configd's, so a failure here points at the production
+/// wiring around it (the session-scoped key, the store thread, `Steering`).
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_steer_global_net_state_steers_the_os_resolver() {
     let (before_dns, before_nameservers) = resolver_set_uncovered("the resolver set before");
     println!("[dns_steer] before:\n{before_dns}");
 
-    // 1. Open a real utun. Name is NOT requested — kernel-assigned, read back
-    //    below; the exact discovery shape Task 4/6 thread through production.
+    // 1. Open a real utun. The name is not requested: it is kernel-assigned and
+    //    read back below, as production does.
     let cfg = tun::Configuration::default();
     let dev = tun::create(&cfg).expect("HARNESS: open a kernel-assigned utun");
     let tun_name = dev
@@ -315,8 +305,7 @@ fn dns_steer_global_net_state_steers_the_os_resolver() {
 
     // 5. Withdraw through the PRODUCTION API and prove the machine is back to
     //    where it started. `withdraw` blocks for the store thread's own
-    //    confirmation (Decided-without-asking #6) — no additional wait is
-    //    needed before checking `key_present`-equivalent state.
+    //    confirmation, so no additional wait is needed before checking.
     let withdraw_result = steering.withdraw();
     let unmerged = notify.settle(budget(30), &RESOLVER.to_string(), false);
 

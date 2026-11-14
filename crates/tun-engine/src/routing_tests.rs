@@ -353,10 +353,9 @@ fn an_on_link_upstream_installs_an_interface_scoped_bypass() {
     );
 }
 
-/// The regression guard that matters most: an ordinary gateway upstream must
-/// keep installing today's gateway-scoped bypass, never the interface-scoped
-/// form — `an_on_link_upstream_installs_an_interface_scoped_bypass` is the
-/// new capability, this is the existing one it must not disturb.
+/// An ordinary gateway upstream must install the gateway-scoped bypass, never
+/// the interface-scoped form that
+/// `an_on_link_upstream_installs_an_interface_scoped_bypass` covers.
 #[skuld::test]
 fn a_gateway_upstream_still_installs_the_gateway_form() {
     let server_ip: IpAddr = "5.6.7.8".parse().unwrap();
@@ -369,7 +368,7 @@ fn a_gateway_upstream_still_installs_the_gateway_form() {
 
 /// A loopback server needs no bypass: it is reached via the kernel's on-link
 /// `127.0.0.0/8` route, more specific than the `/1` splits. Installing a `/32`
-/// gateway bypass for it would hijack all loopback traffic (bindreams/hole#541).
+/// gateway bypass for it would hijack all loopback traffic.
 /// So setup yields only the 4 split routes — no 5th bypass command.
 #[skuld::test]
 fn setup_with_loopback_server_has_no_bypass() {
@@ -674,8 +673,8 @@ fn a_host_with_ipv6_aborts_when_an_ipv6_add_fails() {
 //
 // The first group drives the real subprocess path, so the exit code is the
 // OS's, not a mock's. They spawn a shell that only sets an exit code — never a
-// `route` / `netsh` command — so the #165 isolation contract holds: no host
-// routing state is touched. The second group injects a recording executor to
+// `route` / `netsh` command — so the `Routing` test-isolation contract holds:
+// no host routing state is touched. The second group injects a recording executor to
 // assert each loop's failure policy (fatal aborts, best-effort does not).
 
 /// The arguments of a command that always exits with `code`. The `tool` of a
@@ -745,7 +744,7 @@ fn a_failed_setup_command_is_an_error() {
         .is_err(),
         "a non-zero exit during route setup must surface as an error — returning Ok \
          reports split routes that were never installed, and traffic egresses outside \
-         the tunnel while the UI says it is protected (#901)"
+         the tunnel while the UI says it is protected"
     );
 }
 
@@ -911,8 +910,8 @@ fn cleanup_issues_every_command_even_when_all_of_them_fail() {
 
 #[skuld::test]
 fn cleanup_survives_a_spawn_failure_and_keeps_going() {
-    // A spawn failure used to `?` out of the loop, skipping every remaining
-    // delete. It is now just another failed command.
+    // A spawn failure is just another failed command: it must not skip the
+    // remaining deletes.
     let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let cmds = numbered_teardown_commands(3);
     let mut still_installed: Vec<RouteId> = cmds.iter().map(|c| c.id).collect();
@@ -974,7 +973,7 @@ fn setup_stops_at_the_first_failing_command() {
 // `SystemRouting::install_with` failure path ==========================================================================
 //
 // `install_with` injects the two per-command runners, so these drive the real
-// checkpointing/rollback logic without issuing a route command (#165).
+// checkpointing/rollback logic without issuing a route command.
 
 #[skuld::test]
 fn install_hands_back_no_guard_when_a_setup_command_fails() {
@@ -992,7 +991,7 @@ fn install_hands_back_no_guard_when_a_setup_command_fails() {
     assert!(
         result.is_err(),
         "a failed route install must not return a guard — the guard IS the bridge's \
-         evidence that the tunnel carries traffic (#901)"
+         evidence that the tunnel carries traffic"
     );
 }
 
@@ -1077,20 +1076,21 @@ fn install_returns_a_guard_when_every_setup_command_succeeds() {
 
     assert!(tmp.path().join(STATE_FILE_NAME).exists());
     // `SystemRoutes::drop` issues REAL netsh/route commands and a
-    // `Remove-NetAdapter`; the #165 contract forbids that from a unit test.
+    // `Remove-NetAdapter`, which the `Routing` test-isolation contract forbids
+    // from a unit test.
     std::mem::forget(routes);
 }
 
 // `SystemRoutes::routed_families` =====================================================================================
 //
-// Ground truth for `hole_bridge::dns::system::Dns::apply`'s D4 filter: which
+// Ground truth for `hole_bridge::dns::system::Dns::apply`'s address-family filter: which
 // address families this guard's OWN `installed` set actually landed, read
 // directly off the field — no OS probe, no second measurement. Constructed
 // as a bare struct literal (not through `install_with`) because
-// `install_with`'s own fail-closed Rule #0 check rolls back and errors on
+// `install_with`'s own fail-closed check rolls back and errors on
 // ANY narrowed `installed`, so it cannot produce a `SystemRoutes` with a
 // partial family set to assert against — the accessor is exercised for what
-// it reads, independent of whether today's `install` can currently hand it
+// it reads, independent of whether `install` can currently hand it
 // a partial result (see
 // `crates/tun-engine/src/routing.rs`'s `RoutesInstalled` doc). Every field
 // but `installed` is a placeholder — `routed_families` reads only that one.
@@ -1116,8 +1116,8 @@ fn routed_families_reports_only_the_splits_that_landed() {
     };
     assert_eq!(both.routed_families(), RoutedFamilies { v4: true, v6: true });
     // `SystemRoutes::drop` issues REAL netsh/route commands and a
-    // `Remove-NetAdapter`; the #165 contract forbids that from a unit test —
-    // same reasoning as `install_returns_a_guard_when_every_setup_command_succeeds`.
+    // `Remove-NetAdapter`, which the `Routing` test-isolation contract forbids
+    // from a unit test — same reasoning as `install_returns_a_guard_when_every_setup_command_succeeds`.
     std::mem::forget(both);
 
     let v4_only = SystemRoutes {
@@ -1162,7 +1162,7 @@ fn routed_families_reports_only_the_splits_that_landed() {
 //
 // Nothing to test at runtime. Each runner accepts only its own phase type, and
 // the command types differ too (`SetupCommand` vs `RouteCommand`), so a
-// mismatched pairing no longer compiles. Which family is which is a `const`
+// mismatched pairing does not compile. Which family is which is a `const`
 // pinned by the `const _: () = assert!(..)` pair in routing.rs; a
 // `#[skuld::test]` over it would be vacuous (clippy::assertions_on_constants).
 
@@ -1291,8 +1291,7 @@ fn recover_with_loopback_server_skips_bypass() {
     );
 }
 
-// Deliberate design choice, preserved across the #907 merge: teardown/recovery
-// has no error channel, so a command that fails to SPAWN means its route may
+// Teardown/recovery has no error channel, so a command that fails to SPAWN means its route may
 // still be installed — it must stay recorded for the next start to retry,
 // never silently discarded.
 
@@ -1705,9 +1704,9 @@ fn recover_passes_adopting_only_on_adopt() {
 #[skuld::test]
 fn adopt_deletes_nothing() {
     // With a wiped state dir, `Unset` x `Live` decides Adopt — and Adopt must
-    // not disengage a cover that may belong to a RUNNING first bridge. After
-    // the volatile-permit refresh moved into `engage_lockdown`, `Sweep` is the
-    // only decision that can disengage the standing cover on either platform.
+    // not disengage a cover that may belong to a RUNNING first bridge. `Sweep`
+    // is the only decision that can disengage the standing cover on either
+    // platform, since the volatile-permit refresh lives in `engage_lockdown`.
     use failclosed::RecoveryDispatch;
     assert_eq!(
         failclosed::recovery_dispatch(Adopt),
@@ -2028,7 +2027,7 @@ fn recover_adopts_but_writes_nothing_from_a_recorded_only_cover() {
 
 #[skuld::test]
 fn recover_prefers_its_own_route_state_tun_name_over_the_fallback() {
-    // The TUN-permit reclaim (#881 finding 2) prefers THIS bridge's own prior
+    // The TUN-permit reclaim prefers THIS bridge's own prior
     // run's device — sourced from its own bridge-routes.json — over the
     // caller-supplied fallback, using a DIFFERENT name for each so the
     // precedence is actually exercised, not merely consistent with either.
@@ -2064,13 +2063,12 @@ fn recover_prefers_its_own_route_state_tun_name_over_the_fallback() {
 
 #[skuld::test]
 fn recover_falls_back_to_the_given_tun_name_when_no_route_state_exists() {
-    // Finding 3 (#898 rework): `bridge-routes.json`'s lifetime is
-    // anti-correlated with the condition the reclaim needs — a clean
-    // `Cutover` teardown (the canonical Adopt path, kill switch armed) drops
-    // the file via `SystemRoutes::drop` before recovery ever runs, and a
-    // crashed run's file is deleted by THIS SAME startup's recovery before
-    // reaching this call. Passing `None` here skipped the reclaim outright on
-    // both; the caller-supplied name must be used instead.
+    // `bridge-routes.json`'s lifetime is anti-correlated with the condition the
+    // reclaim needs: a clean `Cutover` teardown (the canonical Adopt path, kill
+    // switch armed) drops the file via `SystemRoutes::drop` before recovery ever
+    // runs, and a crashed run's file is deleted by THIS SAME startup's recovery
+    // before reaching this call. The caller-supplied name must be used instead
+    // of skipping the reclaim.
     let dir = tempfile::tempdir().unwrap();
     let seen: RefCell<Option<Option<String>>> = RefCell::new(None);
     recover_routes_with(
@@ -2733,10 +2731,8 @@ fn run_teardown_commands_checkpoints_after_every_command() {
 
 /// An empty `installed` (e.g. an install where every planned route failed to
 /// go in, or a fully-drained recovery) must be a safe no-op — not a panic.
-/// The production runner unconditionally indexes `cmd[0]`; a prior version of
-/// this code synthesized an empty-argv "phase entered, nothing to do" signal
-/// through that same runner and crashed on every loopback-server crash
-/// recovery.
+/// The production runner unconditionally indexes `cmd[0]`, so an empty argv must
+/// never be passed through it as a "nothing to do" signal.
 #[skuld::test]
 fn teardown_routes_with_nothing_installed_does_not_panic() {
     #[allow(clippy::disallowed_methods)]
@@ -2755,10 +2751,9 @@ fn teardown_routes_with_nothing_installed_does_not_panic() {
 }
 
 /// Same as above but through the REAL production runner (`exec_one`, which
-/// spawns real subprocesses for a non-empty argv) — proves the empty case
-/// never reaches it at all, closing the gap a scripted-runner-only test
-/// can't: the panic this guards was in the runner's own indexing, not in
-/// anything a mock could stand in for.
+/// spawns real subprocesses for a non-empty argv): proves the empty case never
+/// reaches it at all, which a scripted runner cannot show, since the hazard is
+/// in the real runner's own indexing.
 #[skuld::test]
 fn teardown_routes_with_nothing_installed_never_calls_the_real_runner() {
     #[allow(clippy::disallowed_methods)]
@@ -2862,7 +2857,7 @@ fn teardown_routes_keeps_the_id_whose_delete_fails_to_spawn() {
 // id it failed to durably record — `install`'s `uncertain` set is derived
 // by diffing `persisted.installed` against the runtime accumulator, so a
 // write that never landed must not read as "durably recorded, fate
-// unknown." See bindreams/hole#904's root cause 2.
+// unknown."
 
 /// Forces the NEXT `state::save` against `state_dir` to fail deterministically
 /// on every platform by occupying the destination filename with a directory:
@@ -2936,9 +2931,9 @@ fn install_rollback_clears_the_file_when_a_checkpoint_write_failure_leaves_nothi
     };
 
     // Occupy the exact destination filename with a directory so the very
-    // first pre-command checkpoint's write fails deterministically (the
-    // finding's ENOSPC scenario) — `NamedTempFile::persist` cannot rename a
-    // file onto an existing directory.
+    // first pre-command checkpoint's write fails deterministically (as ENOSPC
+    // would) — `NamedTempFile::persist` cannot rename a file onto an existing
+    // directory.
     let state_file_path = tmp.path().join(STATE_FILE_NAME);
     std::fs::create_dir(&state_file_path).unwrap();
     let write_result = checkpoint_installed(&mut persisted, &state::file(tmp.path()), None, &[RouteId::SplitV4Low]);
@@ -2981,7 +2976,7 @@ fn install_rollback_clears_the_file_when_a_checkpoint_write_failure_leaves_nothi
     );
 }
 
-// Windows bypass-delete gateway scoping (root cause 3) ================================================================
+// Windows bypass-delete gateway scoping ===============================================================================
 //
 // `route.exe`'s own help confirms DELETE's gateway operand is optional but
 // accepted; when supplied it scopes which entry is deleted — unlike macOS,
@@ -3037,7 +3032,9 @@ mod windows_bypass_teardown_scoping {
         );
     }
 
-    /// A record migrated from schema 1/2/3 never persisted a gateway — the
+    /// A record migrated from schema 1 or 2 never persisted a gateway. The code
+    /// that installs and tears down a live session always has one, so `None`
+    /// reaches teardown only when recovery replays such a leftover record; the
     /// delete must still be attempted (the old unscoped shape, a disclosed
     /// residual), not silently skipped.
     #[skuld::test]
@@ -3055,7 +3052,7 @@ mod windows_bypass_teardown_scoping {
     }
 }
 
-// SystemRouting::install pre-install sweep (root cause 1) =============================================================
+// SystemRouting::install pre-install sweep ============================================================================
 //
 // `install`'s pre-install sweep of a record retained by a prior run/attempt
 // in this SAME PROCESS must carry forward whatever it still cannot confirm
@@ -3243,7 +3240,7 @@ fn install_sweep_also_retries_debt_carried_by_an_earlier_sweep() {
     assert!(server_ips.contains(&"5.5.5.5".parse().unwrap()));
 }
 
-// Canonical-form discipline (troyka round 4) ==========================================================================
+// Canonical-form discipline ===========================================================================================
 //
 // `sweep_leftover_before_install` and `recover_routes_with` must route every
 // group they fold into a persisted set through `state::coalesce` — never
@@ -3483,8 +3480,8 @@ fn recovery_never_issues_the_same_split_delete_twice_across_groups() {
 /// `platform_split_teardown_commands`), so two groups with DIFFERENT
 /// `tun_name` — which Windows would treat as genuinely distinct routes on
 /// different adapters — still target the identical kernel route on macOS.
-/// The second delete must not run. Not executable on this box: gated to the
-/// platform whose command-building this depends on.
+/// The second delete must not run. Gated to the platform whose command-building
+/// this depends on.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn recovery_never_issues_the_same_macos_split_delete_twice_across_different_tun_names() {
@@ -3669,7 +3666,7 @@ fn rollback_never_erases_extra_unconfirmed_mid_loop() {
 // before the OS query, it best-effort deletes exactly that leftover.
 //
 // The OS query itself (`GetBestRoute2` via `gateway::upstream_route`) has no
-// injectable seam — proving "the query no longer reports the stale
+// injectable seam — proving "the query does not report the stale
 // interface" end-to-end would need a real routing table, which is what
 // `tests/gateway_privileged.rs` and `best_route_agrees_with_find_netroute`
 // already cover for the query in isolation. What IS unit-testable, and what

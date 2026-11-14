@@ -96,11 +96,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Engine<T> {
     /// IP packet; one `write_all` writes exactly one IP packet. A real TUN
     /// device satisfies this (wintun and a character device each
     /// deliver/accept a whole packet per call, and macOS's 4-byte utun
-    /// protocol header is stripped/prepended inside `tun-0.8.13`'s
-    /// `platform/posix/split.rs` `Reader`/`Writer` before the engine ever
-    /// sees a buffer); `sim::SimTun` (test-only; not a doc link
-    /// since `sim` is feature-gated out of a plain build) is the sanctioned
-    /// in-memory implementation for tests.
+    /// protocol header is stripped/prepended inside `tun`'s posix
+    /// `Reader`/`Writer` before the engine ever sees a buffer); `sim::SimTun`
+    /// (test-only, so not a doc link) is the in-memory implementation for
+    /// tests.
     pub fn from_io<F>(io: T, device_config: DeviceConfig, router: Arc<dyn Router>, init: F) -> Result<Self, EngineError>
     where
         F: FnOnce(&mut MutEngineConfig),
