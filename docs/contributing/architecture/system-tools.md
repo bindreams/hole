@@ -53,14 +53,8 @@ CI is attended and keeps bare names.
 
 ## Plugins
 
-The privileged bridge runs only the plugins Hole ships (the table behind `hole_common::plugin::lookup` and `is_known`), found in the one folder its
-`PluginSource` names, with the same aim by a different mechanism. `PluginSource::resolve`
-({src}`crates/bridge/src/proxy/plugin_source.rs`) is the only production producer of a `BundledPlugin`, a shipped plugin's
-descriptor bound to the absolute path of its binary, and `start_plugin_chain` accepts only that. A bare name for
-`garter::BinaryPlugin` to look up on `PATH` cannot be written on the bridge's path. A test stages an install with
-`PluginSource::build_dir`.
-
-`resolve` is the one gate for "may this plugin run". It is asked first in `start_cancellable` and `run_server_test`, before any
-DoH bootstrap, cover or dial: an unbundled name or a missing binary is refused with nothing touched, and reaches the user as
-the usual start error. Import already rejects such plugins, so only a hand-edited or old config, or a direct IPC call, gets
-here. Third-party SIP003 plugins are not supported.
+The same aim reaches the plugins the bridge starts, by a different mechanism: a plugin runs only from an absolute path
+that `PluginSource::resolve` ({src}`crates/bridge/src/proxy/plugin_source.rs`) built, never from a name looked up on `PATH`.
+`resolve` is the one gate for "may this plugin run", and it is asked first in `start_cancellable` and `run_server_test`,
+before any DoH bootstrap, cover or dial. [Plugin binaries](plugin-binaries.md) has the rest: where each platform keeps the
+plugins, and how the macOS service repairs its folder.
