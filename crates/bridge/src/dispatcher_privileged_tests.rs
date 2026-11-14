@@ -5,21 +5,22 @@
 //! `Dispatcher::new` is the first irreversible step of a Full-mode start — it
 //! runs before `routing.install`, before either fail-closed cover, and before
 //! `Dns::apply`. If the OS refuses the device, Full mode cannot start at all
-//! and nothing downstream is ever reached. No test had ever asked a
-//! non-Windows platform to create one before this file.
+//! and nothing downstream is ever reached.
 //!
 //! Drives `Dispatcher::new` rather than `Device::build` with a copied config:
 //! the device name, subnet and MTU are chosen INSIDE the dispatcher, so a test
 //! that rebuilt them would assert about its own copy. Both tests below assert
 //! about whatever the production path actually asks for.
 //!
-//! `dispatcher_opens_tun_device_the_os_accepts`: the device open (and clean shutdown) must succeed on every platform Hole ships Full mode on. `dispatcher_opens_tun_names_the_interface_it_opened` closes a name-coherence gap: it resolves
-//! `identity().alias()` back to a live OS interface through
-//! [`tun_engine::gateway::interface_index_by_name`] — the same Windows
-//! `ConvertInterfaceAliasToLuid`+`ConvertInterfaceLuidToIndex` / macOS
-//! `if_nametoindex` lookup production route-install already trusts, made
-//! `pub` for this test rather than reimplemented against raw platform FFI —
-//! and, on macOS, that the resolved name has the kernel-assigned `utunN` shape, rather than the `WINDOWS_TUN_ALIAS` constant, which is meaningless off Windows.
+//! - `dispatcher_opens_tun_device_the_os_accepts`: the device open (and clean shutdown) must
+//!   succeed on every platform Hole ships Full mode on.
+//! - `dispatcher_opens_tun_names_the_interface_it_opened`: resolves `identity().alias()` back to
+//!   a live OS interface through [`tun_engine::gateway::interface_index_by_name`] (the same
+//!   Windows `ConvertInterfaceAliasToLuid`+`ConvertInterfaceLuidToIndex` / macOS `if_nametoindex`
+//!   lookup production route-install already trusts, `pub` so this test reuses it rather than
+//!   reimplementing it against raw platform FFI) and, on macOS, checks that the resolved name has the kernel-assigned
+//!   `utunN` shape, rather than the `WINDOWS_TUN_ALIAS` constant, which is meaningless off
+//!   Windows.
 //!
 //! Runs on the elevated `tun` lane only — the `TUN` label (reused from
 //! `crate::test_support::skuld_fixtures`, this crate's "elevated lane" bucket)
@@ -95,7 +96,7 @@ async fn dispatcher_opens_tun_device_the_os_accepts() {
     dispatcher.shutdown().await;
 }
 
-/// The name-coherence gap : the dispatcher's own
+/// Name coherence: the dispatcher's own
 /// `identity().alias()` — not a name this test picked — must resolve, through
 /// the OS's own interface-name table, to the live interface the dispatcher
 /// just opened; and on macOS, where the name is kernel-assigned rather than

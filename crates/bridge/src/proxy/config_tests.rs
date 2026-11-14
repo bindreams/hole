@@ -285,7 +285,7 @@ fn port_zero_errors_http() {
     }
 }
 
-// Pure-VPN (#459) -----------------------------------------------------------------------------------------------------
+// Pure-VPN ------------------------------------------------------------------------------------------------------------
 
 #[skuld::test]
 fn full_mode_pure_vpn_binds_internal_socks5_only() {
@@ -374,10 +374,9 @@ fn tun_subnet6_is_a_generated_unique_local_64() {
 
 // DispatcherStartError conversion =====================================================================================
 
-/// `Dispatcher::new` used to flatten every `tun_engine::DeviceError` into an
-/// opaque `io::Error` before it ever reached this conversion, which made
-/// `ProxyError::ForeignAdapter` unreachable from `start_inner` regardless of
-/// what `Device::build` returned. Asserts the conversion's SHAPE, not any
+/// A `tun_engine::DeviceError` must reach this conversion unflattened, or
+/// `ProxyError::ForeignAdapter` is unreachable from `start_inner` whatever
+/// `Device::build` returned. Asserts the conversion's SHAPE, not any
 /// string embedded in it — a string match would pass even if the variant
 /// were wrong.
 #[skuld::test]

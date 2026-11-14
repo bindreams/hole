@@ -160,7 +160,7 @@ fn e2e_none_socks_only_roundtrip(
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-/// Metrics report tunnel traffic (#461): after a SOCKS5 roundtrip through
+/// Metrics report tunnel traffic: after a SOCKS5 roundtrip through
 /// a real ss-server, the FlowStat-backed metrics must show nonzero
 /// cumulative totals in both directions (wire bytes through the tunnel).
 /// A restart on a fresh port must reset the totals — a new `Server` means
@@ -256,12 +256,11 @@ fn e2e_ws_socks_only_roundtrip(
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-/// #536: the bridge must honor galoshes' authoritative sitrep transports
-/// (`tcp,udp`) rather than the readiness self-probe's hardcoded TCP-only, so a
-/// galoshes chain reports `udp_proxy_available = true`. With the previous
-/// `ReadinessMode::Probe` this was always false and Full-mode galoshes UDP was
-/// wrongly dropped. Asserts the start-time chain transports via the Status
-/// endpoint — no data flow, so it is independent of the e2e roundtrip path.
+/// The bridge must honor galoshes' authoritative sitrep transports (`tcp,udp`) rather than the
+/// readiness self-probe's hardcoded TCP-only, so a galoshes chain reports
+/// `udp_proxy_available = true`; otherwise Full-mode galoshes UDP is wrongly dropped. Asserts the
+/// start-time chain transports via the Status endpoint, with no data flow, so it is independent of
+/// the e2e roundtrip path.
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
 fn e2e_galoshes_chain_reports_udp_available(
     #[fixture(dist_dir)] dist: &Path,
