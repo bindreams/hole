@@ -17,18 +17,14 @@ fn remove_adapter_quotes_a_name_containing_a_quote() {
     );
 }
 
-/// `hole-tun 2` (#936's disambiguated alias for a second concurrent bridge)
-/// must not be refused: a space is real production input, and refusing it
-/// would skip cleanup and leak the adapter — worse than the injection this
-/// module guards against. Same shape as
-/// `remove_adapter_for_absent_name_is_silent_noop` — a name matching no
-/// real adapter completes cleanly regardless of privilege — but with a
-/// space, which an earlier charset-restricting `debug_assert!` used to
-/// reject in every debug build. Not gated to debug: CI also runs this in
-/// `--release`, where that assert was silently compiled out and would have
-/// hidden this exact case — the provenance canary that replaced it
-/// (`debug_assert_fires_when_the_name_is_empty` below) checks only for an
-/// empty name, so this name still passes it.
+/// `hole-tun 2` (the disambiguated alias for a second concurrent bridge) must
+/// not be refused: a space is real production input, and refusing it would skip
+/// cleanup and leak the adapter. Same shape as
+/// `remove_adapter_for_absent_name_is_silent_noop`: a name matching no real
+/// adapter completes cleanly regardless of privilege. Not gated to debug, since
+/// CI also runs this in `--release`, where a `debug_assert!` is compiled out;
+/// the empty-name canary (`debug_assert_fires_when_the_name_is_empty` below)
+/// does not reject this name.
 #[skuld::test]
 #[cfg(target_os = "windows")]
 fn remove_adapter_runs_for_a_name_containing_a_space() {

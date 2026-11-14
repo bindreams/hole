@@ -18,6 +18,7 @@ where `docs/<page>.md` is tracked in the repository.
 
 The root `CLAUDE.md` is a map of links into the repository: each repository-relative
 link must name a tracked path and, for a Markdown target, a heading anchor.
+Percent-encoded links are compared decoded, as GitHub resolves them.
 
 Usage, from the repository root:
     uv run --with-requirements docs/requirements.txt scripts/validate-docs.py
@@ -34,6 +35,7 @@ import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import unquote
 
 from docutils.parsers.rst.states import MarkupError
 from markdown_it import MarkdownIt
@@ -351,7 +353,8 @@ def agent_map_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[st
         href = str(token.attrGet("href") or token.attrGet("src") or "")
         if URL_SCHEME_RE.match(href):
             continue
-        path, _, anchor = href.partition("#")
+        raw_path, _, raw_anchor = href.partition("#")
+        path, anchor = unquote(raw_path), unquote(raw_anchor)
         problem = link_problem(repo_root, tracked, f"{AGENT_MAP}:{number}", "link", path or AGENT_MAP, anchor, anchored)
         if problem:
             problems.append(problem)
@@ -400,7 +403,7 @@ def single_readme_problems(repo_root: Path, tracked: frozenset[str], readme: str
             if token.type == "text":
                 written = written.rstrip(AUTOLINK_TRAILING)
             url = SITE_BASE + written
-            page = written.partition("?")[0]
+            page = unquote(written.partition("?")[0])
             if page.endswith(".html"):
                 source = f"docs/{page.removesuffix('.html')}.md"
             elif page == "":
@@ -749,6 +752,17 @@ def test_agent_map_links_accept_tracked_paths_anchors_and_urls(tmp_path: Path) -
     assert agent_map_link_problems(tmp_path, tracked) == []
 
 
+def test_agent_map_links_are_compared_decoded(tmp_path: Path) -> None:
+    claude = (
+        "# Map\n[a](<docs/my page.md>) [b](docs/my%20page.md) [c](docs/x.md#привет) [d](docs/x.md#heading-with-é)\n"
+        "[e](<docs/über.md>)\n"
+    )
+    files = {"docs/my page.md": "", "docs/x.md": "## Привет\n\n## Heading with é\n", "docs/über.md": ""}
+    tracked = _agent_map_repo(tmp_path, claude, files)
+
+    assert agent_map_link_problems(tmp_path, tracked) == []
+
+
 def test_agent_map_links_report_a_missing_path_and_a_wrong_anchor(tmp_path: Path) -> None:
     claude = "# Map\n[gone](docs/gone.md)\n[a](docs/a.md#other)\n[self](#nope)\n```\n[ignored](docs/x.md)\n```\n"
     tracked = _agent_map_repo(tmp_path, claude, {"docs/a.md": "## Some heading\n"})
@@ -778,6 +792,15 @@ def test_readme_links_accept_pages_and_the_site_root(tmp_path: Path) -> None:
     )
 
     assert readme_link_problems(tmp_path, frozenset({"docs/index.md", "docs/reference/cli.md"})) == []
+
+
+def test_readme_links_are_compared_decoded(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text(
+        "[a](https://hole.readthedocs.io/en/latest/über%20us.html) [b](<https://hole.readthedocs.io/en/latest/über us.html>)\n",
+        encoding="utf-8",
+    )
+
+    assert readme_link_problems(tmp_path, frozenset({"docs/index.md", "docs/über us.md"})) == []
 
 
 def test_readme_links_report_a_page_that_is_not_tracked(tmp_path: Path) -> None:

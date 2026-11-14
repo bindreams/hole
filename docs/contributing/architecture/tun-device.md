@@ -44,6 +44,11 @@ leftover) and `Foreign` (refuse with `DeviceError::ForeignAdapter`, having writt
 an error, never `Foreign`: "cannot read the GUID" and "the GUID is not ours" are different facts, and only the second
 may refuse on ownership grounds.
 
+Nothing is verified after the create, and nothing sweeps adapters at startup. A post-create GUID check would judge the
+create path as well as the incumbent, so a single Windows GUID-assignment quirk would become a permanent refusal to
+connect. A startup sweep of leftover adapters would rest on the belief that only one bridge runs on the machine, which
+is false.
+
 The probe does not retry. The alias lookup can transiently answer "not found" on a live machine, and a retry would need
 a chosen delay. The cost is bounded and in the safe direction: a raced probe reads as `None`, so an existing adapter is
 adopted without the check. Do not probe with `wintun_bindings::Adapter::open`: its `Drop` closes the adapter, which would
@@ -136,6 +141,16 @@ and reading the upstream there would refuse a connection that works. The probe a
 whole host is blocked by [the cover](kill-switch.md) during this phase, so a Cancel the build could not see would extend
 the window. Nothing is cancelled by dropping a future: when the cancel wins, the blocking task runs to completion and drops
 its own `Device` on its own thread, which releases the adapter.
+
+## The interface metric (Windows)
+
+`Dispatcher::new` gives `hole-tun` the lowest interface metric (`TUNNEL_INTERFACE_METRIC`) with `set_interface_metric`
+({src}`crates/tun-engine/src/net/metric.rs`), not through `tun::Configuration::metric`. `tun` applies both families, but it
+waits for the IPv4 interface and not the IPv6 one, and it swallows `ERROR_NOT_FOUND` on the IPv6 call into a `log` record
+Hole never surfaces, so the IPv6 metric would land or vanish from run to run with no trace. `set_interface_metric` returns
+the absence as `MetricOutcome::NoInterfaceRow`, which the caller logs at `warn`. That removes the silent part of the
+failure and not the race itself: the IPv6 interface row may not exist yet, and waiting for it would take a chosen delay,
+which Hole does not use. No test asserts the row is present.
 
 ## Read next
 

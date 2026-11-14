@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use smoltcp::socket::tcp;
 use smoltcp::wire::{TcpControl, TcpSeqNumber};
 use tokio::io::{Empty, Join, Sink};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::super::tcp_test_support::*;
 use super::super::udp_flow::UdpFlow;
@@ -44,11 +44,34 @@ impl Router for HoldingRouter {
     }
 }
 
+/// A router that drops each TCP flow at once and reports that it has, so a
+/// test can wait on the drop itself rather than on elapsed time.
+struct DroppingRouter(std::sync::Mutex<Option<oneshot::Sender<()>>>);
+
+#[async_trait::async_trait]
+impl Router for DroppingRouter {
+    async fn route_tcp(&self, _meta: TcpMeta, flow: TcpFlow) -> io::Result<()> {
+        drop(flow);
+        if let Some(dropped) = self.0.lock().unwrap().take() {
+            let _ = dropped.send(());
+        }
+        Ok(())
+    }
+
+    async fn route_udp(&self, _meta: UdpMeta, _flow: UdpFlow) -> io::Result<()> {
+        std::future::pending().await
+    }
+}
+
 /// The driver under test. Its TUN reads EOF and discards writes: these tests
 /// drive the smoltcp layer through `stack` and never call [`Driver::run`].
 type TestDriver = Driver<Join<Empty, Sink>>;
 
 fn driver(max_connections: usize) -> TestDriver {
+    driver_with(max_connections, Arc::new(HoldingRouter))
+}
+
+fn driver_with(max_connections: usize, router: Arc<dyn Router>) -> TestDriver {
     let config = MutEngineConfig {
         max_connections,
         ..MutEngineConfig::default()
@@ -57,7 +80,7 @@ fn driver(max_connections: usize) -> TestDriver {
     Driver::new(
         tokio::io::join(tokio::io::empty(), tokio::io::sink()),
         device_config(),
-        Arc::new(HoldingRouter),
+        router,
         Arc::new(config.freeze()),
         CancellationToken::new(),
     )
@@ -251,7 +274,7 @@ async fn a_timewait_connection_socket_is_dropped_at_once() {
     );
 }
 
-/// Route A (F7a): `copy_bidirectional` calls `flow.shutdown()` on the
+/// `copy_bidirectional` calls `flow.shutdown()` on the
 /// half that closes first and keeps relaying the other way, so the router
 /// task is still alive and reading when the client's final bytes arrive.
 /// This is the dominant path — every proxied TCP connection takes it.
@@ -299,16 +322,14 @@ async fn a_half_closing_router_still_receives_the_clients_final_bytes() {
     assert_eq!(out[0].ack, Some(TcpSeqNumber(1001 + 100 + 1)));
 }
 
-/// Route B (F7a): the router task ended and dropped its flow, so nothing
-/// can be delivered. Confined to this route is F7b's remaining downside —
-/// bytes still in `rx_buffer` at removal are now acknowledged and then
-/// dropped — which is #923's to close, not this plan's.
+/// The router task ended and dropped its flow, so nothing can be delivered.
+/// Bytes still in `rx_buffer` at removal are acknowledged and then dropped,
+/// which this test does not cover.
 ///
 /// A live spawned router cannot be observed reaching this state without a
-/// sleep or a poll-with-timeout, both forbidden here (see the plan's F8/Task
-/// 2 Step 1b note). This closes the driver's own `to_handler` directly
-/// instead of dropping a router's `TcpFlow` — the test is about what the
-/// driver does once that channel is closed, not about how it got closed, so
+/// sleep or a poll-with-timeout. This closes the driver's own `to_handler`
+/// directly instead of dropping a router's `TcpFlow`: the test is about what
+/// the driver does once that channel is closed, not about how it got closed, so
 /// it does not demonstrate that a dropped router causes the closure.
 #[skuld::test]
 async fn a_dropped_router_leaves_the_clients_final_bytes_undelivered() {
@@ -353,6 +374,30 @@ async fn a_dropped_router_leaves_the_clients_final_bytes_undelivered() {
         "the ACK still leaves — this fix's remaining cost, confined to route B"
     );
     assert_eq!(out[0].ack, Some(TcpSeqNumber(1001 + 100 + 1)));
+}
+
+/// Pins the `Router::route_tcp` contract: a router that drops its `TcpFlow`
+/// closes the connection with a FIN, not an RST.
+#[skuld::test]
+async fn a_router_that_drops_its_flow_closes_the_connection_with_a_fin() {
+    let (dropped_tx, dropped_rx) = oneshot::channel();
+    let mut d = driver_with(4, Arc::new(DroppingRouter(std::sync::Mutex::new(Some(dropped_tx)))));
+    let (handle, synack_seq) = admit_one(&mut d, client(), dest(), 1000, 0);
+    d.stack.enqueue_rx(ack(client(), dest(), 1001, synack_seq));
+    d.stack.poll(t(2));
+    assert_eq!(d.stack.socket(handle).state(), tcp::State::Established);
+
+    dropped_rx.await.expect("the router task dropped its flow");
+    d.relay_tcp_data();
+    d.stack.poll(t(3));
+
+    let out = tcp_out(&mut d.stack);
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].control,
+        TcpControl::Fin,
+        "the drop closed the connection with a FIN"
+    );
 }
 
 /// `relay_tcp_data`'s `send_slice` calls are guarded by `can_send()`
@@ -406,14 +451,11 @@ async fn a_partial_send_resumes_from_pending_send_on_the_next_relay_pass() {
     );
 }
 
-/// Reaches Task 2's conclusion through `Driver`'s own methods instead of
-/// `SocketStack`'s. The phase sequence below is a copy of
-/// `Driver::run`'s (`driver.rs:153-159`), substituting `stack.poll(t(..))`
-/// for `poll_smoltcp()` because the fixture drives time explicitly — it is
-/// not a read of that order, and no assertion here would catch it changing.
-/// Its RED sibling is Task 2's
-/// `a_fin_carrying_data_is_acknowledged_before_the_socket_can_be_removed`,
-/// which fails without the fix at the layer the fix lives in.
+/// Pins, through `Driver`'s own methods, that the ACK of a peer's
+/// data-carrying FIN leaves on the poll after ingestion and only then is the
+/// connection reaped. The phase sequence is a hand-copy of `Driver::run`'s with
+/// explicit time (`stack.poll(t(..))`), so it does not catch that order
+/// changing.
 #[skuld::test]
 async fn the_last_ack_reaches_the_wire_before_the_connection_is_reaped() {
     let mut d = driver(4);
@@ -467,12 +509,11 @@ async fn a_connection_whose_client_never_answers_is_reclaimed() {
 
 // settle_packet ordering ==============================================================================================
 
-/// The invariant behind #911's fix, proven against the call `Driver::run`
-/// actually makes — not a hand-sequenced stand-in for it. `settle_packet` is
-/// the one production entry point for a TUN packet; enqueue, both polls,
-/// admission and retirement never straddle two calls, so a socket
-/// mid-retirement can never intercept the next packet's SYN regardless of how
-/// many packets a future `run()` reads per iteration.
+/// The invariant behind `settle_packet`, proven against the call `Driver::run`
+/// actually makes, not a hand-sequenced stand-in for it. `settle_packet` is the
+/// one production entry point for a TUN packet; enqueue, both polls, admission
+/// and retirement never straddle two calls, so a socket mid-retirement can
+/// never intercept the next packet's SYN.
 ///
 /// A hijacked SYN is not silent on the wire — the reverted socket kept the
 /// SYN-ACK unpaused from its earlier admission, so it answers anyway. The

@@ -1,59 +1,47 @@
-//! Privileged-lane live proof for the DNS-egress confinement (#846).
+//! Privileged-lane live proof for the DNS-egress confinement.
 //!
 //! The claim under test is a kernel behaviour that cannot be proven from
-//! sources: that `IP_LOCAL_INTERFACE` at `ALE_AUTH_CONNECT` really does
-//! discriminate a DNS query routed into a named `hole-tun`-shaped adapter
-//! from one routed out any other interface, and that a **dynamic** FWPM
-//! session's filters really do vanish the instant its engine handle closes.
-//! Same argument as `routing::failclosed::live_tun_permit_privileged_tests`
-//! (#874) and `lockdown_privileged_tests` (#527) — this module follows their
-//! shape.
+//! sources: that `IP_LOCAL_INTERFACE` at `ALE_AUTH_CONNECT` discriminates a DNS
+//! query routed into a named `hole-tun`-shaped adapter from one routed out any
+//! other interface, and that a **dynamic** FWPM session's filters vanish the
+//! instant its engine handle closes. It follows the shape of
+//! `routing::failclosed::live_tun_permit_privileged_tests` and
+//! `lockdown_privileged_tests`.
 //!
-//! **Assertions are on the wire, never on elapsed time.** A WFP block fails
-//! synchronously; it does not stall. But for the UDP probes below, "the wire"
-//! means an actual `pktmon` capture
-//! ([`crate::test_utils::pktmon`]), not the `send_to` call's own return
-//! value: a bound, unconnected UDP socket's `send_to` returns `Ok` whether
-//! the datagram left or was dropped at `ALE_AUTH_CONNECT`, so `Ok(22)` is
-//! exactly what a successfully blocked send looks like too. Only the one TCP
-//! probe here (`leaves_other_ports_alone`) can trust its own `connect`
-//! result: a completed three-way handshake is proof no firewall drop can
-//! manufacture. Every UDP test instead sends a per-marker nonce and asks the
-//! capture whether it egressed, using a rendezvous tail on the same socket
-//! where the claim under test is an absence (see each test's own doc) — no
-//! sleep, no poll.
+//! **Assertions are on the wire, never on elapsed time.** For the UDP probes,
+//! "the wire" is a `pktmon` capture ([`crate::test_utils::pktmon`]), not the
+//! `send_to` return value: a bound, unconnected UDP socket's `send_to` returns
+//! `Ok` whether the datagram left or was dropped at `ALE_AUTH_CONNECT`. Only
+//! the one TCP probe (`leaves_other_ports_alone`) can trust its own `connect`
+//! result, since a completed handshake is proof no firewall drop can
+//! manufacture. Every UDP test sends a per-marker nonce and asks the capture
+//! whether it egressed, using a rendezvous tail on the same socket where the
+//! claim is an absence.
 //!
-//! **`serial = TUN` reuses `crate::TUN`** — the crate-root serial token
-//! declared once for the whole binary — rather than minting a second
-//! `#[skuld::label] const TUN`, which would race the cover tests that label
-//! excludes. Plus the `global_net_state` nextest test-group
-//! (`.config/nextest.toml`) for cross-binary serialization. COUPLED NAMES:
-//! every test below carries the literal substring
-//! `dns_confine_global_net_state_`, which that group's filter matches by
-//! substring — renaming one without updating `.config/nextest.toml` silently
-//! drops it from the group. Each also carries the `GLOBAL_NET_STATE` skuld
-//! label so `cargo xtask verify-global-net-state-labels` can bind the
-//! filter's membership to the label's live membership.
+//! **`serial = TUN` reuses `crate::TUN`**, the crate-root serial token, rather
+//! than minting a second `#[skuld::label] const TUN`. The `global_net_state`
+//! nextest test-group (`.config/nextest.toml`) serializes across binaries.
+//! COUPLED NAMES: every test below carries the substring
+//! `dns_confine_global_net_state_`, which that group's filter matches;
+//! renaming one without updating `.config/nextest.toml` silently drops it from
+//! the group. Each also carries the `GLOBAL_NET_STATE` skuld label so
+//! `cargo xtask verify-global-net-state-labels` can bind the filter's
+//! membership to the label's live membership.
 //!
-//! No `EscapeGuard` / recovery-record machinery here, unlike the fail-closed
-//! cover's privileged tests: the confinement persists NO state file by
-//! design — its entire disengage is `DnsConfinement`'s `Drop`, which this
-//! module relies on directly. A killed test leaves nothing on the host
-//! but a leaked wintun adapter (cleared the same way any other test's is —
-//! `scripts/network-reset.py`), never a stranded firewall block.
+//! There is no `EscapeGuard` or recovery record, unlike the fail-closed cover's
+//! privileged tests: the confinement persists no state, and its entire
+//! disengage is `DnsConfinement`'s `Drop`. A killed test leaves at most a
+//! leaked wintun adapter (cleared by `scripts/network-reset.py`), never a
+//! stranded firewall block.
 //!
-//! **What a real run does to the machine**: opens several real wintun
-//! adapters and engages a real, process-scoped WFP confinement more than
-//! once. Not `#[ignore]`d; runs under the elevated `tun` lane
-//! (`SKULD_LABELS="tun"`) and fails loud, un-elevated, under the default
+//! A real run opens several wintun adapters and engages a real WFP confinement
+//! more than once. Not `#[ignore]`d; it runs under the elevated `tun` lane
+//! (`SKULD_LABELS="tun"`) and fails loudly, un-elevated, under the default
 //! unprivileged pass.
 //!
 //! `dns_confine_global_net_state_adapter_reports_back_its_requested_guid` at
-//! the bottom of this file is the create→read-back ship gate for the
-//! adapter-GUID identity in `device::identity` — it tests THAT mechanism,
-//! not the confinement, and lives here only because the
-//! `dns_confine_global_net_state_` name prefix is what the nextest group
-//! matches on.
+//! the bottom pins the adapter-GUID identity in `device::identity`, not the
+//! confinement; it carries the group's prefix to join the same nextest group.
 
 #![cfg(target_os = "windows")]
 
@@ -258,14 +246,10 @@ fn capture_udp_window(dir: &Path, label: &str, body: impl FnOnce()) -> std::path
 /// actually egress — proven at the wire (module doc): `send_to`'s `Ok` alone
 /// cannot attest that on an unconnected UDP socket.
 ///
-/// Not a separate harness-control gate for the tests below: a prior design
-/// made this test that gate, but as its own nextest test it gated nothing —
-/// alphabetical ordering ran `blocks_dns_off_the_tun` first, it failed, and
-/// fail-fast killed this one before it ever ran. Every UDP test below proves
-/// its own capture pipeline live within its own window instead (its
-/// rendezvous tail, or — for a lone must-egress marker like this one — the
-/// marker itself: a broken pipeline fails this test loud, it does not pass
-/// it vacuously).
+/// This is not a harness-control gate for the tests below: each UDP test
+/// proves its own capture pipeline live within its own window instead (its
+/// rendezvous tail, or, for a lone must-egress marker like this one, the
+/// marker itself: a broken pipeline fails this test loudly).
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_permits_dns_on_the_named_tun() {
     let name = "dns-confine-test-tun-a";
@@ -404,11 +388,10 @@ fn dns_confine_global_net_state_is_sensitive_to_the_interface_it_names() {
     drop(dev_b);
 }
 
-/// Rule #0, asserted rather than assumed: dropping the guard must fully
-/// release the confinement — a dynamic session's filters vanish with the
-/// engine handle, with no by-key sweep and nothing left to strand a user.
-/// Proven at the wire, after the guard is dropped: `send_to`'s `Ok` alone
-/// cannot attest that DNS is unblocked again.
+/// Dropping the guard must fully release the confinement: a dynamic session's
+/// filters vanish with the engine handle, with no by-key sweep and nothing left
+/// to strand a user. Proven at the wire, after the guard is dropped:
+/// `send_to`'s `Ok` alone cannot attest that DNS is unblocked again.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_filters_die_with_the_session() {
     let dev = open_device("dns-confine-test-tun-f", "10.255.245.1", "255.255.255.0");
@@ -479,17 +462,15 @@ fn dns_confine_global_net_state_permits_the_server_on_port_53() {
     });
 }
 
-/// SHIP GATE (Task 6, #846 plan). The vendor header calls the
+/// Ship gate for the adapter-GUID identity. The vendor header calls the
 /// `RequestedGUID` API "completely undocumented, and so there could be
-/// minor interesting complications with its usage"
-/// (`wintun-bindings-0.7.39/wintun/include/wintun.h:50-53`), and
-/// `wintun-bindings` ships a live GUID-mismatch handler — so this is not a
-/// formality. Creates a real adapter through the PRODUCTION path
-/// (`Device::build`, which requests `HOLE_ADAPTER_GUID`), drops it, then
-/// re-opens by NAME (not by handle) and reads the GUID back via
-/// `probe_incumbent` — the exact ADOPT-path read `Device::build` itself
-/// performs on its next start. If this fails, the ownership gate is
-/// worthless as designed: **stop and raise it, do not weaken this test.**
+/// minor interesting complications with its usage" (`wintun.h`), and
+/// `wintun-bindings` ships a live GUID-mismatch handler. Creates a real adapter
+/// through the PRODUCTION path (`Device::build`, which requests
+/// `HOLE_ADAPTER_GUID`), drops it, then re-opens by NAME (not by handle) and
+/// reads the GUID back via `probe_incumbent` — the exact ADOPT-path read
+/// `Device::build` itself performs on its next start. A failure means the
+/// GUID-based ownership gate does not work.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_adapter_reports_back_its_requested_guid() {
     let name = "dns-confine-test-tun-guid";

@@ -1,10 +1,9 @@
 //! Privileged-lane proof that the upstream-route lookup can see a **wintun**
 //! adapter.
 //!
-//! This is the one test that covers bindreams/hole#798's actual defect — see
-//! `gateway/windows.rs`'s module doc for the full blind-spot story. Here, a
-//! real wintun adapter proves the lookup can see an `IfType 53` interface,
-//! which `default-net`'s allowlist could not.
+//! This is the one test that covers the `default-net` blind spot; see
+//! `gateway/windows.rs`'s module doc. A real wintun adapter proves the lookup
+//! can see an `IfType 53` interface, which `default-net`'s allowlist could not.
 //!
 //! **It never touches the default route.** The property under test is "can this
 //! lookup name an `IfType 53` adapter", not "what happens when one owns the
@@ -16,8 +15,7 @@
 //!
 //! Its own binary rather than a module in the lib test binary: skuld validates
 //! that a label is declared once per binary, and the lib already declares `TUN`
-//! in `routing/failclosed/lockdown_privileged_tests.rs`. Keeping this separate
-//! also leaves that file — contended by bindreams/hole#832 — untouched.
+//! in `routing/failclosed/lockdown_privileged_tests.rs`.
 //!
 //! Runs on the elevated `tun` lane only: creating a wintun adapter needs the
 //! elevated token. Not `#[ignore]`d, and it does not skip on missing privilege —
@@ -193,9 +191,7 @@ mod windows_impl {
     /// `GetUnicastIpAddressEntry`": exactly `Address`, `InterfaceLuid` and
     /// `InterfaceIndex`. Every other member — `DadState` included — is left at
     /// its zero value, and `IpDadStateInvalid` IS zero, so reading it here
-    /// reports a rejection on every single notification. That is what made the
-    /// first version of this test fail deterministically while claiming the
-    /// subnet was already in use.
+    /// reports a rejection on every single notification.
     ///
     /// So the callback forwards only the interface index and the main thread
     /// does the authoritative query. Keeping it to a channel send also respects
@@ -345,7 +341,7 @@ mod windows_impl {
         assert_eq!(
             hop.interface_index, expected,
             "the lookup named interface {} instead of the wintun adapter {expected} — that is \
-             the #798 blind spot: an IfType 53 adapter the enumeration cannot see",
+             the `default-net` blind spot: an IfType 53 adapter the enumeration cannot see",
             hop.interface_index
         );
         assert_eq!(hop.interface_alias, TEST_ADAPTER);
@@ -354,8 +350,8 @@ mod windows_impl {
         // `MIB_IPFORWARD_ROW2.NextHop` as unspecified for exactly that case.
         // `classify_hop` never reads `DestinationPrefix`, so a real on-link
         // route against a real kernel — not a fabricated `RouteHop` — is
-        // what proves `NextHop::OnLink` (bindreams/hole#798's PR1) reaches
-        // production from something the OS actually returned.
+        // what proves `NextHop::OnLink` reaches production from something the
+        // OS actually returned.
         assert!(
             hop.next_hop.is_unspecified(),
             "an on-link destination must resolve to an unspecified next hop, got {}",
@@ -368,15 +364,14 @@ mod windows_impl {
     /// `Device::build`. `NotifyUnicastIpAddressChange`/`CancelMibChangeNotify2`
     /// registration is itself unprivileged — only creating the wintun adapter
     /// needs the elevated token — so this is the ONE piece of that test
-    /// reachable unelevated, and the ONLY one the leaked-callback defect
-    /// actually lived in.
+    /// reachable unelevated, and the one that guards against a leaked callback.
     ///
     /// Drops the guard via an early return (not the end of its natural
     /// scope — the same "control leaves before the happy-path cleanup"
     /// shape a `panic!` unwind has) and proves the cancel already ran, via
     /// `cancel_confirmed` — a second REAL `CancelMibChangeNotify2` on the
     /// same handle is not a safe way to observe this (confirmed empirically:
-    /// it corrupted the heap on this box), so `Drop`'s own confirmation is
+    /// it corrupted the heap), so `Drop`'s own confirmation is
     /// the only sound signal. Mutates no OS routing/adapter state, so —
     /// unlike the test above — it carries neither `TUN` nor
     /// `GLOBAL_NET_STATE` and runs in the ordinary unprivileged pass.

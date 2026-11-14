@@ -1,6 +1,5 @@
 //! Privileged-lane live proof for [`set_interface_metric`]: a real wintun
-//! device, both families, read back via `GetIpInterfaceEntry` — the module
-//! had no live coverage at all before this. Same shape as
+//! device, both families, read back via `GetIpInterfaceEntry`. Same shape as
 //! `device::ipv6_addr_privileged_tests`.
 //!
 //! Runs on the elevated `tun` lane only (creating a wintun adapter needs

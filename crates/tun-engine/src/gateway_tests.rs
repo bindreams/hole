@@ -30,8 +30,8 @@ fn interface_index_by_name_errs_for_an_unknown_name() {
 #[skuld::test]
 fn tun_ipv6_available_is_false_when_the_adapter_cannot_be_resolved() {
     // No adapter of this name exists on this host, so resolution fails —
-    // `false` is the safe default (tolerate the IPv6 route commands failing,
-    // never skip issuing them; see `SetupCommand`).
+    // `false` is the safe default (the IPv6 route commands stop being fatal for
+    // the runner, and are never skipped; see `SetupCommand`).
     assert!(!tun_ipv6_available("definitely-not-a-real-adapter-xyz"));
 }
 
@@ -126,7 +126,7 @@ fn classify_hop_accepts_a_real_next_hop() {
 // Pure and platform-independent, so it is testable on every host regardless
 // of which platform's `get_default_gateway_info` calls it. macOS has no
 // interface-scoped IPv4 bypass form (`routing.rs`), so on-link must stay a
-// refusal there even though Windows now accepts it.
+// refusal there even though Windows accepts it.
 
 #[skuld::test]
 fn reject_macos_on_link_refuses_on_link_as_no_default_route() {

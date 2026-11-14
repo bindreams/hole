@@ -1,32 +1,16 @@
 //! Give `hole-tun` the lowest interface metric, per address family, so
 //! Windows prefers whatever resolver Hole advertises over the physical
-//! adapter's — the positive half of #846 (the negative half is
-//! `crate::dns_confine`). `1` is the minimum possible metric — a structural
-//! extremum, not a tuned number.
+//! adapter's (the negative half is `crate::dns_confine`).
 //!
-//! **Do not route this through `tun::Configuration::metric`.** It looks
-//! right and is not:
-//! `tun-0.8.13/src/platform/windows/device.rs:79-85` applies both families
-//! unconditionally, but `sys.rs:151-158` swallows `ERROR_NOT_FOUND` on the
-//! IPv6 call with a `log::warn!` and `return Ok(())`, and
-//! `PlatformConfig::default` leaves `wait_for_ipv6_interface: false` while
-//! `wait_for_ipv4_interface` is `true` — so the v4 metric is ordered behind
-//! a real wait and the v6 metric races the OS creating the interface row,
-//! landing or vanishing run to run, reporting success either way through a
-//! `log` record Hole never surfaces (Hole is on `tracing`). Setting the
-//! metric ourselves, and making absence a **returned value** rather than a
-//! swallowed warning, is the fix this module makes.
+//! The metric is set here rather than through `tun::Configuration::metric`:
+//! `tun` swallows `ERROR_NOT_FOUND` on the IPv6 call into a `log` record Hole
+//! never surfaces. Here absence is a returned value,
+//! [`MetricOutcome::NoInterfaceRow`], which the caller logs at `warn!`.
 //!
-//! **This removes the silent part, not the race.** `set_interface_metric`
-//! calls `GetIpInterfaceEntry` at the same point in the same lifecycle with
-//! no wait, so whether the v6 interface row exists yet is still
-//! timing-dependent. It becomes a *reported* coin flip
-//! ([`MetricOutcome::NoInterfaceRow`], logged at `warn!` by the caller), not
-//! an asserted condition. The obvious repair — waiting for the row — is
-//! barred by the no-time-sync rule: the only mechanism `tun` offers,
-//! `sys::wait_for_interfaces`, is a 5-second `recv_timeout`. There is
-//! deliberately no test here asserting the v6 row is present; that would be
-//! asserting a race.
+//! That removes the silent part of the failure, not the race: the IPv6
+//! interface row may not exist yet when this runs, so the IPv6 outcome is
+//! timing-dependent, and no test asserts the row is present. See
+//! `docs/contributing/architecture/tun-device.md`.
 
 use std::io;
 
@@ -35,9 +19,8 @@ use windows::Win32::NetworkManagement::IpHelper::{GetIpInterfaceEntry, SetIpInte
 use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
-/// The metric `Dispatcher::new` requests for `hole-tun`, both families. `1`
-/// is the minimum possible value — the OS's first choice by construction,
-/// not a chosen rank.
+/// The metric `Dispatcher::new` requests for `hole-tun`, both families: the
+/// lowest value the OS accepts, not a tuned rank.
 pub const TUNNEL_INTERFACE_METRIC: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

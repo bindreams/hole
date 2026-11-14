@@ -17,11 +17,9 @@ use util::versioned_file::StoreError;
 use crate::error::{CheckpointFailure, CommandFailure, RouteCommandError, RoutingError, SetupFailure};
 use crate::gateway::{self, get_default_gateway_info, tun_ipv6_available, GatewayError, GatewayInfo, NextHop};
 
-/// Total number of routing subprocess spawns this process has performed.
-/// Incremented once per command executed. Exposed so
-/// `diagnostics` handlers and tests can assert the no-routing-subprocess
-/// invariant. The one-instruction `fetch_add` has negligible production
-/// cost — far below the millisecond-scale subprocess itself.
+/// Total number of routing subprocess spawns this process has performed,
+/// incremented once per command executed. Exposed so `diagnostics` handlers and
+/// tests can assert the no-routing-subprocess invariant.
 pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 
 // Route identity ======================================================================================================
@@ -99,21 +97,18 @@ fn route_form_of(gateway: &GatewayInfo) -> state::RouteForm {
 
 /// One route-install command, tagged with the route it acts on (so a setup
 /// command's outcome can be checkpointed against [`RouteId`]) and whether its
-/// failure aborts the install.
+/// failure stops the runner.
 ///
-/// Fatality is per command, not per phase. The IPv4 splits and the server
-/// bypass are always fatal — a missing one of those sends traffic outside the
-/// tunnel. The two IPv6 splits are fatal only when the TUN interface they
-/// target has an IPv6 binding ([`tun_ipv6_available`]):
-/// where it does not, `netsh interface ipv6 add route` / `route add -inet6`
-/// on the TUN can outright fail (`DisabledComponents`, or an EDR policy that
-/// unbinds IPv6 from new adapters), and a host with no IPv6 stack emits no
-/// IPv6 traffic to leak. Where the TUN's IPv6 IS bound every command is
-/// fatal, because there a missing `::/1` route is exactly the #901 leak.
+/// Fatality is per command. The IPv4 splits and the server bypass are always
+/// fatal. The two IPv6 splits are fatal only when the TUN interface they target
+/// has an IPv6 binding ([`tun_ipv6_available`]): where it does not,
+/// `netsh interface ipv6 add route` / `route add -inet6` on the TUN can fail
+/// (`DisabledComponents`, or an EDR policy that unbinds IPv6 from new adapters).
 ///
-/// Non-fatal means *issued and tolerated*, never omitted. A bound TUN always
-/// accepts the route regardless of upstream connectivity (it is a virtual
-/// device), so an unbound TUN is the only case where the command can fail.
+/// A non-fatal command is still issued. When it fails the runner logs it and
+/// continues, but the route is not recorded as installed, so
+/// [`SystemRouting::install`] still rolls back and fails with
+/// `RoutingError::RouteSetup` when a planned route is missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupCommand {
     pub id: RouteId,
@@ -371,12 +366,11 @@ fn route_confirmed_absent(output: &std::process::Output) -> bool {
 }
 /// Windows has no text-based oracle: `route.exe`/`netsh` give no signal
 /// beyond the exit code, and unlike macOS, a non-zero exit does NOT
-/// unambiguously mean "already gone" — verified empirically on this box,
-/// `netsh ... delete route` on an absent route and on a route requiring
-/// elevation both exit 1 with no distinguishing text. Only exit 0 (a
-/// definite, successful delete) confirms the route gone; a non-zero exit
-/// conservatively keeps it recorded rather than risk silently dropping a
-/// route that is still there — a disclosed residual.
+/// unambiguously mean "already gone": `netsh ... delete route` on an absent
+/// route and on a route requiring elevation both exit 1 with no distinguishing
+/// text. Only exit 0 (a definite, successful delete) confirms the route gone;
+/// a non-zero exit conservatively keeps it recorded rather than risk silently
+/// dropping a route that is still there.
 #[cfg(not(target_os = "macos"))]
 fn route_confirmed_absent(output: &std::process::Output) -> bool {
     output.status.success()
@@ -386,8 +380,8 @@ fn route_confirmed_absent(output: &std::process::Output) -> bool {
 ///
 /// Deliberately **not** hand-redacted: the argv carries the server IP and the
 /// redacting log sink covers it, along with every other producer this crate
-/// does not author. Extracted so recovery tests can drive the real log site
-/// without spawning a subprocess.
+/// does not author. Separate from the runner so tests can drive the real log
+/// site without spawning a subprocess.
 pub(crate) fn log_route_command(phase: &str, cmd: &str) {
     info!(phase, cmd, "running route command");
 }
@@ -489,38 +483,34 @@ fn run_command<P: Phase>(mut command: Command, cmd: String, phase: P) -> Result<
 // Execute (checkpointed) ==============================================================================================
 //
 // Both loops below persist `installed`/`still_installed` after EVERY command,
-// not once per phase or once per install. The
-// on-disk record is therefore never a prediction (superset or otherwise): at
-// any instant, including mid-loop, it names exactly what the accumulator in
-// memory names, so a crash or a later command's spawn failure narrows the
-// leak window to at most the single command in flight.
+// not once per phase or once per install. Setup writes the record BEFORE each
+// command, so it names at most one route more than the in-memory accumulator
+// confirms (the command in flight); a confirmed outcome narrows it to match.
+// A crash therefore leaks at most the single command in flight.
 
 /// Execute route setup commands one at a time via `runner` (production:
-/// [`exec_one::<FatalPhase>`]; tests inject a scripted closure so they can
-/// simulate a specific command failing without touching the host, matching
-/// [`Routing`]'s test-isolation contract). `installed` accumulates the
-/// [`RouteId`]s confirmed in the table; `checkpoint` is called with it
-/// before AND after every command. Stops at the first FATAL command whose
-/// runner call does not confirm — a non-fatal one (an IPv6 split on a TUN
-/// with no IPv6 binding, see [`SetupCommand`]) is popped and skipped instead.
+/// [`exec_one::<FatalPhase>`]; tests inject a scripted closure so a specific
+/// command can fail without touching the host, per [`Routing`]'s test-isolation
+/// contract). `installed` accumulates the [`RouteId`]s confirmed in the table;
+/// `checkpoint` is called with it before AND after every command. Stops at the
+/// first FATAL command whose runner call does not confirm; a non-fatal one is
+/// popped from `installed` and skipped (see [`SetupCommand`]).
 ///
-/// A pre-command checkpoint failure aborts immediately (mirrors the
-/// write-before-mutate ordering contract: this codebase must not run a
-/// mutation it failed to record first) and propagates as
-/// [`SetupFailure::Checkpoint`], not as a failure of the command; the id is
-/// popped back out first — the write never durably happened, so the command
-/// is treated exactly like one that never ran. A post-command checkpoint
-/// failure does not abort — the record it failed to write is a narrowing,
-/// and the last successful checkpoint (naming a superset of at most one
-/// extra route) still stands — so the caller is expected to log it.
+/// A pre-command checkpoint failure aborts immediately, because a mutation that
+/// could not be recorded first must not run. It propagates as
+/// [`SetupFailure::Checkpoint`], not as a failure of the command, and the id is
+/// popped back out of `installed`: the command is treated like one that never
+/// ran. A post-command checkpoint failure does not abort; the record it failed
+/// to write is only a narrowing, so the last successful checkpoint (naming at
+/// most one extra route) stands, and the caller is expected to log it.
 ///
-/// On a runner `Err` for a FATAL command, the in-flight command's id is
-/// likewise popped back out of `installed` before the error propagates: the
-/// caller uses `installed` to decide what to roll back, and a command that
-/// never confirmed must not be rolled back as if it had. The ON-DISK
-/// checkpoint from just before the failed command is deliberately NOT
-/// corrected to match — it still names the speculative id, which is the safe
-/// superset-of-one this design accepts.
+/// On a runner `Err` for a FATAL command, the in-flight command's id is popped
+/// back out of `installed` before the error propagates, so the caller does not
+/// roll back a route that never confirmed. After [`CommandFailure::Exit`] the
+/// record is narrowed like any confirmed-absent route. After
+/// [`CommandFailure::Spawn`] the command's fate is unknown, so the checkpoint
+/// from just before it is deliberately left naming the speculative id, for
+/// `install_with` to treat as uncertain.
 pub(crate) fn setup_routes<R>(
     tun_name: &str,
     server_ip: IpAddr,
@@ -632,11 +622,8 @@ where
 /// each command confirms its route gone; `checkpoint` is called with the
 /// narrowed value after every command. Best-effort: every command in `cmds`
 /// is attempted regardless of an earlier one's outcome — there is no error
-/// channel to abort through. An empty `cmds` is a plain no-op — `runner` (the
-/// real subprocess spawner in production) is never called with a synthetic
-/// empty argv to signal that; doing so previously panicked on the
-/// unconditional `Command::new(&cmd[0])` index, reachable from crash
-/// recovery on every loopback-server deployment.
+/// channel to abort through. An empty `cmds` is a plain no-op: `runner` is
+/// never called with a synthetic empty argv.
 fn run_teardown_commands<R>(
     cmds: &[RouteCommand],
     phase: BestEffortPhase,
@@ -693,25 +680,19 @@ where
     still_installed
 }
 
-/// Tear down every route-provenance group in `groups` — already reduced to
-/// canonical form by [`state::coalesce`] — running every group's split
-/// deletes before any group's bypass delete. A split-route delete command's
-/// argv is a function of `tun_name` alone, not a group's full identity, so
-/// two distinct groups (e.g. carrying different `server_ip`s from different
-/// sessions) can legitimately name the identical command; issuing it twice
-/// would re-delete whatever claimed the freed prefix in the interim, so each distinct split argv runs
-/// at most once here and its confirmation narrows every group that named it.
-/// The bypass loop below gets the identical treatment: on macOS the bypass
-/// delete embeds only `server_ip` — not `tun_name`, `interface_name`, or a
-/// gateway (see `platform_bypass_teardown_command`'s doc) — so two crashed
-/// sessions to the SAME server produce the identical bypass argv even though
-/// they differ in `tun_name` (what every pair of crashed macOS sessions to
-/// one server now looks like, since `utunN` is kernel-assigned per open);
-/// Windows' bypass argv is likewise silent on `tun_name`. `checkpoint`
-/// receives the full narrowed group list after every command. Shared by
-/// [`recover_routes_with`] (primary record + `stale`) and
-/// [`sweep_leftover_before_install`] (`stale` alone) — the sole place either
-/// path actually spawns/scripts a teardown command.
+/// Tear down every route-provenance group in `groups`, already reduced to
+/// canonical form by [`state::coalesce`], running every group's split deletes
+/// before any group's bypass delete. Each distinct split argv runs at most once
+/// and its confirmation narrows every group that named it: a split delete's argv
+/// depends on `tun_name` alone, so distinct groups can name the identical
+/// command, and issuing it twice would re-delete whatever claimed the freed
+/// prefix in between. The bypass loop does the same: the macOS bypass delete
+/// embeds only `server_ip` and the Windows one is silent on `tun_name`, so two
+/// crashed sessions to one server produce the identical bypass argv.
+/// `checkpoint` receives the full narrowed group list after every command.
+/// Shared by [`recover_routes_with`] (primary record + `stale`) and
+/// [`sweep_leftover_before_install`] (`stale` alone), the only places either
+/// path spawns a teardown command.
 fn recover_groups<R>(
     mut groups: Vec<state::StaleRecord>,
     runner: &R,
@@ -1073,35 +1054,29 @@ pub(crate) fn run_capturing<P: Phase>(
 
 // Crash recovery ======================================================================================================
 
-/// Clean up routes left behind by a previous run.
+/// Clean up what a previous run left behind: routes, then covers.
 ///
 /// Called at startup **after** the IPC socket bind succeeds (so a second
-/// instance can't damage the first's routing state). Removes the fixed-CIDR
-/// split routes (idempotent — harmless if absent); if a [`state::RouteState`]
-/// file is present in `state_dir`, also removes the server bypass route
-/// described by it; finally deletes the state file. Route errors are
-/// best-effort and logged at `warn`.
+/// instance can't damage the first's routing state).
 ///
-/// Returns the standing-lockdown [`Recovery`] so the caller can record
-/// "a standing cover is live this run" — the claim that keeps the escape
-/// visible when the intent file cannot be read or repaired.
+/// Routes: only what `bridge-routes.json` records is deleted (see
+/// `docs/contributing/architecture/route-ownership.md`), split routes before the
+/// server bypass. With no record, or an unreadable one, no route command runs.
+/// Route errors are best-effort and logged at `warn`; the record is cleared only
+/// once nothing it names remains.
 ///
-/// `owner` is [`Routing::owner`], the uid/gid every bridge write into `state_dir` carries. Recovery's
-/// intent repair may CREATE both the directory and `bridge-lockdown.json` — a
-/// wiped state dir is exactly the condition that produces the `Unset` intent —
-/// so without it a user-scoped macOS bridge drops root-owned files into
-/// `~/Library/Application Support/hole`.
+/// Covers: decides what to do with a standing lockdown cover from the recorded
+/// intent and the measured presence ([`decide_cover_recovery`]), acts on it,
+/// then sweeps any transient cover. Returns that [`Recovery`] so the caller can
+/// record "a standing cover is live this run".
 ///
-/// `tun_name` is the caller's own configured TUN device name (the bridge's
-/// `WINDOWS_TUN_ALIAS` constant, on Windows) — the fallback the TUN-permit
-/// reclaim uses when no `bridge-routes.json` survived this startup to name
-/// one. `None` on a
-/// platform with no such compile-time fallback to offer (macOS, where the
-/// name is kernel-assigned and unknowable before the device is opened) —
-/// the reclaim then relies solely on the recovered file's own `tun_name`,
-/// falling back to a no-op when neither source is available. See
-/// [`recover_routes_with`]'s doc for why the file alone cannot be the only
-/// source.
+/// `owner` is [`Routing::owner`], the uid/gid every bridge write into
+/// `state_dir` carries: recovery's intent repair may create the directory and
+/// `bridge-lockdown.json`.
+///
+/// `tun_name` is the caller's configured TUN device name where it has a
+/// compile-time one (Windows: `WINDOWS_TUN_ALIAS`), and `None` on macOS, where
+/// the kernel assigns it. See `recover_routes_with`.
 pub fn recover_routes(state_dir: &Path, owner: Option<(u32, u32)>, tun_name: Option<&str>) -> Recovery {
     recover_routes_with(
         state_dir,
@@ -1121,32 +1096,20 @@ pub fn recover_routes(state_dir: &Path, owner: Option<(u32, u32)>, tun_name: Opt
 pub enum CoverRecovery {
     /// A standing cover is live and nothing recorded says to remove it: KEEP
     /// the host fail-closed across the restart. Performs **no OS call that
-    /// could clobber a RUNNING first bridge's cover** — its whole effect is
-    /// that the bridge records "a standing cover is live this run", so the
-    /// next connect re-engages through `install_lockdown`, which refreshes
-    /// the volatile permits (the dead TUN LUID/utun and the possibly-changed
-    /// server IP) itself.
+    /// could clobber a RUNNING first bridge's cover**. Its effect is that the
+    /// bridge records "a standing cover is live this run", so the next connect
+    /// re-engages through `install_lockdown`, which refreshes the volatile
+    /// permits (the dead TUN LUID/utun and the possibly-changed server IP)
+    /// itself. A crash never runs `stop()`, so the persistent cover survives and
+    /// Adopt holds it.
     ///
-    /// The one exception, Windows only: it also reclaims the volatile
-    /// TUN-LUID permit pair when `hole-tun` no longer resolves — see
-    /// `failclosed::reclaim_stale_tun_permit`. That is safe where deleting the
-    /// server permit here is not: a genuinely running bridge's own `hole-tun`
-    /// resolves successfully, so the reclaim can never touch a live bridge's
-    /// permit, whereas the server IP has no equivalent liveness check.
-    ///
-    /// Disclosed cost of the remaining inertness: between an adopted cover and
-    /// the next connect the stale server-IP permit stays installed rather than
-    /// being dropped immediately (and, until `hole-tun` is confirmed gone, so
-    /// does the TUN-LUID permit). Both are *permits* on an idle cover, and the
-    /// App-ID permit already grants the bridge and plugin binaries unrestricted
-    /// egress in that same window, so the added surface is one
-    /// previously-configured server IP for other processes while nothing is
-    /// connected. The alternative — deleting the server permit at recovery
-    /// time — would let a second bridge with a fresh state dir delete a
-    /// RUNNING first bridge's server permit while block-all stayed in force.
-    ///
-    /// This is also the crash-leak fix: a crash never runs `stop()`, so the
-    /// persistent cover survives and Adopt holds it.
+    /// The one exception, Windows only: it reclaims the TUN-LUID permit pair when
+    /// `hole-tun` no longer resolves (`failclosed::reclaim_stale_tun_permit`). A
+    /// running bridge's own `hole-tun` resolves, so the reclaim cannot touch a
+    /// live bridge's permit; the server IP has no equivalent liveness check, so
+    /// its permit stays until the next connect. The cost of that, and why the
+    /// alternative was rejected, is in
+    /// `docs/contributing/architecture/kill-switch-recovery.md`.
     Adopt,
     /// [`Intent::Off`](failclosed::lockdown_state::Intent::Off) with an
     /// actionable presence: fully disengage the leftover cover (Windows: delete
@@ -1302,18 +1265,14 @@ pub fn decide_cover_recovery(intent: failclosed::lockdown_state::Intent, presenc
 /// `owner` is passed straight through to the intent repair — see
 /// [`recover_routes`].
 ///
-/// `tun_name` is the fallback TUN-permit-reclaim hint: `bridge-routes.json`'s
-/// own `tun_name` wins when a route-state file was recovered THIS startup, but
-/// that file's lifetime is anti-correlated with the condition the reclaim
-/// needs — `SystemRoutes::drop` clears it on every CLEAN teardown, including
-/// the `Cutover` stop that precedes the canonical Adopt path, so the file is
-/// present exactly when the adapter probably still resolves and absent
-/// exactly when it definitely does not. Falling back to the caller's own
-/// configured name keeps the reclaim reachable on that path too; the resolve
-/// check inside `should_reclaim_tun_permit` is what makes deleting on a
-/// guessed name safe — a live `hole-tun` still blocks it. `None` when the
-/// caller has no compile-time fallback to offer (macOS) — the hint then
-/// degrades to whatever the recovered file itself names, or nothing at all.
+/// `tun_name` is the fallback hint for reclaiming a stale TUN permit.
+/// `bridge-routes.json`'s own `tun_name` wins when a record was recovered this
+/// startup, but that file is cleared on every clean teardown (including the
+/// `Cutover` stop that precedes Adopt), so it is present exactly when the
+/// adapter probably still resolves. The caller's configured name keeps the
+/// reclaim reachable on that path, and `should_reclaim_tun_permit`'s resolve
+/// check makes acting on a guessed name safe. `None` where the caller has no
+/// compile-time name (macOS).
 #[allow(clippy::too_many_arguments)] // private test seam — bundling into a struct adds more noise than the warning.
 pub(crate) fn recover_routes_with<R, S, I, P, L>(
     state_dir: &Path,
@@ -1514,17 +1473,13 @@ where
     let adopt = matches!(decision.action, CoverRecovery::Adopt);
     // `tun_name_hint` prefers THIS bridge's own last-known TUN device (from its
     // own `bridge-routes.json`) and falls back to the caller-supplied
-    // `tun_name` otherwise — see this function's doc for why the file alone
-    // is not a safe gate. On Windows, the fallback is `WINDOWS_TUN_ALIAS`, a
-    // compile-time constant shared by every install, so it names the same
-    // device a different install's cover would too. On macOS there is no
-    // such fallback (`tun_name` is `None`: the name is kernel-assigned and
-    // unknowable ahead of opening the device) — a wiped
-    // `bridge-routes.json` there leaves `tun_name_hint` `None` and the
-    // reclaim below a no-op, never a cross-install guess. Either way, only
-    // the reclaim's server-IP counterpart is scoped by the per-install
-    // identity gap described in kill-switch-recovery.md, and this reclaim never
-    // touches that permit.
+    // `tun_name`; see this function's doc. On Windows the fallback is a
+    // constant shared by every install, so it names the same device a
+    // different install's cover would too. On macOS there is none, so a wiped
+    // `bridge-routes.json` leaves the hint `None` and the reclaim a no-op,
+    // never a cross-install guess. The per-install identity gap described in
+    // kill-switch-recovery.md concerns the server-IP permit, which this reclaim
+    // never touches.
     lockdown_recover(&lock, decision.action, tun_name_hint.as_deref());
 
     // Sweep any transient fail-closed cover left by a bridge that crashed holding one. Only a bridge up to
@@ -1597,7 +1552,7 @@ pub trait CoverGuard {
 /// are generic over `R: Routing` so unit tests can substitute a mock whose
 /// `Installed` type counts teardown invocations. A helper that bypasses the
 /// trait cannot be intercepted by the mock and will exercise real production
-/// code from unit tests. See the bindreams/hole#165 incident.
+/// code from unit tests.
 pub trait Routing: Send + Sync {
     /// RAII guard returned by [`install`](Self::install). Dropping this
     /// value tears down the routes and clears the crash-recovery state
@@ -1625,10 +1580,9 @@ pub trait Routing: Send + Sync {
     ///
     /// Takes the whole [`TunIdentity`](crate::device::TunIdentity) (not a
     /// bare name) so the alias reaching the route table, the lockdown cover,
-    /// and DNS steering all provably come from the SAME opened device — the
-    /// device-name plumbing. The conversion to a
-    /// bare name happens once, at this trait boundary; everything below it
-    /// keeps using `&str`.
+    /// and DNS steering all provably come from the SAME opened device. The
+    /// conversion to a bare name happens once, at this trait boundary;
+    /// everything below it keeps using `&str`.
     fn install(
         &self,
         tun: &crate::device::TunIdentity,
@@ -1637,29 +1591,21 @@ pub trait Routing: Send + Sync {
     ) -> Result<Self::Installed, RoutingError>;
 
     /// Returns the upstream route to `dest` that the *next* call to
-    /// [`install`](Self::install) — passed the same `server_ip` — will bypass
-    /// the tunnel through. Lives on the trait (not as a free function) so
-    /// mocks can stub a predictable gateway without calling the real OS —
-    /// without this seam, every consumer unit test would depend on the host
-    /// having a route to the Internet.
+    /// [`install`](Self::install), passed the same `server_ip`, will bypass the
+    /// tunnel through. On the trait so mocks can stub a gateway without calling
+    /// the real OS.
     ///
-    /// Destination-scoped so the query answers "what route reaches `dest`
-    /// specifically", not "what is the host's default route" — the two
-    /// answers can differ, and `install`'s bypass must point at the route
-    /// this call named. For "is there a default route at all" with no
-    /// specific destination (the diagnostics poll), see
-    /// [`default_route`](Self::default_route) instead — passing a sentinel
-    /// destination here would silently conflate the two questions.
+    /// Destination-scoped: it answers "what route reaches `dest` specifically",
+    /// which can differ from the host's default route, and `install`'s bypass
+    /// must point at the route this call named. For "is there a default route at
+    /// all" with no destination (the diagnostics poll), use
+    /// [`default_route`](Self::default_route).
     ///
-    /// NOT a pure query in [`SystemRouting`]'s implementation: it first
-    /// best-effort deletes a leftover `ServerBypass` route to `dest` from a
-    /// prior crashed run, if the persisted state still names one (see
-    /// `clear_stale_server_bypass`'s own doc for why — the `/32` bypass
-    /// would otherwise outrank every real route in this same query). That
-    /// can spawn a real `route`/`netsh` delete and rewrite the persisted
-    /// route-state file before this returns. `MockRouting` implementations
-    /// are pure, matching this doc's framing; only the production path
-    /// mutates.
+    /// Not a pure query in [`SystemRouting`]: it first best-effort deletes a
+    /// leftover `ServerBypass` route to `dest` from a prior run if the persisted
+    /// state still names one (see `clear_stale_server_bypass`), which can spawn a
+    /// real `route`/`netsh` delete and rewrite the route record before it
+    /// returns. Mocks are pure.
     fn default_gateway(&self, dest: IpAddr) -> Result<GatewayInfo, RoutingError>;
 
     /// Returns the host's default route, independent of any specific
@@ -1676,29 +1622,19 @@ pub trait Routing: Send + Sync {
     type Cover: Send + CoverGuard;
 
     /// Engage a fail-closed cover: block all egress except loopback, `server_ip`,
-    /// and (when `Some`) `resolver_ip` — the address the caller's own
-    /// `ech-doh` URL names (`hole_bridge::dns::ech::EchDoh::resolver`), scoped
-    /// to TCP/443 (see `crate::dns::ech::DOH_PORT`). The caller authors that
-    /// URL from its own configured resolver set, so config-authorship trust
-    /// alone is judged sufficient — permitting it is never a claim that this
-    /// exact attempt personally dialed the address (see `EchDoh`'s doc: that
-    /// additionally holds for some `PinSource` variants but not all). `None`
-    /// covers every case where nothing should be permitted: no plugin
-    /// configured, a plugin that takes no Hole directives, malformed plugin options, or an
-    /// OPERATOR's own `ech-doh` winning instead of Hole's (an address Hole
-    /// did not author, so the config-authorship trust does not extend to it
-    /// — a disclosed residual, see
-    /// docs/contributing/architecture/kill-switch.md#the-transient-cover).
-    /// `None` is never permitted as "no restriction". Residuals of the retry
-    /// repair (a resolver drift releases and re-engages the cover with the
-    /// corrected value) are in
+    /// and (when `Some`) `resolver_ip`, the address the caller's own `ech-doh`
+    /// URL names (`hole_bridge::dns::ech::EchDoh::resolver`), scoped to TCP/443
+    /// (`DOH_PORT` in `hole_bridge::dns::ech`). `None` permits nothing extra: no
+    /// plugin configured, a plugin that takes no Hole directives, malformed
+    /// plugin options, or an operator's own `ech-doh` winning instead of Hole's.
+    /// The trust argument and its residuals are in
     /// docs/contributing/architecture/kill-switch.md#the-transient-cover.
     ///
-    /// The cover survives a process crash (Windows: persistent WFP filters keyed by fixed
-    /// GUID; macOS: pf enable token persisted to `bridge-failclosed.json`) and is
-    /// swept by [`recover_routes`] on the next start. Does NOT permit the TUN
-    /// interface — the block-until-connected connect gate holds it only until the
-    /// tunnel comes up.
+    /// The cover survives a process crash (Windows: persistent WFP filters
+    /// keyed by fixed GUID; macOS: pf enable token persisted to
+    /// `bridge-failclosed.json`) and is swept by [`recover_routes`] on the next
+    /// start. Does NOT permit the TUN interface — the block-until-connected
+    /// connect gate holds it only until the tunnel comes up.
     fn install_failclosed_cover(
         &self,
         lock: &failclosed::CoverLock,
@@ -1726,42 +1662,32 @@ pub trait Routing: Send + Sync {
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError>;
 
-    /// Clear every fail-closed cover this provider can install — both the
-    /// transient block-until-connected cover and the standing lockdown cover
-    /// — without asking whether either is present. See
-    /// [`failclosed::release_all`] for the full contract. This is the escape
-    /// from a stranded cover; a required method (no default) so every
-    /// `Routing` implementation, including every test mock, commits to one.
+    /// Clear every fail-closed cover this provider can install, the transient
+    /// block-until-connected cover and the standing lockdown cover, without
+    /// asking whether either is present. See [`failclosed::release_all`] for the
+    /// full contract. This is the escape from a stranded cover; a required
+    /// method (no default) so every `Routing` implementation, including every
+    /// test mock, commits to one.
     ///
-    /// Drops [`failclosed::Clearance`] deliberately, and this is the ONE site
-    /// allowed to. What it drops is the operator MESSAGE: every caller of this
-    /// method is in-process — the tray's Unblock action, `turn_lockdown_off`,
-    /// session teardown — and for them `hole.exe` is still on disk and `hole
-    /// bridge unlock` remains reachable, so an unproven boot-time key binds
-    /// nothing HERE. The distinction matters where the binary is about to be
-    /// removed, which is `cutover::release_covers` — and that caller reaches
-    /// the free function directly, not this trait.
+    /// Drops [`failclosed::Clearance`], the operator message, and this is the
+    /// ONE site allowed to: every caller is in-process (the tray's Unblock,
+    /// `turn_lockdown_off`, session teardown), so `hole.exe` stays on disk and
+    /// `hole bridge unlock` stays reachable. A caller about to remove the binary
+    /// must not use this method: `cutover::release_covers` calls the free
+    /// [`failclosed::release_all`] and reads the clearance. The evidence the
+    /// clearance carries is persisted by `release_all` itself (see
+    /// docs/contributing/architecture/kill-switch-uninstall.md). A filter whose
+    /// delete the OS refused fails none of these callers; it reaches only the
+    /// bridge log, through the warning the provider sweep writes.
     ///
-    /// That includes the clearance's refused strangers ([`failclosed::Clearance::refused_strangers`]): a filter whose
-    /// delete the OS refused fails none of these callers, and reaches only the bridge log from here, through the
-    /// warning the provider sweep writes. `bridge unlock` and `release-covers` print it from the clearance they read.
-    ///
-    /// What it does NOT drop is the evidence, and that correction is
-    /// bindreams/hole#1010's F1. The old justification added "the next engage
-    /// re-arms and pre-deletes the key", which is false for the two callers
-    /// that matter most: `turn_lockdown_off` and the tray's Unblock write the
-    /// intent OFF, so there is no next engage — and this very sweep DELETES
-    /// the standing cover's `PERSISTENT` sibling, the only live evidence that
-    /// a boot-time twin could be outstanding. [`failclosed::release_all`]
-    /// persists that evidence (`failclosed::boottime_witness`) before
-    /// returning, which is what makes the discard here cost a message and not
-    /// the finding.
-    ///
-    /// Takes the cover lock as proof that no other cover mutation runs: a release decides and acts as one section
-    /// (see [`failclosed::CoverLock`]), and a guard held from before it releases nothing afterwards, because a
-    /// sweep outdates the stamps of each cover kind it released. An implementation calls `outdate_stamps` for the
-    /// kinds whose release completed, as [`failclosed::release_all`] does, even when the other kind's release
-    /// failed; a kind whose release failed keeps its stamps, so a held guard's drop retries.
+    /// Takes the cover lock as proof that no other cover mutation runs: a release
+    /// decides and acts as one section (see [`failclosed::CoverLock`]), and a
+    /// guard held from before it releases nothing afterwards, because a sweep
+    /// outdates the stamps of each cover kind it released. An implementation
+    /// calls `outdate_stamps` for the kinds whose release completed, as
+    /// [`failclosed::release_all`] does, even when the other kind's release
+    /// failed; a kind whose release failed keeps its stamps, so a held guard's
+    /// drop retries.
     fn release_all_covers(&self, lock: &failclosed::CoverLock) -> Result<(), RoutingError>;
 
     /// Take the cover lock for this provider's own state directory: the one every cover method above takes as its
@@ -1975,18 +1901,10 @@ impl Routing for SystemRouting {
 
     fn release_all_covers(&self, lock: &failclosed::CoverLock) -> Result<(), RoutingError> {
         self.assert_own_lock(lock);
-        // Named discard, not `?;` — see the trait method's doc for why the
-        // in-process escape is the one caller the clearance does not bind.
-        //
-        // What is dropped here is the operator MESSAGE, never the evidence:
-        // `failclosed::release_all` persists the `boottime_witness` before it
-        // returns. That matters because this is the sweep the tray's "Unblock
-        // Network" and `turn_lockdown_off` both reach the host through, and it
-        // is what DELETES a standing cover's `PERSISTENT` sibling — the live
-        // evidence that a boot-time twin could be outstanding. Without the
-        // persisted copy, every later sweep (including the uninstall gate's)
-        // would read the empty sibling set as "no cover was ever here" and go
-        // silent for good.
+        // The operator message (`Clearance`) is dropped by name: this is the
+        // in-process escape, where `hole bridge unlock` stays reachable.
+        // `release_all` persists the boot-time witness before it returns, so the
+        // evidence is kept.
         failclosed::release_all(lock).map(|_clearance_binds_only_the_uninstall_gate| ())
     }
 
@@ -2007,33 +1925,31 @@ impl SystemRouting {
 
     /// Test seam for [`Routing::install`]: injectable per-command setup/
     /// teardown runners (the same shape [`exec_one`] has) so unit tests can
-    /// drive the failure/rollback path without issuing real route commands
-    /// (#165), while still exercising the REAL per-command checkpointing —
-    /// unlike a whole-phase seam, this cannot silently skip it. Production
-    /// passes [`exec_one::<FatalPhase>`]/[`exec_one::<BestEffortPhase>`] —
-    /// see [`Routing::install`].
+    /// drive the failure/rollback path without issuing real route commands,
+    /// while still exercising the REAL per-command checkpointing. Production
+    /// passes [`exec_one::<FatalPhase>`]/[`exec_one::<BestEffortPhase>`].
     ///
     /// # What the failure path does
     ///
-    /// A partially-installed route set is a real state — `setup_routes` is not
-    /// transactional. When it reports a failed command this does exactly four
+    /// A partially-installed route set is a real state: `setup_routes` is not
+    /// transactional. The path is taken when a fatal setup command fails, or when
+    /// setup returns `Ok` with fewer routes confirmed than [`planned_routes`]
+    /// names (which includes a failed non-fatal command). It does exactly four
     /// things, and nothing else:
     ///
-    /// 1. issues no further setup commands (`setup_routes` already stopped at
-    ///    the first FATAL failure, so route mutation ends there — a non-fatal
-    ///    one, an IPv6 split on a TUN with no IPv6 binding, does not reach this
-    ///    path at all);
+    /// 1. issues no further setup commands;
     /// 2. runs teardown narrowed to exactly the [`RouteId`]s the per-command
     ///    checkpointing confirmed installed (`rollback_and_record`), never the
-    ///    full planned set — deleting a route this run never confirmed going in
+    ///    full planned set: deleting a route this run never confirmed going in
     ///    is never safe;
     /// 3. clears the persisted route-state file ONLY once nothing remains
-    ///    unconfirmed — a command whose fate is genuinely unknown (a spawn
+    ///    unconfirmed: a command whose fate is genuinely unknown (a spawn
     ///    failure, or teardown itself not confirming a delete) stays recorded
     ///    for the next start's crash recovery to retry, as
     ///    docs/contributing/architecture/route-failure-policy.md describes;
-    /// 4. returns `Err(RoutingError::RouteSetup)`. No [`SystemRoutes`] guard is
-    ///    constructed, so no caller can report the tunnel up.
+    /// 4. returns `Err(RoutingError::RouteSetup)`, or `StateUnreadable` over an
+    ///    unreadable record. No [`SystemRoutes`] guard is constructed, so no
+    ///    caller can report the tunnel up.
     fn install_with<Rs, Rt>(
         &self,
         tun_name: &str,
@@ -2049,12 +1965,12 @@ impl SystemRouting {
         let interface_name = gateway.interface_name.as_str();
         // Checkpoint template: `setup_routes` calls `checkpoint(ids)` before
         // AND after every route command, so `persisted.installed` — and the
-        // on-disk file it writes — is never a prediction. At any instant it
-        // names exactly what `installed` below names, so a crash narrows the
-        // leak window to at most the single command in flight. Built BEFORE the sweep below
-        // (not after) so the sweep can layer carried-forward debt into
-        // `persisted.stale` instead of this install's own first checkpoint
-        // racing it for the same on-disk slot.
+        // on-disk file it writes — names at most one route more than
+        // `installed` below confirms (the command in flight, or one whose
+        // spawn failed); a confirmed outcome narrows it to match. Built
+        // BEFORE the sweep below (not after) so the sweep can layer
+        // carried-forward debt into `persisted.stale` instead of this
+        // install's own first checkpoint racing it for the same on-disk slot.
         let mut persisted = state::RouteState {
             tun_name: tun_name.to_owned(),
             server_ip,
@@ -2108,9 +2024,9 @@ impl SystemRouting {
         // another process holds that prefix) is popped from `installed` by
         // `setup_routes`, so setup_result can be `Ok` with `installed` a
         // strict subset of what was planned. A degraded tunnel is worse than
-        // no tunnel (Rule #0): the user believes traffic is captured when
-        // some of it is not. Roll back and fail closed rather than return a
-        // partial connect as success.
+        // no tunnel: the user believes traffic is captured when some of it is
+        // not. Roll back and fail closed rather than return a partial connect
+        // as success.
         let planned = planned_routes(server_ip);
         if installed.len() != planned.len() {
             let missing: Vec<RouteId> = planned.iter().copied().filter(|id| !installed.contains(id)).collect();
@@ -2156,8 +2072,8 @@ impl SystemRouting {
 /// read-back or the upstream gateway's IPv6 availability, both of which can
 /// disagree with which split routes actually landed. Lives here (not in
 /// `hole_bridge`, its only consumer) because `hole-bridge` depends on
-/// `tun-engine`, not the reverse — `hole_bridge::dns::system` re-exports
-/// this type rather than defining its own .
+/// `tun-engine`, not the reverse; `hole_bridge::dns::system` re-exports this
+/// type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutedFamilies {
     pub v4: bool,
@@ -2166,7 +2082,7 @@ pub struct RoutedFamilies {
 
 /// Ground truth for which address families a [`Routing::Installed`] guard
 /// actually routed into the TUN — implemented by every `Routing::Installed`
-/// type so `Dns::apply`'s D4 filter can read it directly rather than
+/// type so `Dns::apply`'s address-family filter can read it directly rather than
 /// re-deriving it. See [`RoutedFamilies`]'s own doc for the anti-derivation
 /// rule this exists to satisfy.
 pub trait RoutesInstalled {
@@ -2490,9 +2406,9 @@ fn platform_split_teardown_commands(tun_name: &str) -> Vec<RouteCommand> {
 /// delete with. [`state::RouteForm::Via`] keeps `original_gateway`, when
 /// known, appended as the `route delete` gateway operand — `route.exe`'s own
 /// help confirms DELETE accepts (and does not require) a gateway argument,
-/// and unlike macOS, that argument DOES scope which entry is deleted. `None` (a record migrated from
-/// schema 1 or 2, which never persisted a gateway) falls back to the old
-/// unscoped delete — a disclosed residual, not a silent skip.
+/// and unlike macOS, that argument DOES scope which entry is deleted. `None` (a
+/// record migrated from schema 1 or 2, which never persisted a gateway) falls
+/// back to the old unscoped delete — a disclosed residual, not a silent skip.
 #[cfg(target_os = "windows")]
 fn platform_bypass_teardown_command(
     server_ip: IpAddr,

@@ -18,9 +18,10 @@ use system_configuration::sys::schema_definitions::{
     kSCPropNetDNSSearchOrder, kSCPropNetDNSServerAddresses, kSCPropNetDNSSupplementalMatchDomains,
 };
 
-/// Below configd's 200000 default search order —  Tailscale's own choice.
+/// The published resolver's `SearchOrder`, ahead of configd's default.
 const SEARCH_ORDER: i32 = 100_000;
 
+/// Why [`engage`] or [`Steering::withdraw`] failed.
 #[derive(Debug, thiserror::Error)]
 pub enum DnsSteerError {
     #[error("could not open the DNS-steer dynamic-store session")]
@@ -36,9 +37,9 @@ pub enum DnsSteerError {
 // Dictionary shape ====================================================================================================
 
 /// `{ ServerAddresses: servers, SupplementalMatchDomains: [""], SearchOrder:
-/// 100000 }` — the whole mechanism, in one dictionary. Pure: no configd, no
-/// I/O, so the published shape is assertable without a live dynamic-store
-/// session — the same reason `device::build_tun_configuration` exists.
+/// SEARCH_ORDER }`: the whole mechanism, in one dictionary. Pure (no configd,
+/// no I/O), so a test can assert the shape without a live dynamic-store
+/// session.
 ///
 /// Untyped `CFDictionary` (not `CFDictionary<CFString, CFType>`): that is
 /// the only form `system_configuration::SCDynamicStore::set`'s
@@ -69,8 +70,7 @@ pub(crate) fn build_dns_dictionary(servers: &[IpAddr]) -> CFDictionary {
 
 /// The UUID names a service that does not exist; the point of the mechanism
 /// is that configd merges it anyway, as a supplemental resolver. A fresh one
-/// per `engage` call (D3) — no two sessions in this or any other Hole
-/// process ever collide.
+/// per `engage` call, so no two sessions in any Hole process collide.
 pub(crate) fn store_key(session: &str) -> String {
     format!("State:/Network/Service/{session}/DNS")
 }
@@ -106,9 +106,8 @@ impl StoreOps for RealStore {
 }
 
 fn open_real_store() -> Result<RealStore, DnsSteerError> {
-    // `session_keys(true)` (`kSCDynamicStoreUseSessionKeys`, D3): the key is
-    // scoped to this process's session and dies with it — see the module
-    // doc's lifetime argument.
+    // `session_keys(true)` (`kSCDynamicStoreUseSessionKeys`): the key is scoped
+    // to this process's session and dies with it; see the module doc.
     SCDynamicStoreBuilder::new("hole-dns-steer")
         .session_keys(true)
         .build()
@@ -141,11 +140,9 @@ impl Steering {
     }
 
     /// Remove the published key and block for the store thread's
-    /// confirmation. Confirmable, not `Drop`-only (Decided-without-asking
-    /// #6): a caller that needs to know teardown actually happened —
-    /// `DnsApplied::shutdown`, mirroring `ProxyManager::stop_with`'s
-    /// lockdown-cover discipline — must be able to observe a failure,
-    /// something `Drop`'s `()` return cannot express.
+    /// confirmation. Confirmable, not `Drop`-only, so a caller that needs to
+    /// know teardown happened (`DnsApplied::shutdown`) can observe a failure,
+    /// which `Drop`'s `()` return cannot express.
     pub fn withdraw(mut self) -> Result<(), DnsSteerError> {
         let (ack_tx, ack_rx) = mpsc::channel();
         let sent = self.cmd_tx.send(StoreCmd::Withdraw(ack_tx));
@@ -165,13 +162,12 @@ impl Steering {
 }
 
 impl Drop for Steering {
-    /// The crash/unwind fallback: closing `cmd_tx` (by dropping it, which
-    /// this drop glue does after this function returns) wakes the store
-    /// thread's blocking `recv()` with an `Err`, and it does the best-effort
-    /// removal itself — see `store_thread_main`. This function only warns if
-    /// that removal is later reported to have failed; it never blocks and
-    /// never panics. A failure here is not a leak either way: session keys
-    /// (D3) die with this process regardless of whether removal succeeded.
+    /// The crash/unwind fallback: dropping `cmd_tx` after this function
+    /// returns wakes the store thread's blocking `recv()` with an `Err`, and the
+    /// thread does the best-effort removal itself (see `store_thread_main`),
+    /// warning if it fails. This function only warns that the guard was dropped
+    /// unwithdrawn; it never blocks and never panics. A failed removal is not a
+    /// leak: session keys die with this process regardless.
     fn drop(&mut self) {
         if self.withdrawn {
             return;
@@ -240,13 +236,12 @@ fn store_thread_main<S: StoreOps>(
         let _ = ready_tx.send(Err(DnsSteerError::SetValue));
         return;
     }
-    // The only way to find a stranded key by hand (module doc's residual).
+    // The only way to find a stranded key by hand.
     tracing::info!(key = %key, "dns_steer: published a synthetic supplemental resolver key");
 
     if ready_tx.send(Ok(())).is_err() {
-        // `engage`'s caller is already gone (e.g. it timed out or the
-        // process is unwinding before it could hold the guard) — nothing to
-        // hand the key to, so remove it now rather than stranding it.
+        // `engage`'s caller is already gone, so there is nothing to hand the
+        // key to: remove it now rather than stranding it.
         let _ = store.remove(&key);
         return;
     }
@@ -274,10 +269,9 @@ pub fn engage(servers: &[IpAddr]) -> Result<Steering, DnsSteerError> {
     spawn_steering(open_real_store, key, servers.to_vec())
 }
 
-// Pure tests (Task 2 Step 1) — dictionary shape and error mapping over the
-// injectable `StoreOps`, no configd. Declared here (rather than from the
-// `dns_steer` facade) so this module's private items need no extra
-// visibility widening, mirroring `phase.rs`'s placement of `phase_tests`.
+// Pure tests of the dictionary shape and error mapping over the injectable
+// `StoreOps`, no configd. Declared here so they can reach this module's
+// private items.
 #[cfg(test)]
 #[path = "../dns_steer_tests.rs"]
 mod dns_steer_tests;

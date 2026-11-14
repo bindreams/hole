@@ -1,73 +1,29 @@
 //! macOS IPv6 address assignment, via `ifconfig`.
 //!
-//! Everything asserted here about runtime behaviour is **reasoned, not
-//! measured**: this path could not run in production before
-//! (the `tun` crate rejects any macOS device name not starting with `utun`,
-//! so `Dispatcher::new` failed before a device existed), and still cannot be
-//! built on the maintainer's box.
-//! blocker; whether this specific path has since run green on the darwin TUN
-//! lane is a separate, still-open fact — `proxy_manager_macos_full_tunnel_privileged_tests.rs`'s
-//! Full-mode start exercises this code as a side effect but asserts nothing
-//! about it, so its first real run must be read from that test's own CI
-//! logs, not assumed from this file.
-//!
 //! A subprocess rather than FFI: `libc`'s Apple module has `in6_ifreq` but
-//! neither `in6_aliasreq` nor `SIOCAIFADDR_IN6`, so an FFI path would mean
-//! hand-defining a kernel struct and an ioctl number that nothing here can
-//! compile or run. `tun-engine` already shells out on macOS for `route` and
-//! `pfctl`.
+//! neither `in6_aliasreq` nor `SIOCAIFADDR_IN6`, so FFI would mean
+//! hand-defining a kernel struct and an ioctl number. `tun-engine` already
+//! shells out on macOS for `route` and `pfctl`.
 //!
-//! **Failures warn and continue; on Windows they are fatal.** The asymmetry is
-//! deliberate, and the condition for removing it is: once this path has run
-//! green on the darwin TUN lane, make it fatal like Windows. That condition
-//! has not fired yet — the naming fix landing is necessary but not
-//! sufficient, since no test asserts success on this path. Until it does, a
-//! fatal failure here would first execute in a user's hands. `Ipv6StackAbsent`
-//! consequently means only "the alias did not take": macOS has no supported
-//! way to unbind the IPv6 stack from an interface, so there is no appearance
-//! wait and nothing else it could mean.
+//! **Failures warn and continue; on Windows they are fatal.** No test asserts
+//! that the alias succeeds on a real macOS run, so a failure here is not yet
+//! made fatal; the condition for making it fatal like Windows is that this path
+//! has run green on the darwin TUN lane (bindreams/hole#1316).
+//! [`Assigned::Ipv6StackAbsent`] therefore means only "the alias did not take":
+//! macOS has no supported way to unbind the IPv6 stack from an interface, so
+//! there is no appearance wait.
 //!
-//! Two open items:
+//! `assign` logs the `ifconfig` argv before running it (`info`), then the
+//! outcome with exit code, stdout and stderr (`info` on success, `warn` on
+//! failure). On success it also reads back whether the prefix has a route, with
+//! `route -n get -inet6` on an address inside the prefix other than the one
+//! just aliased: an assigned address always has a host-scope local route, so
+//! querying it would prove nothing. `route(8)` exits `0` unconditionally, so the
+//! answer is read from its output text (see `crate::routing`'s
+//! `macos_route_confirmed_absent`), never the exit code.
 //!
-//! - **Duplicate address detection is left enabled and its cost is
-//!   unmeasured.** Nothing on a TUN answers a DAD probe, so it always
-//!   succeeds; the only question is how long the address stays tentative, which
-//!   costs first-flow latency rather than correctness.
-//! - **The alias may not create a prefix route.** wg-quick-style Darwin setups
-//!   add the prefix route explicitly after the alias, which suggests it does
-//!   not follow from the alias — the same open question as the Windows
-//!   `OnLinkPrefixLength` measurement.
-//!
-//! `assign` logs its `ifconfig` invocation and outcome the same way
-//! `routing.rs`'s route runner logs a route command: the argv before it
-//! runs (`info`, so a passing darwin-lane run always shows it, not only on
-//! an investigation's `debug` level — this call is one-shot per session,
-//! not per-packet, so it does not carry the route runner's volume
-//! concern), then the outcome with the full exit code, stdout, and stderr
-//! (`info` on success, `warn` on failure, matching the asymmetry
-//! documented above).
-//!
-//! On success, it additionally reads back whether the prefix now has a
-//! route, via `route -n get -inet6` on an address inside the prefix that is
-//! NOT the one just aliased (querying our own address would hit macOS's
-//! always-present host-scope local route regardless of whether the wider
-//! prefix route exists, which would prove nothing). This is the same
-//! real-kernel-lookup technique `proxy_manager_macos_full_tunnel_privileged_tests.rs`'s
-//! `route_get_interface` uses for the IPv4 splits, for the same reason: `route(8)`
-//! exits `0` unconditionally, so success/absence is read from stderr text
-//! (`crate::routing`'s `macos_route_confirmed_absent` convention), never the
-//! exit code. This answers the second open item above directly, on every
-//! passing run — not by inference.
-//!
-//! The first open item — DAD's cost — is still NOT measured or logged
-//! anywhere in this file. Answering it means observing the address's
-//! `tentative` flag clear over time, which this module does not yet do:
-//! unlike the prefix-route check above, the exact text `ifconfig` prints for
-//! that flag is not confirmed against a real DAD-tentative window on any
-//! host available to this change (the man page on this box does not spell
-//! it out, and there is no root here to force a real conflict and observe
-//! it), so no polling was added on an unverified guess. That gap is
-//! unresolved, not silently closed.
+//! Duplicate address detection is left enabled; it always succeeds on a TUN
+//! and costs only first-flow latency.
 
 use smoltcp::wire::Ipv6Cidr;
 use tracing::{info, warn};
@@ -90,9 +46,8 @@ pub(super) fn assign(if_index: u32, cidr: Ipv6Cidr) -> Result<Assigned, DeviceEr
     };
 
     let args = ifconfig_alias_args(&if_name, cidr);
-    // Logged before spawning, same as `routing.rs`'s `log_route_command`:
-    // the argv carries no PII (an interface name and a link-local-scoped
-    // CIDR), so it needs no redaction and no separate extraction point.
+    // The argv carries no PII (an interface name and the TUN's own CIDR), so it
+    // needs no redaction.
     info!(interface = %if_name, cmd = SystemTool::Ifconfig.display_with(&args), "running ifconfig alias command");
     let output = match SystemTool::Ifconfig.command().and_then(|mut c| c.args(&args).output()) {
         Ok(output) => output,
@@ -105,9 +60,7 @@ pub(super) fn assign(if_index: u32, cidr: Ipv6Cidr) -> Result<Assigned, DeviceEr
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if output.status.success() {
-        // Answers "did the alias succeed" AND "did the alias create the
-        // prefix route" (two of the three open items above) — DAD's cost is
-        // the one this still does not speak to; see the module doc.
+        // Whether the alias created the prefix route; see the module doc.
         let prefix_route = prefix_route(cidr);
         info!(
             interface = %if_name,
@@ -188,11 +141,9 @@ impl std::fmt::Display for PrefixRoute {
 /// our own address would report an interface regardless of whether the wider
 /// prefix route exists, proving nothing.
 ///
-/// `route(8)` exits `0` unconditionally (confirmed live on this host, both
-/// for a present and an absent destination — see the module doc), so success
-/// is read from stdout's `"interface: "` line and absence from stderr's
-/// `"not in table"` text — never the exit code, the same reasoning
-/// `crate::routing::macos_route_confirmed_absent` documents for deletes.
+/// `route(8)` exits `0` unconditionally, so success is read from stdout's
+/// `"interface: "` line and absence from stderr's `"not in table"` text, never
+/// the exit code (as in `crate::routing::macos_route_confirmed_absent`).
 /// Anything else is [`PrefixRoute::Indeterminate`] rather than absence.
 fn prefix_route(cidr: Ipv6Cidr) -> PrefixRoute {
     let Some(probe) = probe_address_for(cidr) else {
@@ -217,37 +168,27 @@ fn prefix_route(cidr: Ipv6Cidr) -> PrefixRoute {
 }
 
 /// An address inside `cidr`'s prefix that is NOT `cidr.address()` — see
-/// [`prefix_route`]'s doc for why that distinction matters. Uses
-/// the prefix's network address (all host bits cleared); on the vanishingly
-/// unlikely chance that address instance equals `cidr.address()` (only
-/// possible if the configured address's own host part is already
-/// all-zero), the low bit is flipped instead — still inside the prefix,
-/// still not the configured address. `None` at `/128`, where the prefix
-/// holds exactly one address and no such neighbour can exist.
+/// [`prefix_route`]'s doc for why that distinction matters. Uses the prefix's
+/// network address (host bits cleared), or, when that is `cidr.address()`
+/// itself, the address with its low bit flipped. `None` at `/128` (the prefix
+/// holds one address) and at `/0` (its network address is the unspecified
+/// address, which the default route answers).
 fn probe_address_for(cidr: Ipv6Cidr) -> Option<std::net::Ipv6Addr> {
     let addr = cidr.address();
     let net = network_address(addr, cidr.prefix_len());
-    // A `/0` network address is the unspecified address, which macOS answers
-    // from the default route — the IPv6 twin of `route get 0.0.0.0`. Probing
-    // it would report an interface whether or not any prefix route exists,
-    // which is the exact failure this function is shaped to avoid.
     if cidr.prefix_len() == 0 {
         return None;
     }
     if net != addr {
         return Some(net);
     }
-    // The configured address is its own network address, so flip the low bit
-    // to land elsewhere in the prefix. At /128 the prefix holds exactly one
-    // address, so no such neighbour exists and flipping would leave the
-    // prefix entirely — answer honestly instead of probing a different one.
+    // The configured address is its own network address: flip the low bit.
+    // At /128 that would leave the prefix, so there is no probe address.
     (cidr.prefix_len() < 128).then(|| std::net::Ipv6Addr::from(u128::from(net) ^ 1))
 }
 
 /// `addr` masked down to `prefix_len` leading bits, host bits cleared.
-/// Reimplemented here rather than via smoltcp's own `Cidr` masking because
-/// that logic lives on a `pub(crate)` trait of smoltcp's, not reachable from
-/// this crate.
+/// (smoltcp's own masking is on a `pub(crate)` trait.)
 fn network_address(addr: std::net::Ipv6Addr, prefix_len: u8) -> std::net::Ipv6Addr {
     let bits = u128::from(addr);
     let mask = if prefix_len == 0 {

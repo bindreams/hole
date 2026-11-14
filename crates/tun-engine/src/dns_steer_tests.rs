@@ -248,13 +248,9 @@ async fn withdraw_reports_a_remove_failure() {
     );
 }
 
-/// The `Drop` fallback (Decided-without-asking #6): a `Steering` dropped
-/// without calling `withdraw()` must still attempt removal — asserted here
-/// via the call count, since `Drop` returns nothing observable. The warning
-/// this path logs on a failed removal is covered by inspection (see this
-/// test's final comment); nothing in the crate's test harness captures
-/// `tracing::warn!` output today; `remove_calls` is the behavioral half of
-/// the same guarantee and is what regresses if the fallback is ever deleted.
+/// The `Drop` fallback: a `Steering` dropped without calling `withdraw()`
+/// must still attempt removal. Asserted via the call count, since `Drop`
+/// returns nothing observable; the warning on a failed removal is not asserted.
 #[skuld::test]
 async fn drop_without_withdraw_still_attempts_removal() {
     let (removed_tx, removed_rx) = std::sync::mpsc::channel();
