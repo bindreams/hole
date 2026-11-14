@@ -245,7 +245,7 @@ fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
     match event {
         // No new process is spawned on reopen, so single-instance never fires;
         // this is the only signal. `has_visible_windows` is ignored: reveal-or-build
-        // also covers a minimized dashboard. Skipped once `EXITING` is set.
+        // also covers a minimized dashboard.
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen { .. } if !EXITING.load(Ordering::SeqCst) => tray::open_settings_window(app),
         #[cfg(target_os = "macos")]
@@ -259,7 +259,7 @@ fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
 }
 
 /// Keeps the app running for the tray icon after the last window is destroyed
-/// (`ExitRequested { code: None }`). Does nothing while `EXITING` is set.
+/// (`ExitRequested { code: None }`).
 fn keep_running_for_tray(app: &tauri::AppHandle, api: &tauri::ExitRequestApi) {
     if EXITING.load(Ordering::SeqCst) {
         return;
@@ -272,9 +272,7 @@ fn keep_running_for_tray(app: &tauri::AppHandle, api: &tauri::ExitRequestApi) {
 }
 
 /// Destroys every webview window before an explicit `AppHandle::exit(N)`
-/// (`ExitRequested { code: Some(_) }`: `tray::exit_app`, reached from the tray's
-/// Exit and the dashboard's File > Exit, and the version-mismatch self-heal's
-/// relaunch) and sets `EXITING`. Needed because tao calls `process::exit` at the
+/// (`ExitRequested { code: Some(_) }`) and sets `EXITING`. Needed because tao calls `process::exit` at the
 /// end of `EventLoop::run`, bypassing every `Drop` in the wry/Tauri tree: a
 /// window left alive survives to AtExit, where Chromium logs `Failed to
 /// unregister class Chrome_WidgetWin_0. Error = 1412`.
@@ -284,8 +282,7 @@ fn destroy_windows_before_exit(app: &tauri::AppHandle) {
         // Safe on the main thread: wry routes this to `on_window_close`, not to the
         // `WindowMessage::Destroy` arm of `handle_user_message`, which panics there.
         // On Windows, tao's `runner.handling_events()` guard defers the
-        // `ControlFlow::Exit` until the destroy has been processed; the ordering
-        // on macOS has not been checked.
+        // `ControlFlow::Exit` until the destroy has been processed.
         if let Err(e) = window.destroy() {
             // stderr, not `tracing`: the async appender is not flushed before
             // `process::exit`. Only dev builds have a console to show it.
