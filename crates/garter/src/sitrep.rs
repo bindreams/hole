@@ -6,12 +6,24 @@
 //! presence (a `protocol` matching `^sitrep-`) is the tier-1 capability
 //! signal. Subsequent JSON-object lines are events (dispatched by
 //! `event`; unknown events are ignored for forward-compat); non-JSON
-//! lines are log passthrough. The normative protocol spec is in
-//! `crates/garter/SITREP.md`; this module is its reference implementation.
+//! lines are log passthrough. The normative protocol spec is `SITREP.md`
+//! in this crate's source tree; this module is its reference implementation.
 //!
-//! `SITREP_PROTOCOL` is the protocol version this consumer SPEAKS. Bump
-//! the MAJOR only for breaking envelope/semantics changes; MINOR is
-//! additive (old consumers ignore new events/fields); PATCH is non-wire.
+//! Readiness has two tiers. Tier 1 is a plugin that speaks sitrep, so the
+//! `hello` handshake and typed events decide readiness. Tier 2 is a TCP
+//! connect probe on the plugin's listener, which carries no typed failure.
+//! [`ReadinessMode`](crate::ReadinessMode) chooses between them: `Probe` always
+//! uses tier 2, and `Auto` races the probe against the `hello`, standing the
+//! probe down on a supported `hello` that arrives first (see
+//! [`ReadinessMode::Auto`](crate::ReadinessMode::Auto)). `ExpectSitrep`
+//! has no such fallback: a plugin that never sends `hello` fails (it closes
+//! stdout) or never readies (it stays silent). A `hello` whose protocol MAJOR
+//! the consumer does not know falls back to tier 2 in `ExpectSitrep` and `Auto`
+//! alike. See [`ProtocolSupport`].
+
+/// The protocol version this consumer SPEAKS. Bump the MAJOR only for breaking
+/// envelope/semantics changes; MINOR is additive (old consumers ignore new
+/// events/fields); PATCH is non-wire.
 pub const SITREP_PROTOCOL: &str = "sitrep-1.0.0";
 
 use std::net::SocketAddr;
@@ -90,7 +102,7 @@ impl std::fmt::Display for StartError {
 
 impl std::error::Error for StartError {}
 
-/// A parsed sitrep control event.
+/// A parsed sitrep control event, as a plugin writes it on stdout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum SitrepEvent {
@@ -116,7 +128,9 @@ pub enum SitrepEvent {
 /// Whether this consumer can speak a plugin's advertised protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolSupport {
+    /// The plugin's MAJOR is this consumer's: tier 1.
     Supported,
+    /// An unknown MAJOR or a malformed protocol string: readiness falls back to the tier-2 connect probe.
     FallBackToTier2,
 }
 
@@ -128,11 +142,8 @@ pub enum ProtocolSupport {
 ///   that isn't a sitrep envelope. Callers treat this as log passthrough.
 ///   Note: a `{`-prefixed line whose `event` matches a known variant but
 ///   contains a malformed field (e.g. an unparseable `listen` address) is
-///   also swallowed to `Ok(None)` — the reserved `Err` arm is where a
-///   future strict mode would surface it.
-/// - `Err(_)` — reserved; currently never returned (unknown events are
-///   ignored, not errors). Kept in the signature so a future strict mode
-///   can surface malformed envelopes without an API break.
+///   also swallowed to `Ok(None)`.
+/// - `Err(_)` — never returned; reserved for malformed envelopes.
 pub fn parse_event(line: &str) -> Result<Option<SitrepEvent>, serde_json::Error> {
     let trimmed = line.trim();
     if !trimmed.starts_with('{') {

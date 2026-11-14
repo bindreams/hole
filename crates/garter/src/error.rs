@@ -1,14 +1,19 @@
+/// Why running a chain or one of its plugins failed.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{0}")]
     Io(#[from] std::io::Error),
 
+    /// A plugin process ended with a nonzero exit code.
     #[error("plugin '{name}' exited with code {code}")]
     PluginExit { name: String, code: i32 },
 
+    /// A plugin process ended without an exit code: a signal on Unix. Never produced on Windows, where
+    /// `ExitStatus::code()` is always `Some`.
     #[error("plugin '{name}' was killed by signal")]
     PluginKilled { name: String },
 
+    /// Any other failure, carried as a message.
     #[error("{0}")]
     Chain(String),
 
@@ -20,9 +25,11 @@ pub enum Error {
         cause: crate::sitrep::StartError,
     },
 
+    /// A SIP003 environment variable is missing or invalid.
     #[error("environment variable '{var}' missing or invalid: {reason}")]
     Env { var: String, reason: String },
 
+    /// `SS_PLUGIN_OPTIONS` is an options string a SIP003 plugin rejects.
     #[error("malformed SS_PLUGIN_OPTIONS: {0}")]
     MalformedOptions(#[from] crate::sip003::MalformedOptions),
 
@@ -34,4 +41,5 @@ pub enum Error {
     Cosca(#[from] cosca::error::Error),
 }
 
+/// [`std::result::Result`] with this crate's [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;

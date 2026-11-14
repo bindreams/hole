@@ -80,7 +80,7 @@ async fn tap_relays_data_through_binary_plugin_to_echo_server() {
 }
 
 // Install the workspace test subscriber + panic hook. See
-// `crates/test-observability/` and bindreams/hole#301.
+// `crates/test-observability/`.
 hole_test_observability::register!();
 
 fn main() {

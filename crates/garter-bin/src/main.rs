@@ -8,7 +8,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Sanctioned production caller of `fmt::SubscriberBuilder::init`;
-    // banned in tests via clippy.toml `disallowed_methods`. See #301.
+    // banned in tests via clippy.toml `disallowed_methods`.
     #[allow(clippy::disallowed_methods)]
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -18,13 +18,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = garter_bin::config::resolve_chain_config(env.plugin_options.as_deref())?;
 
-    // Contract, not input validation: `resolve_chain_config` above already
-    // ran the same string through the identical parser
-    // (`config_path_from_plugin_options` → `split_plugin_options`) and
-    // returned `Ok`, so this is provably unreachable on every real input —
-    // a hard `.expect()`, not a soft `?`, matching `exray_options.rs`'s own
-    // idiom for the identical shape (a value already re-validated by the
-    // same underlying parser).
+    // `resolve_chain_config` already parsed this string, so this cannot fail.
     let mode = Mode::from_plugin_options(env.plugin_options.as_deref())
         .expect("well-formed by construction: already validated by resolve_chain_config above");
     let mut runner = ChainRunner::new().mode(mode);

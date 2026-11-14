@@ -14,7 +14,7 @@ pub mod lost_port;
 /// form with a compile-time counterpart. Same pattern as
 /// `crates/handle-holders/tests/live_holders.rs`. Never invoke cargo here:
 /// a concurrent build's uplift deletes+recreates `target/debug/<bin>`
-/// (always, on macOS), racing sibling tests' spawns (bindreams/hole#496).
+/// (always, on macOS), racing sibling tests' spawns.
 pub fn mock_plugin_path() -> PathBuf {
     std::env::var("CARGO_BIN_EXE_mock-plugin")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_mock-plugin").to_string())

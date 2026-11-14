@@ -40,24 +40,23 @@ pub const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(300);
 /// on every datagram for the process's whole lifetime, so a `udp_timeout`
 /// that fit `Instant::now()` at parse time (`parse_udp_timeout`'s own
 /// `checked_add` probe) is not guaranteed to still fit once the process has
-/// been up for a while — the margin shrinks as uptime grows. Mirrors the
-/// ask-forgiveness shape `tokio::time::sleep` itself uses (`checked_add`
-/// falling back to `Instant::far_future`), re-derived here because
-/// `far_future` is `pub(crate)` upstream.
+/// been up for a while — the margin shrinks as uptime grows. Falls back to a
+/// far-future deadline when the sum overflows.
 pub(crate) fn saturating_deadline(udp_timeout: Duration) -> Instant {
     Instant::now().checked_add(udp_timeout).unwrap_or_else(|| {
-        // Roughly 30 years out — matches tokio::time::Instant::far_future's
-        // own margin, chosen there because 1000 years overflows on macOS and
-        // 100 years overflows on FreeBSD.
+        // The margin tokio's own `far_future` uses: a longer one overflows on macOS or FreeBSD.
         Instant::now() + Duration::from_secs(86_400 * 365 * 30)
     })
 }
 
 // Protocol framing ====================================================================================================
 
+/// The first byte of every yamux substream, naming what the substream carries so the server can dispatch it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamTag {
+    /// A relayed TCP connection.
     Tcp = 0x01,
+    /// A relayed UDP association: length-prefixed datagrams ([`frame_udp_datagram`]).
     Udp = 0x02,
     /// Client-opened liveness probe: the client writes `KEEPALIVE_NONCE_LEN`
     /// bytes and the server echoes them back and closes.
@@ -269,8 +268,7 @@ fn unspecified_for(target: SocketAddr) -> SocketAddr {
 /// server) and routinely come and go, so this is reachable under ordinary UDP
 /// churn (e.g. finished DNS queries). Disabling `SIO_UDP_CONNRESET` is the
 /// standard fix (also applied by quinn / hickory-dns); tokio/mio leave the
-/// Windows default (enabled). See the documented hazard in
-/// `crates/bridge/src/dns/forwarder.rs`.
+/// Windows default (enabled).
 pub(crate) fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     // Bind via std so the raw handle is available for the Windows ioctl before
     // the socket is registered with tokio's reactor.
@@ -454,8 +452,7 @@ impl<T: futures::AsyncWrite + Unpin> futures::AsyncWrite for TransportLivenessTa
 /// finished, discarding an in-flight response — a truncation when a client
 /// half-closes its write side mid-request. The compat shim maps
 /// `copy_bidirectional`'s `poll_shutdown` onto `yamux::Stream::poll_close`, so
-/// the yamux FIN is sent without a separate `close()`. Mirrors the bridge's own
-/// endpoints (`endpoint/socks5.rs`, `endpoint/interface.rs`).
+/// the yamux FIN is sent without a separate `close()`.
 async fn relay_tcp(mut yamux_stream: yamux::Stream, mut tcp_stream: TcpStream) -> Result<()> {
     let mut compat = (&mut yamux_stream).compat();
     tokio::io::copy_bidirectional(&mut compat, &mut tcp_stream).await?;
@@ -572,7 +569,7 @@ pub(crate) async fn connect_retrying(addr: SocketAddr, shutdown: &CancellationTo
                     }
                     (true, _) => {}
                     // A routable peer may be genuinely down: warn each attempt
-                    // (the backoff throttles this to at most ~one line per 30 s).
+                    // (the backoff, capped at `REMOTE_BACKOFF_MAX`, throttles this).
                     (false, _) => {
                         tracing::warn!(%addr, error = &e as &dyn std::error::Error, delay_ms = delay.as_millis(), "connection failed, retrying")
                     }
@@ -631,9 +628,7 @@ async fn run_udp_association(
     let mut acc = FrameAccumulator::new();
 
     // NAT idle-eviction timer. The delay IS the behavior under management
-    // (conntrack-style idle expiry of a UDP association), not synchronization
-    // between our own code paths — sanctioned per the synchronization
-    // invariant's "the delay IS the behavior" exception.
+    // (conntrack-style idle expiry of a UDP association).
     let idle = tokio::time::sleep(udp_timeout);
     tokio::pin!(idle);
 
@@ -679,15 +674,12 @@ async fn run_udp_association(
     // Close the outbound channel so that, from here on, a datagram the
     // `run_client` loop tries to forward hits `Closed` and re-creates the
     // association instead of vanishing into a receiver that will never read it.
-    // This does not recover datagrams already buffered (or `try_send`-accepted
-    // in the brief, multi-thread-only window between the loop `break` and this
-    // call): those are dropped when `outbound_rx` is dropped at return. That is
-    // correct NAT-teardown lossy-UDP behavior — an `evicted` flow was idle for
-    // `udp_timeout`, so a datagram arriving exactly at eviction is the first of
-    // a resumed flow that the app will retransmit (DNS/QUIC do); on an error
-    // teardown the stream is already dead and those datagrams could not have
-    // been delivered anyway. Conntrack/shadowsocks-rust drop the same boundary
-    // packet.
+    // Datagrams already buffered (or `try_send`-accepted in the brief,
+    // multi-thread-only window between the loop `break` and this call) are
+    // dropped when `outbound_rx` is dropped at return: lossy-UDP behavior at
+    // NAT teardown. An `evicted` flow was idle for `udp_timeout`, so such a
+    // datagram is the first of a resumed flow that the app will retransmit
+    // (DNS and QUIC do); on an error teardown the stream is already dead.
     outbound_rx.close();
 
     tracing::debug!(peer = %peer, reason, "udp association closed");
@@ -927,6 +919,10 @@ pub(crate) async fn run_client_session(
     }
 }
 
+/// The client hop: binds `local` for TCP and UDP once, then relays them over a yamux connection to `remote`,
+/// reconnecting with a backoff whenever the transport dies, until `shutdown` fires. `bound_addr_tx` receives the
+/// bound addresses once both listeners are up, or the typed start failure if one is not. Fails only on a start
+/// failure or a panic of the driver task.
 pub(crate) async fn run_client(
     config: yamux::Config,
     local: SocketAddr,
@@ -1037,6 +1033,9 @@ pub(crate) async fn run_client(
 
 // Server mode =========================================================================================================
 
+/// The server hop: accepts yamux connections on `local` and relays each substream to `remote`, until `shutdown` fires.
+/// `bound_addr_tx` receives the bound address once the listener is up, or the typed start failure if it is not. Fails
+/// only on a start failure or a panic in a connection task.
 pub(crate) async fn run_server(
     config: yamux::Config,
     local: SocketAddr,
@@ -1285,19 +1284,14 @@ async fn echo_keepalive(mut stream: yamux::Stream) -> Result<()> {
 /// `SS_PLUGIN_OPTIONS` string.
 ///
 /// Returns [`DEFAULT_UDP_TIMEOUT`] when the key is absent. The FIRST
-/// occurrence wins on a duplicate key — matching every other reader of this
-/// same options string (ex-ray's own `Args.Get`, and the bridge's
-/// `classify_transport`/garter-bin's `config_path_from_plugin_options`),
-/// even though `udp_timeout` is galoshes' own extension ex-ray never reads:
-/// there is no cross-tool parity requirement for this key, but there IS an
-/// intra-string one — an operator reading one options string should not
-/// see different keys resolve duplicates in opposite directions.
+/// occurrence wins on a duplicate key, as in every other reader of this
+/// options string (ex-ray's own `Args.Get`, garter-bin's
+/// `config_path_from_plugin_options`), even though `udp_timeout` is
+/// galoshes' own key that ex-ray never reads.
 ///
-/// EVERY occurrence is validated, not just the winning first one — a value
-/// that is not a positive integer is a hard error on ANY occurrence (`0`
-/// would evict every association immediately, breaking all UDP), so a
-/// self-contradictory duplicate still refuses the start rather than
-/// silently keeping the first value and discarding the rest unchecked.
+/// Every occurrence is validated, not only the first: a value that is not a
+/// positive integer (`0` would evict every association at once) is an error on
+/// any occurrence.
 pub fn parse_udp_timeout(plugin_options: Option<&str>) -> Result<Duration> {
     let Some(opts) = plugin_options else {
         return Ok(DEFAULT_UDP_TIMEOUT);
@@ -1311,7 +1305,7 @@ pub fn parse_udp_timeout(plugin_options: Option<&str>) -> Result<Duration> {
         // later segment into a value, so an unparseable
         // `udp_timeout=abc\;token=SECRET` could otherwise leak `token`'s
         // value through this message (same reason `Mode::from_plugin_options`
-        // and every `parse*Option` in ex-ray's own options.go withhold theirs).
+        // and ex-ray's own option parsers withhold theirs).
         let secs: u64 = value
             .parse()
             .context("invalid udp_timeout: value is not a positive integer of seconds")?;
@@ -1333,6 +1327,14 @@ pub fn parse_udp_timeout(plugin_options: Option<&str>) -> Result<Duration> {
     Ok(selected.unwrap_or(DEFAULT_UDP_TIMEOUT))
 }
 
+/// The yamux hop of the galoshes chain: carries TCP connections and UDP associations as substreams of a yamux
+/// transport connection. It reports both transports at its TCP listen address.
+///
+/// - A client instance binds `local` for TCP and for UDP and relays both over one transport connection that it dials
+///   to `remote` and redials when it dies. With port 0 the two binds get separate ports, and only the TCP one is
+///   reported.
+/// - A server instance binds only a TCP listener on `local`, accepts any number of transport connections there, and
+///   relays each substream, TCP or UDP, to `remote`: UDP reaches it as substreams over the TCP transport.
 pub struct YamuxPlugin {
     config: yamux::Config,
     is_server: bool,
@@ -1341,6 +1343,7 @@ pub struct YamuxPlugin {
 }
 
 impl YamuxPlugin {
+    /// A server hop when `is_server`, else a client hop. `udp_timeout` is the client's UDP NAT idle-eviction timeout.
     pub fn new(is_server: bool, udp_timeout: Duration) -> Self {
         Self {
             config: yamux::Config::default(),
@@ -1379,22 +1382,20 @@ impl garter::ChainPlugin for YamuxPlugin {
     ) -> garter::Result<()> {
         // Readiness comes from the bind point itself, over the same channel the
         // tests use: `run_server`/`run_client` send their bound address once
-        // their listeners are up, and a YAMUX plugin serves both TCP and UDP
-        // there. A listener that does not come up sends its typed `StartError`
+        // their listeners are up, and a YAMUX plugin reports both TCP and UDP.
+        // A listener that does not come up sends its typed `StartError`
         // instead: a lost bind is a `BindConflict`, so the chain restarts an
-        // intermediate hop on a fresh port and the bridge retries a public one.
-        // `run` joins the task that forwards it, so `ready` holds it by the time
-        // `run` returns. Startup is not gated on `shutdown` here — garter's
+        // intermediate hop on a fresh port and the caller retries a public one.
+        // `run` joins the task that forwards it, so `ready` holds it by the
+        // time `run` returns. Startup is not gated on `shutdown` here: garter's
         // start sequence is `biased` on it and owns the "shutdown before ready"
         // outcome for the whole chain.
         //
         // This is galoshes' INTERNAL hop-readiness signal: it feeds galoshes'
-        // OWN `ChainRunner`, which intersects it with the inner
-        // ex-ray hop and fires the chain-level `on_ready`. The PROCESS-level
-        // sitrep the bridge reads is emitted separately in `main.rs` off that
-        // `on_ready` outcome (see `galoshes::sitrep_out`). This signal knows
-        // only its own hop, not the chain, so it cannot own the process-stdout
-        // contract.
+        // OWN `ChainRunner`, which intersects it with the inner ex-ray hop and
+        // fires the chain-level `on_ready`. The PROCESS-level sitrep the host
+        // reads is emitted separately in `main.rs` off that outcome (see
+        // `galoshes::sitrep_out`).
         let transports = garter::Transports::TCP | garter::Transports::UDP;
         let result = if self.is_server {
             let (bound_tx, bound_rx) = oneshot::channel::<Bound<SocketAddr>>();

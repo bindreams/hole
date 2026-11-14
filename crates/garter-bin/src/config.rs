@@ -9,14 +9,19 @@ mod escaping_tests;
 use escaping::config_path_from_plugin_options;
 pub use escaping::{load_config_or_explain_escaping, ConfigPath, MangledPath};
 
+/// The YAML chain config: plugins from the Shadowsocks side outward, as [`garter::ChainRunner::add`] takes them.
 #[derive(Debug, Deserialize)]
 pub struct ChainConfig {
     pub chain: Vec<PluginEntry>,
 }
 
+/// One plugin of the chain.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PluginEntry {
+    /// The plugin executable. A relative path is resolved against the config file's directory by
+    /// [`ChainConfig::resolve_paths`].
     pub plugin: PathBuf,
+    /// The plugin's own `SS_PLUGIN_OPTIONS`.
     #[serde(default)]
     pub options: Option<String>,
 }
@@ -43,10 +48,9 @@ pub fn load_config(path: &Path) -> anyhow::Result<ChainConfig> {
     Ok(config.resolve_paths(config_dir))
 }
 
-/// Validate every chain entry's `options` up front, before any plugin
-/// spawns — naming the specific chain entry index before any plugin
-/// process spawns, rather than only once that entry's own plugin starts
-/// and dies mid-chain.
+/// Validate every chain entry's `options` before any plugin process spawns,
+/// naming the chain entry index of a malformed one, rather than only once that
+/// entry's own plugin starts and dies mid-chain.
 pub fn validate_chain_options(chain: &[PluginEntry]) -> anyhow::Result<()> {
     for (index, entry) in chain.iter().enumerate() {
         if let Some(opts) = &entry.options {
