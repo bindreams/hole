@@ -5,12 +5,21 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
+/// An executable compiled into galoshes, to be extracted and run from disk.
 pub struct EmbeddedBinary {
+    /// The file name it is extracted under.
     pub name: &'static str,
     pub data: &'static [u8],
+    /// The expected SHA-256 of `data`, checked before extraction and again on every file found on disk.
     pub sha256: [u8; 32],
 }
 
+/// An extracted binary that is held open: an open descriptor on Unix, on Windows a handle that denies writes and
+/// deletes. Dropping it releases the hold.
+///
+/// The held file is not proven to be the one hashed: the hash is taken over a read of the path and the hold is a
+/// second open of it. Only on Linux does the held descriptor decide what runs (see [`exec_path`](Self::exec_path));
+/// elsewhere the path runs. Tracked in bindreams/hole#1334.
 pub struct VerifiedBinary {
     fs_path: PathBuf,
     exec_path: PathBuf,
@@ -21,17 +30,20 @@ pub struct VerifiedBinary {
 }
 
 impl VerifiedBinary {
+    /// The path to execute: on Linux `/proc/self/fd/N`, a kernel-resolved link to the open verified file; elsewhere
+    /// the file's own path.
     pub fn exec_path(&self) -> &Path {
         &self.exec_path
     }
 
+    /// The file's path on disk.
     pub fn fs_path(&self) -> &Path {
         &self.fs_path
     }
 }
 
 impl EmbeddedBinary {
-    /// Extract to the platform-specific runtime directory.
+    /// Extract to [`runtime_dir`], unless a file there already hashes right, and verify it.
     pub fn prepare(&self) -> Result<VerifiedBinary> {
         let dir = runtime_dir()?;
         self.prepare_in(&dir)
@@ -52,9 +64,12 @@ impl EmbeddedBinary {
         if target.exists() {
             match self.try_verify(&target) {
                 Ok(verified) => return Ok(verified),
-                Err(_) => {
-                    // Hash mismatch or other error — re-extract.
-                }
+                // A mismatch or any other failure: the file is extracted again below.
+                Err(e) => tracing::debug!(
+                    binary = self.name,
+                    error = %format_args!("{e:#}"),
+                    "the existing file did not verify; extracting it again"
+                ),
             }
         }
 
@@ -137,6 +152,8 @@ fn hex(bytes: &[u8; 32]) -> String {
 
 // Platform: runtime_dir ===============================================================================================
 
+/// The per-user directory the embedded binary is extracted to: under `XDG_RUNTIME_DIR` when set, else the platform's
+/// per-user cache or data folder. Errors when neither is available.
 pub fn runtime_dir() -> Result<PathBuf> {
     let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
     let default_root = platform_default_env().ok();

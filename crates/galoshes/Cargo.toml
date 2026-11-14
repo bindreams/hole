@@ -12,7 +12,7 @@ group = "galoshes"
 workspace = true
 
 [features]
-# Dev-only minidump passthrough (bindreams/hole#438). NON-DEFAULT. Enabled
+# Dev-only minidump passthrough. NON-DEFAULT. Enabled
 # only by `cargo xtask galoshes` when HOLE_CRASH_DUMPS is set (the dev path sets
 # it in the `hole` run step). Release / MSI / standalone galoshes builds never set it,
 # so minidump-writer is absent from the windows-arm64 galoshes matrix (where
@@ -43,7 +43,7 @@ tombstone = { path = "../tombstone" }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# WSAIoctl(SIO_UDP_CONNRESET) — see `bind_udp` in yamux.rs (#415).
+# WSAIoctl(SIO_UDP_CONNRESET) — see `bind_udp` in yamux.rs.
 # Win32_System_IO supplies WSAOVERLAPPED, referenced by WSAIoctl's signature.
 windows = { version = "0.62", features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
 

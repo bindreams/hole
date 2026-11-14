@@ -67,8 +67,7 @@ async fn first_read_at_does_not_update_after_first_set() {
     // Two separate writes from the server; counter must reflect the FIRST
     // one's time. The client signals via `oneshot` after consuming the
     // first byte so the server's second write happens strictly *after*
-    // the first read — deterministic, no sleep-based gating. See
-    // bindreams/hole#383.
+    // the first read — deterministic, no sleep-based gating.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (after_first_read_tx, after_first_read_rx) = tokio::sync::oneshot::channel::<()>();

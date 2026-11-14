@@ -1,11 +1,11 @@
 # galoshes
 
 galoshes is a [SIP003](https://shadowsocks.org/doc/sip003.html) plugin for Shadowsocks that carries UDP as well as TCP.
-It is [Hole](https://github.com/bindreams/hole)'s UDP-capable plugin. It puts every TCP connection and every UDP
-exchange from the client on its own numbered stream inside one connection to the server, using the
-[yamux](https://github.com/hashicorp/yamux/blob/master/spec.md) multiplexing protocol, and sends that one connection
-through an [ex-ray](https://github.com/bindreams/hole/tree/main/crates/ex-ray) that is embedded in the galoshes binary
-and runs as a child process. To the network, that connection looks the way an ex-ray connection does.
+It is [Hole](https://github.com/bindreams/hole)'s UDP-capable plugin. It puts each TCP connection and UDP
+exchange on its own stream inside one connection to the server, using the
+[yamux](https://github.com/hashicorp/yamux/blob/master/spec.md) multiplexing protocol, carried by an
+[ex-ray](https://github.com/bindreams/hole/tree/main/crates/ex-ray) child process embedded in the galoshes binary, so on
+the wire it looks like an ex-ray connection.
 
 ## Who it is for
 

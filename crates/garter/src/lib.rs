@@ -1,3 +1,9 @@
+//! Runs a chain of SIP003u Shadowsocks plugins as one.
+//!
+//! [`ChainRunner`] starts [`ChainPlugin`]s one at a time, each listening where the next forwards to, and reports
+//! readiness for the whole chain. [`BinaryPlugin`] is a `ChainPlugin` backed by an external plugin executable.
+//! [`sitrep`] is the readiness protocol a plugin can speak over its stdout. The crate README has a worked example.
+
 mod ansi;
 mod backoff;
 pub mod binary;
@@ -78,7 +84,7 @@ mod tracing_test_tests;
 
 // Install the workspace test subscriber + panic hook. The dev-dep
 // is gated on cfg(test) because it isn't linked in non-test builds.
-// See `crates/test-observability/` and bindreams/hole#301.
+// See `crates/test-observability/`.
 #[cfg(test)]
 hole_test_observability::register!();
 

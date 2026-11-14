@@ -158,7 +158,7 @@ fn accumulator_empty_payload_frame() {
     assert_eq!(drain_all(&mut acc), vec![Vec::<u8>::new()]);
 }
 
-// parse_udp_timeout (#415) --------------------------------------------------------------------------------------------
+// parse_udp_timeout ---------------------------------------------------------------------------------------------------
 
 #[skuld::test]
 fn udp_timeout_defaults_when_absent() {
@@ -246,7 +246,7 @@ fn saturating_deadline_never_panics_on_a_duration_too_large_to_add() {
     assert!(deadline > Instant::now(), "must still land in the future");
 }
 
-// End-to-end UDP relay (#415) -----------------------------------------------------------------------------------------
+// End-to-end UDP relay ------------------------------------------------------------------------------------------------
 
 /// Spawn a UDP echo server bound on `ip:0`; returns its bound address. The task
 /// echoes every datagram back to its sender and lives until the runtime drops.
@@ -363,7 +363,7 @@ async fn udp_ipv6_remote() {
 #[cfg(windows)]
 #[skuld::test]
 async fn bind_udp_send_to_dead_peer_does_not_poison_recv() {
-    // Windows-only regression for #415: a UDP send to a loopback peer with no
+    // Windows-only: a UDP send to a loopback peer with no
     // listener must NOT surface a phantom WSAECONNRESET on the socket's next
     // recv. With SIO_UDP_CONNRESET left enabled (tokio/mio default) the recv
     // below would return Err(ConnectionReset) instead of the self-datagram,
@@ -469,7 +469,7 @@ async fn tcp_full_response_survives_client_half_close() {
     shutdown.cancel();
 }
 
-// Connect-cadence policy (#550) ---------------------------------------------------------------------------------------
+// Connect-cadence policy ----------------------------------------------------------------------------------------------
 
 #[skuld::test]
 fn connect_delay_is_tight_and_constant_for_a_loopback_peer() {
@@ -1489,7 +1489,7 @@ async fn ready_after_a_lost_bind(
 }
 
 /// A hop that loses its bind says so, typed, before `run` returns: the chain restarts an intermediate hop on a
-/// `BindConflict` and the bridge retries a public one. The server's TCP bind, the client's TCP bind and the client's
+/// `BindConflict` and the caller retries a public one. The server's TCP bind, the client's TCP bind and the client's
 /// UDP bind are three separate sites.
 #[skuld::test]
 async fn a_hop_that_loses_its_bind_reports_a_bind_conflict_before_run_returns() {
@@ -1511,7 +1511,7 @@ async fn a_hop_that_loses_its_bind_reports_a_bind_conflict_before_run_returns() 
     }
 }
 
-/// End to end, as the bridge runs it (multi-thread): a hop that loses its bind ends the chain with the typed
+/// End to end, as a host runs it (multi-thread): a hop that loses its bind ends the chain with the typed
 /// conflict on `on_ready`, not an untyped exit-before-ready.
 #[skuld::test]
 fn a_hop_that_loses_its_bind_reports_the_conflict_through_a_chain() {
