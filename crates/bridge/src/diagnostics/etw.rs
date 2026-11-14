@@ -30,50 +30,13 @@
 //!    After the first `warn!`, repeated query failures (e.g. another bridge
 //!    swept the session) drop to `info!`: loud enough to survive log rotation as
 //!    evidence the session is gone, quiet enough not to re-flood.
-//! 4. [`EtwGuard::drop`] stops and joins the timer thread, reads the statistics
-//!    one last time, then stops the session ([`EtwGuard::stop_session`]). If the
-//!    kernel confirmed the session reclaimed, it joins the processing thread so
-//!    the callback drains its queue; otherwise it detaches the thread (see
-//!    [Drain on Drop](#drain-on-drop)).
+//! 4. [`EtwGuard`]'s `Drop` shuts all of this down; its contract is on that type.
 //!
 //! Each stats query reports `EventsLost`, `BuffersWritten`, `LogBuffersLost` and
 //! `RealTimeBuffersLost`. Nonzero loss in any of the three loss counters
 //! escalates to `warn!`, delta-tracked on the periodic path by
 //! [`should_escalate`] so an unchanged count does not re-warn every tick;
 //! `BuffersWritten` is throughput and never escalates.
-//!
-//! # Drop's added wait
-//!
-//! Joining the timer thread adds a bounded wait ahead of the processing-thread
-//! join: one in-flight `ControlTraceW(QUERY)`, a single synchronous Win32 call,
-//! not [`LIVE_STATS_INTERVAL`], because closing the shutdown channel wakes the
-//! timer's `recv_timeout` at once. It is the same kind of wait `Drop` already
-//! makes for the processing thread, and is not bounded by a timeout.
-//!
-//! # Drain on Drop
-//!
-//! `ferrisetw::UserTrace::Drop` does not join the processing thread, and events
-//! still queued for the callback when the handle closes are lost. So the guard
-//! uses the split-lifecycle API: `UserTrace::start` returns `(trace, handle)`
-//! without a thread, the guard spawns and joins its own, and
-//! [`ferrisetw::UserTrace::stop`] signals STOP, after which `process_from_handle`
-//! returns and the join completes.
-//!
-//! `UserTrace::stop` does not itself guarantee that: it chains `CloseTrace` and
-//! `ControlTraceW(STOP)` with `?`, so a `CloseTrace` error skips STOP.
-//! `ERROR_CTX_CLOSE_PENDING` is not such an error (ferrisetw returns `Ok` for it,
-//! and it is the ordinary answer for any busy session). On a genuine error the
-//! session stays live and `process_from_handle` has no exit condition left: MSDN
-//! gives a real-time consumer two, a `CloseTrace` that took effect and the
-//! controller stopping the session.
-//!
-//! `UserTrace::stop` takes `self`, so ferrisetw's own `Drop` repeats close+STOP,
-//! discarding the error. A one-off `CloseTrace` failure is therefore covered by
-//! that second attempt and [`EtwGuard::stop_session`]'s by-name STOP is a no-op;
-//! a failure that repeats reaches the third attempt, the only one addressed to
-//! the session rather than to a handle. If even that fails, `Drop` cannot tell a
-//! stuck thread from one whose `CloseTrace` succeeded and is about to return, so
-//! it abandons the thread instead of risking a shutdown that never ends.
 //!
 //! # Failure mode
 //!
@@ -239,8 +202,47 @@ const RETRANSMIT_WARN_THRESHOLD: u32 = 3;
 // Public types ========================================================================================================
 
 /// RAII guard holding the live ETW session, its processing thread, and the
-/// periodic live-stats timer thread. Drop order and rationale: see module
-/// doc [Drain on Drop](self#drain-on-drop) and [Drop's added wait](self#drops-added-wait).
+/// periodic live-stats timer thread.
+///
+/// # Drop order
+///
+/// `Drop` stops and joins the timer thread, reads the statistics one last time,
+/// then stops the session ([`EtwGuard::stop_session`]). If the kernel confirmed
+/// the session reclaimed, it joins the processing thread so the callback drains
+/// its queue.
+///
+/// # Drop's added wait
+///
+/// Joining the timer thread adds a bounded wait ahead of the processing-thread
+/// join: one in-flight `ControlTraceW(QUERY)`, a single synchronous Win32 call,
+/// not [`LIVE_STATS_INTERVAL`], because closing the shutdown channel wakes the
+/// timer's `recv_timeout` at once. It is the same kind of wait `Drop` already
+/// makes for the processing thread, and is not bounded by a timeout.
+///
+/// # Drain on Drop
+///
+/// `ferrisetw::UserTrace::Drop` does not join the processing thread, and events
+/// still queued for the callback when the handle closes are lost. So the guard
+/// uses the split-lifecycle API: `UserTrace::start` returns `(trace, handle)`
+/// without a thread, the guard spawns and joins its own, and
+/// [`ferrisetw::UserTrace::stop`] signals STOP, after which `process_from_handle`
+/// returns and the join completes.
+///
+/// `UserTrace::stop` does not itself guarantee that: it chains `CloseTrace` and
+/// `ControlTraceW(STOP)` with `?`, so a `CloseTrace` error skips STOP.
+/// `ERROR_CTX_CLOSE_PENDING` is not such an error (ferrisetw returns `Ok` for it,
+/// and it is the ordinary answer for any busy session). On a genuine error the
+/// session stays live and `process_from_handle` has no exit condition left: MSDN
+/// gives a real-time consumer two, a `CloseTrace` that took effect and the
+/// controller stopping the session.
+///
+/// `UserTrace::stop` takes `self`, so ferrisetw's own `Drop` repeats close+STOP,
+/// discarding the error. A one-off `CloseTrace` failure is therefore covered by
+/// that second attempt and [`EtwGuard::stop_session`]'s by-name STOP is a no-op;
+/// a failure that repeats reaches the third attempt, the only one addressed to
+/// the session rather than to a handle. If even that fails, `Drop` cannot tell a
+/// stuck thread from one whose `CloseTrace` succeeded and is about to return, so
+/// it abandons the thread instead of risking a shutdown that never ends.
 pub struct EtwGuard {
     // `Option<UserTrace>` so Drop can `take()` it and consume via
     // `UserTrace::stop(self)` (which takes `self` by value).
@@ -261,7 +263,7 @@ impl Drop for EtwGuard {
     fn drop(&mut self) {
         // Stop the periodic timer thread FIRST and join it, so no live-phase
         // query can still be in flight when the stop-phase query and
-        // `stop_session` below run — see module doc "Drop's added wait".
+        // `stop_session` below run — see `EtwGuard`'s "Drop's added wait".
         drop(self.stats_tx.take());
         if let Some(stats_thread) = self.stats_thread.take() {
             if let Err(e) = stats_thread.join() {
@@ -299,7 +301,7 @@ impl Drop for EtwGuard {
             } else {
                 // `stop_session` returned `false` -- see its doc for what
                 // that guarantees and doesn't. Abandoning here is not free:
-                // it forfeits the drain-on-drop guarantee (module doc,
+                // it forfeits the drain-on-drop guarantee (`EtwGuard`'s
                 // "Drain on Drop") for whatever the processing thread still
                 // has queued, and that loss is accepted only because a join
                 // with no remaining exit condition would hang shutdown
@@ -326,11 +328,11 @@ impl EtwGuard {
     /// STOP issued after it failed, in which case the processing thread
     /// will still return on its own; `false` cannot distinguish that from a
     /// session genuinely still live, so a caller must not join the
-    /// processing thread on the strength of this return value alone (module
-    /// doc, [Drain on Drop](self#drain-on-drop)).
+    /// processing thread on the strength of this return value alone
+    /// ([Drain on Drop](EtwGuard#drain-on-drop)).
     ///
     /// Why a by-name STOP is needed, and why it is the third close+STOP attempt
-    /// rather than the second: module doc, [Drain on Drop](self#drain-on-drop).
+    /// rather than the second: [Drain on Drop](EtwGuard#drain-on-drop).
     ///
     /// The trigger is unestablished, not the consequence. MSDN documents only
     /// `ERROR_INVALID_HANDLE` and the pre-Vista `ERROR_BUSY` for `CloseTrace`,
@@ -519,8 +521,7 @@ fn start_consumer_named_with_spawn(
         .build();
 
     // Split-lifecycle: start session without the internal processing
-    // thread so we own the join handle. See the "Drain on Drop" section
-    // of the module doc.
+    // thread so we own the join handle. See `EtwGuard`'s "Drain on Drop".
     //
     // Buffer sizing: with all TCPIP keywords enabled, per-connect event
     // volume is high (SendPath included). The default `buffer_size` risks
@@ -570,7 +571,7 @@ fn start_consumer_named_with_spawn(
             // statement, i.e. AFTER the helper call, which would make the
             // by-name STOP run against a session ferrisetw's own `Drop`
             // hasn't yet had a chance to stop, instead of staying the final
-            // attempt (see "Drain on Drop" above).
+            // attempt (see `EtwGuard`'s "Drain on Drop").
             drop(trace);
             return Err(abandon_session_on_thread_spawn_failure(&session_name, e));
         }
@@ -579,7 +580,7 @@ fn start_consumer_named_with_spawn(
     // Best-effort, unlike the session/processing-thread spawns above: by
     // this point the processing thread is already live and consuming real
     // events, so a fallible `?` here would tear the whole consumer down
-    // (dropping `trace` without joining `thread` — see the module's
+    // (dropping `trace` without joining `thread` — see `EtwGuard`'s
     // "Drain on Drop" contract) over the failure of a purely supplementary
     // periodic diagnostics timer. Missing live stats is a degraded
     // diagnostic, not a reason to lose ETW event logging entirely.

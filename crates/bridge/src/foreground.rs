@@ -264,7 +264,7 @@ async fn run_inner(
 
     // Start the always-on ETW consumer, held for the lifetime of the
     // foreground bridge; Drop may abandon rather than join its processing
-    // thread if reclaim can't be confirmed (see `etw.rs` module doc, "Drain
+    // thread if reclaim can't be confirmed (see `EtwGuard`'s "Drain
     // on Drop"). Failure logs at error (not warn) — a silent ETW-broken
     // customer machine is the opposite of the diagnostic goal. See
     // diagnostics::etw.
