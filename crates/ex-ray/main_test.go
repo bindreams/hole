@@ -508,3 +508,82 @@ func TestReadySitrepReportsCanonicalFormOfV4MappedV6LocalAddr(t *testing.T) {
 		return
 	}
 }
+
+// A leading-zero localPort ("0" + the port) is the same port to v2ray-core, so
+// ready.listen must report the canonical decimal form, not the spelling the
+// operator wrote: a host compares it against the endpoint it dials.
+func TestReadySitrepReportsCanonicalFormOfLeadingZeroLocalPort(t *testing.T) {
+	for {
+		port := freeTCPPort(t)
+		hello, terminal, _ := runExRaySubprocess(t, map[string]string{
+			"SS_REMOTE_HOST":    "example.com",
+			"SS_REMOTE_PORT":    "443",
+			"SS_LOCAL_HOST":     "127.0.0.1",
+			"SS_LOCAL_PORT":     "0" + port,
+			"SS_PLUGIN_OPTIONS": "host=example.com;path=/",
+		})
+		if terminal["event"] == "bind_conflict" {
+			errno, _ := terminal["errno"].(float64)
+			if isAddrInUse(int(errno)) {
+				continue
+			}
+			t.Fatalf("bind_conflict with errno %v, want the address-in-use code to retry, anything else is a real failure; terminal: %v", terminal["errno"], terminal)
+		}
+		if hello["event"] != "hello" {
+			t.Errorf("first sitrep line event = %v, want %q", hello["event"], "hello")
+		}
+		if terminal["event"] != "ready" {
+			t.Fatalf("terminal sitrep event = %v, want %q", terminal["event"], "ready")
+		}
+		wantListen := "127.0.0.1:" + port
+		if terminal["listen"] != wantListen {
+			t.Errorf("listen = %v, want the canonical port %q, not the leading-zero spelling", terminal["listen"], wantListen)
+		}
+		return
+	}
+}
+
+// The operator-facing `fatal` detail for a refused listen address keeps its
+// reason: port 0 is refused because v2ray-core cannot report the bound port, and
+// a `|` list because `ready` carries one address. The value is never echoed.
+func TestListenAddrFatalDetailKeepsTheReason(t *testing.T) {
+	cases := []struct {
+		name, options, want string
+	}{
+		{
+			"port_zero",
+			"localPort=0;host=example.com;path=/",
+			"invalid localPort: port-0 OS-assignment is not supported (v2ray-core does not expose the bound port)",
+		},
+		{
+			"address_list",
+			"server;remoteAddr=127.0.0.1|127.0.0.2;host=example.com;path=/",
+			"invalid localAddr: a single listen address is required (the ready sitrep cannot report more than one)",
+		},
+		{
+			"hostname",
+			"localAddr=nosuchhost.invalid;host=example.com;path=/",
+			"invalid localAddr: must be an IP literal",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, terminal, exitCode := runExRaySubprocess(t, map[string]string{
+				"SS_REMOTE_HOST":    "10.9.8.7",
+				"SS_REMOTE_PORT":    "9443",
+				"SS_LOCAL_HOST":     "10.1.2.3",
+				"SS_LOCAL_PORT":     "45999",
+				"SS_PLUGIN_OPTIONS": tc.options,
+			})
+			if terminal["event"] != "fatal" {
+				t.Fatalf("terminal sitrep event = %v, want %q", terminal["event"], "fatal")
+			}
+			if detail, _ := terminal["detail"].(string); detail != tc.want {
+				t.Errorf("fatal detail = %q, want %q", detail, tc.want)
+			}
+			if exitCode != 23 {
+				t.Errorf("exit code = %d, want 23", exitCode)
+			}
+		})
+	}
+}

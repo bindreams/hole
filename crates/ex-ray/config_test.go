@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"math"
+	stdnet "net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -103,8 +104,10 @@ func withFlags(t *testing.T, muxV, fwmarkV int, serverV bool) func() {
 	return func() { *mux, *fwmark, *server = origMux, origFwmark, origServer }
 }
 
-// listenAddr returns the host:port v2ray-core binds, in canonical form (the one
-// `ready.listen` reports), for exactly one IP literal and a non-zero port.
+// listenAddr returns the address and port v2ray-core binds, in canonical form
+// (what `ready.listen` reports once formatted), for exactly one IP literal and a
+// non-zero port. The cases past the first four pin what ParseAddress and
+// net.PortFromString accept today; the Rust mirror in the bridge copies them.
 func TestListenAddrReturnsCanonicalBoundAddress(t *testing.T) {
 	origAddr, origPort := *localAddr, *localPort
 	defer func() { *localAddr, *localPort = origAddr, origPort }()
@@ -115,15 +118,19 @@ func TestListenAddrReturnsCanonicalBoundAddress(t *testing.T) {
 		{"[::1]", "1984", "[::1]:1984"},
 		// v2ray-core folds an IPv4-mapped IPv6 literal to plain IPv4 before binding.
 		{"::ffff:127.0.0.1", "1984", "127.0.0.1:1984"},
+		// The port is the parsed number, never the operator's spelling of it.
+		{"127.0.0.1", "01984", "127.0.0.1:1984"},
+		// ParseAddress trims surrounding whitespace off an address.
+		{" 127.0.0.1", "1984", "127.0.0.1:1984"},
 	}
 	for _, c := range cases {
 		*localAddr, *localPort = c.addr, c.port
-		got, err := listenAddr()
+		host, port, err := listenAddr()
 		if err != nil {
 			t.Errorf("listenAddr() with localAddr=%q localPort=%q: unexpected error %v", c.addr, c.port, err)
 			continue
 		}
-		if got != c.want {
+		if got := stdnet.JoinHostPort(host.IP().String(), port.String()); got != c.want {
 			t.Errorf("listenAddr() with localAddr=%q localPort=%q = %q, want %q", c.addr, c.port, got, c.want)
 		}
 	}
@@ -140,6 +147,9 @@ func TestListenAddrRejectsAndNeverEchoesValue(t *testing.T) {
 		{"non-numeric port", "127.0.0.1", "SECRETPORT", "localPort", "SECRETPORT"},
 		{"port out of range", "127.0.0.1", "70000", "localPort", "70000"},
 		{"empty port", "127.0.0.1", "", "localPort", ""},
+		// strconv.ParseUint takes neither a sign nor whitespace in a port.
+		{"signed port", "127.0.0.1", "+1984", "localPort", ""},
+		{"port with leading space", "127.0.0.1", " 1984", "localPort", ""},
 		{"address list", "127.0.0.1|127.0.0.2", "1984", "localAddr", "127.0.0.2"},
 		{"localhost", "localhost", "1984", "localAddr", ""},
 		{"other hostname", "secret.invalid", "1984", "localAddr", "secret.invalid"},
@@ -147,9 +157,9 @@ func TestListenAddrRejectsAndNeverEchoesValue(t *testing.T) {
 	}
 	for _, c := range cases {
 		*localAddr, *localPort = c.addr, c.port
-		got, err := listenAddr()
+		host, port, err := listenAddr()
 		if err == nil {
-			t.Errorf("%s: listenAddr() = %q, nil error, want an error", c.desc, got)
+			t.Errorf("%s: listenAddr() = %v:%v, nil error, want an error", c.desc, host, port)
 			continue
 		}
 		if !strings.Contains(err.Error(), c.wantOpt) {

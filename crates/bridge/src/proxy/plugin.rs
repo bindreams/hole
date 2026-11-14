@@ -751,45 +751,47 @@ fn ex_ray_fatal_config_error(
     {
         return Some("tcp-keepalive");
     }
-    // config.go listenAddr (`net.PortFromString`, nonzero) for `localPort`; under `server` the `remotePort` key is
-    // cross-assigned here, but both share this rule.
+    // main.go's cross-assign: under `*server` the `localX` and `remoteX` KEYS swap flags, so which key reaches
+    // listenAddr (the listener) and which reaches generateConfig (the upstream) swaps too. The checks run in
+    // ex-ray's order: listenAddr (port, then address), then generateConfig (port, then address), so the key
+    // returned is the one ex-ray fails on first.
+    let (listen_port_key, listen_addr_key, upstream_port_key, upstream_addr_key) = if server_present {
+        ("remotePort", "remoteAddr", "localPort", "localAddr")
+    } else {
+        ("localPort", "localAddr", "remotePort", "remoteAddr")
+    };
+    // config.go listenAddr: `net.PortFromString`, nonzero.
     if segments
         .iter()
-        .find(|s| s.key == "localPort")
+        .find(|s| s.key == listen_port_key)
         .is_some_and(|s| !matches!(ex_ray_parses_as_uint32(ex_ray_flag_value(s)), Some(p) if p != 0 && p <= 65535))
     {
-        return Some("localPort");
+        return Some(listen_port_key);
     }
-    // main.go's cross-assign: under `*server` the `remoteAddr` KEY feeds `*localAddr`, so the two address keys swap
-    // rules. (The port pair shares one rule, so it needs no swap.) `localAddr` rule: listenAddr.
-    let (local_addr_key, remote_addr_key) = if server_present {
-        ("remoteAddr", "localAddr")
-    } else {
-        ("localAddr", "remoteAddr")
-    };
+    // config.go listenAddr: one IP literal.
     if segments
         .iter()
-        .find(|s| s.key == local_addr_key)
+        .find(|s| s.key == listen_addr_key)
         .is_some_and(|s| ex_ray_local_addr_is_invalid(ex_ray_flag_value(s)))
     {
-        return Some(local_addr_key);
+        return Some(listen_addr_key);
     }
 
-    // generateConfig: `remotePort`, same rule as `localPort`.
+    // generateConfig: the upstream port, same rule as the listen port.
     if segments
         .iter()
-        .find(|s| s.key == "remotePort")
+        .find(|s| s.key == upstream_port_key)
         .is_some_and(|s| !matches!(ex_ray_parses_as_uint32(ex_ray_flag_value(s)), Some(p) if p != 0 && p <= 65535))
     {
-        return Some("remotePort");
+        return Some(upstream_port_key);
     }
-    // generateConfig: `remoteAddr` must not normalize to an empty domain or an unspecified IP.
+    // generateConfig: the upstream address must not normalize to an empty domain or an unspecified IP.
     if segments
         .iter()
-        .find(|s| s.key == remote_addr_key)
+        .find(|s| s.key == upstream_addr_key)
         .is_some_and(|s| ex_ray_remote_addr_is_invalid(ex_ray_flag_value(s)))
     {
-        return Some(remote_addr_key);
+        return Some(upstream_addr_key);
     }
     // generateConfig: `mux`, `fwmark` range check (uint32Opt).
     for key in ["mux", "fwmark"] {
@@ -2171,6 +2173,43 @@ mod inject_tests {
         assert_eq!(ex_ray_fatal_config_error(&segments, None), None);
     }
 
+    // When several keys are faulty, the key that is logged is the one ex-ray
+    // fails on first: `listenAddr` (port, then address), then `generateConfig`
+    // (remote port, then remote address). Under `server` each KEY swaps with its
+    // partner, so the order of KEYS swaps too.
+    #[skuld::test]
+    fn the_first_fault_ex_ray_reaches_names_the_key() {
+        let first = |opts: &str| {
+            let segments = garter::split_plugin_options(opts).unwrap();
+            ex_ray_fatal_config_error(&segments, None)
+        };
+        // Client: listenAddr checks localPort before localAddr, both before remotePort.
+        assert_eq!(
+            first("host=cdn.example;localAddr=cdn.example;localPort=0;remotePort=0"),
+            Some("localPort")
+        );
+        assert_eq!(
+            first("host=cdn.example;localAddr=cdn.example;remotePort=0"),
+            Some("localAddr")
+        );
+        // Server: the listener is fed by remotePort and remoteAddr, so those two keys come first,
+        // port before address, and both before the keys that feed the upstream.
+        assert_eq!(
+            first("server;host=cdn.example;remotePort=0;remoteAddr=cdn.example;localPort=0"),
+            Some("remotePort")
+        );
+        assert_eq!(
+            first("server;host=cdn.example;remoteAddr=cdn.example;localPort=0"),
+            Some("remoteAddr")
+        );
+        // Then generateConfig: the upstream port before the upstream address.
+        assert_eq!(
+            first("server;host=cdn.example;localPort=0;localAddr=0.0.0.0"),
+            Some("localPort")
+        );
+        assert_eq!(first("server;host=cdn.example;localAddr=0.0.0.0"), Some("localAddr"));
+    }
+
     // `remoteAddr` (`generateConfig`) must not be an empty domain or the
     // unspecified IP (`0.0.0.0`/`::`) — a wrong destination that binds fine
     // and reports ready, then fails (or silently misroutes) every dial.
@@ -2855,19 +2894,29 @@ mod inject_tests {
         );
         assert!(
             source.contains("rport, err := net.PortFromString(*remotePort)"),
-            "ex_ray_fatal_config_error's remotePort ceiling (65535, shared with localPort) no \
-             longer matches config.go — remotePort must still parse with the same `net.PortFromString` \
-             as localPort, not a bare `strconv.ParseUint`"
+            "ex_ray_fatal_config_error's remotePort ceiling (65535) no longer matches config.go — \
+             generateConfig must still parse remotePort with `net.PortFromString`, not a bare \
+             `strconv.ParseUint`"
+        );
+        assert!(
+            source.contains("port, err := net.PortFromString(*localPort)"),
+            "ex_ray_fatal_config_error's localPort parse no longer matches config.go's `listenAddr` — \
+             it must still use `net.PortFromString`, whose ceiling and syntax the mirror copies"
+        );
+        assert!(
+            source.contains("if port == 0 {"),
+            "ex_ray_fatal_config_error's localPort nonzero check no longer matches config.go's \
+             `listenAddr` — update the mirror to the vendored source"
+        );
+        assert!(
+            source.contains("if !addr.Family().IsIP() {"),
+            "ex_ray_fatal_config_error's localAddr IP-literal check no longer matches config.go's \
+             `listenAddr` — update ex_ray_local_addr_is_invalid to the vendored source"
         );
         assert!(
             source.contains("family.IsIP() && remoteAddress.IP().IsUnspecified()"),
             "ex_ray_fatal_config_error's remoteAddr unspecified-IP check no longer matches \
              config.go — update ex_ray_remote_addr_is_invalid to the vendored source"
-        );
-        assert!(
-            source.contains("func listenAddr"),
-            "ex_ray_fatal_config_error's localAddr IP-literal check no longer matches config.go's \
-             `listenAddr` — update ex_ray_local_addr_is_invalid to the vendored source"
         );
         assert!(
             source.contains("if *echMode == \"always\" && !*tlsEnabled {"),

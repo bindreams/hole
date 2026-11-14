@@ -7,6 +7,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -229,10 +230,11 @@ func main() {
 
 	// The address v2ray-core binds and that emitReady reports (see
 	// parseOptsIntoFlags for the client/server mapping).
-	localListenAddr, err := listenAddr()
+	listenHost, listenPort, err := listenAddr()
 	if err != nil {
 		failFatal(err)
 	}
+	localListenAddr := net.JoinHostPort(listenHost.IP().String(), listenPort.String())
 
 	// The transport the inbound listener binds, reported as the sitrep transports.
 	network := listenerNetwork()
