@@ -19,12 +19,9 @@ import (
 //     parsePluginOptions), so a bare `host` sets "1" and a bare `tcp-keepalive`
 //     sets 1 rather than its default.
 //   - An unrecognized key is deliberately not an error, unlike every malformed
-//     shape here. SS_PLUGIN_OPTIONS is shared with other tools in the chain:
-//     galoshes reads its own `udp_timeout` from it and forwards the string to
-//     its embedded ex-ray with only `mux=0` appended, and the Hole bridge
-//     preserves keys it does not know when it composes the string. Rejecting
-//     unknown keys would break them; catching a typo'd key needs those callers'
-//     cooperation.
+//     shape here. SS_PLUGIN_OPTIONS is shared with other programs in the chain,
+//     which read their own keys from it (galoshes' `udp_timeout`), so rejecting
+//     unknown keys would break them.
 
 // parseIntOption applies an integer option to dest, shared by mux,
 // tcp-keepalive and fwmark. A present value, empty included, must parse as an
@@ -87,12 +84,10 @@ func parseEnumOption(opts Args, key string, allowed []string, dest *string) erro
 
 // parseURLOption applies an option to dest if its value is a well-formed https
 // URL. Unlike the other helpers an empty value is valid and clears dest: the
-// ech-doh flag's help says "Empty disables ECH.". This helper does not check
-// that against the ech mode: with ech=always an empty ech-doh is a fatal
-// config error (buildTLSConfig). A malformed non-empty value is fatal, because v2ray-core only logs a failed
-// ECH config fetch: a typo'd ech-doh would silently disable ECH with ech=auto,
-// or leave RequireEch armed and unsatisfiable with ech=always, in both cases
-// with ex-ray reporting ready.
+// ech-doh flag's help says "Empty disables ECH.". A malformed non-empty value is
+// fatal, because v2ray-core only logs a failed ECH config fetch: a typo'd ech-doh
+// would silently disable ECH with ech=auto, or leave RequireEch armed and
+// unsatisfiable with ech=always, in both cases with ex-ray reporting ready.
 func parseURLOption(opts Args, key string, dest *string) error {
 	c, ok := opts.Get(key)
 	if !ok {

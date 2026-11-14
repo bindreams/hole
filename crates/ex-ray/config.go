@@ -141,18 +141,13 @@ func logConfig(logLevel string) (*vlog.Config, error) {
 	return config, nil
 }
 
-// listenAddr returns the address and port of the inbound listener, from
-// *localAddr and *localPort: what v2ray-core binds and what `ready` reports as
-// `listen`. The port is the parsed number, so a leading-zero spelling comes back
-// in its canonical decimal form once formatted. v2ray-core exposes no API for the
-// bound port, so port 0 (OS assignment, in any spelling such as "00") cannot be
-// reported and is refused. A host parses `listen` as one socket address, so
-// anything that is not exactly one IP literal is refused too: a `|`-joined list,
-// "localhost" (v2ray-core's listener would bind 127.0.0.1) and every other
-// hostname. v2ray-core's canonical form of the literal is what is returned, so an
-// IPv4-mapped IPv6 one ("::ffff:127.0.0.1") comes back as plain IPv4. An error
-// names the option and the reason, never the value; main reports its text as the
-// `fatal` detail.
+// listenAddr returns the address and port the inbound binds, from *localAddr and
+// *localPort, and what `ready` reports as `listen`. It refuses port 0
+// (v2ray-core cannot report an OS-assigned port) and anything but exactly one IP
+// literal (`ready` carries one address). The address is v2ray-core's canonical
+// form, so "::ffff:127.0.0.1" returns as 127.0.0.1, and the port is the parsed
+// number, so "01984" returns as 1984. Errors name the option, never the value;
+// main reports their text as the `fatal` detail.
 func listenAddr() (net.Address, net.Port, error) {
 	port, err := net.PortFromString(*localPort)
 	if err != nil {
@@ -359,13 +354,10 @@ func securitySettings(tlsConfig *tls.Config) proto.Message {
 // listens on localAddr:localPort over that transport and forwards to
 // remoteAddr:remotePort.
 //
-// It validates for itself, whatever main has already checked, because tests call
-// it directly: the listen address (listenAddr), the remote port and address, mux,
-// fwmark, mode, ech and the tls it needs, cert, certRaw and key against tls,
-// tcp-keepalive and loglevel. With tls on it calls buildTLSConfig, which refuses
-// ech=always with an empty ech-doh. It does not check host, path or fastOpen: only
-// parseOptsIntoFlags guards an empty host or path. The form of ech-doh is checked
-// there too (parseURLOption). Error text never contains an option value.
+// It rejects invalid options itself, whatever main has already checked, because
+// tests call it directly. With tls on it calls buildTLSConfig, which refuses
+// ech=always with an empty ech-doh; the form of ech-doh is checked by
+// parseURLOption. Error text never contains an option value.
 func generateConfig() (*core.Config, error) {
 	listenHost, listenPort, err := listenAddr()
 	if err != nil {
@@ -449,8 +441,7 @@ func generateConfig() (*core.Config, error) {
 	}
 	// A client-mode `key` is not rejected, unlike a cert without tls: it is read
 	// only in server mode, and real client options carry an unused `key=<path>`
-	// beside `cert=<path>` (crates/bridge/src/test_support/skuld_fixtures.rs builds
-	// its ws_tls and quic client fixtures that way).
+	// beside `cert=<path>`.
 
 	streamConfig := internet.StreamConfig{
 		ProtocolName: *mode,

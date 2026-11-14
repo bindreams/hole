@@ -22,8 +22,7 @@ func (p keepAliveParams) enabled() bool { return p.IdleSeconds > 0 }
 // the probe count, which v2ray-core's SocketConfig cannot express: SocketConfig
 // carries only the idle time and the interval. v2ray-core turns Go's own default
 // keepalive off once SocketConfig carries either, so what the socket gets is p,
-// not Go's default (net's default idle, interval and probe count, none of them
-// the OS's). Non-TCP setsockopt calls would fail, hence the network check below.
+// not Go's default. Non-TCP setsockopt calls would fail, hence the network check below.
 func keepAliveDialerController(p keepAliveParams) func(network, address string, fd uintptr) error {
 	if !p.enabled() {
 		return nil

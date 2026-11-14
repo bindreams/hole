@@ -85,12 +85,7 @@ const exRayHelperProcessEnv = "EXRAY_TEST_HELPER_PROCESS"
 // child process whose sitrep stream and exit code the parent observes. It is the
 // standard library's TestHelperProcess pattern (see os/exec's tests).
 //
-// keepalive_wiring_test.go's TestMain calls registerTCPKeepAlive before any test,
-// including in the child, and main calls it again once it gets past
-// parseOptsIntoFlags. Each call appends a controller to a process-global slice
-// (no removal), so in client mode the child sets the keepalive options twice,
-// which is harmless; the parent's state is unaffected. A fatal exit from
-// parseOptsIntoFlags happens before main's call.
+// The child registers the keepalive controller twice, which is harmless.
 func TestMainHelperProcess(_ *testing.T) {
 	if os.Getenv(exRayHelperProcessEnv) != "1" {
 		return

@@ -153,8 +153,8 @@ struct ChainTask {
 
 impl ChainTask {
     /// Cancel the chain, abort its task and wait until the runner is gone. The plugins get no grace period: garter's
-    /// own drain would hold a cancelled start, and a stop, for its whole drain bound. The abort drops each plugin's task,
-    /// possibly after this returns; a plugin's child goes when its task is dropped.
+    /// own drain would hold a cancelled start, and a stop, until `garter::chain::DEFAULT_DRAIN_TIMEOUT` expires. The
+    /// abort drops each plugin's task, possibly after this returns; a plugin's child goes when its task is dropped.
     async fn end(mut self) {
         self.cancel.cancel();
         self.handle.abort();
@@ -2142,6 +2142,20 @@ mod inject_tests {
         assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("localAddr"));
     }
 
+    // The spellings config_test.go's listenAddr table pins: `ParseAddress` trims a padded address and
+    // `PortFromString` accepts a leading zero but neither a sign nor padding.
+    #[skuld::test]
+    fn local_addr_and_port_spellings_follow_what_listen_addr_accepts() {
+        let fatal = |opts: &str| {
+            let segments = garter::split_plugin_options(opts).unwrap();
+            ex_ray_fatal_config_error(&segments, None)
+        };
+        assert_eq!(fatal("host=cdn.example;localAddr= 127.0.0.1"), None);
+        assert_eq!(fatal("host=cdn.example;localPort=01984"), None);
+        assert_eq!(fatal("host=cdn.example;localPort=+1984"), Some("localPort"));
+        assert_eq!(fatal("host=cdn.example;localPort= 1984"), Some("localPort"));
+    }
+
     // Under `server`, main.go cross-assigns a `localAddr` OPTION to
     // `*remoteAddr` and a `remoteAddr` OPTION to `*localAddr` — so the
     // single-IP-literal rule (`localAddr`'s own) must be checked against the
@@ -2600,7 +2614,7 @@ mod inject_tests {
             assert_eq!(
                 effective_ech_doh(bundled("ex-ray"), Some(opts), Some(&e)),
                 EffectiveEchDoh::None,
-                "opts={opts:?}: ex-ray cannot honor port-0/empty OS-assignment (main.go) — exits before dialing"
+                "opts={opts:?}: ex-ray cannot honor port-0/empty OS-assignment (config.go listenAddr) — exits before dialing"
             );
         }
     }

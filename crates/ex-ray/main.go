@@ -1,7 +1,7 @@
-// Command ex-ray is a first-party SIP003 shadowsocks plugin built on
-// v2ray-core. It is wire-compatible with shadowsocks/v2ray-plugin servers
-// and clients; `ex-ray -h` and the flag definitions in config.go list its
-// options, and third_party/VENDORING.md covers the vendored patches.
+// Command ex-ray is a SIP003 plugin for Shadowsocks, built on v2ray-core. It
+// carries the connection over WebSocket or QUIC, optionally over TLS with ECH,
+// and is wire-compatible with shadowsocks/v2ray-plugin. It reports readiness to
+// its parent as sitrep events on stdout. See README.md.
 package main
 
 import (
