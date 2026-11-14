@@ -269,7 +269,6 @@ scan (exact-substring match on the literal identifiers, not scoped to
 call-graph reachability) — a best-effort tripwire against an accidental
 upstream reintroduction, not a proof against a determined rename/alias.
 
-
 ### Tray menu rebuild contract
 
 All tray menu commits go through `tray::rebuild_tray_menu`, which dispatches
