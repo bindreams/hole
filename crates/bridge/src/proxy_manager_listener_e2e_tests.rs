@@ -110,14 +110,14 @@ enum UnboundEvidence {
 /// already holds it).
 ///
 /// The probe pins [`util::syn_budget::SynBudget::NoRetransmit`]: a refusal
-/// is observed in ~0.1 ms instead of paying Windows' ~2.05 s stock
-/// SYN-retransmission budget, and the budget's contract holds because a
+/// is observed at once instead of paying Windows' stock SYN-retransmission
+/// budget, and the budget's contract holds because a
 /// `NoVerdict` is never taken as an answer — it is settled by the bind
 /// below, which involves no SYN at all.
 async fn assert_port_unbound(addr: SocketAddr) -> UnboundEvidence {
     // Coarse backstop on the OS's connect state machine (an external event);
-    // it is well clear of the pinned connect's own ~1.02 s give-up, so it
-    // never decides the verdict — `probe` reads that from the error.
+    // it is well clear of the pinned connect's own give-up, so it never decides
+    // the verdict: `probe` reads that from the error.
     const BACKSTOP: Duration = Duration::from_secs(5);
 
     match util::syn_budget::probe(addr, BACKSTOP, util::syn_budget::SynBudget::NoRetransmit).await {
@@ -285,8 +285,8 @@ fn e2e_reload_toggling_http_listener_rebinds(
         let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
         assert_port_unbound_recorded("http", http_addr).await;
 
-        // Flip HTTP on, keep every other structural field identical so
-        // the pre-#242 check would have short-circuited.
+        // Flip HTTP on, keep every other structural field identical so a
+        // reload that ignored the listener fields would short-circuit.
         let mut reloaded = config;
         reloaded.proxy_http = true;
         let resp = harness
@@ -384,8 +384,7 @@ fn e2e_start_rejects_full_mode_without_socks5(
 // bounds the TCP case. The TCP transit proof lives in
 // `proxy_manager_e2e_tests.rs::tun::e2e_*_full_tunnel_captures_unowned_destination`.
 //
-// OPEN GAP, tracked as a follow-up to #880, not closed by this test: in-TUN
-// UDP transit has no coverage anywhere in this suite. Building the oracle
+// OPEN GAP, not closed by this test: in-TUN UDP transit has no coverage anywhere in this suite. Building the oracle
 // needs something that answers a datagram from inside the TUN, which the TCP
 // oracle gets for free from the handshake. Do not read this test as covering
 // it, and do not delete this note without landing that oracle.

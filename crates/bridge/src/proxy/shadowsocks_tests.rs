@@ -82,7 +82,7 @@ fn socks_only_config(server: SocketAddr, local_port: u16) -> shadowsocks_service
 }
 
 /// Build a `SocksOnly` config with one HTTP CONNECT listener on
-/// `local_port_http` and no SOCKS5 listener — the literal shape of #876's
+/// `local_port_http` and no SOCKS5 listener — the literal shape of the
 /// reported repro (toggling the HTTP listener on a live session).
 fn http_only_config(server: SocketAddr, local_port_http: u16) -> shadowsocks_service::config::Config {
     let entry = ServerEntry {
@@ -216,7 +216,7 @@ fn stop_then_start_reuses_the_same_ports() {
     });
 }
 
-/// The literal shape of #876's reported repro: the HTTP CONNECT listener,
+/// The reported repro's literal shape: the HTTP CONNECT listener,
 /// not the SOCKS5 one. Every other test in this file exercises SOCKS5;
 /// nothing else here would catch a regression specific to the HTTP local
 /// instance's teardown path.
@@ -245,11 +245,9 @@ fn stop_then_start_reuses_the_same_http_listener_port() {
 /// which holds an `Arc` clone of the inbound SOCKS5 UDP listener inside a
 /// per-association task whose handle never leaves `UdpAssociationManager`.
 ///
-/// This is NOT evidence that layer 3 leaks today: layer 2 alone already
-/// holds the port, so this test is red on unmodified code for the same
-/// reason `stop_releases_the_listener_ports` is. Its value is
-/// forward-looking — it is the only test that would catch a future
-/// regression to a layer-2-only teardown.
+/// Layer 2 alone already holds the port, so a leak here is indistinguishable
+/// from `stop_releases_the_listener_ports` failing. This is the only test that
+/// would catch a regression to a layer-2-only teardown.
 #[skuld::test]
 fn stop_releases_the_udp_port_with_a_live_association(#[fixture(ssserver_none)] ss: &SsServerHandle) {
     current_thread_runtime().block_on(async {
@@ -277,10 +275,8 @@ fn stop_releases_the_udp_port_with_a_live_association(#[fixture(ssserver_none)] 
 /// `stop()`ping) a started proxy on a multi-thread runtime must still
 /// release both ports before `drop` returns.
 ///
-/// Deterministic only on the fixed code, because `Drop` joins the
-/// runtime. On unmodified code this is a genuine race (whichever poll
-/// happens to run first), so this is not a red-on-main guard the way
-/// the `stop()` tests above are.
+/// Deterministic because `Drop` joins the runtime. A `Drop` that did not join
+/// would make this a race (whichever poll runs first), not a reliable failure.
 #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn drop_releases_the_listener_ports_on_a_multi_thread_runtime() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -325,7 +321,7 @@ fn drop_releases_the_listener_ports_on_a_current_thread_runtime() {
 
 // Upstream assumption guard ===========================================================================================
 
-/// Guards the one property this change relies on that no behavioural test
+/// Guards the one property the join relies on that no behavioural test
 /// can see: `drop(Runtime)` waits for *running* blocking-pool tasks, and
 /// nothing reachable on Hole's local-server path has one today (confirmed
 /// by reading source, not merely assumed) — not in `shadowsocks-service` /

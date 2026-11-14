@@ -1,8 +1,6 @@
-//! Tests for `ProxyManager::turn_lockdown_off` — the whole feature's only
-//! stateful decision (whether `cover_step` calls for a release given the
-//! persisted target and OS-probed presence, the ordering that keeps the
-//! tray's escape available across a failed release, and the drop of a held
-//! transient guard before the OS-level clear). Reuses the mocks and
+//! Tests for `ProxyManager::turn_lockdown_off`: the unconditional release, the ordering that
+//! keeps the tray's escape available across a failed release, and the drop of a held transient
+//! guard before the OS-level clear. Reuses the mocks and
 //! constructors from the sibling `proxy_manager_tests` module rather than
 //! redefining them.
 
@@ -145,11 +143,9 @@ fn turn_lockdown_on_reports_an_unsaved_intent_as_the_store_error() {
 
 #[skuld::test]
 fn turn_lockdown_off_releases_even_when_presence_reads_absent() {
-    // Inverted deliberately. This used to assert the release was SKIPPED on a
-    // confirmed-clean host, which is a check-then-act guard in front of an
-    // operation documented idempotent — and at an explicit disarm a stale
-    // `Absent` is the one wrong answer that matters: it reports success to the
-    // user while the host stays blocked. The redundant call costs nothing.
+    // No presence check stands in front of the release: it is idempotent, and at an explicit
+    // disarm a stale `Absent` would report success to the user while the host stays blocked. The
+    // redundant call costs nothing.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -406,9 +402,8 @@ fn a_failed_release_keeps_the_adopted_cover_claim() {
 
 #[skuld::test]
 fn unblock_during_a_session_disarms_a_promoted_adopted_switch() {
-    // Rule #0 in the other direction: making the claim durable must not make
-    // the kill switch unreleasable. Turning it off mid-session releases the
-    // session's own stranded cover and nothing re-promotes it once gone.
+    // Making the claim durable must not make the kill switch unreleasable. Turning it off
+    // mid-session releases the session's own stranded cover and nothing re-promotes it once gone.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -442,11 +437,9 @@ fn unblock_during_a_session_disarms_a_promoted_adopted_switch() {
 
 // Transient cover on a clean shutdown =================================================================================
 
-/// The `PendingStart` arm used to group `CutoverRestart | Blipped |
-/// ProcessExiting => disarm()` against `UserStopped | GaveUp => drop()` —
-/// grouped by their shared consequence to the TARGET, which is the exact
-/// "collapse two variants onto a shared consequence" defect `SessionEvent`'s
-/// own doc forbids, reproduced inside the model built to remove it.
+/// The `PendingStart` arm must not group `CutoverRestart | Blipped | ProcessExiting` as `disarm()`
+/// against `UserStopped | GaveUp` as `drop()`: that groups variants by their shared consequence to
+/// the TARGET, which `SessionEvent`'s own doc forbids.
 ///
 /// The transient cover's real question is not "does the target move" but
 /// "will a successor process adopt these filters", and that is true for

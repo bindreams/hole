@@ -83,8 +83,8 @@ pub struct Dispatcher {
     ipv6_assigned: Option<Assigned>,
     /// The identity of the TUN device this dispatcher opened. Captured
     /// before the device is consumed by `Engine::build`; threaded to
-    /// `Dns::apply` (bindreams/hole#846) so DNS is confined to the adapter
-    /// this process actually opened, never a name lookup.
+    /// `Dns::apply` so DNS is confined to the adapter this process actually
+    /// opened, never a name lookup.
     identity: TunIdentity,
 }
 
@@ -131,13 +131,12 @@ impl Dispatcher {
 
         let built = build_or_cancel(cancel, move || {
             Device::build(|c: &mut MutDeviceConfig| {
-                // macOS's `utun` driver rejects any `Requested` name that
-                // doesn't already have the kernel's own `utunN` shape
-                //  — asking for the fixed
-                // `WINDOWS_TUN_ALIAS` there fails before Full mode can start
-                // at all. `KernelAssigned` instead asks the driver for the
+                // On macOS the `tun` crate rejects any `Requested` name that
+                // doesn't already have the kernel's own `utunN` shape, so asking
+                // for the fixed `WINDOWS_TUN_ALIAS` there fails before Full mode
+                // can start. `KernelAssigned` instead asks the driver for the
                 // next free `utunN` and reads the real name back via
-                // `Device::identity` (`crate::proxy::config` doc).
+                // `Device::identity` (docs/contributing/architecture/tun-device.md).
                 #[cfg(target_os = "macos")]
                 {
                     c.tun_name = TunName::KernelAssigned;
@@ -159,8 +158,8 @@ impl Dispatcher {
 
         // Give hole-tun the lowest possible interface metric so Windows
         // prefers whatever resolver Hole advertises over the physical
-        // adapter's (#846's positive half; the negative half is
-        // `tun_engine::dns_confine`). IPv4 absence is fatal: a v4 row must
+        // adapter's (the confining half is `tun_engine::dns_confine`).
+        // IPv4 absence is fatal: a v4 row must
         // exist for an adapter that was just created. IPv6 absence is
         // logged and accepted: `Device::build` already waited for the IPv6
         // half, so a missing row follows from `Assigned::Ipv6StackAbsent`
@@ -202,7 +201,7 @@ impl Dispatcher {
 
         // Captured BEFORE `Engine::build` consumes `device` below — this is
         // the identity of the concrete OS object this call opened, never a
-        // name lookup (bindreams/hole#846).
+        // name lookup.
         let identity = device.identity().clone();
 
         // Build the two endpoints, the drop sink, and the HoleRouter.
@@ -218,9 +217,9 @@ impl Dispatcher {
             rules,
         ));
 
-        // Build the engine. Hole no longer registers a DnsInterceptor —
-        // DNS queries traverse the tunnel like any other traffic, and
-        // names are recovered from TLS/HTTP peek at connect time.
+        // Build the engine. DNS queries traverse the tunnel like any other
+        // traffic (no DnsInterceptor), and names are recovered from TLS/HTTP
+        // peek at connect time.
         let router_for_engine: Arc<dyn tun_engine::Router> = router.clone();
         let engine = Engine::build(device, router_for_engine, |_c| {})
             .map_err(|e| std::io::Error::other(format!("failed to build engine: {e}")))?;
@@ -250,11 +249,10 @@ impl Dispatcher {
         }))
     }
 
-    /// What the OS TUN interface ended up holding for [`TUN_SUBNET6`].
-    ///
-    /// `Ipv6StackAbsent` is the second operand of the route-install fatality
-    /// rule: the IPv6 route adds are non-fatal when the upstream has no IPv6
-    /// **or** the TUN interface has no IPv6 half.
+    /// What the OS TUN interface ended up holding for [`TUN_SUBNET6`]; `None`
+    /// when no IPv6 address was requested. Reported in the start log only: the
+    /// fatality of an IPv6 split-route failure is decided inside
+    /// `Routing::install`, by an OS probe of the TUN's own name.
     pub fn ipv6_assigned(&self) -> Option<Assigned> {
         self.ipv6_assigned
     }
@@ -270,8 +268,8 @@ impl Dispatcher {
     }
 
     /// The identity of the TUN device this dispatcher opened — the LUID and
-    /// alias of the concrete OS object, not a name lookup. See
-    /// `crate::proxy_manager::start_inner`'s Phase 7.
+    /// alias of the concrete OS object, not a name lookup. Threaded to
+    /// `Routing::install`, `Routing::install_lockdown` and `Dns::apply`.
     pub fn identity(&self) -> &TunIdentity {
         &self.identity
     }

@@ -42,7 +42,7 @@ pub(crate) struct MockProxyState {
     crashed: AtomicBool,
     /// Last shadowsocks Config passed to `start` — lets tests assert
     /// which local instances a start produced (e.g. the pure-VPN
-    /// internal ephemeral SOCKS5 instance, #459).
+    /// internal ephemeral SOCKS5 instance).
     last_config: std::sync::Mutex<Option<shadowsocks_service::config::Config>>,
     /// Cumulative traffic counters surfaced via `MockRunning::traffic_totals`.
     /// Tests `fetch_add` to simulate tunnel traffic. Zeroed on every
@@ -62,8 +62,7 @@ pub(crate) struct MockProxy {
     start_gate: Option<Arc<tokio::sync::Notify>>,
     /// If Some, `start` fires this sender on entry — before awaiting
     /// `start_gate`. Lets tests park until `start` is *known* to be in
-    /// flight, instead of sleeping. One-shot per MockProxy. See
-    /// bindreams/hole#383.
+    /// flight, instead of sleeping. One-shot per MockProxy.
     start_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     /// If Some, run on every `start` once it is past the gate — where
     /// production's plugin chain has already recorded its pid.
@@ -353,7 +352,7 @@ pub(crate) struct MockRouting {
     /// `GatewayInfo::interface_name` returned by `default_gateway`. Default
     /// "MockEthernet"; a test can override it via
     /// [`Self::with_gateway_interface_name`] to stand in for a foreign VPN
-    /// adapter (bindreams/hole#846's `dns_apply_targets_only_the_hole_tun`).
+    /// adapter (`dns_apply_targets_only_the_hole_tun`).
     gateway_interface_name: String,
 }
 
@@ -453,15 +452,12 @@ impl Routing for MockRouting {
             return Err(RoutingError::RouteSetup("mock install failure".into()));
         }
 
-        // Mirror `SystemRouting::install`'s ACTUAL fatality, which is
-        // per-command, not per-install (see `routing.rs`'s `RouteCommand`
-        // doc): the IPv4 splits and the server bypass are always fatal — a
-        // missing one of those sends traffic outside the tunnel — while the
-        // IPv6 splits are tolerated where the TUN has no IPv6 binding,
-        // because a host with no IPv6 stack emits no IPv6 to leak. So a
-        // narrowed `installed` IS returned as `Ok` when only the v6 splits
-        // are missing, which is exactly the shape `routed_families` exists
-        // to report.
+        // Mirror the INTENDED per-command fatality (`SetupCommand::fatal`): the IPv4 splits and the
+        // server bypass are always fatal, and the IPv6 splits are tolerated where the TUN has no
+        // IPv6 binding. So a narrowed `installed` is returned as `Ok` when only the v6 splits are
+        // missing, the shape `routed_families` exists to report. The real `SystemRouting::install`
+        // does not yet carry that tolerance through to the start (route-failure-policy.md), so this
+        // mock is more tolerant than the real install on that one input.
         let missing_fatal = planned
             .iter()
             .any(|id| !installed.contains(id) && !matches!(id, RouteId::SplitV6Low | RouteId::SplitV6High));
@@ -619,11 +615,8 @@ impl Drop for MockRoutes {
 }
 
 impl RoutesInstalled for MockRoutes {
-    // Mirrors `SystemRoutes::routed_families` exactly, reading the same
-    // `installed: Vec<RouteId>` shape `MockRouting::install` populates
-    // above (narrowed by `fail_routes_for` under the same PER-COMMAND
-    // fatality `SystemRouting::install` applies — see that install's own
-    // comment).
+    // Mirrors `SystemRoutes::routed_families`, reading the same `installed: Vec<RouteId>` shape
+    // `MockRouting::install` populates above (narrowed by `fail_routes_for`).
     fn routed_families(&self) -> RoutedFamilies {
         RoutedFamilies {
             v4: self.installed.contains(&RouteId::SplitV4Low) && self.installed.contains(&RouteId::SplitV4High),
@@ -947,10 +940,9 @@ pub(crate) fn test_config() -> ProxyConfig {
         local_port: 1080,
         tunnel_mode: hole_common::protocol::TunnelMode::Full,
         filters: Vec::new(),
-        // dns.enabled = false avoids the #388 forwarder self-test gate in
-        // happy-path tests — MockProxy doesn't bind a real TCP listener,
-        // so the forwarder's Socks5Connector to `127.0.0.1:1080` would cost
-        // up to TUNNEL_QUERY_TIMEOUT (10s) on every test. Tests that
+        // dns.enabled = false skips the forwarder self-test gate in happy-path tests:
+        // MockProxy binds no TCP listener, so the forwarder's Socks5Connector to
+        // `127.0.0.1:1080` would cost up to TUNNEL_QUERY_TIMEOUT on every test. Tests that
         // exercise the gate enable DNS explicitly (see the self_test mod).
         dns: hole_common::config::DnsConfig {
             enabled: false,
@@ -968,8 +960,8 @@ pub(crate) fn test_config() -> ProxyConfig {
 /// an SNI domain to key its DoH lookup on — an absent, empty, or IP-literal
 /// `host` means ex-ray dials with an IP-literal `ServerName`, so
 /// `ApplyECH` bails before ever dialing DoH), `ech` left at its `auto`
-/// default (`crates/ex-ray/config.go:209-223,290-294,334`;
-/// `third_party/v2ray-core/transport/internet/tls/ech.go:26-51`). Bare
+/// default (`crates/ex-ray/config.go`;
+/// `third_party/v2ray-core/transport/internet/tls/ech.go`). Bare
 /// `plugin = Some("ex-ray")` with no options — TCP-only, no `tls`, no
 /// `host` — never reaches ECH at all regardless of `ech-doh`; tests that
 /// need a real cover permit or an ECH-posture warning must opt in via this
@@ -979,11 +971,10 @@ const ECH_CAPABLE_OPTS: &str = "tls;host=cdn.example";
 
 // Tests ===============================================================================================================
 
-/// Scaffolding for #846: no unit test reaches `Dns::apply` through
-/// `start_inner` before this — the Phase-4 forwarder self-test gate fails
-/// first because `MockProxy` binds nothing. Wiring `Socks5DnsUpstream` in
-/// as the real listener at `config.local_port`, plus `MockDns` standing in
-/// for `SystemDns`, lets a Full-mode start clear the gate and reach Phase 7.
+/// A Full-mode start reaches `Dns::apply` once the forwarder answers. `MockProxy` binds nothing,
+/// so the phase-4 self-test gate would fail first; `Socks5DnsUpstream` serves as the real listener
+/// at `config.local_port` and `MockDns` stands in for `SystemDns`, so the start clears the gate
+/// and reaches phase 7.
 #[skuld::test]
 fn start_reaches_dns_apply_when_the_forwarder_answers() {
     rt().block_on(async {
@@ -1011,17 +1002,14 @@ fn start_reaches_dns_apply_when_the_forwarder_answers() {
     });
 }
 
-/// Call-site wiring only — NOT a naming regression guard. Under
-/// `#[cfg(test)]`, `start_inner` builds its `TunIdentity` from
-/// `TunIdentity::synthetic(0xFEED, WINDOWS_TUN_ALIAS)` (`proxy_manager.rs`)
-/// rather than the real device-discovery path, so this test cannot catch a
-/// regression in macOS's real kernel-assigned naming (Task 8's privileged
-/// smoke is the only test that can). What it DOES prove: `Routing::install`,
-/// `Routing::install_lockdown`, and `Dns::apply` are all handed the SAME
-/// `TunIdentity`'s alias from one Full-mode start with the standing lockdown
-/// engaged — the three signatures accepting `&TunIdentity` (
-/// plan, Task 5) is what makes passing three DIFFERENT names a compile error
-/// rather than a runtime drift only a privileged test would catch.
+/// Call-site wiring only, not a naming guard. Under `#[cfg(test)]`, `start_inner` builds its
+/// `TunIdentity` from `TunIdentity::synthetic(0xFEED, WINDOWS_TUN_ALIAS)` rather than the real
+/// device-discovery path, so this test cannot catch a regression in macOS's kernel-assigned
+/// naming; only the privileged macOS full-tunnel test can. What it pins: `Routing::install`,
+/// `Routing::install_lockdown`, and `Dns::apply` are all handed the SAME `TunIdentity`'s alias
+/// from one Full-mode start with the standing lockdown engaged. The three signatures take
+/// `&TunIdentity`, so passing three DIFFERENT names is a compile error rather than a runtime
+/// drift.
 #[skuld::test]
 fn install_and_lockdown_name_the_device_dns_was_given() {
     rt().block_on(async {
@@ -1732,7 +1720,7 @@ fn an_unexpected_death_restores_dns() {
     });
 }
 
-// death_reason: path-free GUI/toast surface, distinct from last_error (#470) ==========================================
+// death_reason: path-free GUI/toast surface, distinct from last_error =================================================
 
 #[skuld::test]
 fn check_health_sets_path_free_death_reason() {
@@ -2081,15 +2069,12 @@ fn sample_traffic_resets_on_restart() {
     });
 }
 
-// #165 regression guard ===============================================================================================
+// Routing mock isolation ==============================================================================================
 
-/// The #165 bug was that every start→stop cycle ran real `netsh` because
-/// `RouteGuard::drop` bypassed the `ProxyBackend` trait. The post-#165
-/// design makes the teardown RAII guard the `Routing::Installed`
-/// associated type, so `MockRoutes::drop` (not `routing::teardown_routes`)
-/// runs on stop. This test asserts that directly: if a future regression
-/// reintroduces a bypass, `teardown_calls` will stay at 0 after a clean
-/// start→stop and the assertion will fail.
+/// A stop runs the mock routing's teardown, not a real routing subprocess. The teardown RAII guard
+/// is the `Routing::Installed` associated type, so `MockRoutes::drop` (not
+/// `routing::teardown_routes`) runs on stop. If a bypass were reintroduced, `teardown_calls` would
+/// stay at 0 after a clean start then stop.
 #[skuld::test]
 fn stop_runs_mock_teardown_not_real_netsh() {
     rt().block_on(async {
@@ -2106,7 +2091,7 @@ fn stop_runs_mock_teardown_not_real_netsh() {
         assert_eq!(
             routing_state.teardown_calls.load(Ordering::SeqCst),
             1,
-            "MockRoutes::Drop must run exactly once per stop — if this fails, a real-routing bypass has been reintroduced (regression of #165)"
+            "MockRoutes::Drop must run exactly once per stop — if this fails, a real-routing bypass has been reintroduced"
         );
     });
 }
@@ -2129,14 +2114,11 @@ fn proxy_manager_tests_never_spawn_routing_subprocess() {
 
     let count = routing::ROUTING_SUBPROCESS_SPAWN_COUNT.load(Ordering::SeqCst);
     eprintln!("proxy_manager start/stop cycles spawned {count} routing subprocesses");
-    assert_eq!(
-        count, 0,
-        "proxy_manager tests must not spawn routing subprocesses (regression of #165)"
-    );
+    assert_eq!(count, 0, "proxy_manager tests must not spawn routing subprocesses");
 }
 
 /// The fail-closed cover path must also never spawn a real routing subprocess
-/// from a mock — the #165 isolation contract extends to the cover. Engage +
+/// from a mock: the routing isolation contract extends to the cover. Engage +
 /// drop N covers through the mock and assert zero spawns and balanced
 /// engage/disengage counts.
 #[skuld::test(serial)]
@@ -2182,7 +2164,7 @@ fn mock_install_failclosed_cover_records_the_resolver_argument() {
     drop(cover);
 }
 
-// Standing lockdown guard lifecycle (#527) ============================================================================
+// Standing lockdown guard lifecycle ===================================================================================
 //
 // `start_inner` engages the standing lockdown cover AFTER routing.install and
 // BEFORE Dns::apply, ONLY when `bridge-lockdown.json` intent is on. The Cover
@@ -2771,7 +2753,7 @@ fn stop_clears_last_error() {
         // Successful start clears last_error itself. The point of this
         // test is to verify the stop() side: any error left over from a
         // hypothetical earlier failed start must be cleared on a clean
-        // stop. See issue #142.
+        // stop.
         let (mut pm, _dir) = new_manager(MockProxy::new());
         pm.start(&test_config()).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
@@ -2835,10 +2817,9 @@ fn route_failure_clears_stale_state_file() {
 
 /// A partial route failure (another VPN already holds one of the split
 /// prefixes) must fail the whole `start` closed, not return a degraded
-/// tunnel — `SystemRouting::install` treats a narrowed `installed` as a
-/// hard error and rolls back (Rule #0: a user who believes traffic is
-/// captured when some of it is not is worse off than one told Hole failed
-/// to connect). `MockRouting::failing_routes` mirrors that contract.
+/// tunnel: `SystemRouting::install` treats a narrowed `installed` as a hard error and rolls
+/// back, because a user who believes traffic is captured when some of it is not is worse off than
+/// one told Hole failed to connect. `MockRouting::failing_routes` mirrors that contract.
 #[skuld::test]
 fn partial_route_failure_fails_closed_and_clears_state() {
     rt().block_on(async {
@@ -3042,7 +3023,7 @@ fn start_cancellable_dropped_future_runs_guards() {
     });
 }
 
-// Pure-VPN (#459) =====================================================================================================
+// Pure-VPN ============================================================================================================
 
 #[skuld::test]
 fn pure_vpn_start_binds_internal_ephemeral_socks5() {
@@ -3210,7 +3191,7 @@ fn dns_apply_emits_done_info_log() {
 
     // Current-thread runtime so `tokio::spawn` in `SystemDns::apply`
     // (or anything downstream) stays on the test thread. The helper
-    // asserts this at install time. See bindreams/hole#302.
+    // asserts this at install time.
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -3251,7 +3232,7 @@ fn dns_apply_emits_done_info_log() {
         });
 }
 
-// Phase 7 target + fail-fatal tests (bindreams/hole#846) ==============================================================
+// Phase 7 target + fail-fatal tests ===================================================================================
 
 /// `Dns::apply` must be reachable only with `hole-tun` — never the foreign
 /// gateway interface name `MockRouting::default_gateway` reports. Drives
@@ -3801,7 +3782,7 @@ mod self_test {
     /// **Load-bearing**: when the forwarder self-test fails, `start_cancellable`
     /// returns `Err(ForwarderSelfTestFailed)` AND `routing.install` is NEVER
     /// called. Catches any future regression that re-orders the gate
-    /// AFTER route install — re-introducing the #388 dead-tunnel DNS hijack.
+    /// AFTER route install, which would hijack OS DNS into a dead tunnel.
     ///
     /// Test plumbing: `MockProxy::new()` does not bind a real TCP listener
     /// on `127.0.0.1:1080`, so the forwarder's `Socks5Connector` connection
@@ -3840,7 +3821,7 @@ mod self_test {
             assert_eq!(
                 routing_state.install_calls.load(Ordering::SeqCst),
                 0,
-                "routing.install MUST NOT be called when self-test fails (#388 regression guard)"
+                "routing.install MUST NOT be called when self-test fails"
             );
             assert_eq!(routing_state.teardown_calls.load(Ordering::SeqCst), 0);
             assert!(!state_path.exists(), "no state file when install never ran");
@@ -3854,7 +3835,7 @@ mod self_test {
         });
     }
 
-    /// Pure-VPN (#459): the resolved ephemeral port — not
+    /// Pure-VPN: the resolved ephemeral port — not
     /// `config.local_port` — must be what `build_local_dns` (and
     /// `Dispatcher::new`) receive. The regression mode is a swap back to
     /// `config.local_port` at a consumer call site, which would make the
@@ -6723,10 +6704,9 @@ mod self_test {
     }
 
     /// `hold_pending`'s contract ("posture must be Idle") is exercised
-    /// against both of its invalid inputs: a live `Session` (below — the
-    /// silent-overwrite scenario the PR body's "what the collapse costs"
-    /// section describes, dropping a live `RunningState` without
-    /// `stop_with`'s ordered teardown) and an existing `PendingStart`
+    /// against both of its invalid inputs: a live `Session` (below; a silent
+    /// overwrite would drop a live `RunningState` without `stop_with`'s
+    /// ordered teardown) and an existing `PendingStart`
     /// (`posture_hold_pending_rejects_a_posture_that_already_holds_one`,
     /// next). `commit_session`'s `debug_assert!` stays unexercised, and that
     /// IS a disclosed gap, not an oversight: reaching it needs a second
@@ -7042,11 +7022,8 @@ fn a_config_edit_does_not_disarm_an_adopted_kill_switch() {
 
 #[skuld::test]
 fn an_unexpected_session_death_retires_the_claim_too() {
-    // Spec correction (#898 follow-up): this used to assert the release as an
-    // incidental teardown side effect (a disengage-call count) and asserted
-    // nothing about the target or ordering. Under the target model the
-    // release is a *consequence of the target moving to `Off`*, and it must
-    // still follow the session teardown it covered, not precede it.
+    // The release is a consequence of the target moving to `Off`, and it must follow the session
+    // teardown it covered, not precede it.
     rt().block_on(async {
         let proxy = MockProxy::new();
         let proxy_state = proxy.state_handle();
@@ -7085,13 +7062,11 @@ fn an_unexpected_session_death_retires_the_claim_too() {
 
 #[skuld::test]
 fn a_user_stop_whose_release_does_not_confirm_keeps_the_claim_and_the_escape() {
-    // Reintroduction proof for finding 5 (#898 rework): an unconditional
-    // `set_standing_cover_adopted(false)` right after the guard's silent Drop
-    // would clear the claim even when the OS-level release did not confirm —
-    // the Unblock item disappearing exactly in the failure case it exists to
-    // cover (Rule #0). Asserted against `CoverPresence` — the measured OS
-    // fact — rather than the internal claim: a false "released" is worse than
-    // a stale "still armed".
+    // An unconditional `set_standing_cover_adopted(false)` right after the guard's silent Drop
+    // would clear the claim even when the OS-level release did not confirm, and the Unblock item
+    // would disappear exactly in the failure case it exists to cover. Asserted against
+    // `CoverPresence`, the measured OS fact, rather than the internal claim: a false "released" is
+    // worse than a stale "still armed".
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -7157,11 +7132,9 @@ fn a_crashed_session_whose_release_does_not_confirm_keeps_the_claim() {
 
 #[skuld::test]
 fn turning_lockdown_off_mid_session_clears_a_stale_adopted_claim() {
-    // Finding 4 (#898 rework): a claim carried in from startup recovery (or
-    // from this session's own now-superseded adoption) must not keep
-    // overriding an explicit off the user just persisted mid-session — or the
-    // toggle springs back to "on" and a second Unblock click reports success
-    // while changing nothing observable.
+    // A claim carried in from startup recovery (or from this session's own adoption) must not keep
+    // overriding an explicit off the user just persisted mid-session, or the toggle springs back to
+    // "on" and a second Unblock click reports success while changing nothing observable.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -7311,8 +7284,9 @@ fn proxy_start_diag_carries_no_address() {
 /// `routed_families` by `routed_families_reports_only_the_splits_that_landed`
 /// in tun-engine, `apply`'s use of the value by the per-platform DNS tests —
 /// but nothing proved the wire between them. A start whose IPv6 splits fail
-/// is exactly the production shape (a host whose TUN has no IPv6 binding,
-/// where those commands are non-fatal by design), so the value arriving as
+/// is the shape a host whose TUN has no IPv6 binding is meant to produce
+/// (those commands are non-fatal by design; the real install does not yet
+/// tolerate it, see route-failure-policy.md), so the value arriving as
 /// `{v4: true, v6: false}` is the whole claim.
 #[skuld::test]
 fn the_installed_routed_families_reach_dns_apply() {
@@ -7351,8 +7325,8 @@ fn the_installed_routed_families_reach_dns_apply() {
 /// `cover_step` holds on every unknown, which is right for a steady-state
 /// reconciler with no information — but a user Disconnect is an explicit
 /// disarm and must lean the other way. Keying teardown on `cover_step` alone
-/// meant an `Unreachable` probe produced `Hold`, which disarmed the guard and
-/// left the filters installed with nothing left to own them.
+/// would let an `Unreachable` probe produce `Hold`, which disarms the guard and
+/// leaves the filters installed with nothing left to own them.
 #[skuld::test]
 fn a_user_disconnect_with_an_unreachable_probe_releases_the_cover() {
     rt().block_on(async {

@@ -1,9 +1,7 @@
 // Shadowsocks config construction, error types, and TUN/plugin constants.
 //
-// Split out of `proxy.rs` during the #165 rearchitecture so that `proxy.rs`
-// can be a thin module-root file holding the `Proxy` / `RunningProxy`
-// trait definitions. See `crates/bridge/src/proxy.rs` and
-// `crates/bridge/src/proxy/shadowsocks.rs`.
+// `proxy.rs` holds the `Proxy` / `RunningProxy` trait definitions and
+// `proxy/shadowsocks.rs` their production implementation.
 
 use hole_common::protocol::ProxyConfig;
 use shadowsocks::config::{Mode, ServerAddr, ServerConfigError};
@@ -40,8 +38,8 @@ pub enum KeyMaterialFault {
 /// Per-variant policy on the type: the ONE exhaustive match on
 /// [`ServerConfigError`] in the workspace. No `_` arm — a new upstream
 /// variant fails compilation here rather than defaulting into a message that
-/// carries its `Display`. `shadowsocks` is pinned to `=1.24.0`, so that break
-/// arrives with a deliberate bump.
+/// carries its `Display`. `shadowsocks` is pinned to an exact version, so that
+/// break arrives with a deliberate bump.
 ///
 /// `pub(crate)` for [`crate::server_test`], which builds its own
 /// `ServerConfig` and has the same leak on the same error.
@@ -102,10 +100,8 @@ pub enum ProxyError {
     #[error(transparent)]
     PluginResolve(#[from] PluginResolveError),
     /// Plugin options a SIP003 parser rejects. Refused rather than forwarded:
-    /// ex-ray fails fatally on the same string rather than silently
-    /// discarding it, so refusing here isn't preventing a silent bad-config
-    /// start — it's failing earlier and attributably, naming the fault
-    /// before spawning a process that would die immediately after. PII-free
+    /// ex-ray fails fatally on the same string, so refusing here fails earlier
+    /// and attributably, before spawning a process that would die immediately. PII-free
     /// `Display` by construction — the wrapped `MalformedOptions` names the
     /// fault class and a segment index, never the segment, which can carry a
     /// per-connection secret.
@@ -122,7 +118,7 @@ pub enum ProxyError {
     /// `tunnel_mode == Full` with the HTTP listener enabled requires the
     /// user-facing SOCKS5 listener: the TUN data plane either rides the
     /// user-facing SOCKS5 listener on `local_port`, or — when no
-    /// user-facing listener is requested at all (pure-VPN, #459) — an
+    /// user-facing listener is requested at all (pure-VPN) — an
     /// internal one on an ephemeral port. A mixed user-facing-HTTP +
     /// internal-SOCKS5 split is rejected.
     #[error("tunnel_mode=full with proxy_http requires the SOCKS5 listener; enable proxy_socks5, or disable proxy_http for a pure-VPN start, or switch to tunnel_mode=socks-only")]
@@ -158,11 +154,8 @@ pub enum ProxyError {
     /// `Display` interpolates only integers, so it is PII-free by construction.
     ///
     /// Do not claim `shadowsocks-service` answers the SOCKS5 CONNECT as soon as
-    /// it reaches the plugin's local port — the field captures disprove it.
-    /// Sixteen of seventeen archived `upstream failed` lines show
-    /// `socks5_ms: None` against `budget_ms: 3000`, i.e. no acknowledgement
-    /// after three seconds. What is observed is only that the acknowledgement
-    /// can stay outstanding for seconds; that case is
+    /// it reaches the plugin's local port: field captures show the acknowledgement
+    /// staying outstanding for seconds. That case is
     /// [`Self::TunnelSetupIncomplete`], not this one.
     #[error("Nothing came back through the tunnel ({elapsed_ms}ms). Either the proxy connection could not be established, or the server cannot reach your DNS resolver.")]
     TunnelSilent { attempts: u32, elapsed_ms: u64 },
@@ -300,13 +293,10 @@ impl From<tun_engine::DeviceError> for ProxyError {
 }
 
 /// `Dispatcher::new` keeps `DeviceError` distinguishable from its other
-/// start-time I/O failures (metric set, engine build) instead of flattening
-/// everything to `io::Error` — the flattening was what made
-/// `ProxyError::ForeignAdapter` unreachable from `start_inner`: the `?` on
-/// `Dispatcher::new(..).await?` converted straight to `ProxyError::Runtime`
-/// via `io::Error`'s own `#[from]`, before this impl ever got a chance to
-/// run. Delegating the `Device` arm to the impl above is what makes it
-/// reachable again.
+/// start-time I/O failures (metric set, engine build). The `Device` arm
+/// delegates to the `DeviceError` impl above, so `ProxyError::ForeignAdapter`
+/// is reachable from `start_inner`; flattening to `io::Error` would convert
+/// it to `ProxyError::Runtime`.
 impl From<crate::dispatcher::DispatcherStartError> for ProxyError {
     fn from(e: crate::dispatcher::DispatcherStartError) -> Self {
         match e {
@@ -361,7 +351,7 @@ pub(crate) const WINDOWS_TUN_ALIAS: &str = "hole-tun";
 /// * **HTTP CONNECT** (`proxy_http`): `127.0.0.1:{local_port_http}`,
 ///   always `TcpOnly` (HTTP CONNECT is TCP-only by RFC 7231 §4.3.6).
 ///
-/// # Pure-VPN starts (#459)
+/// # Pure-VPN starts
 ///
 /// `Full && !proxy_socks5 && !proxy_http` is the pure-VPN configuration
 /// (the GUI's "Local proxy server" master toggle off): no user-facing

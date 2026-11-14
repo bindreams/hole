@@ -1,9 +1,8 @@
 // Garter-based plugin lifecycle management.
 //
-// Replaces shadowsocks-service's built-in `PluginConfig` spawning with
-// Garter's `BinaryPlugin` + `ChainRunner`, giving us structured log
-// capture, SIP003u-compliant graceful shutdown, and future chain
-// composition support.
+// Plugins run through Garter's `BinaryPlugin` + `ChainRunner` rather than
+// shadowsocks-service's built-in `PluginConfig` spawning, which gives structured
+// log capture, SIP003u-compliant graceful shutdown, and chain composition.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -154,7 +153,7 @@ struct ChainTask {
 
 impl ChainTask {
     /// Cancel the chain, abort its task and wait until the runner is gone. The plugins get no grace period: garter's
-    /// own drain would hold a cancelled start, and a stop, for up to 12 s. The abort drops each plugin's task,
+    /// own drain would hold a cancelled start, and a stop, for its whole drain bound. The abort drops each plugin's task,
     /// possibly after this returns; a plugin's child goes when its task is dropped.
     async fn end(mut self) {
         self.cancel.cancel();
@@ -203,7 +202,7 @@ fn runtime_dir_env(plugin: &BundledPlugin) -> Option<(&'static str, String)> {
 /// propagate immediately. `bind_ephemeral`'s in-process probe step (run
 /// before each `op` call) is what catches the Windows excluded-range
 /// race class here, before the subprocess spawn. The residual
-/// probe-drop-to-subprocess-bind TOCTOU is tracked in bindreams/hole#304.
+/// probe-drop-to-subprocess-bind TOCTOU is an open gap.
 #[allow(clippy::too_many_arguments)] // bundling into a struct adds more noise than the warning; matches spawn_plugin_runner_at below.
 pub async fn start_plugin_chain(
     plugin: &BundledPlugin,
@@ -266,7 +265,7 @@ pub async fn start_plugin_chain(
             }
             // The chain never became a `PluginChain`, so nothing downstream can
             // reach its ring. "exited before becoming ready" and "did not become
-            // ready within 30s" carry no detail of their own, and the plugin's
+            // ready" carry no detail of their own, and the plugin's
             // own last lines are the only account of why — emit them here, once,
             // after every bind retry has had its say.
             crate::proxy::plugin_log::warn_recent(&log);
@@ -348,14 +347,14 @@ fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
 }
 
 /// Single-attempt plugin-runner spawn. Constructs `BinaryPlugin`
-/// (with optional `pid_sink`), wraps in `TapPlugin` when
-/// `HOLE_BRIDGE_PLUGIN_TAP=1`, builds the `ChainRunner`, spawns it,
-/// and awaits readiness with a 30-second timeout. The chain's task is owned
+/// (with optional `pid_sink`), wraps in `TapPlugin` when the tap is enabled
+/// ([`resolve_tap_source`]), builds the `ChainRunner`, spawns it,
+/// and awaits readiness, bounded by [`READINESS_TIMEOUT`]. The chain's task is owned
 /// by a [`ChainTask`] from the spawn on: a failure ends it before it returns
 /// (see [`ready_or_end`]), and the future being dropped ends it, so a retried attempt by `bind_ephemeral` doesn't
 /// leak the previous attempt's task. On success returns `(task, ready_addr, transports)`
 /// — the caller wraps these in a [`PluginChain`]. The `transports` is the
-/// sitrep-reported end-to-end transport set (#414), threaded into the
+/// sitrep-reported end-to-end transport set, threaded into the
 /// bridge's UDP-drop policy.
 ///
 /// A plugin `StartError::BindConflict` (the only retryable start class)
@@ -508,7 +507,7 @@ async fn await_ready(
 ///   races we can in-band classify; the in-process probe step inside
 ///   `bind_ephemeral` already catches Windows excluded-range
 ///   disagreements before the subprocess spawn (stderr-based
-///   classification of subprocess bind failures is bindreams/hole#304).
+///   classification of subprocess bind failures is not done).
 /// - [`ProxyError::Cancelled`] (bridge cancel observed mid-spawn)
 ///   — a non-bind-race `io::Error::other`; the outer `start_plugin_chain`
 ///   distinguishes it via `cancel.is_cancelled()` to re-emit the
@@ -608,20 +607,16 @@ pub(crate) fn ech_doh_will_reach_ex_ray(
 }
 
 /// Which `ech-doh` value ex-ray will actually dial for this exact
-/// `(plugin, opts, ech_doh)` triple — a PURE query, no logging. Shares
-/// [`classify_ech_doh`] with `inject_plugin_directives`, so the "will
-/// something fetch an ECH config, and whose value" question and the actual
-/// plugin spawn read the exact same parse and the exact same outrank
-/// decision (they cannot drift the way two independent re-derivations of
-/// the parse + `hole_ech_doh_outranks` could), WITHOUT also
-/// re-triggering `inject_plugin_directives`'s `tracing::warn!` calls: this
-/// is queried once per start attempt from the permit-derivation path
-/// (`ProxyManager::start_cancellable`), and the eventual plugin spawn calls
-/// `inject_plugin_directives` again for real — calling that function here
-/// too would double-emit every ECH-posture warning on every start. A
-/// malformed `opts` string reads as `None` too — the same input that would
-/// make `inject_plugin_directives` return `Err`, so the plugin chain never
-/// starts and nothing ech-doh-shaped ever reaches ex-ray.
+/// `(plugin, opts, ech_doh)` triple: a PURE query, no logging. It shares
+/// [`classify_ech_doh`] with `inject_plugin_directives`, so the permit
+/// derivation and the plugin spawn read the same parse and the same outrank
+/// decision, but it does not re-trigger `inject_plugin_directives`'s
+/// `tracing::warn!` calls (this is queried once per start attempt by
+/// `ProxyManager::start_cancellable`; the spawn calls
+/// `inject_plugin_directives` again for real, so calling it here would
+/// double-emit every ECH-posture warning). A malformed `opts` string reads as
+/// `None` too: the same input makes `inject_plugin_directives` return `Err`,
+/// so the plugin chain never starts.
 pub(crate) fn effective_ech_doh(
     plugin: &PluginDescriptor,
     opts: Option<&str>,
@@ -664,13 +659,11 @@ pub(crate) fn derive_ech_doh(
     derived
 }
 
-/// ex-ray's own default for the `host` option
-/// (`crates/ex-ray/config.go:65`: `flag.String("host", "cloudfront.com", ...)`)
-/// — a real DOMAIN, not "no SNI". An absent `host` segment is NOT the same
-/// as an unreachable config; see `ex_ray_default_host_matches_vendored_config_go`
-/// for the executable pin against the vendored Go source (can't run the Go
-/// code itself, but a text-level assertion still fails loudly if the
-/// literal ever changes there without a matching edit here).
+/// ex-ray's own default for the `host` option (`crates/ex-ray/config.go`) — a
+/// real DOMAIN, not "no SNI". An absent `host` segment is NOT the same as an
+/// unreachable config. `ex_ray_default_host_matches_vendored_config_go` pins it
+/// against the vendored Go source by text, so a change there without a matching
+/// edit here fails loudly.
 const EX_RAY_DEFAULT_HOST: &str = "cloudfront.com";
 
 /// Whether ex-ray's own config-build step — `parseOptsIntoFlags`
@@ -1045,8 +1038,8 @@ fn ex_ray_parses_as_uint32(v: &str) -> Option<u32> {
 ///   from the dial destination — so the empty-after-strip case reaches
 ///   `ApplyECH` with `remoteAddr` as its SNI, same first-wins rule as every
 ///   other key here (third_party/v2ray-core/transport/internet/tls/
-///   config.go:20,173-183,262-264,296-301,371-381; `ech.go:26-51,37-51`;
-///   `websocket/dialer.go:67`).
+///   config.go; `ech.go`;
+///   `websocket/dialer.go`).
 ///
 /// Every flag read here goes through [`ex_ray_flag_value`] rather than
 /// `OptionSegment::value` — see its doc. For `host` the divergence is
@@ -1087,7 +1080,7 @@ fn ech_fetch_is_reachable(segments: &[garter::OptionSegment<'_>], ech_doh: Optio
 
 /// v2ray-core's `Config.parseServerName` strips this literal prefix from the
 /// TLS `ServerName` before `ApplyECH` (and `GetTLSConfig` generally) ever
-/// reads it (third_party/v2ray-core/transport/internet/tls/config.go:20).
+/// reads it (third_party/v2ray-core/transport/internet/tls/config.go).
 /// Pinned against the vendored source by
 /// `ech_and_mode_enums_match_vendored_config_go`.
 const V2RAY_CORE_EXP_8357_PREFIX: &str = "experiment:8357";
@@ -1103,7 +1096,7 @@ fn ex_ray_flag_value<'a>(s: &'a garter::OptionSegment<'_>) -> &'a str {
 }
 
 /// Mirrors v2ray-core's `net.ParseAddress` normalization
-/// (third_party/v2ray-core/common/net/address.go:78-95): strips ONE matched
+/// (third_party/v2ray-core/common/net/address.go): strips ONE matched
 /// `[...]` bracket pair, then trims surrounding whitespace ONLY when the
 /// first or last byte isn't alphanumeric.
 fn v2ray_core_normalize(value: &str) -> &str {
@@ -1153,7 +1146,7 @@ fn ex_ray_local_addr_is_invalid(value: &str) -> bool {
 /// `IpAddr::to_canonical()` folds an IPv4-mapped IPv6 literal
 /// (`::ffff:0.0.0.0`) to plain IPv4 BEFORE the unspecified test, mirroring
 /// v2ray-core's own `IPAddress()` constructor (third_party/v2ray-core/
-/// common/net/address.go:99-101, `bytes[:10]==0 && [10]==[11]==0xff`) —
+/// common/net/address.go `bytes[:10]==0 && [10]==[11]==0xff`) —
 /// without the fold, `Ipv6Addr::is_unspecified()` (`octets() == [0; 16]`)
 /// misses it: `::ffff:0.0.0.0`'s last four octets are `0.0.0.0`, but its
 /// 11th/12th are `0xff`, so the raw 16-byte check reads it as specified.
@@ -1229,7 +1222,7 @@ fn classify_ech_doh(
     }
 
     // ex-ray only arms ECH_DOHserver when the value is non-empty
-    // (config.go:360-361: `if *echDoh != "" { tlsConfig.Ech_DOHserver =
+    // (config.go: `if *echDoh != "" { tlsConfig.Ech_DOHserver =
     // *echDoh }`) — an EMPTY operator value is inert, same as no `ech-doh`
     // at all. A BARE `ech-doh` (no `=`) is different: it reads as ex-ray's
     // own literal `"1"` (args.go), not an empty string, and `parseURLOption`
@@ -1638,7 +1631,7 @@ mod inject_tests {
 
     // The cohort a pin-only rule would miss: a literal-IP server entry needs no
     // bootstrap query, so nothing is pinned — yet postern's hostname URL would
-    // still win under first-wins and cost the plaintext lookup #694 is about.
+    // still win under first-wins and cost the plaintext lookup the pin exists to close.
     #[skuld::test]
     fn an_unpinned_url_still_displaces_a_name_config_value() {
         let out = merged(
@@ -2964,7 +2957,7 @@ mod inject_tests {
         // nothing to do with the bound it protects (e.g. to stop a
         // mux=abc\;certRaw=SECRET-shaped escape from leaking a later
         // segment's value through it) — a message-text pin would go stale
-        // for that unrelated reason, and did.
+        // for that unrelated reason.
         assert!(
             source.contains("v >= 0 && v <= math.MaxUint32"),
             "ex_ray_fatal_config_error's mux/fwmark range (0..=u32::MAX) no longer matches \

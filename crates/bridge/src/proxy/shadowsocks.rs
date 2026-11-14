@@ -26,10 +26,9 @@ use super::{Proxy, ProxyError, RunningProxy, TrafficTotals};
 /// Accepted exception to the no-failure-path guarantee: the scratch-thread
 /// `std::thread::spawn` itself can panic if the OS refuses to create a new
 /// thread (resource exhaustion). That is a whole-process condition no
-/// `Result` plumbing here would meaningfully recover from — `SsRuntime::new`
-/// just created four more OS threads moments earlier via the same
-/// allocator — and it is scoped to exactly this one syscall, not to the
-/// `drop(Runtime)` legality predicate this function exists to satisfy.
+/// `Result` plumbing here could recover from, and it is scoped to exactly this
+/// one syscall, not to the `drop(Runtime)` legality predicate this function
+/// exists to satisfy.
 fn join_runtime(rt: tokio::runtime::Runtime) {
     let join = move || {
         std::thread::spawn(move || drop(rt))
@@ -59,8 +58,8 @@ thread_local! {
 
 /// Owns the dedicated runtime a single shadowsocks server runs on.
 ///
-/// `worker_threads(4)` is a reduction from the ambient runtime's
-/// `available_parallelism()` — unmeasured; see
+/// The worker count is a reduction from the ambient runtime's
+/// `available_parallelism()`, unmeasured; see
 /// docs/contributing/architecture/proxy-shutdown.md for the tradeoff and the
 /// falsifier.
 struct SsRuntime(Option<tokio::runtime::Runtime>);
@@ -123,12 +122,11 @@ impl Drop for SsRuntime {
 /// task on `start(config)` and returns a [`ShadowsocksRunning`] handle that
 /// owns the spawned task for the duration of its lifetime.
 ///
-/// `ShadowsocksProxy` itself is stateless (zero-sized) — per-session state
+/// `ShadowsocksProxy` itself is stateless (zero-sized): per-session state
 /// (the dedicated runtime, the spawned task, the traffic counters) lives in
-/// the returned [`ShadowsocksRunning`]'s `SsRuntime`, not here. Keeping it
-/// as a named type — rather than a free function or an associated constant —
-/// gives [`crate::proxy_manager::ProxyManager`] a generic type parameter
-/// `P: Proxy` that can be substituted for a mock in tests.
+/// the returned [`ShadowsocksRunning`]'s `SsRuntime`. It is a named type so
+/// [`crate::proxy_manager::ProxyManager`]'s `P: Proxy` parameter can be
+/// substituted for a mock in tests.
 #[derive(Debug, Default)]
 pub struct ShadowsocksProxy;
 

@@ -142,7 +142,7 @@ async fn shutdown_reports_a_panicking_driver_as_panicked() {
 
 // build_or_cancel =====================================================================================================
 
-/// Phase 5 can now wait on an OS interface-appearance notification, so a Cancel
+/// Phase 5 can wait on an OS interface-appearance notification, so a Cancel
 /// arriving while the device build is parked must be observed without waiting
 /// for the build: on a covered (auto-connect) start the user's whole host is
 /// fail-closed for exactly that window. The build runs on a blocking thread, so

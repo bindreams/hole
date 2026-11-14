@@ -73,7 +73,7 @@ fn test_config() -> ProxyConfig {
     }
 }
 
-// Task 1: persistence =================================================================================================
+// Persistence =========================================================================================================
 
 #[skuld::test]
 fn an_absent_target_file_reads_off() {
@@ -159,7 +159,7 @@ fn a_saved_target_file_is_owner_only_in_an_owner_only_directory() {
     }
 }
 
-// Task 2: target_after ================================================================================================
+// target_after ========================================================================================================
 
 #[skuld::test]
 fn a_cutover_leaves_the_target_connected() {
@@ -237,13 +237,12 @@ fn a_clean_machine_shutdown_leaves_the_target_connected() {
     );
 }
 
-// Task 4: startup preference / apply ==================================================================================
+// Startup preference / apply ==========================================================================================
 
 #[skuld::test]
 fn the_bridge_owns_the_startup_connect_decision() {
-    // The full truth table, relocated verbatim from `crates/hole/src/tray.rs`
-    // (#979) — see `the_gui_no_longer_decides` for the structural half of
-    // this guarantee.
+    // The full truth table. `crates/hole`'s `the_gui_no_longer_decides` pins the
+    // structural half: the app does not decide this.
     assert!(!startup_should_connect(StartupBehavior::DoNotConnect, true));
     assert!(!startup_should_connect(StartupBehavior::DoNotConnect, false));
     assert!(startup_should_connect(StartupBehavior::RestoreLastState, true));
@@ -827,8 +826,7 @@ fn windows_state_dir_and_files_are_not_readable_by_users() {
 
 /// The on-disk shapes are the same ladder as [`Target`]'s, and unlike
 /// `Target` they *do* derive `Serialize` — so a `dump!` on one renders the
-/// serde tree and never reaches `ProxyConfig::dump`. Private to this module
-/// today; visibility is not what makes a secret safe.
+/// serde tree and never reaches `ProxyConfig::dump`.
 ///
 /// Drives this through `dump!`, not a direct `.dump()` call: a direct call
 /// only proves the hand-written `Dump` impl itself redacts, not that the

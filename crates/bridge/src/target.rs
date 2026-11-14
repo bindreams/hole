@@ -9,11 +9,11 @@
 //! `docs/contributing/architecture/kill-switch.md`.
 //!
 //! Both files here are `VersionedFile`s of role `Decision`, like the sibling
-//! `lockdown_state.rs`, but note the *opposite* lean on load failure: an
-//! unreadable lockdown intent is conservatively read as armed (keep
-//! protecting); an unreadable target is conservatively read as `Off` (not
-//! authority to connect, and not authority to disarm either — see
-//! [`Target::Unreadable`]).
+//! `lockdown_state.rs`, but with a different lean on load failure: an
+//! unreadable lockdown intent is read as armed (keep protecting); an
+//! unreadable target is read as [`Target::Unreadable`], which is neither `Off`
+//! nor `Connected`: no authority to connect, and none to disarm either. A
+//! file that is absent altogether reads as `Off`.
 
 use std::fs::File;
 use std::io;
@@ -72,10 +72,8 @@ enum PersistedTarget {
 }
 
 /// [`Target`]'s `Dump` impl below exists because `Target` has no `Serialize`
-/// to fall through to. These two do, which makes the trap live rather than
-/// hypothetical: a `dump!` on either renders the serde tree and
-/// `ProxyConfig::dump` is never reached. Private to this module today, and
-/// visibility is not what makes a secret safe.
+/// to fall through to. These two do: a `dump!` on either would render the serde
+/// tree and never reach `ProxyConfig::dump`, so each has its own impl.
 ///
 /// Destructured rather than field-accessed, here and in
 /// [`StartupPreferenceFile`]'s impl below: a new field fails compilation
@@ -367,11 +365,9 @@ pub fn apply(
 
 // Startup preference ==================================================================================================
 
-/// Pure launch-time decision (#458): should the bridge auto-connect at its
-/// own next boot? Relocated verbatim from `crates/hole/src/tray.rs` (#979) —
-/// same exhaustive match, same doc intent: `last_enabled` is the persisted
-/// last-honored intent, and the exhaustive match makes a future
-/// `StartupBehavior` variant a compile error here.
+/// Pure launch-time decision: should the bridge auto-connect at its own next
+/// boot? `last_enabled` is the persisted last-honored intent, and the
+/// exhaustive match makes a new `StartupBehavior` variant a compile error here.
 pub fn startup_should_connect(behavior: StartupBehavior, last_enabled: bool) -> bool {
     match behavior {
         StartupBehavior::DoNotConnect => false,
@@ -554,12 +550,10 @@ impl dump::Dump for Target {
 // SessionEvent / target_after =========================================================================================
 
 /// A named cause for a session ending or persisting, each mapped to a
-/// deliberate target transition by [`target_after`]. Five variants, not
-/// two: `decide_cover_recovery`'s idiom (`crate::routing`, `tun-engine`)
-/// applies here too — an enum whose author must supply a case for every
-/// cause is what stops a fresh transition site from picking an existing
-/// variant "by elimination" (the defect `StopReason` had: two variants and
-/// a non-`Cutover` one opened the host).
+/// deliberate target transition by [`target_after`]. As with
+/// `decide_cover_recovery` (`tun-engine`), an enum whose author must supply a
+/// case for every cause is what stops a fresh transition site from picking an
+/// existing variant "by elimination".
 ///
 /// Do not collapse any two variants onto their shared consequence. `GaveUp`
 /// and `UserStopped` both move the target to `Off`, but differ at the
@@ -595,7 +589,7 @@ impl SessionEvent {
     /// ended, which teardown must therefore NOT clear.
     ///
     /// A classifier method rather than a comparison at the call site: that is
-    /// the one place a sixth variant has to answer this question, instead of
+    /// the one place a new variant has to answer this question, instead of
     /// silently inheriting whichever side of an `!=` it happens to fall on.
     /// `check_health` sets `last_error`/`death_reason` to explain a `GaveUp`
     /// teardown; clearing them there would erase the explanation before
@@ -620,8 +614,7 @@ impl SessionEvent {
 ///
 /// `CutoverRestart` and `Blipped` leave a `Connected` target unchanged; that
 /// is the whole reason a cutover disarms rather than releases the cover
-/// (see `crate::reconciler`), and it is what `StopReason::Cutover` used to
-/// encode by itself, one call site at a time.
+/// (see `crate::reconciler`).
 ///
 /// Over [`Target::Unreadable`]: there is no config to preserve, so an event
 /// that would otherwise "leave the target unchanged" leaves it `Unreadable`
