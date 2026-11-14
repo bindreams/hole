@@ -69,9 +69,8 @@ fn stage_errors_when_source_missing() {
 
 #[skuld::test]
 fn stage_recursively_copies_directory_bundle() {
-    // Directory-bundle support was added for macOS `.dSYM` in
-    // bindreams/hole#393. Verify the recursion preserves nested
-    // structure.
+    // Directory bundles exist for macOS `.dSYM`. Verify the recursion
+    // preserves nested structure.
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
 

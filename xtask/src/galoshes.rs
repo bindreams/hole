@@ -50,12 +50,11 @@ pub fn build(repo_root: &Path) -> Result<PathBuf> {
 ///
 /// `crash_dumps` is the `HOLE_CRASH_DUMPS` opt-in, set only by the `hole`
 /// target's run: step — run-only, so `--all` and the release installers
-/// never link `minidump-writer` (#438). `windows_host` gates it further,
-/// because `.dmp` is a Windows-only branch: `minidump-writer` is declared
-/// under `cfg(windows)` and the macOS `on_crash` has had no dump branch
-/// since #842. Off Windows the opt-in must not even change the command
-/// line — a different feature set is a different cargo fingerprint, which
-/// bought a full release rebuild of galoshes and tombstone for nothing.
+/// never link `minidump-writer`. `windows_host` gates it further, because `.dmp`
+/// is a Windows-only branch: `minidump-writer` is declared under `cfg(windows)`
+/// and the macOS `on_crash` has no dump branch. Off Windows the opt-in must not
+/// even change the command line: a different feature set is a different cargo
+/// fingerprint, which rebuilds galoshes and tombstone in release for nothing.
 pub(crate) fn build_args(crash_dumps: bool, windows_host: bool) -> Vec<&'static str> {
     let mut args = vec!["build", "--release", "-p", "galoshes"];
     if crash_dumps && windows_host {

@@ -1,134 +1,54 @@
-//! Is `typify` still the reason `schemars` is held at 0.8?
+//! Is `typify` still the reason `schemars` is held at [`PINNED_SERIES`]?
 //!
 //! Backs the `schemars_pin_still_tracks_typify` conformance test and the
-//! `cargo xtask check-schemars-pin` prek hook.
+//! `cargo xtask check-schemars-pin` prek hook. The reasoning is in
+//! `docs/contributing/testing.md` ("The schemars pin").
 //!
-//! `crates/common/build.rs` generates the wire types from `api/openapi.yaml`
-//! through `typify::TypeSpace`, and every ingestion path that type offers
-//! (`add_ref_types`, `add_type`, `add_type_with_name`, `add_root_schema`)
-//! takes a `schemars` schema. `typify` does not re-export `schemars`, so the
-//! version is not ours to choose: we must name it ourselves and it must be the
-//! one typify speaks. `schemars` 0.9 and 1.x both made the `schema` module
-//! private, so any bump past 0.8 fails the build script with `E0603`
-//! regardless of what the rest of the workspace wants.
+//! `crates/common/build.rs` generates the wire types through `typify`, which takes
+//! `schemars` schemas without re-exporting `schemars`, so the version is not ours
+//! to choose: it must be the one typify speaks. A bump past 0.8 fails that build
+//! script with `E0603`. That compile error is the real protection; this module
+//! notices upstream moving before Renovate proposes the impossible bump.
 //!
-//! **The real protection is that `E0603`, not this module.** A wrong pin does
-//! not ship silently: it fails `crates/common/build.rs` to compile, on every
-//! platform, unconditionally. This module exists one layer up from that: to
-//! keep the *annoyance* of a reopened bindreams/hole#379 self-resolving
-//! instead of a standing trap nobody notices, by catching upstream moving
-//! before Renovate proposes the impossible bump at all.
+//! The Renovate `allowedVersions` rule is best-effort noise suppression, and this
+//! module does not check that Renovate applies it. `.github/renovate.json` is still
+//! schema-validated by the `renovate-config` CI step.
 //!
-//! Cargo cannot see the compile failure coming. Three semver-incompatible
-//! `schemars` already coexist in this tree — 0.8.22, 0.9.0 and 1.2.1 — with
-//! `serde_with` 3.18.0 declaring all three as optional features and resolving
-//! to two of them, 0.9.0 and 1.2.1. So 1.x is already vendored, a bump
-//! resolves cleanly, and the only failure is at compile time. Renovate cannot
-//! see the constraint either, which is why `.github/renovate.json` carries an
-//! `allowedVersions` rule for it.
+//! [`PINNED_SERIES`] is the canonical copy of the fact. `crates/common/Cargo.toml`'s
+//! `schemars = "0.8"` is checked against it ([`check_local_pin`]), and so is the
+//! literal boundary of the `allowedVersions` rule ([`check_renovate_boundary`]), so a
+//! constant edited out from under the guard cannot leave it policing the wrong
+//! series. If the upstream fact stops holding (`typify` no longer requires 0.8), the
+//! pin, the Renovate rule and this module are friction with no fact behind them and
+//! should be deleted; see [`WHEN_UPSTREAM_MOVES`].
 //!
-//! ## The Renovate rule is best-effort, and is not modelled here
+//! Two upstream signals, neither of which subsumes the other:
 //!
-//! This module used to also verify that Renovate would actually *apply* that
-//! `allowedVersions` rule: a hand-rolled model of Renovate's own packageRule
-//! selector resolution — which selectors reach `schemars`, glob/regex
-//! dependency-name matching, negation precedence, last-wins merging across
-//! nested and manager-scoped rules. Three independent review rounds each found
-//! a fresh divergence from Renovate's real behaviour — an arms race against a
-//! moving upstream, fought with machinery that itself needed guarding as much
-//! as the thing it guarded.
+//! - **Declared** ([`declared_schemars_requirements`], from `cargo metadata`): what
+//!   `typify-impl` says it accepts. It catches upstream *widening*, admitting 1.x
+//!   alongside 0.8. A widened requirement leaves the lock entry untouched, so the
+//!   resolved signal stays green through exactly the change the pin exists to catch.
+//! - **Resolved** ([`upstream_schemars`], from `Cargo.lock`): which `schemars` the
+//!   graph settled on. It catches upstream being *forced* off 0.8, and `schemars`
+//!   leaving `typify-impl`'s normal dependencies (demoted to dev, or made optional
+//!   and left unenabled; both drop the edge from the lock).
 //!
-//! That model has been removed. The Renovate rule is now **best-effort noise
-//! suppression, and nothing more is claimed of it**: if it is ever malformed,
-//! scoped away from `schemars`, or shadowed by a later rule, the worst case is
-//! that Renovate reopens bindreams/hole#379 as an ordinary PR. `E0603` refuses
-//! the bump regardless of why Renovate proposed it, so a *dead* Renovate rule
-//! costs a noisy reopened PR — never a broken build, and never a shipped
-//! defect. Guarding the guard was the part of this that needed to stop.
+//! Each lane runs every check it can source data for, and the declared-requirement
+//! check fails rather than passing when `cargo metadata` cannot run:
 //!
-//! `.github/renovate.json` is still schema-validated — the `renovate-config`
-//! CI step runs `renovate-config-validator --strict` against it — so a
-//! typo that Renovate's schema itself rejects is still caught. What is gone is
-//! this module deciding, on Renovate's behalf, whether a *schema-valid* rule
-//! would actually reach `schemars`.
-//!
-//! ## The fact this module still guards
-//!
-//! [`PINNED_SERIES`] is that fact — its canonical copy.
-//! `crates/common/Cargo.toml`'s `schemars = "0.8"` is a consequence of it and
-//! is checked *against* it ([`check_local_pin`]), not compared textually: a
-//! constant edited out from under the guard would otherwise leave it policing
-//! the wrong series without anything noticing. `.github/renovate.json`'s
-//! `allowedVersions` rule is a second, independently hand-written copy of the
-//! same boundary; [`check_renovate_boundary`] compares its literal string
-//! against what [`PINNED_SERIES`] computes, for the same reason.
-//!
-//! If the upstream fact stops holding — `typify` no longer requires 0.8 — the
-//! pin, the Renovate rule and this module have all become friction with no
-//! fact behind them, and should be deleted rather than defended; see
-//! [`WHEN_UPSTREAM_MOVES`].
-//!
-//! ## Two upstream signals, and why both
-//!
-//! - **Declared** ([`declared_schemars_requirements`], from `cargo metadata`):
-//!   what `typify-impl` says it accepts. This is the signal that catches
-//!   upstream *widening* — admitting 1.x alongside 0.8, the shape `serde_with`
-//!   already has.
-//! - **Resolved** ([`upstream_schemars`], from `Cargo.lock`): which `schemars`
-//!   the graph actually settled on. This catches upstream being *forced* off
-//!   0.8, and it catches schemars leaving typify-impl's normal dependencies
-//!   altogether (demoted to dev, or made optional and left unenabled — both
-//!   drop the edge from the lock).
-//!
-//! Neither subsumes the other. A widened requirement leaves the lock entry
-//! untouched — cargo keeps a locked version that still satisfies the new range
-//! — so the resolved signal stays green through exactly the change the pin
-//! exists to catch.
-//!
-//! **Why the split is by lane, not by strength:** the declared signal *could*
-//! run in the archive lane. `Test tooling` has network, and a cold-`CARGO_HOME`
-//! `cargo metadata --locked` was measured there at 16.5 s, exit 0 — the
-//! `--offline` failure on `cosca` is real but [`cargo_metadata_json`]
-//! deliberately does not pass `--offline`. It does not run there because a
-//! conformance test is the wrong place to spend a registry round trip, and
-//! because this repo's tests do not shell out to cargo at all
-//! (bindreams/hole#496, enforced by its own prek hook). So:
-//!
-//! - `schemars_pin_still_tracks_typify` (this crate's tests, and therefore the
-//!   archive lane) checks everything readable from tracked files: the resolved
-//!   version and the local pin.
-//! - `cargo xtask check-schemars-pin` checks that *plus* the declared
-//!   requirement and the `.github/renovate.json` boundary (see
-//!   [`check_renovate_boundary`]), and runs where a registry exists: the
-//!   `check-schemars-pin` prek hook, which `prek.toml` gates by `files` to
-//!   commits touching any of the four files this check reads — and
+//! - `schemars_pin_still_tracks_typify` (this crate's tests, and so the archive lane)
+//!   checks what tracked files show: the resolved version and the local pin. Tests do
+//!   not shell out to cargo, and a registry round trip does not belong in a
+//!   conformance test.
+//! - `cargo xtask check-schemars-pin` checks that plus the declared requirement and
+//!   the `.github/renovate.json` boundary. It runs where a registry exists: the
+//!   `check-schemars-pin` prek hook, which `prek.toml` gates by `files`, and
 //!   unconditionally in the `lint` CI step, which runs prek `--all-files`.
 //!
-//! Nothing is skipped: each lane runs every check it can source data for, and
-//! the declared-requirement check fails loudly rather than passing when
-//! `cargo metadata` cannot run.
-//!
-//! ## What this does NOT check, and why
-//!
-//! That `crates/common/Cargo.toml` agrees with *typify*. It cannot: a mismatch
-//! fails `crates/common/build.rs` to compile with the very `E0603` above, so
-//! any run of this test already proves that agreement. An assertion that can
-//! only execute when it is already true detects nothing — the shape
-//! bindreams/hole#894 exists to stop. [`check_local_pin`] compares that
-//! manifest against [`PINNED_SERIES`] instead, which is a different question
-//! and is not compiler-covered.
-//!
-//! ## Why this is a test and not a comment
-//!
-//! The pin is correct only while the upstream fact holds. Left as prose it
-//! would outlive that fact silently: the `allowedVersions` rule would keep
-//! suppressing a bump that had become possible, and nobody would notice,
-//! because a suppressed update produces no signal at all.
-//!
-//! Note the eventual fix is not expected to be a `schemars` bump. Typify's
-//! maintainer has said the schemars schema structures "have been removed. We
-//! will roll our own IR" (oxidecomputer/typify#886), so when this fires, read
-//! that issue before assuming the answer is `schemars = "1"`.
+//! Not checked: that `crates/common/Cargo.toml` agrees with `typify`. A mismatch
+//! fails `crates/common/build.rs` with the `E0603` above, so any run of this test
+//! already proves the agreement, and an assertion that can only execute when it is
+//! already true detects nothing.
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 

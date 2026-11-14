@@ -829,9 +829,9 @@ fn the_read_only_check_only_compares_the_build_state() {
     }
 }
 
-/// #200: the Windows TUN lane corrupts NDIS loopback, so every loopback user
+/// The Windows TUN lane corrupts NDIS loopback, so every loopback user
 /// (compiles through sccache, tests, the installer E2E) runs before it. What may
-/// follow on the Windows leg is the #999 proof step, a set diff over two files,
+/// follow on the Windows leg is the `hole-verify-executed` proof step, a set diff over two files,
 /// the build-state comparison (`hole-verify-no-compile`, which only reads
 /// `target/`), and artifact uploads (`uses:` steps, no `run:`). A script step is not allowed
 /// by default: the installer E2E drives WebDriver over loopback and invokes no
@@ -847,7 +847,7 @@ fn nothing_but_the_proof_step_and_uploads_follows_the_windows_tun_lane() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "steps other than an artifact upload after the Windows TUN lane (#200): {offenders:?}"
+        "steps other than an artifact upload after the Windows TUN lane: {offenders:?}"
     );
 }
 
@@ -1031,7 +1031,7 @@ fn the_cleanup_runs_after_a_lifecycle_failure_but_not_without_an_msi() {
     assert!(!ran_after_failure("windows/amd64", "installer-build-msi").contains("installer-cleanup"));
 }
 
-/// The #999 proof step reads both lanes' reports, which is only meaningful once
+/// The `hole-verify-executed` proof step reads both lanes' reports, which is only meaningful once
 /// both passed: a failed lane leaves partial reports and is its own signal.
 #[skuld::test]
 fn the_proof_step_runs_only_when_both_lanes_passed() {

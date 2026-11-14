@@ -1,13 +1,14 @@
 //! Guards `.github/workflows/ci.yaml`'s complementary `SKULD_LABELS` step
-//! pair against going stale (bindreams/hole#891).
+//! pair against going stale.
 //!
-//! The `hole-` steps of the `ci` job split ten packages across two `cargo
+//! The `hole-` steps of the `ci` job split their packages across two `cargo
 //! nextest run` steps —
-//! `SKULD_LABELS: "!tun"`, then `SKULD_LABELS: "tun"` last for #200 — and
+//! `SKULD_LABELS: "!tun"`, then `SKULD_LABELS: "tun"` last, because the Windows TUN
+//! lane corrupts loopback for whatever runs after it — and
 //! skuld drops label-filtered-out tests before libtest ever sees them. A value
 //! that selects nothing therefore produces no signal: no `filtered out` count,
 //! and nextest only refuses a run selecting zero tests *in total*, which the
-//! other nine packages hide.
+//! other packages hide.
 //!
 //! [`verify`] asserts three properties. Two are static, read out of ci.yaml
 //! itself (via `extract_lane_candidates`) so this guard cannot drift from
@@ -18,7 +19,7 @@
 //!   complements. Parsed, not textual: skuld binds `!` tighter than `&`/`|`,
 //!   so comparing `off` against `"!"` + `on` accepts `"tun | slow"` /
 //!   `"!tun | slow"` — and a test carrying both labels then runs in *both*
-//!   steps, the #200 ordering hazard the split exists to prevent.
+//!   steps, the ordering hazard the split exists to prevent.
 //! - duplicate steps declaring the same lane (Windows and macOS both run
 //!   `"tun"`) must be identical, since only one of them is listed.
 //!
@@ -34,7 +35,7 @@
 //! skuld's runtime filter evaluation against the parse, and is not itself a
 //! drift detector.
 //!
-//! Not checked: which *packages* contribute. Most of the ten carry no `tun`
+//! Not checked: which *packages* contribute. Most carry no `tun`
 //! test, and platform gating zeroes out the rest (on darwin every
 //! `tun`-labelled test in `hole-bridge`'s lib binary is
 //! `cfg(target_os = "windows")`), so "this package contributed nothing" is
@@ -203,8 +204,8 @@ fn is_launcher_token(tok: &str) -> bool {
 
 /// Boolean flags `cargo nextest run` accepts that neither `cargo nextest
 /// list` nor `cargo nextest run --no-run` does — nextest rejects both
-/// combinations outright (bindreams/hole#961: `--no-run` + `--no-fail-fast`
-/// broke the `hole-tests` target's build step). None of these
+/// combinations outright (`--no-run` with `--no-fail-fast` fails the
+/// `hole-tests` target's build step). None of these
 /// narrow *which* tests a filter selects (that's `-E`'s job, always carried
 /// through), only how a `run` that actually executes tests
 /// schedules/reports the ones it already selected — so dropping them can
@@ -432,13 +433,13 @@ pub(crate) fn stranded_tests(
     out
 }
 
-// Guard 1: TUN-lane non-emptiness (bindreams/hole#894) ================================================================
+// Guard 1: TUN-lane non-emptiness =====================================================================================
 
 /// `true` iff at least one binary's set in `on` is non-empty — i.e. at least
 /// one test, anywhere, was selected under the `on` side's `SKULD_LABELS`
 /// value on this leg. `false` for an entirely-empty map or one whose every
 /// binary maps to an empty set: the platform's whole privileged lane has
-/// gone empty (bindreams/hole#894, #865 audit finding 3).
+/// gone empty.
 pub(crate) fn on_side_is_nonempty(on: &BTreeMap<String, BTreeSet<String>>) -> bool {
     on.values().any(|names| !names.is_empty())
 }
@@ -493,7 +494,7 @@ pub fn verify(repo_root: &Path, job_id: &str, step_prefix: Option<&str>) -> Resu
     let off_names = run_nextest_list(repo_root, &off.list_command, Some(&off.label_value))?;
     let on_names = run_nextest_list(repo_root, &on.list_command, Some(&on.label_value))?;
 
-    // Guard 1 (bindreams/hole#894): the `on` side's own listing — the
+    // Guard 1: the `on` side's own listing — the
     // platform's privileged/TUN lane — must select at least one test. An
     // entirely-conserved-by-the-off-side result (every compiled test found
     // by SKULD_LABELS=off) would pass the conservation check below while the

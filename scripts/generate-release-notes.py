@@ -341,8 +341,7 @@ def emit(text: str) -> None:
     """Write to stdout as UTF-8 regardless of the console's code page.
 
     Category titles carry emoji, so the output is UTF-8 by contract; going
-    through the text layer dies on cp1252 (stock Windows) — invisible while
-    this only ran on ubuntu (#682).
+    through the text layer dies on cp1252 (stock Windows).
     """
     sys.stdout.buffer.write(text.encode("utf-8"))
     sys.stdout.buffer.flush()
@@ -530,8 +529,8 @@ def test_path_spec_basic():
 
 
 def test_path_spec_workspace_engineering_patterns():
-    """Lock in the post-pathspec-migration behavior for the include-path
-    patterns actually used by `release-*.yaml` configs.
+    """The include-path patterns actually used by `release-*.yaml` configs
+    match the paths they are meant to.
 
     The critical case is bare filenames (e.g. `Cargo.toml`): without
     `build_path_spec`'s root-anchoring normalization, gitignore would
@@ -571,7 +570,7 @@ def test_path_spec_workspace_engineering_patterns():
         ("README.md", False),
         # Anchoring: bare filenames match ONLY at the repo root, not at
         # arbitrary depth. Without normalization these would all be True
-        # under raw gitignore — the boy-scout fix for the migration bug.
+        # under raw gitignore.
         ("crates/galoshes/Cargo.toml", False),
         ("crates/garter/Cargo.toml", False),
         ("crates/garter-bin/Cargo.toml", False),
@@ -585,8 +584,8 @@ def test_path_spec_workspace_engineering_patterns():
 
 
 def test_path_spec_root_anchors_bare_filenames():
-    """Standalone regression test for build_path_spec's anchoring rule.
-    A pattern WITHOUT `/` is treated as a root-only filename match."""
+    """build_path_spec anchors a pattern WITHOUT `/` to the repo root: it is a
+    root-only filename match."""
     spec = build_path_spec(["Cargo.toml"])
     assert spec.match_file("Cargo.toml")
     assert not spec.match_file("crates/foo/Cargo.toml")
@@ -665,7 +664,7 @@ def test_integration_filtering_against_real_history():
         check=False,
     )
     # Surface the child's stderr: `check=True` raises with only the exit status,
-    # which left a CI failure undiagnosable (#682).
+    # which would leave a CI failure undiagnosable.
     assert result.returncode == 0, f"generate-release-notes exited {result.returncode}:\n{result.stderr}"
     out = result.stdout
     assert out.strip(), "Empty output"

@@ -1,7 +1,7 @@
 //! `xtask` library — workspace task runner core.
 //!
 //! See `main.rs` for the binary entry point and `bindir.rs` for the canonical
-//! BINDIR file list (the single source of truth motivating issue #143).
+//! BINDIR file list (the single source of truth for what ships).
 
 use std::path::{Path, PathBuf};
 
@@ -164,7 +164,7 @@ pub enum Command {
         out_dir: PathBuf,
 
         /// Also compile workspace test binaries and stage them at stable paths
-        /// under `--tests-out-dir`. See bindreams/hole#210 for motivation.
+        /// under `--tests-out-dir`.
         #[arg(long)]
         with_tests: bool,
 
@@ -177,8 +177,7 @@ pub enum Command {
     },
     /// Build the ex-ray sidecar from `crates/ex-ray/`.
     ///
-    /// Output goes into `<repo>/.cache/ex-ray/`. Replaces the previous
-    /// build.rs side effect.
+    /// Output goes into `<repo>/.cache/ex-ray/`.
     ExRay,
     /// Build the galoshes sidecar (workspace member `crates/galoshes/`).
     ///
@@ -205,8 +204,7 @@ pub enum Command {
     /// ex-ray cross-implementation interop test.
     ///
     /// Output goes into `<repo>/.cache/upstream-v2ray-plugin/<commit>/`. This
-    /// is a TEST dependency, deliberately NOT part of `cargo xtask deps` —
-    /// keeping the build-deps lean. The `plugin-e2e-tests` build.yaml target
+    /// is a test dependency, not part of `cargo xtask deps`. The `plugin-e2e-tests` build.yaml target
     /// runs it before the interop round-trip tests.
     ProvisionUpstreamV2ray,
     /// Pull a vendored git-subrepo to a new upstream tag, fixing the
@@ -430,7 +428,7 @@ pub enum Command {
     /// Verify that `.config/nextest.toml`'s `global_net_state` test-group
     /// name-substring filter and the `global_net_state` skuld label select
     /// the exact same live tests, and that the group's `max-threads` is
-    /// still `1` — see `xtask::global_net_state_conformance` (bindreams/hole#894).
+    /// still `1` — see `xtask::global_net_state_conformance`.
     VerifyGlobalNetStateLabels {
         /// ci.yaml job id to check (its in-scope steps must include exactly
         /// one test-running nextest command shape).
@@ -451,8 +449,7 @@ pub enum Command {
     /// `verify-global-net-state-labels --record` actually ran — present,
     /// non-skipped — in this job's per-lane nextest JUnit reports, not merely
     /// that it was selectable (guard 2 above already covers that) — see
-    /// `xtask::global_net_state_conformance::verify_executed`
-    /// (bindreams/hole#999).
+    /// `xtask::global_net_state_conformance::verify_executed`.
     VerifyGlobalNetStateExecuted {
         /// The membership file `verify-global-net-state-labels --record`
         /// wrote earlier in this job, relative to the repo root unless

@@ -99,13 +99,10 @@ fn resolved_blob_hash_or_deleted(cwd: &Path, spec: &str) -> Result<String> {
 /// 0), or the literal string `<deleted>` if it isn't staged — the
 /// sentinel-writing primitive `pull_subrepo::conflict::force_commit_conflicted`
 /// uses immediately after its own `git add -A`, before committing. Reading
-/// from the index (not re-hashing the filesystem) means the recorded hash
-/// is exactly the blob `git commit` is about to store, regardless of
-/// whatever the on-disk bytes look like at that moment — a prior checkout
-/// inside git-subrepo's temp worktree may have smudged them (Windows
-/// `core.autocrlf=true` converts LF to CRLF on checkout), and re-hashing
-/// filesystem content post-checkout would record that smudged form instead
-/// of the canonical one `git add` actually staged.
+/// from the index (not re-hashing the filesystem) yields exactly the blob
+/// `git commit` is about to store, whatever the on-disk bytes look like: a
+/// checkout inside git-subrepo's temp worktree may have smudged them (Windows
+/// `core.autocrlf=true` converts LF to CRLF).
 pub fn index_blob_hash_or_deleted(cwd: &Path, relative_path: &str) -> Result<String> {
     resolved_blob_hash_or_deleted(cwd, &format!(":./{relative_path}"))
 }
@@ -113,16 +110,11 @@ pub fn index_blob_hash_or_deleted(cwd: &Path, relative_path: &str) -> Result<Str
 /// The git blob hash `relative_path` has in `HEAD`, or the literal string
 /// `<deleted>` if `HEAD` has no such path — `finish_vendor_bump::run`'s
 /// sentinel-clearing check uses this once a human's own resolution has been
-/// committed (see `VENDORING.md`'s documented hand-resolution steps: commit
-/// before running `finish-vendor-bump`). Reading from `HEAD` rather than
-/// re-hashing the working tree makes this immune to the same checkout/smudge
-/// and `.gitattributes`-scope divergence `index_blob_hash_or_deleted`
-/// avoids — and since `git subrepo commit`'s fold-in is a tree-level merge
-/// (not a checkout-and-rewrite), a blob written by
-/// `index_blob_hash_or_deleted` in the temp worktree and later read here via
-/// `HEAD:./<path>` in the main worktree are guaranteed to agree for
-/// unchanged content, on any platform, regardless of either worktree's
-/// `.gitattributes` or `core.autocrlf` state.
+/// committed (`VENDORING.md` documents the hand-resolution steps: commit
+/// before running `finish-vendor-bump`). Like `index_blob_hash_or_deleted`,
+/// it reads git's object database rather than re-hashing the working tree,
+/// so checkout smudging and `.gitattributes` or `core.autocrlf` differences
+/// between worktrees cannot change the result.
 pub fn head_blob_hash_or_deleted(cwd: &Path, relative_path: &str) -> Result<String> {
     resolved_blob_hash_or_deleted(cwd, &format!("HEAD:./{relative_path}"))
 }

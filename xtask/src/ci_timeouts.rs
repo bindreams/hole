@@ -201,8 +201,8 @@ fn step_timeouts_in_order(ci_yaml: &str, job_id: &str) -> Result<Vec<(String, u6
 
 /// Labels of the steps of `job_id` that declare no literal `timeout-minutes` —
 /// absent, an expression, or not a whole number. A step with no bound of its
-/// own runs to the job wall, and a wall that fires destroys the step's log
-/// (#989). `uses:` steps count: they hang too.
+/// own runs to the job wall, and a wall that fires destroys the step's log.
+/// `uses:` steps count: they hang too.
 pub fn steps_without_literal_timeout(ci_yaml: &str, job_id: &str) -> Result<Vec<String>> {
     let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
     let job = ci

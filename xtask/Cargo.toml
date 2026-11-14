@@ -18,14 +18,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-# Parses `.config/nextest.toml` for `global_net_state_conformance`
-# (bindreams/hole#894) — already vendored transitively via `xtask-lib`'s
-# `version` feature, adds no new crate to the graph.
+# Parses `.config/nextest.toml` for `global_net_state_conformance`.
 toml = "1.0"
 cargo_metadata = "0.23"
 regex = "1" # `renovate_prek_tests` runs the Renovate managers' patterns over `prek.toml`
 clap = { version = "4", features = ["derive"] }
-ctrlc = "3" # transparent-launcher interrupt handling (#568): a handler (not SIG_IGN) resets to default across exec, so children stay interruptible while xtask survives Ctrl+C and propagates the child's exit status
+ctrlc = "3" # transparent-launcher interrupt handling: a handler (not SIG_IGN) resets to default across exec, so children stay interruptible while xtask survives Ctrl+C and propagates the child's exit status
 # `tauri-config` is for the `frontend_dist` tests: the nextest lanes select `-p xtask-lib` without `hole`,
 # which is the only other consumer that turns the feature on.
 xtask-lib = { path = "../xtask-lib", features = ["serde", "clap", "version", "tauri-config"] }
@@ -69,18 +67,15 @@ skuld = { workspace = true }
 # (`libsearch_guard::verify`, the check the crates' own tests run on their debug binaries).
 libsearch-guard = { workspace = true }
 
-# `verify-global-net-state-executed` (bindreams/hole#999) parses nextest's
-# JUnit report to confirm the `global_net_state`-labeled tests it expects
-# actually ran, not merely that they were selectable. Pinned to "0.21" so it
-# resolves to the SAME version (0.21.1) already in the graph via the macOS
-# `typst`/`resvg` chain below — adds no new roxmltree version, just a new
-# direct edge to one already present.
+# `verify-global-net-state-executed` parses nextest's JUnit report to confirm the
+# `global_net_state`-labeled tests it expects actually ran, not merely that they
+# were selectable. The major matches the one the macOS `typst`/`resvg` chain below
+# already resolves, so the lockfile holds a single roxmltree.
 roxmltree = "0.21"
 
 # background.typ → transparent PNG via Typst. macOS-only: the DMG background is a
-# darwin feature and the Typst tree is heavy (~300 crates); compiling it on
-# windows/linux needlessly slowed every `cargo xtask` there (the MSI build hit its
-# 20-min timeout). The lockfile stays identical across platforms (Cargo.lock is
+# darwin feature and the Typst tree is heavy; compiling it on
+# windows/linux would needlessly slow every `cargo xtask` there. The lockfile stays identical across platforms (Cargo.lock is
 # target-independent). Pinned: the four typst crates are one workspace and must match.
 [target.'cfg(target_os = "macos")'.dependencies]
 typst-as-lib = "=0.16.0"
@@ -120,4 +115,4 @@ quote = "1"
 libc = { workspace = true } # raise()/kill() + SIGINT in signal tests
 
 [target.'cfg(windows)'.dev-dependencies]
-windows = { version = "0.62", features = ["Win32_System_Console"] } # GenerateConsoleCtrlEvent in the Ctrl+Break e2e test (#568)
+windows = { version = "0.62", features = ["Win32_System_Console"] } # GenerateConsoleCtrlEvent in the Ctrl+Break e2e test

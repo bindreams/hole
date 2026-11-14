@@ -29,7 +29,7 @@ use anyhow::{anyhow, bail, Context, Result};
 /// a newer Go than the release its own binary was built with, so this pin has
 /// to keep up with the `go` directive in `crates/ex-ray/go.mod`. Each release
 /// names its build in `GO_VERSION` in golangci-lint's `.github/workflows/release.yml`
-/// at that tag; v2.13.2 is built with go1.27.0.
+/// at that tag.
 ///
 /// Bump this const AND every per-platform SHA256 in [`asset_for`] together —
 /// the `.verified` sentinel stores the pinned hash, so a mismatch re-downloads.
@@ -152,7 +152,7 @@ pub fn ensure(repo_root: &Path) -> Result<PathBuf> {
         return Ok(bin_path);
     }
 
-    // Ceiling against a runaway server; the archives are ~40 MiB.
+    // Size ceiling against a runaway server.
     let archive_bytes = crate::download::fetch_verified(
         &format!("golangci-lint v{VERSION}"),
         &asset.url(),

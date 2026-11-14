@@ -17,9 +17,7 @@
 //! earlier v2ray-plugin track was pinned to. `ex-ray` is wire-compatible with
 //! that protocol, so building stock upstream at exactly this revision is the
 //! cleanest interop baseline: an ex-ray-vs-stock round-trip exercises
-//! wire-compat against a known upstream build. The pinned commit (not a
-//! pinned hash) is the supply-chain anchor and lives here as the single
-//! durable record.
+//! wire-compat against a known upstream build.
 //!
 //! Output: `<repo>/.cache/upstream-v2ray-plugin/<commit>/v2ray-plugin-<host-triple>{.exe}`.
 
@@ -31,9 +29,9 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 /// Pinned upstream `shadowsocks/v2ray-plugin` commit
-/// (`e9af1cdd2549d528deb20a4ab8d61c5fbe51f306`) — the revision Hole vendored
-/// before #414 (see the module docstring for why this is the interop
-/// baseline). Bumping this is a deliberate one-line change: update the SHA,
+/// (`e9af1cdd2549d528deb20a4ab8d61c5fbe51f306`) — the revision Hole's earlier
+/// v2ray-plugin track was pinned to (see the module docstring for why this is
+/// the interop baseline). Bumping this is a deliberate one-line change: update the SHA,
 /// delete the `.cache/upstream-v2ray-plugin/<old>` entry, and re-run
 /// `cargo xtask provision-upstream-v2ray` to clone, build, and regenerate the
 /// `.verified` sentinel for the new commit.

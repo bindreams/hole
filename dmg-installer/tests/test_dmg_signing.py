@@ -6,7 +6,7 @@ that ships with only the linker's ad-hoc Mach-O signature and no
 under Gatekeeper quarantine because the Mach-O claims sealed resources
 that don't exist.
 
-The plugins are no longer in the bundle (`hole` embeds them), so no signature is asserted on them here; the
+The bundle carries no plugins (`hole` embeds them), so no signature is asserted on them here; the
 install-and-connect e2e covers running them.
 """
 

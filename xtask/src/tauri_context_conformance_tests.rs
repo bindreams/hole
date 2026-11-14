@@ -6,7 +6,7 @@
 //! fingerprint from the start of the compile. A fresh `OUT_DIR` therefore
 //! always leaves the unit stale for the next cargo command, and the bin and its
 //! `cfg(test)` build (same `src/main.rs`) also write the same files in
-//! parallel (bindreams/hole#1087). The build script writes the assets before
+//! parallel. The build script writes the assets before
 //! any unit that reads them starts; `tauri::tauri_build_context!()` only
 //! `include!`s the generated file, so it has no such effect and appears once.
 

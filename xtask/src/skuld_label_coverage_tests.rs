@@ -1,7 +1,7 @@
 //! Unit tests for the skuld-label lane guard: [`extract_lane_candidates`],
 //! [`pick_complementary_pair`], [`matching_test_names`], [`selects_nothing`],
 //! and [`stranded_tests`]. Also the guard 1 non-emptiness predicate,
-//! [`on_side_is_nonempty`] (bindreams/hole#894).
+//! [`on_side_is_nonempty`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -128,7 +128,7 @@ jobs:
 }
 
 /// `--no-fail-fast` is a `cargo nextest run`-only flag: `cargo nextest list`
-/// rejects it as an unrecognized argument (bindreams/hole#961). It must not
+/// rejects it as an unrecognized argument. It must not
 /// survive into the derived list command.
 #[skuld::test]
 fn drops_the_run_only_no_fail_fast_flag() {
@@ -497,7 +497,7 @@ fn empty_baseline_binary_is_not_reported() {
     assert!(stranded_tests(&baseline, &off, &on).is_empty());
 }
 
-// ===== on_side_is_nonempty (guard 1, bindreams/hole#894) =============================================================
+// ===== on_side_is_nonempty (guard 1) =================================================================================
 
 #[skuld::test]
 fn on_side_is_nonempty_true_when_any_binary_has_a_test() {

@@ -1,7 +1,7 @@
-//! Unit tests for guard 2's structural building blocks (bindreams/hole#894):
+//! Unit tests for guard 2's structural building blocks:
 //! [`group_config`], [`job_list_template`], [`narrow_filter`],
 //! [`set_mismatch`], [`conformant_membership`], and [`verify_with`] itself —
-//! and guard 3's (bindreams/hole#999): [`junit_executed_tests`],
+//! and guard 3's: [`junit_executed_tests`],
 //! [`merge_executed`], the recorded-expectation handoff, [`set_missing`], and
 //! [`verify_executed`] itself. Neither guard shells out to a real `cargo
 //! nextest list`/subprocess from a unit test — guard 3 only reads files, and
@@ -273,7 +273,7 @@ fn set_mismatch_treats_a_binary_absent_from_one_map_as_empty_on_that_side() {
     assert_eq!(mismatches["hole-bridge"], (names(&["a"]), names(&[])));
 }
 
-// ===== junit_executed_tests (bindreams/hole#999) =====================================================================
+// ===== junit_executed_tests ==========================================================================================
 
 #[skuld::test]
 fn junit_executed_tests_collects_passed_and_failed_but_not_skipped() {
@@ -342,7 +342,7 @@ fn junit_executed_tests_returns_empty_map_for_a_report_with_no_testcases() {
     assert!(executed.is_empty());
 }
 
-// ===== set_missing (bindreams/hole#999) ==============================================================================
+// ===== set_missing ===================================================================================================
 
 #[skuld::test]
 fn set_missing_is_empty_when_every_expected_test_was_executed() {
@@ -378,7 +378,7 @@ fn set_missing_ignores_tests_executed_but_not_expected() {
     assert!(set_missing(&expected, &executed).is_empty());
 }
 
-// ===== merge_executed (bindreams/hole#999) ===========================================================================
+// ===== merge_executed ================================================================================================
 
 /// The property the whole per-lane-report design rests on: the group spans
 /// BOTH `SKULD_LABELS` lanes, so neither lane's report alone accounts for it
@@ -431,7 +431,7 @@ fn merge_executed_deduplicates_a_name_present_in_more_than_one_report() {
     assert_eq!(merge_executed(&[a, b])["hole-bridge"], names(&["a"]));
 }
 
-// ===== recorded expectation (bindreams/hole#999) =====================================================================
+// ===== recorded expectation ==========================================================================================
 
 #[skuld::test]
 fn expectation_round_trips_through_the_recorded_file() {
@@ -460,7 +460,7 @@ fn read_expectation_names_the_recording_flag_when_the_file_is_absent() {
     assert!(msg.contains("--record"), "{msg}");
 }
 
-// ===== verify_executed (bindreams/hole#999, guard 3 end-to-end) ======================================================
+// ===== verify_executed (guard 3 end-to-end) ==========================================================================
 
 /// A minimal JUnit report naming exactly the given `(classname, [name, ...])`
 /// testcases — enough for [`junit_executed_tests`] to parse, nothing else.
@@ -539,7 +539,7 @@ fn verify_executed_passes_when_every_group_member_appears_in_the_junit_reports()
 }
 
 /// Zero `--junit` reports would confirm nothing — the same emptiness defense
-/// guard 2 applies to its own listings (bindreams/hole#865 audit finding 4).
+/// guard 2 applies to its own listings.
 #[skuld::test]
 fn verify_executed_errs_when_no_junit_paths_are_given() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -556,10 +556,9 @@ fn verify_executed_errs_when_no_junit_paths_are_given() {
     assert!(err.to_string().contains("--junit"), "{}", err);
 }
 
-/// A vacuously-empty recorded expectation must not pass trivially — the exact
-/// risk M5 (bindreams/hole#999) named for `verify`'s `--record` branch, from
-/// guard 3's side: even if it somehow got written, guard 3 must still refuse
-/// to treat "nothing was expected" as "everything ran".
+/// A vacuously-empty recorded expectation must not pass trivially: even if one
+/// somehow got written, guard 3 must still refuse to treat "nothing was
+/// expected" as "everything ran".
 #[skuld::test]
 fn verify_executed_errs_when_the_recorded_expectation_is_vacuously_empty() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -582,10 +581,9 @@ fn verify_executed_errs_when_the_recorded_expectation_is_vacuously_empty() {
     assert!(err.to_string().contains("EMPTY"), "{}", err);
 }
 
-// ===== conformant_membership (bindreams/hole#894 / #999) =============================================================
+// ===== conformant_membership =========================================================================================
 
-/// The property M5 (bindreams/hole#999) named directly: reaching `Ok` here
-/// must never carry a vacuously-empty membership, because `verify` writes
+/// Reaching `Ok` here must never carry a vacuously-empty membership, because `verify` writes
 /// this exact return value out via `--record` for guard 3 to diff against —
 /// an empty write would make that diff trivially pass no matter what actually
 /// ran.
@@ -596,7 +594,7 @@ fn conformant_membership_returns_the_agreed_membership_when_it_is_non_empty() {
     assert_eq!(out, binmap(&[("hole-bridge", &["a", "b"])]));
 }
 
-/// Guards exactly the #999 risk M5 calls out: when the two sides disagree,
+/// When the two sides disagree,
 /// `conformant_membership` must error rather than return either side — here
 /// the label side is empty, so returning `Ok` would let `verify` record an
 /// empty expectation that trivially passes guard 3's diff.
@@ -610,9 +608,8 @@ fn conformant_membership_errs_rather_than_recording_when_only_one_side_matched_a
     assert!(msg.contains("hole-bridge") && msg.contains('a'), "{msg}");
 }
 
-/// The other half of the same defense (bindreams/hole#865 audit finding 4,
-/// carried into #999 by the same reasoning): a vacuous empty/empty pass must
-/// not be recordable either.
+/// The other half of the same defense: a vacuous empty/empty pass must not be
+/// recordable either.
 #[skuld::test]
 fn conformant_membership_errs_when_neither_side_matched_anything() {
     let empty: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -639,7 +636,7 @@ fn a_cutover_privileged_test_outside_the_bounded_prefix_is_reported() {
     );
 }
 
-// ===== verify_with (bindreams/hole#894 / #999, guard 2's orchestration with an injected `list`) ======================
+// ===== verify_with (guard 2's orchestration with an injected `list`) =================================================
 
 /// A minimal `ci.yaml` + `.config/nextest.toml` + `build.yaml` on disk —
 /// `verify_with`'s only real file I/O, all plain text, none of it a
@@ -663,8 +660,7 @@ jobs:
     std::fs::write(dir.join("build.yaml"), "targets: {}").expect("write build.yaml");
 }
 
-/// The exact risk M5 (bindreams/hole#999) named for `verify`'s `--record`
-/// branch: it must write the *label*-matched set, not the name-matched one.
+/// `verify`'s `--record` branch must write the *label*-matched set, not the name-matched one.
 /// `bin_b` here is label-only (an empty-set entry the name side never lists,
 /// which is not itself a conformance mismatch — see `set_mismatch`), so its
 /// presence in the recorded file is proof of which side was actually
@@ -712,7 +708,7 @@ fn verify_with_writes_nothing_when_record_is_none() {
     assert!(!dir.path().join("expected.json").exists());
 }
 
-/// The other half M5 (bindreams/hole#999) asked for directly: a failed
+/// A failed
 /// conformance check must not write a file either — the guard's whole point
 /// is that a rejected membership is never the one guard 3 reads back.
 #[skuld::test]

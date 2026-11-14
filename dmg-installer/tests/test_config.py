@@ -20,7 +20,7 @@ def test_tauri_conf_macos_signing_identity_is_ad_hoc() -> None:
     bundle = conf["bundle"]
     assert "macOS" in bundle, (
         f"{conf_path} has no `bundle.macOS` block — Tauri will skip codesign "
-        "and produce a 'damaged' .app under Gatekeeper quarantine (issue #364)."
+        "and produce a 'damaged' .app under Gatekeeper quarantine."
     )
     assert bundle["macOS"].get("signingIdentity") == "-", (
         f"{conf_path} `bundle.macOS.signingIdentity` must be `-` (ad-hoc) "
@@ -37,6 +37,6 @@ def test_tauri_targets_are_app_only() -> None:
     assert conf["bundle"]["targets"] == ["app"], (
         f"{conf_path} `bundle.targets` must be ['app'] — the DMG is assembled by "
         "dmg-installer's dmgbuild builder, and re-enabling Tauri's 'dmg' target "
-        "would reintroduce the flaky Finder/bundle_dmg pipeline it replaced "
-        f"(issue #609). Got {conf['bundle'].get('targets')!r}."
+        "would reintroduce the flaky Finder/bundle_dmg pipeline it replaced. "
+        f"Got {conf['bundle'].get('targets')!r}."
     )

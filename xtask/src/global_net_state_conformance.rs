@@ -1,60 +1,52 @@
 //! Guard 2: binds `.config/nextest.toml`'s `global_net_state` test-group's
 //! *name-substring* membership to the `global_net_state` skuld label attached
-//! at each test's own definition site (bindreams/hole#894).
+//! at each test's own definition site.
 //!
-//! `.config/nextest.toml` cannot be eliminated — it is what gives nextest's
-//! own `max-threads = 1` scheduling its cross-binary serialization, and
-//! nextest's filterset DSL has no `test-group(...)` predicate to derive that
-//! membership from anything else. What IS checkable: whether the group's own
-//! *name-substring* filter (`cfg.filter`) and the *label* select the exact
-//! same tests, live, for the `hole-` lane of `job_id` — and whether the group's
-//! `max-threads` is still `1`, without which the group's whole purpose (cross-
-//! binary serialization of tests that mutate global OS network state) is
-//! silently gone.
+//! `.config/nextest.toml` cannot be eliminated: it gives nextest's `max-threads = 1`
+//! its cross-binary serialization, and nextest's filterset DSL has no
+//! `test-group(...)` predicate to derive that membership from anything else. What
+//! is checkable is whether the group's own name-substring filter (`cfg.filter`) and
+//! the label select the exact same tests, live, for the `hole-` lane of `job_id`,
+//! and whether `max-threads` is still `1`, without which the group's purpose
+//! (serializing tests that mutate global OS network state) is silently gone.
 //!
 //! [`group_config`] reads both axes from `.config/nextest.toml`.
-//! [`job_list_template`] resolves `job_id`'s own `cargo nextest run`
-//! command(s) into the one shared `cargo nextest list` argv template — erring
-//! loudly on any divergence (bindreams/hole#894 round-2 finding F5) rather
-//! than silently picking one. [`narrow_filter`] scopes that template to the
+//! [`job_list_template`] resolves `job_id`'s `cargo nextest run` commands into
+//! the one shared `cargo nextest list` argv template, erring on any divergence
+//! rather than picking one. [`narrow_filter`] scopes that template to the
 //! nextest.toml name-substring filter; [`set_mismatch`] diffs the two live
-//! listings. [`verify`] orchestrates all four and fails loudly, by exact test
-//! name in both directions, on any divergence.
+//! listings. [`verify`] orchestrates all four and fails, by exact test name in
+//! both directions, on any divergence.
 //!
-//! Guard 3 (bindreams/hole#999) answers a different question: not "is the
-//! `global_net_state` group's membership correct" (guard 2), but "did the
-//! tests it selected on THIS run actually execute" — closing the gap where a
-//! job that silently ran zero of them would still look green.
+//! Guard 3 answers a different question: not whether the group's membership is
+//! correct (guard 2) but whether the tests it selected on THIS run executed, so
+//! a job that silently ran none of them cannot look green.
 //!
-//! The group is NOT a subset of any one `SKULD_LABELS` lane. Its
-//! `.config/nextest.toml` filter selects by name substring and deliberately
-//! sweeps in unprivileged cases (`release_all_`, `gateway_global_net_state_`)
-//! that carry no `tun` label, so they run in the `"!tun"` step while the
-//! privileged members run in the `"tun"` one. A single nextest profile writes
-//! one JUnit path, each run overwriting the last, so a lone lane's report can
-//! never account for the whole group on its own. ci.yaml instead runs each
-//! lane under its own nextest profile (`non-tun` / `tun`, selected by the
-//! `NEXTEST_PROFILE` env var — an empty profile table inherits
-//! `[profile.default.junit]`'s path and every override, including this
-//! group's `max-threads = 1`, via nextest's own profile-inheritance model),
-//! so each lane's report survives at its own path and hands guard 3 both of
-//! them; [`merge_executed`] merges them back into the one set the job as a
-//! whole executed.
+//! The group is NOT a subset of any one `SKULD_LABELS` lane. Its filter selects
+//! by name substring and deliberately sweeps in unprivileged cases
+//! (`release_all_`, `gateway_global_net_state_`) that carry no `tun` label, so
+//! they run in the `"!tun"` step while the privileged members run in the `"tun"`
+//! one. A single nextest profile writes one JUnit path, each run overwriting the
+//! last, so one lane's report never accounts for the whole group. ci.yaml
+//! therefore runs each lane under its own nextest profile (`non-tun` / `tun`,
+//! chosen by `NEXTEST_PROFILE`; an empty profile table inherits
+//! `[profile.default.junit]`'s path and every override, including this group's
+//! `max-threads = 1`), and [`merge_executed`] merges the two reports into the one
+//! set the job executed.
 //!
-//! The expectation is likewise NOT re-derived here. Guard 2's step already
-//! lists the group's live membership *before* the test steps run, and records
-//! it ([`write_expectation`]); guard 3 reads it back ([`read_expectation`]).
-//! Re-listing after the run would cost a second `cargo nextest list` — 64s to
-//! 3m30s measured on the windows leg, which runs closest to its job wall —
-//! and would introduce a second, unverified derivation of the very set guard
-//! 2 exists to pin.
+//! The expectation is likewise NOT re-derived here. Guard 2's step lists the
+//! group's live membership before the test steps run and records it
+//! ([`write_expectation`]); guard 3 reads it back ([`read_expectation`]).
+//! Re-listing after the run would cost a second `cargo nextest list` on the leg
+//! closest to its job wall, and would add a second, unverified derivation of the
+//! very set guard 2 pins.
 //!
-//! [`junit_executed_tests`] reads nextest's own JUnit report
+//! [`junit_executed_tests`] reads nextest's JUnit report
 //! (`.config/nextest.toml`'s `[profile.default.junit]`) for the tests that
 //! actually ran (present, un-skipped); [`set_missing`] diffs expectation
 //! against union one-directionally. [`verify_executed`] orchestrates them and
-//! fails loudly, by exact test name, on any test that was selected but never
-//! shows up as executed.
+//! fails, by exact test name, on any test that was selected but never shows up
+//! as executed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -67,9 +59,8 @@ use crate::ci_coverage;
 use crate::manifest::Manifest;
 use crate::skuld_label_coverage::{run_nextest_list, to_list_command};
 
-/// Matches the renamed nextest.toml test-group key exactly (bindreams/hole#894
-/// Task 7) — so no separate `GROUP_NAME` constant or divergence-rationale
-/// comment is needed; this IS both the group name and the skuld label name.
+/// Both the nextest.toml test-group key and the skuld label name, which must be
+/// identical.
 const LABEL_NAME: &str = "global_net_state";
 
 // group_config ========================================================================================================
@@ -134,9 +125,8 @@ pub(crate) fn group_config(nextest_toml: &str, group_name: &str) -> Result<Group
 /// `job_id`'s shared `cargo nextest list` argv template: every test-running
 /// command `ci_run_commands_for_job` returns for the job's steps `step_prefix`
 /// selects, mapped through
-/// [`to_list_command`], must resolve to the SAME argv (full, `-E` included —
-/// bindreams/hole#894 round-2 finding F5). Errs on zero commands or any
-/// divergence, rather than silently picking one.
+/// [`to_list_command`], must resolve to the SAME argv (full, `-E` included).
+/// Errs on zero commands or any divergence, rather than silently picking one.
 pub(crate) fn job_list_template(
     ci_yaml: &str,
     manifest: &Manifest,
@@ -211,15 +201,12 @@ pub(crate) fn set_mismatch(
 /// Guard 2's pass/fail verdict, reduced to its two live listings so it is
 /// unit-testable without a `cargo nextest list` subprocess. `Ok` only once
 /// (a) at least one side matched something — a vacuous empty/empty pass
-/// would defeat the guard exactly as a real divergence would (bindreams/
-/// hole#865 audit finding 4) — and (b) the two sides agree exactly, binary-id
-/// for binary-id (bindreams/hole#894). Returns `label_matched` back on
+/// would defeat the guard exactly as a real divergence would — and (b) the two
+/// sides agree exactly, binary-id for binary-id. Returns `label_matched` back on
 /// success: the exact value [`verify`]'s `--record` branch writes out for
-/// guard 3 (bindreams/hole#999) to read, so any caller holding `Ok` already
-/// has proof its result is not vacuously empty — pinned directly by this
-/// function's own tests, which is the property M5 (bindreams/hole#999) named:
-/// an empty `--record` write would make guard 3's diff trivially pass no
-/// matter what actually ran.
+/// guard 3 to read, so any caller holding `Ok` already has proof its result is
+/// not vacuously empty (an empty `--record` write would make guard 3's diff
+/// trivially pass no matter what actually ran).
 pub(crate) fn conformant_membership(
     name_matched: BTreeMap<String, BTreeSet<String>>,
     label_matched: BTreeMap<String, BTreeSet<String>>,
@@ -499,9 +486,8 @@ pub fn verify_executed(repo_root: &Path, expected_path: &Path, junit_paths: &[Pa
     let expectation = read_expectation(&absolutize(repo_root, expected_path))?;
     let job_id = &expectation.job;
 
-    // Same defense as guard 2 (bindreams/hole#865 audit finding 4): a
-    // vacuously-empty expectation would make an all-zero JUnit report pass
-    // just as cleanly as a real one.
+    // Same defense as guard 2: a vacuously-empty expectation would make an
+    // all-zero JUnit report pass just as cleanly as a real one.
     ensure!(
         expectation.tests.values().any(|s| !s.is_empty()),
         "job {job_id:?}: the recorded {LABEL_NAME:?} membership is EMPTY — guard 3 has nothing to confirm \

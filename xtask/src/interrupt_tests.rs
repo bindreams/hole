@@ -163,7 +163,7 @@ fn spawn_and_rendezvous() -> (std::process::Child, std::net::TcpStream, std::net
     (parent, parent_conn.unwrap(), child_conn.unwrap(), child_pid.unwrap())
 }
 
-/// The real #568 regression: SIGINT delivered to a launcher WHILE it waits must
+/// The regression this module exists for: SIGINT delivered to a launcher WHILE it waits must
 /// not kill the launcher; it keeps waiting and returns the child's exit code.
 #[cfg(unix)]
 #[skuld::test]

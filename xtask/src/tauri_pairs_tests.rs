@@ -58,7 +58,7 @@ fn unpaired_packages_are_ignored() {
 }
 
 /// The guard: this repo's own lockfiles must agree, or `npx tauri build` fails
-/// at bundle time (#679).
+/// at bundle time.
 #[skuld::test]
 fn this_repo_has_no_tauri_plugin_drift() {
     let root = xtask_lib::repo_root::repo_root().unwrap();

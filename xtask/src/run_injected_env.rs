@@ -20,7 +20,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::child_env::{is_run_injected, launch_env_names};
 
-/// Variables `cargo run` (cargo 1.98.0, the pinned toolchain, via the rustup proxy or a wrapper around
+/// Variables `cargo run` (the pinned toolchain's cargo, via the rustup proxy or a wrapper around
 /// it) adds that the strip must keep. None is package environment: each is toolchain state that
 /// does not depend on which package is run, and a child that runs cargo or
 /// loads the toolchain's libraries needs it. Each is `(name, why it stays)`.

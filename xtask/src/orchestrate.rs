@@ -209,8 +209,9 @@ const STASH_SUBDIR: &[&str] = &[".tmp", "run"];
 /// On non-Windows platforms this is a no-op: POSIX permits replacing running
 /// binaries through ordinary unlink+create, so the lock issue doesn't exist.
 ///
-/// Best-effort: failures here propagate as errors so the caller can decide,
-/// but we tolerate "another xtask process beat me to it" (NotFound on rename).
+/// Failures propagate as errors, except "another xtask process beat me to it"
+/// (NotFound on rename), which is tolerated. Copies left by earlier runs are
+/// pruned first, best-effort.
 pub fn relocate_self_if_windows() -> Result<()> {
     #[cfg(not(windows))]
     {
@@ -253,8 +254,8 @@ fn relocate_self_windows() -> Result<()> {
         }
     }
 
-    // Pick a unique stash name. PID + nanos is collision-free in practice
-    // and easy to read in a directory listing.
+    // The stash name carries the PID and a timestamp, so it is unique per process
+    // and readable in a directory listing.
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -307,7 +308,7 @@ pub(crate) fn substitute_exe(s: &str) -> String {
 /// `Command::current_dir` does NOT affect how a relative *program* path is
 /// resolved — on Windows it resolves against the parent process's cwd (which,
 /// for `cargo xtask`, is wherever the user invoked it). See the
-/// `std::process::Command::current_dir` docs. (#564)
+/// `std::process::Command::current_dir` docs.
 pub(crate) fn resolve_program(program: &str, repo_root: &Path) -> PathBuf {
     let has_sep = program.contains('/') || program.contains('\\');
     let p = Path::new(program);
