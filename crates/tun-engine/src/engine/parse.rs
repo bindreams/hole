@@ -18,6 +18,8 @@ const IPV4_MIN_HEADER: usize = 20;
 /// Fixed IPv6 header length; extension headers are not walked.
 const IPV6_HEADER: usize = 40;
 
+/// The destination port and protocol of an unfragmented TCP or UDP packet,
+/// read without checking lengths beyond the ports; `None` for anything else.
 pub(crate) fn parse_ip_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
     if packet.is_empty() {
         return None;
@@ -101,7 +103,7 @@ fn parse_ipv4_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
     // an L4 header is only present in the first fragment, and this driver
     // does not reassemble, so any fragment must be rejected rather than
     // parsed as if its bytes were an L4 header (or L4 payload mistaken for
-    // one). See issue #951 for reassembly.
+    // one).
     if ip.more_frags() || ip.frag_offset() != 0 {
         return None;
     }

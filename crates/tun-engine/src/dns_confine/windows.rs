@@ -9,7 +9,7 @@
 //! is nothing left to sweep. Consequences, all deliberate: no state file,
 //! nothing for `routing::recover_routes` to reconcile, nothing for
 //! `failclosed::release_all` or `hole bridge unlock` to clear, and nothing
-//! that can survive to lock a user out (Rule #0).
+//! that can survive to lock a user out.
 //!
 //! This is the **opposite** lifetime from `routing::failclosed`'s covers,
 //! which are deliberately **persistent** (`FWPM_FILTER_FLAG_PERSISTENT`) so
@@ -18,9 +18,9 @@
 //! user's *intent*; a DNS block outliving the bridge is pure harm — the
 //! user would be locked out of DNS with no bridge left alive to release it.
 //!
-//! **Failure to engage is fatal to the start** — see
-//! `crate::dns_confine::engage`'s doc: a confinement that failed to engage
-//! is not a degraded session, it is an unprotected one.
+//! **Failure to engage is fatal to the start**: the caller of [`engage`] must
+//! not carry on, because a confinement that failed to engage is an unprotected
+//! session, not a degraded one.
 
 use std::net::IpAddr;
 
@@ -31,9 +31,7 @@ use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
 use super::spec::{self, Action, Condition, FilterSpec, Layer, L4};
 
-/// IANA protocol numbers (RFC 790; never change — not sourced from the
-/// `windows` crate's `WinSock` constants to avoid an extra import for
-/// values this stable). Mirrors `failclosed/windows.rs`'s `IPPROTO_TCP`.
+/// IANA protocol numbers (RFC 790).
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 
@@ -47,6 +45,7 @@ pub enum Stage {
     Commit,
 }
 
+/// Why [`engage`] failed. Neither variant carries a path or address.
 #[derive(Debug, thiserror::Error)]
 pub enum DnsConfineError {
     #[error("could not reach the firewall")]
@@ -56,11 +55,9 @@ pub enum DnsConfineError {
 }
 
 /// Map a raw Win32 status at `stage` to the matching [`DnsConfineError`]
-/// variant. Exists so every variant is reachable from a unit test without
-/// having to make FWPM itself fail: the FFI call sites route through this,
-/// and `windows_tests.rs` drives it directly. A `Stage::AddFilter` /
-/// `Stage::Commit` failure must classify as `AddFilter`, never
-/// `EngineOpen` — mis-mapping which stage failed is exactly the bug this
+/// variant. The FFI call sites route through this so the mapping is testable
+/// without making FWPM fail. A `Stage::AddFilter` / `Stage::Commit` failure
+/// classifies as `AddFilter`, never `EngineOpen`.
 /// seam exists to catch.
 pub(crate) fn classify(stage: Stage, rc: u32) -> DnsConfineError {
     let io = std::io::Error::from_raw_os_error(rc as i32);
@@ -138,13 +135,10 @@ pub fn engage(tun_luid: u64, server_ip: IpAddr) -> Result<DnsConfinement, DnsCon
     }
 }
 
-/// `engage`'s entire error-propagation decision, extracted from the FFI
-/// calls that produce its inputs: open the engine, then run the
-/// transaction, surfacing a typed `Err` from either stage and never a
-/// silent `Ok`. Kept separate so this is provable without a real FWPM call
-/// — `windows_tests.rs` drives it with simulated results directly, because
-/// CI's Windows runner is elevated on both its TUN and non-TUN lanes, so no
-/// lane there can produce a genuine unprivileged failure to assert against.
+/// `engage`'s error-propagation decision, apart from the FFI calls that
+/// produce its inputs: open the engine, then run the transaction, surfacing a
+/// typed `Err` from either stage and never a silent `Ok`. Separate so a test
+/// can drive it with simulated results.
 fn engage_outcome(
     engine_open: Result<HANDLE, DnsConfineError>,
     run_transaction: impl FnOnce(HANDLE) -> Result<(), DnsConfineError>,
@@ -166,10 +160,8 @@ unsafe fn add_provider(engine: HANDLE, key: spec::Guid) -> Result<(), DnsConfine
             name: PWSTR(name.as_mut_ptr()),
             description: PWSTR::null(),
         },
-        // NO `FWPM_PROVIDER_FLAG_PERSISTENT` — this object lives in a
-        // dynamic session; WFP rejects a persistent object inside one, and
-        // the whole point (module doc) is that it must NOT survive the
-        // engine handle closing.
+        // Not persistent: WFP rejects a persistent object inside a dynamic
+        // session, and it must not survive the engine handle closing.
         ..Default::default()
     };
     let rc = FwpmProviderAdd0(engine, &provider, None);
@@ -229,10 +221,9 @@ unsafe fn add_filter(
         Action::Permit => FWP_ACTION_PERMIT,
         Action::Block => FWP_ACTION_BLOCK,
     };
-    // NO persistent flag, NO `CLEAR_ACTION_RIGHT` — dynamic-session object
-    // (see module doc), and within-sublayer arbitration is pure weight
-    // (mirrors `failclosed/windows.rs`'s reasoning: the flag governs only
-    // cross-sublayer arbitration, and we want none of it here either).
+    // No persistent flag (dynamic session) and no `CLEAR_ACTION_RIGHT`: that
+    // flag governs cross-sublayer arbitration only, and within this sublayer
+    // arbitration is by weight.
     let flags = FWPM_FILTER_FLAGS(0);
 
     let mut name = wide("Hole DNS-egress confinement filter");
@@ -324,8 +315,7 @@ unsafe fn add_filter(
                 },
             });
         }
-        // Deliberately NO protocol / port condition: the server permit
-        // must match on address alone so a server on port 53 is never
+        // No protocol or port condition: a server on port 53 must not be
         // locked out of its own tunnel.
         Condition::ServerIp(IpAddr::V4(v4)) => {
             conditions.push(FWPM_FILTER_CONDITION0 {
@@ -373,10 +363,8 @@ unsafe fn add_filter(
     }
 
     let filter = FWPM_FILTER0 {
-        // GUID_NULL — the dynamic-session engine auto-assigns a key. Unlike
-        // `failclosed/windows.rs`'s persistent covers, nothing ever needs to
-        // delete this filter by a compiled-in GUID: the whole session (and
-        // therefore every filter in it) dies with the engine handle.
+        // GUID_NULL: the engine assigns a key. Nothing deletes this filter by
+        // GUID; the session's filters die with the engine handle.
         filterKey: GUID::zeroed(),
         displayData: FWPM_DISPLAY_DATA0 {
             name: PWSTR(name.as_mut_ptr()),

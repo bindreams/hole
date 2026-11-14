@@ -137,6 +137,16 @@ whole host is blocked by [the cover](kill-switch.md) during this phase, so a Can
 the window. Nothing is cancelled by dropping a future: when the cancel wins, the blocking task runs to completion and drops
 its own `Device` on its own thread, which releases the adapter.
 
+## The interface metric (Windows)
+
+`Dispatcher::new` gives `hole-tun` the lowest interface metric (`TUNNEL_INTERFACE_METRIC`) with `set_interface_metric`
+({src}`crates/tun-engine/src/net/metric.rs`), not through `tun::Configuration::metric`. `tun` applies both families, but it
+waits for the IPv4 interface and not the IPv6 one, and it swallows `ERROR_NOT_FOUND` on the IPv6 call into a `log` record
+Hole never surfaces, so the IPv6 metric would land or vanish from run to run with no trace. `set_interface_metric` returns
+the absence as `MetricOutcome::NoInterfaceRow`, which the caller logs at `warn`. That removes the silent part of the
+failure and not the race itself: the IPv6 interface row may not exist yet, and waiting for it would take a chosen delay,
+which Hole does not use. No test asserts the row is present.
+
 ## Read next
 
 - [TCP accept refusal](tcp-admission.md): the TCP side of the packet loop.

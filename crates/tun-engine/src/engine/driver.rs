@@ -186,10 +186,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
     /// Two packets' verdicts must never straddle one `poll()`: a socket
     /// mid-retirement, still bound to its port, would intercept the next SYN
     /// with no accept path able to see it
-    /// (`a_reverted_socket_would_hijack_a_later_syn`). Bundling enqueue, both
-    /// polls, admission, relay and retirement into one call with no seam
-    /// between them makes that impossible regardless of how many packets a
-    /// future `run()` reads per iteration.
+    /// (`a_reverted_socket_would_hijack_a_later_syn`). Enqueue, both polls,
+    /// admission, relay and retirement therefore run in one call.
     fn settle_packet(&mut self, packet: Option<&[u8]>, now: SmoltcpInstant) {
         if let Some(packet) = packet {
             if let Some((dst_port, IpProto::Tcp)) = parse_ip_dst(packet) {

@@ -251,7 +251,7 @@ async fn a_timewait_connection_socket_is_dropped_at_once() {
     );
 }
 
-/// Route A (F7a): `copy_bidirectional` calls `flow.shutdown()` on the
+/// `copy_bidirectional` calls `flow.shutdown()` on the
 /// half that closes first and keeps relaying the other way, so the router
 /// task is still alive and reading when the client's final bytes arrive.
 /// This is the dominant path — every proxied TCP connection takes it.
@@ -299,16 +299,14 @@ async fn a_half_closing_router_still_receives_the_clients_final_bytes() {
     assert_eq!(out[0].ack, Some(TcpSeqNumber(1001 + 100 + 1)));
 }
 
-/// Route B (F7a): the router task ended and dropped its flow, so nothing
-/// can be delivered. Confined to this route is F7b's remaining downside —
-/// bytes still in `rx_buffer` at removal are now acknowledged and then
-/// dropped — which is #923's to close, not this plan's.
+/// The router task ended and dropped its flow, so nothing can be delivered.
+/// Bytes still in `rx_buffer` at removal are acknowledged and then dropped,
+/// which this test does not cover.
 ///
 /// A live spawned router cannot be observed reaching this state without a
-/// sleep or a poll-with-timeout, both forbidden here (see the plan's F8/Task
-/// 2 Step 1b note). This closes the driver's own `to_handler` directly
-/// instead of dropping a router's `TcpFlow` — the test is about what the
-/// driver does once that channel is closed, not about how it got closed, so
+/// sleep or a poll-with-timeout. This closes the driver's own `to_handler`
+/// directly instead of dropping a router's `TcpFlow`: the test is about what
+/// the driver does once that channel is closed, not about how it got closed, so
 /// it does not demonstrate that a dropped router causes the closure.
 #[skuld::test]
 async fn a_dropped_router_leaves_the_clients_final_bytes_undelivered() {
@@ -406,14 +404,13 @@ async fn a_partial_send_resumes_from_pending_send_on_the_next_relay_pass() {
     );
 }
 
-/// Reaches Task 2's conclusion through `Driver`'s own methods instead of
-/// `SocketStack`'s. The phase sequence below is a copy of
-/// `Driver::run`'s (`driver.rs:153-159`), substituting `stack.poll(t(..))`
-/// for `poll_smoltcp()` because the fixture drives time explicitly — it is
-/// not a read of that order, and no assertion here would catch it changing.
-/// Its RED sibling is Task 2's
-/// `a_fin_carrying_data_is_acknowledged_before_the_socket_can_be_removed`,
-/// which fails without the fix at the layer the fix lives in.
+/// Reaches the `SocketStack`-level conclusion through `Driver`'s own methods.
+/// The phase sequence below is a copy of `Driver::run`'s, substituting
+/// `stack.poll(t(..))` for the driver's own poll because the fixture drives
+/// time explicitly; it is not a read of that order, and no assertion here
+/// would catch it changing. The sibling
+/// `a_fin_carrying_data_is_acknowledged_before_the_socket_can_be_removed` fails
+/// without the fix at the layer the fix lives in.
 #[skuld::test]
 async fn the_last_ack_reaches_the_wire_before_the_connection_is_reaped() {
     let mut d = driver(4);
@@ -467,12 +464,11 @@ async fn a_connection_whose_client_never_answers_is_reclaimed() {
 
 // settle_packet ordering ==============================================================================================
 
-/// The invariant behind #911's fix, proven against the call `Driver::run`
-/// actually makes — not a hand-sequenced stand-in for it. `settle_packet` is
-/// the one production entry point for a TUN packet; enqueue, both polls,
-/// admission and retirement never straddle two calls, so a socket
-/// mid-retirement can never intercept the next packet's SYN regardless of how
-/// many packets a future `run()` reads per iteration.
+/// The invariant behind `settle_packet`, proven against the call `Driver::run`
+/// actually makes, not a hand-sequenced stand-in for it. `settle_packet` is the
+/// one production entry point for a TUN packet; enqueue, both polls, admission
+/// and retirement never straddle two calls, so a socket mid-retirement can
+/// never intercept the next packet's SYN.
 ///
 /// A hijacked SYN is not silent on the wire — the reverted socket kept the
 /// SYN-ACK unpaused from its earlier admission, so it answers anyway. The

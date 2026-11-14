@@ -22,7 +22,7 @@ pub fn describe_output(out: &Output) -> String {
 ///
 /// Never panics: a caller inside a covered window can fold the result into a
 /// local and judge it after the cover is released, where a panic would skip
-/// the release guards (Rule #0).
+/// the release guards.
 pub fn ps_capture(script: &str) -> Result<String, String> {
     let out = Command::new("powershell")
         .args(["-NoProfile", "-Command", script])

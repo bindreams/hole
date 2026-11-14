@@ -5,9 +5,8 @@
 //! fail-closed cover a killed test would otherwise strand on the host, and
 //! the resolver set and the configd change notification the macOS DNS tests compare and wait on.
 //!
-//! Both lanes drive the same OS objects, so one copy is one place to fix an
-//! OS quirk: when the two crates each kept their own, a single `netsh`
-//! argument-quoting bug had to be found and patched twice.
+//! Both lanes drive the same OS objects, so one copy is one place to fix an OS
+//! quirk.
 //!
 //! `command`, `escape`, `probe`, `resolvers`, and `route` carry no `#[cfg(target_os)]`
 //! attribute — platform choices are `cfg!()` branches instead, so every

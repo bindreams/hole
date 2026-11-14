@@ -46,7 +46,7 @@ fn display_strings_are_the_user_facing_copy() {
 /// The load-bearing split: the toast gets the sentence, `bridge.log` gets the
 /// adapter. Asserted in BOTH directions — a `Display` that leaks is a PII bug,
 /// and a `Debug` that drops the detail makes "see bridge.log" a promise nothing
-/// keeps (which is what #798 already did to support).
+/// keeps.
 #[skuld::test]
 fn no_usable_gateway_hides_the_adapter_in_display_and_keeps_it_in_debug() {
     let err = GatewayError::NoUsableGateway {

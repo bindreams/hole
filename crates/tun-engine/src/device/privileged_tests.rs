@@ -38,15 +38,13 @@ use super::{Device, MutDeviceConfig, TunName};
 use crate::{GLOBAL_NET_STATE, TUN};
 
 /// `Device::build` must run inside a live Tokio runtime, same as production:
-/// `tun`'s Unix `AsyncDevice::new` (`tun-0.8.13/src/async/unix_device.rs`)
-/// wraps the opened FD in `tokio::io::unix::AsyncFd` eagerly, at
-/// CONSTRUCTION — not lazily at first read/write, and not in `Drop` — so it
-/// panics ("there is no reactor running") the instant it is called off a
-/// runtime. `Dispatcher::new` never hits this because it always calls
+/// `tun`'s Unix `AsyncDevice::new` wraps the opened FD in
+/// `tokio::io::unix::AsyncFd` eagerly, at CONSTRUCTION (not lazily at first
+/// read/write, and not in `Drop`), so it panics ("there is no reactor running")
+/// the instant it is called off a runtime. `Dispatcher::new` always calls
 /// `Device::build` from inside `tokio::task::spawn_blocking`
 /// (`crates/bridge/src/dispatcher.rs`), whose worker threads carry the
-/// runtime's `Handle`; this was the first time this exact test ran the real
-/// macOS path and the first time it did so bare.
+/// runtime's `Handle`.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn device_opens_a_kernel_assigned_utun() {
     let rt = tokio::runtime::Builder::new_current_thread()

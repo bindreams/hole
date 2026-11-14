@@ -1,65 +1,53 @@
-//! Task 2 Steps 2/2b (refs #868) — the two experiments D3's whole design
-//! rests on. Both measure **configd**, not our own code, which is why
-//! neither drives `dns_steer`'s dictionary-building helper: reusing it here
-//! would make a regression in that helper look like a mechanism failure, the
-//! opposite of what these probes exist to isolate.
+//! The two experiments the session-scoped DNS-steer key rests on. Both measure
+//! **configd**, not our own code, so the first does not drive `dns_steer`'s
+//! dictionary-building helper: reusing it would make a regression in that
+//! helper look like a mechanism failure.
 //!
-//! - `macos_dns_global_net_state_session_keys_die_with_their_session`
-//!   (Step 2): a raw `SCDynamicStore` experiment. Builds a
-//!   `session_keys(true)` store by hand, publishes the same dictionary shape
-//!   `dns_steer` publishes, blocks for configd to merge it, drops the store
-//!   handle **without** calling `.remove()`, and blocks again for configd to
-//!   un-merge it. **This confirms D3's mechanism.** A `Drop`-glue-runs-on-
-//!   normal-exit outcome only, deliberately distinct from Step 2b's crash
-//!   path below — collapsing the two would prove nothing about `SIGKILL`.
-//!   If this fails, D3 is unimplementable as written: **stop and escalate to
-//!   Anna** (see this test's own panic messages for why).
-//! - `macos_dns_global_net_state_session_keys_die_with_a_killed_process`
-//!   (Step 2b): drives the PRODUCTION `dns_steer::engage` — unlike Step 2,
-//!   nothing here is exempt from the drive-production-code rule, because
-//!   what is under test is whether `engage`'s key dies with a process that
-//!   never gets to run so much as one line of `Drop` glue. No new `[[bin]]`
-//!   target: this same test binary re-execs itself
-//!   (`std::env::current_exe()`) with `HOLE_DNS_STEER_LIFETIME_PROBE_HOLDER`
-//!   set, and `main` below branches into [`run_holder`] before
-//!   `skuld::run_all` ever runs — the same self-re-exec shape
-//!   `dist_harness_panic_hook_tests.rs` uses, chosen over a dedicated
-//!   `[[bin]]` because the plan's Task 2 file list names no such target.
-//!   The holder calls `engage`, prints a readiness line, and parks forever;
-//!   the parent rendezvous on that line (a real event, not a bound), waits
-//!   for configd to merge the holder's key, sends `SIGKILL`, reaps the
-//!   child, and blocks again for configd to un-merge it. **If this fails,
-//!   D3's justification for having no sweep is false — stop and escalate.**
+//! - `macos_dns_global_net_state_session_keys_die_with_their_session`: a raw
+//!   `SCDynamicStore` experiment. Builds a `session_keys(true)` store by hand,
+//!   publishes the same dictionary shape `dns_steer` publishes, blocks for
+//!   configd to merge it, drops the store handle **without** calling
+//!   `.remove()`, and blocks again for configd to un-merge it. It covers the
+//!   graceful path only (`Drop` glue runs), deliberately distinct from the
+//!   crash path below. If it fails, a session-scoped key is not a viable
+//!   design.
+//! - `macos_dns_global_net_state_session_keys_die_with_a_killed_process`:
+//!   drives the production `dns_steer::engage`, because what is under test is
+//!   whether `engage`'s key dies with a process that never runs a line of
+//!   `Drop` glue. This test binary re-execs itself (`std::env::current_exe()`)
+//!   with `HOLE_DNS_STEER_LIFETIME_PROBE_HOLDER` set, and `main` branches into
+//!   [`run_holder`] before `skuld::run_all`. The holder calls `engage`, prints
+//!   a readiness line, and parks forever; the parent waits for that line,
+//!   waits for configd to merge the holder's key, sends `SIGKILL`, reaps the
+//!   child, and blocks again for configd to un-merge it. If it fails, having
+//!   no startup sweep is not justified.
 //!
-//! Own binary, not a module in the lib test binary: skuld validates that a
-//! label is declared once per binary, and the lib already declares `TUN` in
-//! `routing/failclosed/lockdown_privileged_tests.rs` (mirrors
-//! `gateway_privileged.rs`'s own rationale for the same shape).
+//! Its own binary, not a module in the lib test binary: skuld validates that a
+//! label is declared once per binary, and the lib already declares `TUN`.
 //!
-//! Runs on the elevated `tun` lane only — writing `SCDynamicStore` `State:`
-//! keys needs root, same as the mechanism test in
-//! `dns_steer/privileged_tests.rs`. Not `#[ignore]`d; a default unprivileged
-//! run fails loud rather than silently skipping.
+//! Runs on the elevated `tun` lane only: writing `SCDynamicStore` `State:`
+//! keys needs root, as in the mechanism test in `dns_steer/privileged_tests.rs`.
+//! Not `#[ignore]`d; a default unprivileged run fails loudly rather than
+//! skipping.
 //!
-//! COUPLED NAMES: both tests above carry the literal substring
+//! COUPLED NAMES: both tests above carry the substring
 //! `macos_dns_global_net_state_`, which `.config/nextest.toml`'s
-//! `global_net_state` filter matches by substring — renaming either without
-//! updating that filter AND the `GLOBAL_NET_STATE` label silently drops it
-//! from the group. `cargo xtask verify-global-net-state-labels` (CI,
-//! unprivileged) fails loud on that drift.
+//! `global_net_state` filter matches; renaming either without updating that
+//! filter and the `GLOBAL_NET_STATE` label silently drops it from the group.
+//! `cargo xtask verify-global-net-state-labels` (CI, unprivileged) fails loudly
+//! on that drift.
 //!
 //! **What a real run does to the machine**: publishes two short-lived
 //! synthetic-service DNS keys (one per test, TEST-NET-1 resolvers) and, for
-//! Step 2b, spawns and `SIGKILL`s a child process of this same binary.
+//! the killed-process test, spawns and `SIGKILL`s a child process of this same
+//! binary.
 
 #![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
 hole_test_observability::register!();
 
-/// Set only on the child side of Step 2b's self re-exec — see the module
-/// doc. Checked in `main` before `skuld::run_all`, mirroring
-/// `dist_harness_panic_hook_tests.rs`'s `HOLE_DIST_HARNESS_PANIC_TEST`
-/// branch in `crates/common/src/lib.rs::main`.
+/// Set only on the child side of the killed-process test's self re-exec; see
+/// the module doc. Checked in `main` before `skuld::run_all`.
 const HOLDER_ENV: &str = "HOLE_DNS_STEER_LIFETIME_PROBE_HOLDER";
 
 fn main() {
@@ -146,14 +134,12 @@ mod macos_impl {
         run("scutil", &["--dns"]).1
     }
 
-    // Raw dictionary construction (Step 2 ONLY) =======================================================================
+    // Raw dictionary construction =====================================================================================
 
     /// The exact dictionary shape `dns_steer::macos::build_dns_dictionary`
-    /// publishes, reconstructed by hand rather than called into — Step 2 is
-    /// explicitly exempt from the drive-production-code rule (see the module
-    /// doc): it is measuring configd's own honouring of `session_keys(true)`,
-    /// not our dictionary-building code, so calling the production helper
-    /// here would blur that line.
+    /// publishes, reconstructed by hand rather than called into: the session
+    /// test measures configd's honouring of `session_keys(true)`, not our
+    /// dictionary-building code.
     fn build_dictionary(resolver: Ipv4Addr) -> CFDictionary {
         // SAFETY: schema constants are immortal CFStringRefs owned by the
         // framework.
@@ -178,14 +164,13 @@ mod macos_impl {
         unsafe { CFDictionary::wrap_under_get_rule(typed.as_concrete_TypeRef()) }
     }
 
-    // Step 2b's holder side ===========================================================================================
+    // The killed-process test's holder side ===========================================================================
 
-    /// The child side of Step 2b's self re-exec. Calls the PRODUCTION
-    /// `engage`, reports readiness, then parks forever — deliberately never
-    /// calling `withdraw()` and never returning, so the only way this
-    /// process's `Steering` ever goes away is `SIGKILL`, which runs no `Drop`
-    /// glue at all. That is the entire point of the probe: it proves the key
-    /// dies via the session closing, not via our own cleanup code.
+    /// The child side of the killed-process test's self re-exec. Calls the
+    /// production `engage`, reports readiness, then parks forever, never
+    /// calling `withdraw()`, so the only way this process's `Steering` goes
+    /// away is `SIGKILL`, which runs no `Drop` glue. That proves the key dies
+    /// via the session closing, not via our own cleanup code.
     pub(super) fn run_holder() {
         let resolver = IpAddr::V4(KILLED_PROCESS_RESOLVER);
         match tun_engine::dns_steer::engage(&[resolver]) {
@@ -203,15 +188,12 @@ mod macos_impl {
         }
     }
 
-    // Step 2: the framework lifetime probe ============================================================================
+    // The framework lifetime probe ====================================================================================
 
-    /// SHIP GATE. If this fails, configd does not
-    /// honour `session_keys(true)` for a merged DNS entry on a graceful
-    /// in-process drop, and D3 is unimplementable as written — **stop and
-    /// escalate to Anna**. The fallback (persistent key + owner token +
-    /// evidence-gated sweep) is a materially larger design and must not be
-    /// improvised; an ungated sweep would violate the resource-ownership
-    /// rule this plan carries forward from route ownership.
+    /// Ship gate: if this fails, configd does not honour `session_keys(true)`
+    /// for a merged DNS entry on a graceful in-process drop, and the
+    /// session-scoped key cannot be the design. A persistent key would need an
+    /// owner token and an evidence-gated sweep (see the route-ownership rule).
     #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn macos_dns_global_net_state_session_keys_die_with_their_session() {
         let (before_dns, before_nameservers) = resolver_set_uncovered("the resolver set before");
@@ -237,8 +219,8 @@ mod macos_impl {
         println!("[lifetime-probe] after set (merged={merged}):\n{merged_dns}");
         assert!(
             merged,
-            "D3 UNIMPLEMENTABLE AS WRITTEN: configd never merged a session_keys(true) key into the \
-             derived DNS configuration — stop and escalate to Anna. scutil --dns:\n{merged_dns}"
+            "SESSION KEY UNUSABLE: configd never merged a session_keys(true) key into the \
+             derived DNS configuration. scutil --dns:\n{merged_dns}"
         );
 
         // No `.remove()` call — the store handle is simply dropped. This IS
@@ -260,8 +242,8 @@ mod macos_impl {
 
         assert!(
             unmerged,
-            "D3 UNIMPLEMENTABLE AS WRITTEN: the session key survived the store handle being dropped \
-             — stop and escalate to Anna. scutil --dns:\n{after_dns}"
+            "SESSION KEY UNUSABLE: the session key survived the store handle being dropped. \
+             scutil --dns:\n{after_dns}"
         );
         assert_eq!(
             before_nameservers, after_nameservers,
@@ -269,7 +251,7 @@ mod macos_impl {
         );
     }
 
-    // Step 2b: the killed-process crash-path probe ====================================================================
+    // The killed-process crash-path probe =============================================================================
 
     /// Owns the holder child so a panic between spawn and the explicit kill
     /// cannot leave it running. `Child`'s own `Drop` does not kill, and this
@@ -308,10 +290,8 @@ mod macos_impl {
         }
     }
 
-    /// SHIP GATE. If this fails, a `SIGKILL`ed
-    /// process's session key survives it, D3's "no sweep" justification is
-    /// false, and the resource-ownership rule in Global Constraints forbids
-    /// improvising an ungated sweep to cover the gap — **stop and escalate**.
+    /// Ship gate: if this fails, a `SIGKILL`ed process's session key survives
+    /// it, so having no startup sweep is not justified.
     #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn macos_dns_global_net_state_session_keys_die_with_a_killed_process() {
         let (before_dns, before_nameservers) = resolver_set_uncovered("the resolver set before");
@@ -383,8 +363,8 @@ mod macos_impl {
 
         assert!(
             unmerged,
-            "D3'S JUSTIFICATION FOR HAVING NO SWEEP IS FALSE: a SIGKILLed process's session key \
-             survived it — stop and escalate. scutil --dns:\n{after_dns}\nholder stderr:\n{stderr}"
+            "SESSION KEY SURVIVED: a SIGKILLed process's session key outlived it. \
+             scutil --dns:\n{after_dns}\nholder stderr:\n{stderr}"
         );
         assert_eq!(
             before_nameservers, after_nameservers,

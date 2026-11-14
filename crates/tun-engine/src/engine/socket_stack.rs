@@ -213,8 +213,8 @@ impl SocketStack {
                     // cannot be told apart from the owner's. That needs both
                     // sides readable and equal — if either this SYN's ISN or
                     // the ISN its owner was admitted with could not be read
-                    // off the wire, falling back to the historically-safe
-                    // `Duplicate` means a parsing gap on either side can
+                    // off the wire, falling back to `Duplicate` means a
+                    // parsing gap on either side can
                     // never mint a spurious connection, nor tear down a live
                     // one on its own harmless retransmit.
                     let is_retransmit = match (observed_isn, owners_isn) {
@@ -366,7 +366,7 @@ pub(crate) enum Disposal {
 /// either already clear or clears as soon as the last packet is out.
 ///
 /// `TimeWait` is removed at once instead. Retiring it would hold the socket,
-/// and both its buffers, for smoltcp's 10 s `CLOSE_DELAY` — the tuple survives
+/// and both its buffers, for smoltcp's `CLOSE_DELAY` — the tuple survives
 /// until the close timer fires. That retention buys nothing here: every
 /// socket this stack creates has its delayed ACK disabled, so it owes its
 /// peer nothing by the time it reaches `TimeWait`, and removing it strands no

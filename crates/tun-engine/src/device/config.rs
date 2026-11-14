@@ -12,22 +12,17 @@ use tun_engine_macros::freeze;
 /// - `Requested(name)` — the caller names the device and the OS is trusted
 ///   to honour it exactly, as it does on Windows (`wintun` always assigns
 ///   the requested friendly name). [`super::Device::identity`] carries
-///   `name` straight through; the OS is never asked to confirm it. See
-///   `crate::device::identity`'s module doc for why a read-back here would
-///   be actively harmful: Windows' own interface-name table can transiently
-///   answer "not found" on a live machine, and the no-time-sync rule bars a
-///   retry loop working around it.
+///   `name` straight through; the OS is never asked to confirm it.
 /// - `KernelAssigned` — there is no requested name (an unset `sc_unit` asks
 ///   the kernel for the next free `utunN`). The device's real name is read
 ///   back from the just-opened handle, and that read failing is fatal —
 ///   there is nothing to fall back to.
 ///
-/// Both variants exist on every platform — the type describes the concept
-/// "a name may be requested or kernel-assigned", not "what this platform's
-/// driver happens to support" — but only macOS's `utun` driver actually
+/// Both variants exist on every platform, but only macOS's `utun` driver
 /// grants a kernel-assigned name: [`super::Device::build`] rejects
 /// `KernelAssigned` with [`crate::error::DeviceError::InvalidConfig`] on
-/// every other platform, before any OS call.
+/// every other platform, before any OS call. See
+/// `docs/contributing/architecture/tun-device.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TunName {
     Requested(String),
@@ -58,7 +53,7 @@ pub struct DeviceConfig {
     /// post-open source of the device's real name is
     /// `super::Device::identity().alias()`.
     pub tun_name: TunName,
-    /// The TUN device MTU. Typical value: `1400`.
+    /// The TUN device MTU.
     pub mtu: u16,
     /// The IPv4 address + mask assigned to the TUN.
     pub ipv4: Option<Ipv4Cidr>,

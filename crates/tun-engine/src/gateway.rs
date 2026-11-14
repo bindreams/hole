@@ -1,9 +1,9 @@
 //! Default gateway detection.
 //!
 //! On Windows the upstream route comes from the OS routing table
-//! (`platform::best_route` -> `GetBestRoute2`). On macOS it still comes from the
-//! `default-net` crate; see bindreams/hole#798 for why the Windows path could
-//! not, and `gateway/error.rs` for the failure vocabulary both share.
+//! (`platform::best_route` -> `GetBestRoute2`), which names every adapter class.
+//! On macOS it comes from the `default-net` crate. `gateway/error.rs` holds the
+//! failure vocabulary both share.
 
 pub mod error;
 
@@ -30,8 +30,7 @@ use crate::net::bind_to_interface_v6;
 /// The upstream route's form: a real gateway to bypass through, or on-link
 /// (no gateway — the destination is directly reachable off the interface
 /// itself). `routing.rs`'s IPv4 bypass builder reads this to choose which
-/// route form to emit; `gateway_ip` (below) stays the raw address either way
-/// for callers not yet updated to read it.
+/// route form to emit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NextHop {
     /// A real next-hop gateway to route the bypass through.
@@ -184,12 +183,8 @@ pub fn upstream_route(_dest: IpAddr) -> Result<GatewayInfo, GatewayError> {
 /// classification, rather than this shared function guessing on the caller's
 /// behalf.
 ///
-/// Neither refusal below constructs a `HopDetail` — `NoDefaultRoute` is
-/// fieldless, and `InterfaceNameUnavailable` carries only the index, not
-/// `hop.next_hop`. `HopDetail` (see `gateway/error.rs`) is currently
-/// reachable only from `NoUsableGateway`, which has no producer on this path
-/// (see its own doc); on these two branches the `warn!` is the only thing
-/// that carries the hop, not a convenience on top of a structural guarantee.
+/// Neither refusal below constructs a `HopDetail`; on those two branches the
+/// `warn!` is the only thing that carries the hop.
 pub(crate) fn classify_hop(hop: Option<RouteHop>, ipv6_available: bool) -> Result<GatewayInfo, GatewayError> {
     let Some(hop) = hop else {
         warn!("no default route: nothing routes off this host");
@@ -228,18 +223,14 @@ pub(crate) fn classify_hop(hop: Option<RouteHop>, ipv6_available: bool) -> Resul
     })
 }
 
-/// macOS has no interface-scoped IPv4 bypass form (`routing.rs`'s Windows
-/// IPv4 bypass builder does; the macOS one does not), so an on-link default
-/// route stays a refusal there even though [`classify_hop`] now accepts it.
-/// `NoDefaultRoute` rather than `NoUsableGateway`: that message described
-/// exactly the condition Windows now supports, so reusing it where it is
-/// still unsupported would tell a macOS user something false about what
-/// Hole can do.
+/// macOS has no interface-scoped IPv4 bypass form (`routing.rs`'s Windows IPv4
+/// bypass builder does; the macOS one does not), so an on-link default route is
+/// a refusal there even though [`classify_hop`] accepts it. The error is
+/// `NoDefaultRoute` rather than `NoUsableGateway`, whose message describes
+/// a condition Windows supports.
 ///
-/// Pure and platform-independent so it is testable without macOS: the
-/// platform gate lives at its one call site
-/// ([`get_default_gateway_info`](self)'s `#[cfg(target_os = "macos")]` arm),
-/// not in this function.
+/// Pure and platform-independent so it is testable without macOS; the platform
+/// gate is at its one call site, not in this function.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn reject_macos_on_link(info: GatewayInfo) -> Result<GatewayInfo, GatewayError> {
     match info.next_hop {
@@ -255,10 +246,8 @@ fn reject_macos_on_link(info: GatewayInfo) -> Result<GatewayInfo, GatewayError> 
 /// Shared by upstream-gateway lookup and [`tun_ipv6_available`], which needs
 /// the TUN's own index rather than the upstream one.
 ///
-/// `pub`, not `pub(crate)`: also the OS-name-table oracle
-/// `crates/bridge/src/dispatcher_privileged_tests.rs` uses to prove a
-/// `Dispatcher`'s `TunIdentity::alias` names a live interface, rather than
-/// that test reimplementing this same lookup against raw platform FFI.
+/// `pub` because `crates/bridge/src/dispatcher_privileged_tests.rs` uses it as
+/// the OS-name-table oracle for a `Dispatcher`'s `TunIdentity::alias`.
 #[cfg(target_os = "windows")]
 pub fn interface_index_by_name(name: &str) -> std::io::Result<u32> {
     use windows::core::HSTRING;
@@ -289,10 +278,8 @@ pub fn interface_index_by_name(name: &str) -> std::io::Result<u32> {
 /// upstream-gateway lookup and [`tun_ipv6_available`], which needs the TUN's
 /// own index rather than the upstream one.
 ///
-/// `pub`, not `pub(crate)`: also the OS-name-table oracle
-/// `crates/bridge/src/dispatcher_privileged_tests.rs` uses to prove a
-/// `Dispatcher`'s `TunIdentity::alias` names a live interface, rather than
-/// that test reimplementing this same lookup against raw platform FFI.
+/// `pub` because `crates/bridge/src/dispatcher_privileged_tests.rs` uses it as
+/// the OS-name-table oracle for a `Dispatcher`'s `TunIdentity::alias`.
 #[cfg(target_os = "macos")]
 pub fn interface_index_by_name(name: &str) -> std::io::Result<u32> {
     let c_name =
@@ -333,7 +320,7 @@ fn probe_ipv6_bound(interface_index: u32) -> bool {
 /// upstream gateway, where "bound but no route to the internet" is a
 /// legitimate state — see [`GatewayInfo::ipv6_available`]'s doc.
 ///
-/// Deliberately still a socket probe, on both platforms: `connect()` on a UDP
+/// A socket probe on both platforms: `connect()` on a UDP
 /// socket sends nothing — it is a route lookup **plus source-address
 /// selection** — and `GetBestRoute2` reports the second half separately, so a
 /// route-table replacement is not equivalent on a host that has a route but no
@@ -350,11 +337,12 @@ fn probe_ipv6(interface_index: u32) -> bool {
 
 /// Whether the TUN device named `tun_name` has an IPv6 binding. Meant to be
 /// probed AFTER the OS creates the adapter, so it reflects the interface the
-/// IPv6 split-route commands (`SetupCommand`) actually target — unlike
+/// IPv6 split-route commands (`SetupCommand`) actually target, unlike
 /// [`GatewayInfo::ipv6_available`], which measures the upstream interface the
 /// commands do NOT name. `false` on any resolution failure (including the
-/// adapter not existing yet): `SetupCommand::fatal` treats `false` as
-/// "tolerate this command failing", never as "skip issuing it".
+/// adapter not existing yet). `SetupCommand::fatal` reads it to decide whether
+/// the route runner stops at a failure of an IPv6 split command; it never
+/// decides whether the command is issued.
 pub fn tun_ipv6_available(tun_name: &str) -> bool {
     match interface_index_by_name(tun_name) {
         Ok(index) => probe_ipv6_bound(index),

@@ -469,8 +469,8 @@ fn a_client_rst_after_the_synack_reverts_the_socket_to_listen() {
     assert!(stack.socket(handle).remote_endpoint().is_none());
 }
 
-/// The defect, stated as a test: the reverted socket outranks the re-armed
-/// listener and swallows the next client's SYN, which no accept path can see.
+/// A reverted socket must not outrank the re-armed listener and swallow the
+/// next client's SYN, which no accept path could see.
 #[skuld::test]
 fn a_reverted_socket_would_hijack_a_later_syn() {
     let mut stack = stack();
@@ -544,7 +544,7 @@ fn retiring_a_timewait_socket_would_hold_it_but_removing_does_not() {
     assert!(!dropped.sockets.iter().any(|(h, _)| h == handle));
 }
 
-/// The defect, stated as a test (F2, row 2): a FIN that also carries data
+/// A FIN that also carries data
 /// stays unacknowledged past the poll that ingests it, because arming the
 /// delayed-ACK timer happens before the ingress ACK check ever runs.
 #[skuld::test]
@@ -580,8 +580,8 @@ fn a_fin_carrying_data_is_acknowledged_before_the_socket_can_be_removed() {
     );
 }
 
-/// The defect, stated as a test (F2, row 3): a bare FIN one millisecond after
-/// its data strands both the data's ACK and the FIN's.
+/// A bare FIN one millisecond after its data must not strand the data's ACK or
+/// the FIN's.
 #[skuld::test]
 fn a_fin_within_the_ack_delay_of_its_data_is_still_acknowledged() {
     let isn = 1000u32;
@@ -620,10 +620,9 @@ fn a_fin_within_the_ack_delay_of_its_data_is_still_acknowledged() {
     );
 }
 
-/// States the order this issue depends on: the ACK for the peer's last
-/// segment is on the wire before the socket is removed, and removal itself
-/// emits nothing. The pre-removal half is what makes this non-vacuous — a
-/// removed handle produces no egress in the buggy tree either.
+/// The ACK for the peer's last segment is on the wire before the socket is
+/// removed, and removal itself emits nothing. The pre-removal half is what makes
+/// this non-vacuous: a removed handle produces no egress either way.
 #[skuld::test]
 fn a_timewait_socket_acknowledges_before_removal_and_nothing_follows() {
     let isn = 1000u32;
@@ -695,9 +694,9 @@ fn a_socket_acknowledges_immediately_from_the_moment_it_is_created() {
     assert_eq!(stack.socket(handle).ack_delay(), None);
 }
 
-/// The defect, stated as a test: the stolen SYN belongs to a connection the
-/// driver already owns, so offering it as a new one would buy a second permit,
-/// a second connection entry and a second upstream dial for one client socket.
+/// A stolen SYN belongs to a connection the driver already owns, so offering it
+/// as a new one would buy a second permit, a second connection entry and a
+/// second upstream dial for one client socket.
 #[skuld::test]
 fn a_stolen_retransmit_is_not_offered_as_a_new_connection() {
     let mut stack = stack();
@@ -733,7 +732,7 @@ fn a_dropped_duplicate_answers_nothing_and_leaves_its_port_armed() {
     assert_eq!((src, dst), (other_client(), dest()));
 }
 
-/// The correction to the steal: a SYN carrying a *different* ISN on a tuple
+/// A SYN carrying a *different* ISN on a tuple
 /// the datapath still owns is not a retransmit (RFC 9293 §3.10.7.4). It is
 /// classified `Pending` with `supersedes` naming the stale owner, not dropped
 /// as a `Duplicate`.
@@ -766,12 +765,12 @@ fn superseding_and_removing_the_stale_owner_leaves_one_socket_on_the_tuple() {
     assert_eq!(stack.socket(handle).state(), tcp::State::SynReceived);
 }
 
-/// The fourth defect: the driver's supersede teardown calls `remove` on
-/// whatever `tuple_owner` reports — which can already be sitting in
-/// `retiring` (refused, or cleaned up by a previous `settle_packet`, and not
-/// yet reaped because its peer is still live). `remove` used to leave it
-/// listed there; the next `poll`'s reap loop then calls `SocketSet::get` on a
-/// handle whose slot `remove` just freed, and smoltcp panics.
+/// The driver's supersede teardown calls `remove` on whatever `tuple_owner`
+/// reports, which can already be sitting in `retiring` (refused, or cleaned up
+/// by a previous `settle_packet`, and not yet reaped because its peer is still
+/// live). `remove` must also drop it from `retiring`: otherwise the next
+/// `poll`'s reap loop calls `SocketSet::get` on a handle whose slot `remove`
+/// just freed, and smoltcp panics.
 #[skuld::test]
 fn removing_a_retiring_tuple_owner_does_not_leave_it_queued_for_reap() {
     let mut stack = stack();
@@ -794,8 +793,8 @@ fn removing_a_retiring_tuple_owner_does_not_leave_it_queued_for_reap() {
 }
 
 /// The defensive fallback: if this stack could not read the SYN's ISN off the
-/// wire, a same-tuple owner is never assumed superseded — the
-/// historically-safe `Duplicate` wins over guessing at a new connection.
+/// wire, a same-tuple owner is never assumed superseded: `Duplicate` wins over
+/// guessing at a new connection.
 #[skuld::test]
 fn an_unreadable_isn_falls_back_to_duplicate_rather_than_superseding() {
     let mut stack = stack();
@@ -808,11 +807,9 @@ fn an_unreadable_isn_falls_back_to_duplicate_rather_than_superseding() {
     assert_eq!(port, dest().port());
 }
 
-/// The headline defect: `parse_syn` used to verify a checksum no real inbound
-/// SYN carries (#903), so `pending_syn` was always `None` on the production
-/// path and `owner_isn` was never populated at all. `parse_syn` reads
-/// `TcpPacket`'s raw fields directly and verifies no checksum at all, so this
-/// holds regardless of what the SYN's checksum claims.
+/// `parse_syn` reads `TcpPacket`'s raw fields directly and verifies no
+/// checksum, so a SYN's ISN is captured (and `owner_isn` populated) regardless
+/// of what its checksum claims; no real inbound SYN carries a valid one.
 #[skuld::test]
 fn a_checksumless_syns_isn_is_still_captured_for_owner_isn() {
     let mut stack = stack();
@@ -825,11 +822,10 @@ fn a_checksumless_syns_isn_is_still_captured_for_owner_isn() {
     assert_eq!(stack.owner_isn.get(&handle), Some(&1000));
 }
 
-/// The end-to-end reproduction of the same defect: with the mechanism inert,
-/// every same-tuple SYN's ISN reads as unreadable, so the safety fallback
-/// (`an_unreadable_isn_falls_back_to_duplicate_rather_than_superseding`) fires
-/// on every one of them — a genuinely new connection is reported `Duplicate`
-/// and black-holed, never `Pending`.
+/// End to end: if no SYN's ISN were captured, the safety fallback
+/// (`an_unreadable_isn_falls_back_to_duplicate_rather_than_superseding`) would
+/// fire on every same-tuple SYN, so a genuinely new connection would be
+/// reported `Duplicate` and black-holed, never `Pending`.
 #[skuld::test]
 fn a_checksumless_first_syn_still_lets_a_later_syn_supersede_it() {
     let mut stack = stack();
@@ -846,10 +842,9 @@ fn a_checksumless_first_syn_still_lets_a_later_syn_supersede_it() {
     assert_ne!(handle, connection);
 }
 
-/// The second defect: nothing in `parse_syn` looks at the IP header's declared
-/// protocol, so a bare-SYN-shaped payload carried under ICMP (or anything
-/// else) parses as a TCP SYN — something smoltcp, which dispatches on
-/// `next_header`, would never do.
+/// `parse_syn` must look at the IP header's declared protocol: a
+/// bare-SYN-shaped payload carried under ICMP (or anything else) is not a TCP
+/// SYN, as smoltcp, which dispatches on `next_header`, would agree.
 #[skuld::test]
 fn parse_syn_rejects_a_syn_shaped_payload_under_a_non_tcp_protocol() {
     let packet = syn_shaped_payload_under(IpProtocol::Icmp, client(), dest(), 1000);
@@ -858,8 +853,7 @@ fn parse_syn_rejects_a_syn_shaped_payload_under_a_non_tcp_protocol() {
 }
 
 /// The IPv6 counterpart to the test above: the same guard exists in the IPv6
-/// branch of `parse_syn`, and every builder above this point in the file can
-/// only build IPv4, so it had no coverage at all.
+/// branch of `parse_syn`.
 #[skuld::test]
 fn parse_syn_rejects_a_syn_shaped_payload_under_a_non_tcp_protocol_over_ipv6() {
     let packet = syn_shaped_payload_under_v6(IpProtocol::Icmpv6, client_v6(), dest_v6(), 1000);
@@ -887,10 +881,9 @@ fn take_handshakes_reports_the_peer_tuple_over_ipv6() {
 /// `Interface::poll` strips a Hop-by-Hop extension header before dispatching
 /// on whatever follows it (`process_hopbyhop`), so a SYN carrying one still
 /// reaches the TCP layer and creates a handshake. `parse_syn`'s IPv6 branch
-/// used to check only the fixed header's `next_header`, so it missed this
-/// entirely: the connection was admitted with no `owner_isn` entry, silently
-/// black-holing the tuple for the owner socket's whole life the moment any
-/// later SYN reused it (#913).
+/// must therefore look past the Hop-by-Hop header: otherwise the connection is
+/// admitted with no `owner_isn` entry, silently black-holing the tuple for the
+/// owner socket's whole life the moment any later SYN reuses it.
 #[skuld::test]
 fn syn_under_hop_by_hop() {
     let mut stack = stack();
@@ -903,11 +896,11 @@ fn syn_under_hop_by_hop() {
     assert_eq!(stack.owner_isn.get(&handle), Some(&1000));
 }
 
-/// The third defect: the `Duplicate` guard's fallback is one-sided. A
+/// The `Duplicate` fallback must hold when only the owner's ISN is unknown. A
 /// connection admitted from a SYN whose ISN could not be recorded has no
-/// `owner_isn` entry — and a *retransmit* of it, whose ISN this time is
-/// readable, does not match `None` and so is wrongly reported `Pending` with
-/// `supersedes`, tearing down the very connection it retransmitted for.
+/// `owner_isn` entry, and a *retransmit* of it, whose ISN this time is readable,
+/// must still be `Duplicate` rather than `Pending` with `supersedes`, which
+/// would tear down the very connection it retransmitted for.
 #[skuld::test]
 fn a_missing_owner_isn_entry_falls_back_to_duplicate_rather_than_superseding() {
     let mut stack = stack();

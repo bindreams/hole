@@ -44,17 +44,13 @@ pub enum GatewayError {
     NoDefaultRoute,
 
     /// Currently unconstructed: an on-link default route classifies as
-    /// [`crate::gateway::NextHop::OnLink`] on Windows (which can build an
-    /// interface-scoped bypass for it) and as `NoDefaultRoute` on macOS
-    /// (which cannot — see `crate::gateway::reject_macos_on_link`). Kept
-    /// rather than deleted for the platform-independent copy below, which a
-    /// future macOS-support producer can reuse verbatim.
+    /// [`crate::gateway::NextHop::OnLink`] on Windows and as `NoDefaultRoute` on
+    /// macOS (see `crate::gateway::reject_macos_on_link`).
     ///
     /// The copy names two causes and picks neither. On-link is equally the
     /// signature of another VPN's tunnel adapter and of a point-to-point
-    /// physical link (cellular/WWAN, PPPoE), and separating them would take an
-    /// `IfType` allowlist — the heuristic class this codebase does not allow.
-    /// Asserting "a VPN" would be confidently wrong for a mobile user.
+    /// physical link (cellular/WWAN, PPPoE), and telling them apart would take
+    /// an `IfType` allowlist, a heuristic.
     #[error(
         "Your default network route has no gateway Hole can route around, so the tunnel cannot \
          be built. This happens when another VPN is handling your traffic, and on point-to-point \

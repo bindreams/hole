@@ -6,17 +6,17 @@
 //!
 //! IP Helper, not `netsh`: `netsh interface ipv6 add address` defaults to
 //! `store=persistent`, which writes the address to the registry keyed by the
-//! adapter GUID — and wintun derives that GUID from the adapter name, so a
-//! crash would leave the address waiting to be re-applied to the next
-//! `hole-tun`. `CreateUnicastIpAddressEntry` has no persistence parameter, keys
-//! on the interface identity, and returns a typed `WIN32_ERROR`. Nothing here
-//! outlives the adapter, so `recover_routes` has nothing to sweep.
+//! adapter GUID, and Hole requests the same GUID (`HOLE_ADAPTER_GUID`) on every
+//! create, so a crash would leave the address waiting to be re-applied to the
+//! next `hole-tun`. `CreateUnicastIpAddressEntry` has no persistence parameter,
+//! keys on the interface identity, and returns a typed `WIN32_ERROR`. By its
+//! contract nothing here outlives the adapter, so `recover_routes` has nothing
+//! to sweep.
 //!
-//! Open question, recorded rather than assumed: Microsoft describes
-//! `OnLinkPrefixLength` as the address's prefix length and documents no route
-//! side effect, so whether the assignment also creates an on-link `/64` route
-//! is unverified. Nothing here depends on it — the `/1` split routes carry the
-//! flow either way.
+//! Unverified: whether the assignment also creates an on-link route for the
+//! prefix (Microsoft documents `OnLinkPrefixLength` as the prefix length and
+//! no route side effect). Nothing here depends on it: the `/1` split routes
+//! carry the flow either way.
 
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 use std::sync::Mutex;
@@ -44,14 +44,9 @@ use crate::error::DeviceError;
 #[path = "windows_tests.rs"]
 mod windows_tests;
 
-/// How long to wait for the interface's IPv6 half to appear.
-///
-/// This is a bound on an **external event that genuinely might never happen**,
-/// not a synchronisation delay: when IPv6 is unbound on the host, the kernel
-/// never publishes an AF_INET6 interface for this adapter, and the elapsed
-/// budget *is* the answer. The wait blocks on an IP Helper notification rather
-/// than polling. 5 s matches the `tun` crate's own
-/// `wait_for_interface_timeout` default for the IPv4 half.
+/// How long to wait for the interface's IPv6 half to appear. The wait blocks on
+/// an IP Helper notification rather than polling, and expiry is read as "the
+/// interface has no IPv6 half" ([`Appearance::NeverAppeared`]).
 const IPV6_INTERFACE_BUDGET: Duration = Duration::from_secs(5);
 
 /// Whether the interface's IPv6 half is there.
@@ -130,8 +125,7 @@ fn luid_for(if_index: u32) -> Result<u64, DeviceError> {
 /// The address row, created **non-tentative**: `DadState = IpDadStatePreferred`
 /// makes the stack skip duplicate address detection for this address alone, so
 /// there is no tentative window and no interface-wide state is touched. The
-/// `tun` crate does the same for the IPv4 address (`sys.rs:82`), three lines
-/// from the call this wraps.
+/// `tun` crate does the same for the IPv4 address (`platform/windows/sys.rs`).
 fn unicast_row(if_index: u32, cidr: Ipv6Cidr) -> MIB_UNICASTIPADDRESS_ROW {
     let mut row = MIB_UNICASTIPADDRESS_ROW::default();
     // SAFETY: `row` is a live, zeroed row of the right type.

@@ -1,7 +1,6 @@
-//! Pure data description of the DNS-egress confinement filter set. No FFI —
-//! compiles and is fully testable on every target, including the Linux
-//! baseline check. The platform `windows` module is the only place that
-//! turns this into live WFP objects.
+//! Pure data description of the DNS-egress confinement filter set. No FFI, so
+//! it compiles and is fully testable on every target. The platform `windows`
+//! module is the only place that turns this into live WFP objects.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -17,31 +16,32 @@ pub const DNS_PORT: u16 = 53;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Guid(pub u128);
 
-/// Fresh GUIDs, minted for this confinement only — disjoint from
-/// `crate::routing::failclosed::windows::{PROVIDER_GUID, SUBLAYER_GUID,
-/// FILTER_GUIDS, LOCKDOWN_FILTER_GUIDS, LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS}`.
-/// Every fixed-GUID array the cover sweeps by key is in that set; adding a new
-/// one means adding it to the test below too. A copy-paste collision here would
-/// let a cover's fixed-GUID sweep delete this confinement's filters (or vice
-/// versa); `spec_guids_are_disjoint_from_the_cover_guids` (Windows-only, since
-/// the cover GUIDs it compares against live in a Windows-gated module) pins
-/// it. Individual filters carry no fixed GUID at all — see the module doc on
-/// [`super`] for why a dynamic session doesn't need one.
+/// The confinement's provider and sublayer GUIDs, minted for it alone and
+/// disjoint from every fixed-GUID array the fail-closed covers sweep by key
+/// (`crate::routing::failclosed::windows`), so a cover's sweep cannot delete
+/// this confinement's filters, or the reverse.
+/// `spec_guids_are_disjoint_from_the_cover_guids` pins this; a new cover
+/// GUID array must be added to that test. Individual filters carry no fixed
+/// GUID: a dynamic session needs none.
 pub const PROVIDER_GUID: Guid = Guid(0x8f1c6a2e_3d47_4b1a_9e02_7c5f3a1b6d40);
+/// See [`PROVIDER_GUID`].
 pub const SUBLAYER_GUID: Guid = Guid(0x1b9d4e73_6a52_4c8f_b310_2e6d9a4c7f81);
 
+/// The transport protocols a filter matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L4 {
     Udp,
     Tcp,
 }
 
+/// The WFP connect layer a filter is installed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
     ConnectV4,
     ConnectV6,
 }
 
+/// What a matching filter does with the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Permit,
@@ -62,14 +62,14 @@ pub enum Condition {
     /// Match the Shadowsocks server's address, on ANY port — deliberately
     /// no port condition. `server_port` has no validation forbidding 53
     /// (a standard censorship-evasion configuration), and without this
-    /// permit the confinement would block the tunnel's own handshake
-    /// harder than the fail-closed covers permit it.
+    /// permit the confinement would block the tunnel's own handshake.
     ServerIp(IpAddr),
     /// No local-interface / address condition — protocol + remote port
     /// only. The block-all-else half.
     AnyTo { l4: L4, remote_port: u16 },
 }
 
+/// One filter of the confinement.
 #[derive(Debug, Clone)]
 pub struct FilterSpec {
     pub name: &'static str,
@@ -79,6 +79,7 @@ pub struct FilterSpec {
     pub weight: u8,
 }
 
+/// The whole confinement: its provider, sublayer and filters.
 #[derive(Debug, Clone)]
 pub struct ConfineSpec {
     pub provider: Guid,
@@ -86,22 +87,15 @@ pub struct ConfineSpec {
     pub filters: Vec<FilterSpec>,
 }
 
-/// Weight for every `Permit` filter — higher than [`BLOCK_WEIGHT`] so a
-/// permit always outranks the block-all within this confinement's own
-/// sublayer (no `CLEAR_ACTION_RIGHT` on any filter here, matching
-/// `failclosed/windows.rs`'s PERSISTENT set — that file's boot-time twins do
-/// set it, and this module has no boot-time half at all: its session is
-/// dynamic, which WFP refuses a boot-time filter on).
+/// Weight for every `Permit` filter. Higher than [`BLOCK_WEIGHT`] so a permit
+/// outranks the block-all within this confinement's own sublayer.
 pub const PERMIT_WEIGHT: u8 = 15;
-/// Weight for every `Block` filter. `0`, matching
-/// `failclosed/windows.rs:245` — an unexplained number in a module whose
-/// whole argument is "structural, not heuristic" is not worth the question
-/// it invites.
+/// Weight for every `Block` filter.
 pub const BLOCK_WEIGHT: u8 = 0;
 
 /// Build the DNS-egress confinement: permit UDP+TCP/53 on `tun_luid` and on
 /// loopback, permit the Shadowsocks server on any port, block UDP+TCP/53
-/// everywhere else. Thirteen filters, always. Pure — no FFI;
+/// everywhere else. Pure: no FFI;
 /// `windows::engage` submits it in one transaction inside a dynamic
 /// (process-scoped) FWPM session.
 pub fn build_spec(tun_luid: u64, server_ip: IpAddr) -> ConfineSpec {

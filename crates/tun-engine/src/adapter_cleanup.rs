@@ -10,10 +10,9 @@
 //!
 //! Idempotent: no-op if the adapter is already gone. Requires admin
 //! privileges (the bridge runs elevated; in dev mode, dev-console requires
-//! an already-elevated shell). PowerShell cold-start adds ~500-2000ms to
-//! teardown — acceptable tax for crash-recovery safety. On macOS the
-//! utun adapter auto-cleans on FD close (no equivalent leak), so this
-//! is a no-op there.
+//! an already-elevated shell). It starts a PowerShell, so it adds that
+//! process's cold-start time to teardown. On macOS the utun adapter is
+//! released when its file descriptor closes, so this is a no-op there.
 
 /// Build the PowerShell script [`remove_adapter`] executes. Extracted so the
 /// escaping is unit-testable without spawning PowerShell or touching a real
@@ -27,9 +26,7 @@
 /// a space or a newline, is literal content): it must be doubled (`''`) to
 /// escape it, or it would terminate the string early and let the remainder
 /// be evaluated as PowerShell. A space is passed straight through, never
-/// refused: `hole-tun 2`  is real production
-/// input, and refusing it would skip cleanup and leak the adapter — worse
-/// than the injection this guards against.
+/// refused: a name such as `hole-tun 2` is real production input.
 #[cfg(any(target_os = "windows", test))]
 fn build_remove_adapter_script(tun_name: &str) -> String {
     let escaped = tun_name.replace('\'', "''");
@@ -44,27 +41,17 @@ fn build_remove_adapter_script(tun_name: &str) -> String {
     )
 }
 
+/// Remove every adapter whose name starts with `tun_name`. Failures are logged,
+/// never returned: the caller is already tearing down.
 #[cfg(target_os = "windows")]
 pub fn remove_adapter(tun_name: &str) {
     use tracing::{debug, warn};
     use util::system_tool::SystemPowershell;
 
-    // Provenance canary, not a charset filter — `build_remove_adapter_script`
-    // itself now escapes any `'` safely, so this is not standing in for that,
-    // and a prefix/charset check on `tun_name` was tried and reverted: this
-    // function's callers are not only production's `WINDOWS_TUN_ALIAS`/its
-    // #936-disambiguated siblings (`"hole-tun 2"`, ...) but also the
-    // privileged tests in `device::ipv6_addr_privileged_tests` and
-    // `net::metric_privileged_tests`, whose device names are deliberately
-    // `"ipv6t-hole"`/`"metrict-hole"` — chosen specifically to NOT match
-    // `hole-tun*`, so a live production sweep can't delete them out from
-    // under a concurrent test (see those modules' docs). No shared prefix or
-    // charset exists across every legitimate caller, so the one invariant
-    // actually true of all of them — and the one whose violation is
-    // genuinely dangerous — is checked instead: an empty name turns the glob
-    // at `'{tun}*'` below into `'*'`, matching and deleting *every* adapter
-    // on the machine, not just Hole's own. A caller reaching here with no
-    // real device identity is exactly "provenance drifted".
+    // The callers' names share no prefix (production's `hole-tun`/`hole-tun 2`,
+    // and the privileged tests' deliberately non-matching names), so the one
+    // checkable invariant is a non-empty name: an empty one turns the glob
+    // below into `'*'` and deletes every adapter on the machine.
     debug_assert!(
         !tun_name.is_empty(),
         "adapter_cleanup's provenance assumption drifted: an empty tun_name \

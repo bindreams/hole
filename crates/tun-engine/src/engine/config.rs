@@ -29,9 +29,9 @@ pub struct EngineConfig {
     /// How often an admitted TCP connection with nothing else to send probes
     /// its client while idle.
     ///
-    /// A quarter of [`tcp_peer_timeout`](Self::tcp_peer_timeout), so a client
-    /// that is merely quiet answers three probes before the bound is reached,
-    /// and only a client that has stopped answering altogether trips it.
+    /// Keep this well under [`tcp_peer_timeout`](Self::tcp_peer_timeout), so a
+    /// client that is merely quiet answers several probes before the bound is
+    /// reached, and only a client that has stopped answering altogether trips it.
     pub tcp_keep_alive_interval: Duration,
     /// How long an admitted TCP connection tolerates silence from its client
     /// before it is reset and its slot reclaimed.

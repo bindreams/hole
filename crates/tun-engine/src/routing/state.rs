@@ -39,7 +39,7 @@ use super::{planned_routes, RouteId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RouteForm {
-    /// The bypass names a gateway (today's form).
+    /// The bypass names a gateway.
     Via,
     /// The bypass names only the interface — there was no gateway to name.
     OnLink,
@@ -234,21 +234,22 @@ util::assert_contiguous!(RouteState);
 
 // Canonical form ======================================================================================================
 
-/// Reduce a list of route-provenance groups to canonical form: groups
-/// sharing an identity — `tun_name`, `server_ip`, `interface_name`,
-/// `original_gateway`, `route_form`, the tuple that determines the teardown
-/// argv a group emits — merge into one whose `installed` is the union, each
-/// surviving
-/// group's `installed` is sanitized against `planned_routes(server_ip)` (an
-/// id with no possible teardown command can never drain, so it would pin the
-/// group non-empty forever), and a group left with an empty `installed` is
-/// dropped. Two groups with the same identity would otherwise emit
-/// byte-identical teardown commands: the second is either never confirmed
-/// (permanently stuck bookkeeping) or, on macOS's unscoped split-route
-/// deletes, removes whatever a third party claimed after the first delete
-/// freed the prefix. The sole shared entry point for every path that folds a
-/// group into a persisted `stale`/`installed` set — sweep and crash
-/// recovery alike — so they cannot drift apart on this discipline.
+/// Reduce a list of route-provenance groups to canonical form:
+///
+/// - groups sharing an identity (`tun_name`, `server_ip`, `interface_name`,
+///   `original_gateway`, `route_form`: the tuple that determines the teardown
+///   argv a group emits) merge into one whose `installed` is the union;
+/// - each surviving group's `installed` is sanitized against
+///   `planned_routes(server_ip)`, since an id with no possible teardown command
+///   can never drain and would pin the group non-empty forever;
+/// - a group left with an empty `installed` is dropped.
+///
+/// Two groups with the same identity would otherwise emit byte-identical
+/// teardown commands: the second is either never confirmed (permanently stuck
+/// bookkeeping) or, on macOS's unscoped split-route deletes, removes whatever a
+/// third party claimed after the first delete freed the prefix. The sole shared
+/// entry point for every path that folds a group into a persisted
+/// `stale`/`installed` set, sweep and crash recovery alike.
 pub fn coalesce(groups: Vec<StaleRecord>) -> Vec<StaleRecord> {
     let mut merged: Vec<StaleRecord> = Vec::new();
     for g in groups {

@@ -42,9 +42,8 @@ pub fn udp_flow(key: FlowKey) -> (UdpFlow, UdpFlowPeer) {
 /// going away: `UdpFlow::recv` then yields `None` and `UdpFlow::send`
 /// fails.
 pub struct UdpFlowPeer {
-    // Underscored because they are held, not read: the flow's liveness is
-    // all these two ends are here for. Units that move datagrams through
-    // them come later.
+    // Underscored because they are held, not read: the flow's liveness is all
+    // these two ends are here for.
     _inbound: mpsc::Sender<Vec<u8>>,
     _reply_rx: mpsc::Receiver<UdpReply>,
 }
