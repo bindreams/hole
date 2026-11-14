@@ -13,7 +13,7 @@ fn stage_dir_is_per_pid_under_temp() {
     assert_eq!(p, std::env::temp_dir().join("hole-dev-1234"));
 }
 
-/// The `.cmd`/PATHEXT trap (dev.py §5.17/§6.4): `which` must resolve a
+/// The `.cmd`/PATHEXT trap: `which` must resolve a
 /// PATH name to a spawnable file. Hermetic targets: `cargo` exists on every
 /// dev/CI host running these tests; on Windows additionally pin that a
 /// builtin-shaped name resolves to a real `.exe`/`.cmd` path.
@@ -34,8 +34,8 @@ fn resolve_tool_appends_windows_extension() {
     );
 }
 
-/// The guard is registered BEFORE the dir is created (dev.py §5.11: a
-/// partially-created dir still gets removed) and removes it on drop.
+/// The guard is registered BEFORE the dir is created (so a partially-created
+/// dir still gets removed) and removes it on drop.
 #[skuld::test]
 fn guard_removes_dir_even_when_created_after_registration() {
     let base = tempfile::tempdir().unwrap();
@@ -219,13 +219,11 @@ fn npm_launch_reports_a_missing_node_on_path() {
     );
 }
 
-/// The preflight children (`npm install`, `cargo xtask stage`) are the ones the
-/// containment migration originally skipped. npm shells out for native-module
-/// builds and `cargo xtask stage` runs a nested cargo and rustc, so a lone kill
-/// on the interrupt path orphans all of them — hole#197 in the one place it was
-/// left. The module doc used to justify that by the terminal broadcasting
-/// Ctrl+C to the child's group, which covers neither descendants nor a
-/// programmatic SIGTERM.
+/// The preflight children (`npm install`, `cargo xtask stage`) are contained.
+/// npm shells out for native-module builds and `cargo xtask stage` runs a
+/// nested cargo and rustc, so a lone kill on the interrupt path would orphan
+/// all of them; the terminal broadcasting Ctrl+C to the child's group covers
+/// neither descendants nor a programmatic SIGTERM.
 ///
 /// Two assertions: the mechanism exists (deterministic, and the one an
 /// uncontained spawn loses), and the tree teardown really reaches a grandchild.

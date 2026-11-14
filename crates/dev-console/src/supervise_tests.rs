@@ -1,7 +1,7 @@
 //! Integration seams: ready-rendezvous against a fake bridge child, and the
 //! teardown helper against a real grandchild tree. The REAL end-to-end
-//! (sudo, TUN, Vite, webview) is the manual smoke test in the PR checklist —
-//! it needs a password prompt and a real network stack.
+//! (sudo, TUN, Vite, webview) is a manual smoke test — it needs a password
+//! prompt and a real network stack.
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
@@ -55,9 +55,9 @@ async fn fake_bridge_satisfies_ready_listener() {
     let _ = child.kill().await;
 }
 
-/// dev.py:306-307 parity: an already-exited child must not be signalled — its
-/// pgid may have been recycled, and on Windows its handle is released. Pin the
-/// guard predicate on live vs exited children.
+/// An already-exited child must not be signalled — its pgid may have been
+/// recycled, and on Windows its handle is released. Pin the guard predicate on
+/// live vs exited children.
 ///
 /// The `kill_tree` → `wait` → observed-exit sequence here is also the
 /// executable stand-in for `run_vite_and_measure`'s, which is
@@ -83,7 +83,7 @@ async fn exited_children_are_not_signalled() {
     assert!(has_exited(&mut child), "kill_tree + wait ends the direct child");
 }
 
-/// The spec's promised integration test: teardown reaps a grandchild tree.
+/// Teardown reaps a grandchild tree.
 /// Control-channel death-watch pattern: the GRANDCHILD holds the conn; EOF/RST
 /// proves the tree died.
 #[skuld::test]
@@ -106,8 +106,8 @@ async fn teardown_reaps_grandchild_tree() {
     teardown_grouped(&mut child, ChildRole::Vite).await;
 
     // Teardown alone must leave no survivors: on Windows CTRL_BREAK stops at
-    // console-group boundaries, so a grandchild in its own console group (this
-    // harness's deliberate #197 mirror) dies only to the tree kill.
+    // console-group boundaries, so a grandchild in its own console group (the
+    // production shape) dies only to the tree kill.
 
     let mut buf = [0u8; 1];
     match conn.read(&mut buf).await {

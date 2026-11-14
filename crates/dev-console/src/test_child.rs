@@ -124,10 +124,8 @@ fn run_spawn_grandchild(own_console_group: bool) -> ! {
     let mut cmd = std::process::Command::new(exe);
     cmd.env(MODE_ENV, "sleep");
     // Windows: unless the caller wants it reachable by CTRL_BREAK, give the
-    // grandchild its OWN console group (mirrors
-    // mock-plugin's grandchild, crates/mock-plugin/src/main.rs:196-201) so a
-    // CTRL_BREAK to the root can't reach it — it dies ONLY via the job, the
-    // actual #197 production scenario.
+    // grandchild its OWN console group so a CTRL_BREAK to the root can't
+    // reach it — it dies ONLY via the job, the case containment exists for.
     #[cfg(windows)]
     if own_console_group {
         use std::os::windows::process::CommandExt as _;

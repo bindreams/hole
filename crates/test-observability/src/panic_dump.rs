@@ -4,7 +4,8 @@
 //! calls [`PanicDumpSource::dump`] on each registered source, writing
 //! to stderr. Then chains to the previous hook (typically the
 //! tracing-emitting `hole_common::logging::install_panic_hook` chain,
-//! which itself chains to libtest's panic printer).
+//! which itself chains to libtest's panic printer), except on a poisoned
+//! registry mutex (see `install_panic_hook_once`).
 //!
 //! Hook installation is wired into [`crate::install`], not exposed at
 //! the API surface — consumers register sources, the dispatcher hook
@@ -47,10 +48,9 @@ pub struct PanicDumpGuard {
 
 impl Drop for PanicDumpGuard {
     fn drop(&mut self) {
-        // `lock().ok()` — on a poisoned mutex (a concurrent panic
-        // hook may have observed mid-mutation state), silently skip
-        // unregistration. The map will leak this entry until process
-        // exit, which is fine in a test binary.
+        // On a poisoned mutex, silently skip unregistration. The map
+        // leaks this entry until process exit, which is fine in a test
+        // binary.
         if let Ok(mut reg) = registry().lock() {
             reg.remove(&self.key);
         }
@@ -78,8 +78,7 @@ fn next_key() -> u64 {
 /// iterating), registration silently no-ops and the returned guard is
 /// a tombstone — its `Drop` is also a no-op.
 ///
-/// `next_key()` uses `AtomicU64::fetch_add(1)`; overflow is structurally
-/// out of reach (at 1 register/μs that's 584,000 years).
+/// Registry keys come from a `u64` counter, which a test run cannot overflow.
 pub fn register(source: Arc<dyn PanicDumpSource>) -> PanicDumpGuard {
     let key = next_key();
     if let Ok(mut reg) = registry().lock() {
@@ -96,7 +95,8 @@ pub fn register(source: Arc<dyn PanicDumpSource>) -> PanicDumpGuard {
 /// libtest) and chains it after the dispatcher pass.
 ///
 /// On panic: iterate registry → call `dump` on each source → chain
-/// to previous hook. Poisoned mutex → skip dump pass, fall through.
+/// to previous hook. A poisoned registry mutex makes the hook return without
+/// calling the previous hook (open: bindreams/hole#1300).
 ///
 /// Called from [`crate::install`]; test-support consumers should not
 /// call this directly — registering a source is enough.
@@ -118,7 +118,7 @@ pub(crate) fn install_panic_hook_once() {
             // pass lock-free.
             let sources: Vec<Arc<dyn PanicDumpSource>> = match registry().lock() {
                 Ok(reg) => reg.values().cloned().collect(),
-                Err(_) => return, // poisoned — silently skip
+                Err(_) => return, // poisoned — returns without chaining to `prev`
             };
             if !sources.is_empty() {
                 let mut stderr = std::io::stderr().lock();

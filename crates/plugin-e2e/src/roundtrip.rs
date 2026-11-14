@@ -1,7 +1,6 @@
 //! Client-side roundtrip driver: a garter client chain → `ProxyClientStream`
-//! → fake sentinel. Replaces the suites' former dependency on `hole-bridge`'s
-//! `server_test::run_server_test`, keeping the plugin tests decoupled from the
-//! VPN bridge. Transport-agnostic: the client plugin's local listener is
+//! → fake sentinel. Keeps the plugin tests decoupled from the VPN bridge.
+//! Transport-agnostic: the client plugin's local listener is
 //! always TCP loopback regardless of the client↔server transport
 //! (WS/WS-TLS/QUIC live between the plugin processes).
 //!
@@ -42,8 +41,8 @@ pub enum NotReachableKind {
     /// `ConnectionReset`, `BrokenPipe`, or `ConnectionAborted`. A pre-handshake
     /// gate refusal surfaces here, whether the close is FIN (EOF) or RST (reset).
     PeerClosed,
-    /// The read timed out (the documented cold-start flake), distinct from a
-    /// peer close so a fail-closed assert can exclude transient slowness.
+    /// The read timed out, distinct from a peer close so a fail-closed assert
+    /// can exclude transient slowness.
     ReadTimeout,
     /// Bytes arrived but were not the expected `HTTP` reply.
     WrongReply,
@@ -73,13 +72,11 @@ pub enum Roundtrip {
 /// **galoshes** on both ends, the server and client each extract their own
 /// embedded `ex-ray` concurrently, and a cold host scanning those binaries
 /// (Windows Defender on a just-built `ex-ray.exe`) can push the first
-/// roundtrip past a single-digit-second bound — the observed flake was a
-/// "read timed out" at ~5.9 s against a former 5 s `read_timeout`. These bounds
-/// are not a timing assumption: on a healthy host the roundtrip completes in
-/// milliseconds and the budget is never approached; on a true wedge the test
-/// still fails in bounded time. Do NOT tighten them to "make the suite faster"
-/// — a tight class-2 bound that flakes on cold-start is exactly the degenerate
-/// timing-assumption the invariant forbids.
+/// roundtrip past a single-digit-second bound. On a healthy host the roundtrip
+/// completes in milliseconds and the budget is never approached; on a true
+/// wedge the test still fails in bounded time. Do NOT tighten them to "make the
+/// suite faster" — a tight class-2 bound that flakes on cold-start is exactly
+/// the timing assumption the invariant forbids.
 pub struct RoundtripConfig {
     pub ss_connect_timeout: Duration,
     pub read_timeout: Duration,
@@ -116,20 +113,16 @@ pub async fn run_roundtrip(
 
     // Reserve SS_LOCAL, spawn the client chain, and await its readiness.
     // Retried, unboundedly, only on `StartError::BindConflict` — real
-    // ephemeral-port saturation (per #300, no budget should mask it). Every
+    // ephemeral-port saturation, which no retry budget should mask. Every
     // other outcome (ready, a non-conflict `StartError`, a dropped sender, or
     // the per-attempt `cfg.ready_timeout` firing) ends the loop, so an
     // ambiguous or wedged child cannot spin. The outer bound is the
-    // `test-plugin-e2e` step's 45-minute `timeout-minutes` in `ci.yaml`, which
-    // fails the step with its log kept; the milestone logging below leaves
-    // evidence in that log if it fires.
+    // `test-plugin-e2e` step's `timeout-minutes` in `ci.yaml`, which fails the
+    // step with its log kept; the milestone logging below leaves evidence in
+    // that log if it fires.
     let mut attempt: u64 = 1;
     let (listen, cancel, handle) = loop {
-        // SS_LOCAL: reserved TCP+UDP, not because SS_LOCAL is universally
-        // TCP+UDP, but because this driver is generic over
-        // `client_plugin_path` and its consumer set includes galoshes, whose
-        // yamux client binds both there. Over-reserving UDP for a TCP-only
-        // client (e.g. ex-ray) is free.
+        // SS_LOCAL: why this reservation is TCP+UDP is in the `ports` module doc.
         let local = match ports::reserve_ss_local().await {
             Ok(addr) => addr,
             Err(e) => return Roundtrip::ChainFailed(format!("reserve SS_LOCAL: {e}")),

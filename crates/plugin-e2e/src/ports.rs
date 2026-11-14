@@ -1,28 +1,25 @@
 //! plugin-e2e's only port-reservation seam.
 //!
 //! Reserve a cross-process port for the protocols its consumer will bind.
-//! Where the consumer is known at reservation time, name it —
+//! Where the consumer is known at reservation time, name it:
 //! `hole_common::plugin::PluginDescriptor::alloc_protocols` sizes SS_LOCAL per
-//! plugin (galoshes TCP+UDP, everything else TCP) and is correct because the
-//! bridge knows the plugin. Where the reservation happens before the consumer is
-//! known, reserve the union over the possible consumers: over-reserving
-//! costs a retry, under-reserving costs a race.
+//! plugin (galoshes TCP+UDP, everything else TCP), which is correct there
+//! because the bridge knows the plugin. Where the reservation happens before the
+//! consumer is known, reserve the union over the possible consumers:
+//! over-reserving costs a retry, under-reserving costs a race.
 //!
-//! - [`reserve_ss_local`] — the SIP003 client plugin's local,
+//! - [`reserve_ss_local`]: the SIP003 client plugin's local,
 //!   data-source-facing endpoint, bound by the child. TCP+UDP because this
 //!   harness is generic over client plugins and its consumer set includes
 //!   galoshes, whose yamux client binds both there whatever the tunnel is.
-//!   It is not that SS_LOCAL is universally TCP+UDP: ex-ray's client inbound
-//!   is TCP-only, and the bridge, which knows its binary, correctly reserves
-//!   TCP for it.
-//! - [`reserve_unbound`] — an endpoint nothing in the test binds, only
+//!   SS_LOCAL is not universally TCP+UDP: ex-ray's client inbound is TCP-only.
+//! - [`reserve_unbound`]: an endpoint nothing in the test binds, only
 //!   dials (or never reaches). Same union, so a later change that does bind
 //!   it cannot inherit a narrow reservation.
-//! - [`reserve_public`] — parameterised, because its consumer is known and
+//! - [`reserve_public`]: parameterised, because its consumer is known and
 //!   genuinely varies: ex-ray binds TCP for WS/WS-TLS and UDP for QUIC. Its
-//!   argument is "the protocols the plugin subprocess will bind", not "the
-//!   protocols the transport uses". Those coincide today; the first is the
-//!   reason, the second is a coincidence.
+//!   argument is the protocols the plugin subprocess will bind, not the
+//!   protocols the transport uses.
 
 // Every reservation here is handed to a child process that binds it
 // out-of-process, so none can be folded into `bind_ephemeral`'s in-process

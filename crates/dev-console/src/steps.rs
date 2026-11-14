@@ -2,8 +2,7 @@
 //! here run with INHERITED stdio (the user watches cargo/npm output directly)
 //! and are contained, so an interrupt tears down the whole tree rather than the
 //! one process we hold: `run_step`'s watcher reaps and unwinds with
-//! `Interrupted`, so guards Drop (dev.py's atexit-on-KeyboardInterrupt
-//! equivalent, Delta 2 extends it to SIGTERM).
+//! `Interrupted`, so guards Drop.
 //!
 //! Containment makes that watcher the SINGLE teardown path for both interrupt
 //! kinds. Relying on the terminal to broadcast Ctrl+C to the child's group
@@ -19,8 +18,8 @@ use crate::ansi::{BOLD, RESET, YELLOW};
 use crate::interrupts::Interrupts;
 
 /// A preflight child failed; carries its exit code for propagation.
-/// dev.py message parity: npm/cargo failures exit with the child's code and
-/// print NOTHING extra; only the stage step has a message (dev.py:467).
+/// npm/cargo failures exit with the child's code and print NOTHING extra; only
+/// the stage step has a message.
 #[derive(Debug)]
 pub struct StepFailed {
     pub what: &'static str,
@@ -48,9 +47,8 @@ impl std::fmt::Display for Interrupted {
 }
 impl std::error::Error for Interrupted {}
 
-/// Resolve a tool on PATH. `which` 8 performs Windows PATHEXT resolution
-/// (`npm` → `npm.cmd`), which `CreateProcess` alone does not — the single
-/// most-cited dev.py porting trap (§5.17/§6.4); pinned by
+/// Resolve a tool on PATH. `which` performs Windows PATHEXT resolution
+/// (`npm` → `npm.cmd`), which `CreateProcess` alone does not; pinned by
 /// `resolve_tool_appends_windows_extension`.
 pub fn resolve_tool(name: &str) -> Result<PathBuf> {
     which::which(name).with_context(|| format!("{YELLOW}{name} not found on PATH{RESET}"))
@@ -66,8 +64,8 @@ pub fn resolve_tool(name: &str) -> Result<PathBuf> {
 ///
 /// Resolving to a real image rather than routing around the refusal is what
 /// keeps the spawn on cosca's raw `CreateProcessW` backend, where the handle
-/// list scopes inheritance (bindreams/hole#197); a `commandline()` spawn would
-/// have to drop `executable()` and lose it.
+/// list scopes inheritance; a `commandline()` spawn would have to drop
+/// `executable()` and lose it.
 ///
 /// Deliberately NOT mirrored from `npm.cmd`: its `npm-prefix.js` lookup, which
 /// prefers a globally-installed npm over the bundled one. That needs a
@@ -167,11 +165,10 @@ pub(crate) fn contain_preflight(cmd: &mut cosca::tokio::Command) -> &mut cosca::
 ///
 /// Containment is what makes the teardown reach descendants — npm shells out to
 /// native-module builds and `cargo xtask stage` runs a nested cargo and rustc,
-/// and a lone kill leaves all of them orphaned (bindreams/hole#197). It also
-/// takes the child out of our console/process group, so the terminal's own
-/// Ctrl+C no longer reaches it: this watcher is now the single teardown path,
-/// which is the point. A programmatic SIGTERM never reached the child that way
-/// in the first place.
+/// and a lone kill leaves all of them orphaned. It also takes the child out of
+/// our console/process group, so the terminal's own Ctrl+C does not reach it:
+/// this watcher is the single teardown path. A programmatic SIGTERM never
+/// reached the child through the terminal either.
 ///
 /// Stdio is left unconfigured, which cosca inherits for slots 0/1/2 exactly as
 /// std does — the user watches cargo/npm progress directly.
@@ -213,7 +210,7 @@ async fn run_step(
 
 /// `npm install` unconditionally — a skip-on-exists would silently miss
 /// dependency additions pulled from a new commit and leave Vite failing to
-/// resolve the import; ~1s on a healthy tree (dev.py §5.12).
+/// resolve the import.
 pub async fn ensure_node_modules(npm: &NpmLaunch, interrupts: &mut Interrupts) -> Result<()> {
     note!("{BOLD}Syncing npm dependencies...{RESET}");
     let mut cmd = cosca::tokio::Command::new();
@@ -254,8 +251,8 @@ impl Drop for StageDirGuard {
 }
 
 /// `cargo xtask stage --profile debug --out-dir <stage>` — the BINDIR
-/// contents/naming are owned by xtask (`xtask/src/bindir.rs`, #143). The
-/// only preflight step with a failure message (dev.py:467).
+/// contents/naming are owned by xtask (`xtask/src/bindir.rs`). The only
+/// preflight step with a failure message.
 pub async fn stage_bindir(cargo: &Path, out_dir: &Path, interrupts: &mut Interrupts) -> Result<()> {
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(cargo);

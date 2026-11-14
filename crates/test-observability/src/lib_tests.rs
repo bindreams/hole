@@ -47,11 +47,10 @@ fn install_subscriber_dispatches_info_events() {
         .with_writer(buf.clone())
         .with_ansi(false)
         .finish();
-    // Sync test, no tokio runtime — the #302
-    // `set_default_in_current_thread` helper's check would pass
-    // through. Sanctioned to use the raw form here (test-observability
-    // sits beneath garter in the dep graph, so we can't depend on the
-    // helper).
+    // Sync test, no tokio runtime, so `set_default_in_current_thread`'s
+    // runtime check would pass through. Sanctioned to use the raw form here
+    // (test-observability sits beneath garter in the dep graph, so we can't
+    // depend on the helper).
     #[allow(clippy::disallowed_methods)]
     let _g = tracing::subscriber::set_default(local);
 
@@ -85,13 +84,12 @@ fn shadowsocks_service_trace_is_filter_rejected_cheaply() {
     }
     let elapsed = start.elapsed();
 
-    // Expected wall-clock is < 10 ms. A regression (full formatting
-    // + write per event) would be tens of seconds. 500 ms threshold
-    // is generous.
+    // A regression (full formatting + write per event) would take orders of
+    // magnitude longer than level-rejection, so the threshold is generous.
     assert!(
         elapsed < std::time::Duration::from_millis(500),
         "shadowsocks_service log::trace! took {elapsed:?} for 100k events — \
-         EnvFilter level-rejection path may have regressed. See bindreams/hole#147."
+         EnvFilter level-rejection path may have regressed."
     );
 }
 

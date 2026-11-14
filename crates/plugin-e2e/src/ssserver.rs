@@ -8,8 +8,8 @@
 //! own sitrep `hello` ([`garter::ReadinessMode::Auto`]); the public port is
 //! pre-allocated and retried on the in-band `bind_conflict` signal. There is NO
 //! `shadowsocks-service` `PluginConfig` (its bind-and-drop rendezvous-port juggling
-//! is the #197 race; and it HANGS the test process on an assertion failure by
-//! leaving the plugin subprocess tree unreaped). The returned [`PluginServer`]
+//! races, and it HANGS the test process on an assertion failure by leaving the
+//! plugin subprocess tree unreaped). The returned [`PluginServer`]
 //! must be kept alive for the duration of the test that uses it.
 
 use crate::certs::TestCerts;
@@ -137,8 +137,8 @@ pub async fn start_real_ss_server_with_plugin_ws_tls(
 /// binds a single UDP socket there, nothing else.
 ///
 /// Works with either the **galoshes** binary (which drives its embedded ex-ray)
-/// or a bare **ex-ray** binary: since bindreams/hole#421, ex-ray UDP-probes its
-/// inbound and reports `transports:["udp"]` for server+quic.
+/// or a bare **ex-ray** binary: ex-ray UDP-probes its inbound and reports
+/// `transports:["udp"]` for server+quic.
 pub async fn start_real_ss_server_with_plugin_quic(
     method: CipherKind,
     password: &str,
@@ -161,7 +161,7 @@ pub async fn start_real_ss_server_with_plugin_quic(
 /// subprocess. nextest runs each test in its own process, so a `kill`-orphaned
 /// inner ex-ray (when graceful stop didn't run, e.g. on a test panic) is reaped
 /// by the OS when that per-test process exits — it does NOT block process exit
-/// (the load-bearing fail-fast property; see the #197 hang investigation).
+/// (the load-bearing fail-fast property).
 pub struct PluginServer {
     cancel: CancellationToken,
     _chain: JoinHandle<garter::Result<()>>,
@@ -189,8 +189,8 @@ impl Drop for PluginServer {
 /// on the in-band `StartError::BindConflict` signal with a fresh port — the same
 /// unbounded "no budget" discipline as `port_alloc::bind_ephemeral` (terminates
 /// only on ready or a non-race error; the failure-to-human bound is the
-/// `test-plugin-e2e` step's 45-minute `timeout-minutes` in `ci.yaml`, which fails
-/// the step with its log kept — the milestone logging below leaves evidence if
+/// `test-plugin-e2e` step's `timeout-minutes` in `ci.yaml`, which fails the
+/// step with its log kept — the milestone logging below leaves evidence if
 /// that fires).
 async fn spawn_ss_with_plugin(
     method: CipherKind,
@@ -201,7 +201,7 @@ async fn spawn_ss_with_plugin(
 ) -> (SocketAddr, PluginServer) {
     // Plain ss-server on a HELD loopback port (no plugin). The plugin chain
     // forwards decapsulated traffic here; the port is held for the server's
-    // lifetime, so there is no bind-and-drop rendezvous race (the #197 class).
+    // lifetime, so there is no bind-and-drop rendezvous race.
     let (ss_addr, ss_handle) = start_real_ss_server(method, password).await;
 
     let mut attempt: u32 = 0;
@@ -240,7 +240,7 @@ async fn spawn_ss_with_plugin(
 
         // Bound readiness: a wedged server plugin chain must FAIL LOUDLY, not
         // hang the fixture forever — a fixture hang yields no captured output and
-        // wedges the whole serial group (the #197/#518 lesson). The chain becomes
+        // wedges the whole serial group. The chain becomes
         // ready in seconds; this generous bound only catches a genuine never-ready.
         // Class-2 subprocess failure-bound surfaced to a human, not intra-process sync.
         match tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx).await {

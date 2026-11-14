@@ -8,10 +8,9 @@
 //! Windows (`#[cfg(not(target_os = "windows"))]`): both present a self-signed
 //! cert the client trusts via ex-ray's `AUTHORITY_VERIFY`, and v2ray-core's
 //! `getCertPool` drops custom certs on Windows — the same limitation that gates
-//! `interop.rs::mod quic`. macOS + Linux run all three. (bindreams/hole#197: the
-//! galoshes-server fixture is now the garter-based launcher in `ssserver.rs`,
-//! not `shadowsocks-service`'s `PluginConfig`; readiness is deterministic, so
-//! there is no `wait_for_port`.)
+//! `interop.rs::mod quic`. macOS + Linux run all three. The galoshes-server
+//! fixture is the garter-based launcher in `ssserver.rs`; readiness is
+//! deterministic, so there is no `wait_for_port`.
 
 #![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
@@ -162,7 +161,7 @@ mod roundtrips {
     const WS_CLIENT_OPTS: &str = "host=cloudfront.com;path=/";
 
     /// `mux` also selects the server's dokodemo destination, so a default client
-    /// and a `mux=1` server no longer speak the same wire format. Proving the
+    /// and a `mux=1` server cannot speak the same wire format. Proving the
     /// tunnel BREAKS is what shows the default actually changed.
     #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
     fn galoshes_ws_mux_default_cannot_reach_a_mux1_server() {
@@ -251,8 +250,7 @@ mod roundtrips {
         });
     }
 
-    /// galoshes server↔client over QUIC (the path #421 unblocked; off Windows —
-    /// see file header). Readiness is deterministic — the launcher returns only
+    /// galoshes server↔client over QUIC (off Windows — see file header). Readiness is deterministic — the launcher returns only
     /// after galoshes' sitrep `ready` — so a single roundtrip suffices, no
     /// retry/sleep. (A flake here would mean a real readiness gap to root-cause,
     /// not a reason to re-add timing.)
@@ -416,9 +414,8 @@ mod roundtrips {
 }
 
 /// Pin the premise that makes SS_LOCAL's TCP+UDP reservation necessary: a
-/// galoshes client really does bind UDP there, unconditionally. This is not a
-/// RED test for bindreams/hole#931's fix — it passes both before and after —
-/// it is a deterministic pin on the premise. It fails loudly the day galoshes
+/// galoshes client really does bind UDP there, unconditionally. A deterministic
+/// pin on the premise, not a regression test: it fails loudly the day galoshes
 /// stops binding UDP on SS_LOCAL, which is the day the reservation could be
 /// narrowed.
 mod ss_local {

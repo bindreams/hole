@@ -1,4 +1,4 @@
-//! Port of scripts/test_console_corruption.py — the stdin=null contract.
+//! The stdin=null contract: a child spawned with null stdin cannot corrupt the console input mode.
 //! Label `windows_console`: needs a real interactive console and npm.
 //! Run locally:
 //! `SKULD_LABELS=windows_console cargo nextest run -p dev-console -E 'test(null_stdin_child_cannot_corrupt_console_mode)'`
@@ -21,7 +21,7 @@ fn console_input_mode() -> Option<u32> {
 }
 
 /// Restore-on-drop guard so leg 1's deliberate corruption can't poison
-/// leg 2 or the terminal (ports test_console_corruption.py:110-113).
+/// leg 2 or the terminal.
 struct ConsoleModeGuard(u32);
 impl Drop for ConsoleModeGuard {
     fn drop(&mut self) {
@@ -46,7 +46,7 @@ async fn run_vite_and_measure(stdin: cosca::Stdio) -> u32 {
     cmd.executable(npm.program());
     cmd.args(npm.full_argv(&["run", "dev"]));
     // package.json lives at the workspace root; nextest's cwd is the crate
-    // dir (the Python original ran from the repo root).
+    // dir.
     cmd.current_dir(xtask_lib::repo_root::repo_root().expect("workspace root"));
     cmd.stdin(stdin).unwrap();
     cmd.stdout(cosca::Stdio::pipe()).unwrap();
@@ -91,10 +91,9 @@ async fn run_vite_and_measure(stdin: cosca::Stdio) -> u32 {
     console_input_mode().expect("console mode after")
 }
 
-/// BOTH legs of scripts/test_console_corruption.py — the vacuity guard
-/// matters: if leg 1 (inherited stdin) no longer reproduces the corruption,
-/// the stdin=null assertion in leg 2 proves nothing and the test must say so
-/// (Python exits 1 with "bug did NOT reproduce", lines 124-147).
+/// BOTH legs — the vacuity guard matters: if leg 1 (inherited stdin) no
+/// longer reproduces the corruption, the stdin=null assertion in leg 2 proves
+/// nothing and the test must say so.
 #[skuld::test(labels = [WINDOWS_CONSOLE])]
 async fn null_stdin_child_cannot_corrupt_console_mode() {
     let Some(before) = console_input_mode() else {

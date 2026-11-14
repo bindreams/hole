@@ -2,8 +2,7 @@ use crate::interrupts::Interrupts;
 
 /// A signal raised BETWEEN recv() calls (here: before the first one) must
 /// not be lost — install() registers persistent streams eagerly, and the
-/// watch channel buffers the edge. (The old fresh-ctrl_c()-per-recv design
-/// provably lost these; see the PR discussion.) Unix-gated like the bridge's
+/// watch channel buffers the edge. Unix-gated like the bridge's
 /// sigterm_resolves_shutdown_signal precedent: nextest isolates each test in
 /// its own process, so the raise cannot disturb siblings.
 #[cfg(unix)]

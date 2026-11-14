@@ -63,10 +63,9 @@ async fn port_probe_finds_v4_listener() {
     assert!(wait_for_port(port, std::time::Duration::from_secs(5)).await);
 }
 
-/// The v6-only case dev.py §5.5 guards: a listener on ::1 only must still be
-/// found (hosts-file ordering can make Vite's `localhost` bind v6-only).
-/// Loud-fail by design if ::1 is unavailable — all six GitHub-hosted runner
-/// images have IPv6 loopback; a runner without it should break this test,
+/// The v6-only case: a listener on ::1 only must still be found (hosts-file
+/// ordering can make Vite's `localhost` bind v6-only). Loud-fail by design if
+/// ::1 is unavailable: a runner without IPv6 loopback should break this test,
 /// not skip it.
 #[skuld::test]
 async fn port_probe_finds_v6_only_listener() {
