@@ -38,10 +38,8 @@ use super::{Device, MutDeviceConfig, TunName};
 use crate::{GLOBAL_NET_STATE, TUN};
 
 /// `Device::build` must run inside a live Tokio runtime, same as production:
-/// `tun`'s Unix `AsyncDevice::new` wraps the opened FD in
-/// `tokio::io::unix::AsyncFd` eagerly, at CONSTRUCTION (not lazily at first
-/// read/write, and not in `Drop`), so it panics ("there is no reactor running")
-/// the instant it is called off a runtime. `Dispatcher::new` always calls
+/// `tun`'s Unix `AsyncDevice::new` registers the FD with tokio at construction,
+/// so it panics off a runtime. `Dispatcher::new` always calls
 /// `Device::build` from inside `tokio::task::spawn_blocking`
 /// (`crates/bridge/src/dispatcher.rs`), whose worker threads carry the
 /// runtime's `Handle`.

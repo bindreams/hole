@@ -40,9 +40,8 @@
 //! unprivileged pass.
 //!
 //! `dns_confine_global_net_state_adapter_reports_back_its_requested_guid` at
-//! the bottom tests the adapter-GUID identity in `device::identity`, not the
-//! confinement; it lives here only because the `dns_confine_global_net_state_`
-//! prefix is what the nextest group matches.
+//! the bottom pins the adapter-GUID identity in `device::identity`, not the
+//! confinement; it carries the group's prefix to join the same nextest group.
 
 #![cfg(target_os = "windows")]
 
@@ -468,11 +467,10 @@ fn dns_confine_global_net_state_permits_the_server_on_port_53() {
 /// minor interesting complications with its usage" (`wintun.h`), and
 /// `wintun-bindings` ships a live GUID-mismatch handler. Creates a real adapter
 /// through the PRODUCTION path (`Device::build`, which requests
-/// `HOLE_ADAPTER_GUID`), drops it, then
-/// re-opens by NAME (not by handle) and reads the GUID back via
-/// `probe_incumbent` — the exact ADOPT-path read `Device::build` itself
-/// performs on its next start. If this fails, the ownership gate is
-/// worthless as designed: **stop and raise it, do not weaken this test.**
+/// `HOLE_ADAPTER_GUID`), drops it, then re-opens by NAME (not by handle) and
+/// reads the GUID back via `probe_incumbent` — the exact ADOPT-path read
+/// `Device::build` itself performs on its next start. A failure means the
+/// GUID-based ownership gate does not work.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_adapter_reports_back_its_requested_guid() {
     let name = "dns-confine-test-tun-guid";

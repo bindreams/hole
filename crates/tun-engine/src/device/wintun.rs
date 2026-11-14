@@ -21,8 +21,6 @@
 //!    primary mechanism that puts wintun.dll where it can be found, but if
 //!    that ever drifts the user gets a clear error instead of the cryptic
 //!    "LoadLibraryExW failed".
-//!
-//! The loader's base-name dedup behaviour was verified empirically.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -116,8 +114,8 @@ fn resolve_wintun_path_inner(current_exe: Option<PathBuf>) -> Result<PathBuf, De
 
 /// Walk up from `start`, at most a fixed number of levels, looking for
 /// `<dir>/<rel>`. Returns the first matching candidate path (the caller checks
-/// it is a file). The bound covers `cargo`'s `target/<profile>/` and worktree
-/// layouts under `.tmp/claude/worktrees/`.
+/// it is a file). The bound covers `cargo`'s `target/<profile>/` layout and
+/// nested worktrees.
 fn walk_up_for(start: &Path, rel: &Path) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     for _ in 0..8 {

@@ -8,9 +8,10 @@
 //! **Failures warn and continue; on Windows they are fatal.** No test asserts
 //! that the alias succeeds on a real macOS run, so a failure here is not yet
 //! made fatal; the condition for making it fatal like Windows is that this path
-//! has run green on the darwin TUN lane. [`Assigned::Ipv6StackAbsent`]
-//! therefore means only "the alias did not take": macOS has no supported way to
-//! unbind the IPv6 stack from an interface, so there is no appearance wait.
+//! has run green on the darwin TUN lane (bindreams/hole#1316).
+//! [`Assigned::Ipv6StackAbsent`] therefore means only "the alias did not take":
+//! macOS has no supported way to unbind the IPv6 stack from an interface, so
+//! there is no appearance wait.
 //!
 //! `assign` logs the `ifconfig` argv before running it (`info`), then the
 //! outcome with exit code, stdout and stderr (`info` on success, `warn` on
@@ -21,9 +22,8 @@
 //! answer is read from its output text (see `crate::routing`'s
 //! `macos_route_confirmed_absent`), never the exit code.
 //!
-//! Not measured or logged: how long duplicate address detection keeps the
-//! address tentative. It is left enabled, and nothing on a TUN answers a probe,
-//! so it always succeeds; the cost is first-flow latency, not correctness.
+//! Duplicate address detection is left enabled; it always succeeds on a TUN
+//! and costs only first-flow latency.
 
 use smoltcp::wire::Ipv6Cidr;
 use tracing::{info, warn};

@@ -9,11 +9,7 @@
 //!   configd to merge it, drops the store handle **without** calling
 //!   `.remove()`, and blocks again for configd to un-merge it. It covers the
 //!   graceful path only (`Drop` glue runs), deliberately distinct from the
-//!   crash path below. If it fails, a session-scoped key is not a viable
-//!   design: stop and escalate to the owner. The fallback (a persistent key
-//!   with an owner token and an evidence-gated sweep) is a materially larger
-//!   design and must not be improvised; an ungated sweep would violate route
-//!   ownership (`docs/contributing/architecture/route-ownership.md`).
+//!   crash path below.
 //! - `macos_dns_global_net_state_session_keys_die_with_a_killed_process`:
 //!   drives the production `dns_steer::engage`, because what is under test is
 //!   whether `engage`'s key dies with a process that never runs a line of
@@ -22,9 +18,11 @@
 //!   [`run_holder`] before `skuld::run_all`. The holder calls `engage`, prints
 //!   a readiness line, and parks forever; the parent waits for that line,
 //!   waits for configd to merge the holder's key, sends `SIGKILL`, reaps the
-//!   child, and blocks again for configd to un-merge it. If it fails, having
-//!   no startup sweep is not justified: stop and escalate, and do not
-//!   improvise an ungated sweep to cover the gap.
+//!   child, and blocks again for configd to un-merge it.
+//!
+//! If either fails, a session-scoped key is not a viable design; an ungated
+//! sweep is not a substitute (see
+//! `docs/contributing/architecture/route-ownership.md`).
 //!
 //! Its own binary, not a module in the lib test binary: skuld validates that a
 //! label is declared once per binary, and the lib already declares `TUN`.
@@ -194,12 +192,8 @@ mod macos_impl {
 
     // The framework lifetime probe ====================================================================================
 
-    /// Ship gate: if this fails, configd does not honour `session_keys(true)`
-    /// for a merged DNS entry on a graceful in-process drop, and the
-    /// session-scoped key cannot be the design: stop and escalate to the owner.
-    /// The fallback (a persistent key with an owner token and an evidence-gated
-    /// sweep) is a materially larger design and must not be improvised; an
-    /// ungated sweep would violate route ownership.
+    /// Ship gate: a failure means configd does not honour `session_keys(true)`
+    /// for a merged DNS entry on a graceful in-process drop.
     #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn macos_dns_global_net_state_session_keys_die_with_their_session() {
         let (before_dns, before_nameservers) = resolver_set_uncovered("the resolver set before");
@@ -226,8 +220,7 @@ mod macos_impl {
         assert!(
             merged,
             "SESSION KEY UNUSABLE (never merged): configd never merged a session_keys(true) key \
-             into the derived DNS configuration. Stop and escalate; do not improvise an ungated \
-             sweep. scutil --dns:\n{merged_dns}"
+             into the derived DNS configuration. scutil --dns:\n{merged_dns}"
         );
 
         // No `.remove()` call — the store handle is simply dropped. This IS
@@ -250,7 +243,7 @@ mod macos_impl {
         assert!(
             unmerged,
             "SESSION KEY UNUSABLE (survived the drop): the session key survived the store handle being \
-             dropped. Stop and escalate; do not improvise an ungated sweep. scutil --dns:\n{after_dns}"
+             dropped. scutil --dns:\n{after_dns}"
         );
         assert_eq!(
             before_nameservers, after_nameservers,
@@ -297,10 +290,8 @@ mod macos_impl {
         }
     }
 
-    /// Ship gate: if this fails, a `SIGKILL`ed process's session key survives
-    /// it, so having no startup sweep is not justified: stop and escalate, and
-    /// do not improvise an ungated sweep to cover the gap (it would violate
-    /// route ownership).
+    /// Ship gate: a failure means a `SIGKILL`ed process's session key survives
+    /// it.
     #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn macos_dns_global_net_state_session_keys_die_with_a_killed_process() {
         let (before_dns, before_nameservers) = resolver_set_uncovered("the resolver set before");
@@ -342,7 +333,7 @@ mod macos_impl {
         assert!(
             merged,
             "PRECONDITION FAILED: the holder child's own `engage()` call never got merged into the \
-             DNS configuration, so `SIGKILL` would prove nothing — stop and escalate. \
+             DNS configuration, so `SIGKILL` would prove nothing. \
              scutil --dns:\n{merged_dns}"
         );
 
@@ -372,9 +363,8 @@ mod macos_impl {
 
         assert!(
             unmerged,
-            "SESSION KEY SURVIVED A KILLED PROCESS: a SIGKILLed process's session key outlived it, so \
-             having no startup sweep is not justified. Stop and escalate; do not improvise an \
-             ungated sweep. scutil --dns:\n{after_dns}\nholder stderr:\n{stderr}"
+            "SESSION KEY SURVIVED A KILLED PROCESS: a SIGKILLed process's session key outlived it. \
+             scutil --dns:\n{after_dns}\nholder stderr:\n{stderr}"
         );
         assert_eq!(
             before_nameservers, after_nameservers,

@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use smoltcp::socket::tcp;
 use smoltcp::wire::{TcpControl, TcpSeqNumber};
 use tokio::io::{Empty, Join, Sink};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::super::tcp_test_support::*;
 use super::super::udp_flow::UdpFlow;
@@ -44,11 +44,34 @@ impl Router for HoldingRouter {
     }
 }
 
+/// A router that drops each TCP flow at once and reports that it has, so a
+/// test can wait on the drop itself rather than on elapsed time.
+struct DroppingRouter(std::sync::Mutex<Option<oneshot::Sender<()>>>);
+
+#[async_trait::async_trait]
+impl Router for DroppingRouter {
+    async fn route_tcp(&self, _meta: TcpMeta, flow: TcpFlow) -> io::Result<()> {
+        drop(flow);
+        if let Some(dropped) = self.0.lock().unwrap().take() {
+            let _ = dropped.send(());
+        }
+        Ok(())
+    }
+
+    async fn route_udp(&self, _meta: UdpMeta, _flow: UdpFlow) -> io::Result<()> {
+        std::future::pending().await
+    }
+}
+
 /// The driver under test. Its TUN reads EOF and discards writes: these tests
 /// drive the smoltcp layer through `stack` and never call [`Driver::run`].
 type TestDriver = Driver<Join<Empty, Sink>>;
 
 fn driver(max_connections: usize) -> TestDriver {
+    driver_with(max_connections, Arc::new(HoldingRouter))
+}
+
+fn driver_with(max_connections: usize, router: Arc<dyn Router>) -> TestDriver {
     let config = MutEngineConfig {
         max_connections,
         ..MutEngineConfig::default()
@@ -57,7 +80,7 @@ fn driver(max_connections: usize) -> TestDriver {
     Driver::new(
         tokio::io::join(tokio::io::empty(), tokio::io::sink()),
         device_config(),
-        Arc::new(HoldingRouter),
+        router,
         Arc::new(config.freeze()),
         CancellationToken::new(),
     )
@@ -353,6 +376,30 @@ async fn a_dropped_router_leaves_the_clients_final_bytes_undelivered() {
     assert_eq!(out[0].ack, Some(TcpSeqNumber(1001 + 100 + 1)));
 }
 
+/// Pins the `Router::route_tcp` contract: a router that drops its `TcpFlow`
+/// closes the connection with a FIN, not an RST.
+#[skuld::test]
+async fn a_router_that_drops_its_flow_closes_the_connection_with_a_fin() {
+    let (dropped_tx, dropped_rx) = oneshot::channel();
+    let mut d = driver_with(4, Arc::new(DroppingRouter(std::sync::Mutex::new(Some(dropped_tx)))));
+    let (handle, synack_seq) = admit_one(&mut d, client(), dest(), 1000, 0);
+    d.stack.enqueue_rx(ack(client(), dest(), 1001, synack_seq));
+    d.stack.poll(t(2));
+    assert_eq!(d.stack.socket(handle).state(), tcp::State::Established);
+
+    dropped_rx.await.expect("the router task dropped its flow");
+    d.relay_tcp_data();
+    d.stack.poll(t(3));
+
+    let out = tcp_out(&mut d.stack);
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].control,
+        TcpControl::Fin,
+        "the drop closed the connection with a FIN"
+    );
+}
+
 /// `relay_tcp_data`'s `send_slice` calls are guarded by `can_send()`
 /// immediately beforehand with nothing in between that can change the
 /// socket's state, so `send_slice`'s only error (`InvalidState`) cannot
@@ -404,13 +451,11 @@ async fn a_partial_send_resumes_from_pending_send_on_the_next_relay_pass() {
     );
 }
 
-/// Reaches the `SocketStack`-level conclusion through `Driver`'s own methods.
-/// The phase sequence below is a copy of `Driver::run`'s, substituting
-/// `stack.poll(t(..))` for the driver's own poll because the fixture drives
-/// time explicitly; it is not a read of that order, and no assertion here
-/// would catch it changing. The sibling
-/// `a_fin_carrying_data_is_acknowledged_before_the_socket_can_be_removed` fails
-/// without the fix at the layer the fix lives in.
+/// Pins, through `Driver`'s own methods, that the ACK of a peer's
+/// data-carrying FIN leaves on the poll after ingestion and only then is the
+/// connection reaped. The phase sequence is a hand-copy of `Driver::run`'s with
+/// explicit time (`stack.poll(t(..))`), so it does not catch that order
+/// changing.
 #[skuld::test]
 async fn the_last_ack_reaches_the_wire_before_the_connection_is_reaped() {
     let mut d = driver(4);

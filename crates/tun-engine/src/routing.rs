@@ -368,10 +368,9 @@ fn route_confirmed_absent(output: &std::process::Output) -> bool {
 /// beyond the exit code, and unlike macOS, a non-zero exit does NOT
 /// unambiguously mean "already gone": `netsh ... delete route` on an absent
 /// route and on a route requiring elevation both exit 1 with no distinguishing
-/// text (verified empirically). Only exit 0 (a definite, successful delete)
-/// confirms the route gone; a non-zero exit conservatively keeps it recorded
-/// rather than risk silently dropping a route that is still there — a
-/// disclosed residual.
+/// text. Only exit 0 (a definite, successful delete) confirms the route gone;
+/// a non-zero exit conservatively keeps it recorded rather than risk silently
+/// dropping a route that is still there.
 #[cfg(not(target_os = "macos"))]
 fn route_confirmed_absent(output: &std::process::Output) -> bool {
     output.status.success()
@@ -484,10 +483,10 @@ fn run_command<P: Phase>(mut command: Command, cmd: String, phase: P) -> Result<
 // Execute (checkpointed) ==============================================================================================
 //
 // Both loops below persist `installed`/`still_installed` after EVERY command,
-// not once per phase or once per install. The on-disk record therefore names
-// exactly what the in-memory accumulator names at any instant, including
-// mid-loop, so a crash or a later command's spawn failure narrows the leak
-// window to at most the single command in flight.
+// not once per phase or once per install. Setup writes the record BEFORE each
+// command, so it names at most one route more than the in-memory accumulator
+// confirms (the command in flight); a confirmed outcome narrows it to match.
+// A crash therefore leaks at most the single command in flight.
 
 /// Execute route setup commands one at a time via `runner` (production:
 /// [`exec_one::<FatalPhase>`]; tests inject a scripted closure so a specific
@@ -507,9 +506,11 @@ fn run_command<P: Phase>(mut command: Command, cmd: String, phase: P) -> Result<
 ///
 /// On a runner `Err` for a FATAL command, the in-flight command's id is popped
 /// back out of `installed` before the error propagates, so the caller does not
-/// roll back a route that never confirmed. The on-disk checkpoint from just
-/// before the failed command is deliberately not corrected: it still names the
-/// speculative id, the superset-of-one this design accepts.
+/// roll back a route that never confirmed. After [`CommandFailure::Exit`] the
+/// record is narrowed like any confirmed-absent route. After
+/// [`CommandFailure::Spawn`] the command's fate is unknown, so the checkpoint
+/// from just before it is deliberately left naming the speculative id, for
+/// `install_with` to treat as uncertain.
 pub(crate) fn setup_routes<R>(
     tun_name: &str,
     server_ip: IpAddr,
@@ -1964,12 +1965,12 @@ impl SystemRouting {
         let interface_name = gateway.interface_name.as_str();
         // Checkpoint template: `setup_routes` calls `checkpoint(ids)` before
         // AND after every route command, so `persisted.installed` — and the
-        // on-disk file it writes — is never a prediction. At any instant it
-        // names exactly what `installed` below names, so a crash narrows the
-        // leak window to at most the single command in flight. Built BEFORE the sweep below
-        // (not after) so the sweep can layer carried-forward debt into
-        // `persisted.stale` instead of this install's own first checkpoint
-        // racing it for the same on-disk slot.
+        // on-disk file it writes — names at most one route more than
+        // `installed` below confirms (the command in flight, or one whose
+        // spawn failed); a confirmed outcome narrows it to match. Built
+        // BEFORE the sweep below (not after) so the sweep can layer
+        // carried-forward debt into `persisted.stale` instead of this
+        // install's own first checkpoint racing it for the same on-disk slot.
         let mut persisted = state::RouteState {
             tun_name: tun_name.to_owned(),
             server_ip,
@@ -2405,9 +2406,9 @@ fn platform_split_teardown_commands(tun_name: &str) -> Vec<RouteCommand> {
 /// delete with. [`state::RouteForm::Via`] keeps `original_gateway`, when
 /// known, appended as the `route delete` gateway operand — `route.exe`'s own
 /// help confirms DELETE accepts (and does not require) a gateway argument,
-/// and unlike macOS, that argument DOES scope which entry is deleted. `None` (a record migrated from
-/// schema 1 or 2, which never persisted a gateway) falls back to the old
-/// unscoped delete — a disclosed residual, not a silent skip.
+/// and unlike macOS, that argument DOES scope which entry is deleted. `None` (a
+/// record migrated from schema 1 or 2, which never persisted a gateway) falls
+/// back to the old unscoped delete — a disclosed residual, not a silent skip.
 #[cfg(target_os = "windows")]
 fn platform_bypass_teardown_command(
     server_ip: IpAddr,
