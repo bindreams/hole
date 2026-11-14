@@ -1,10 +1,10 @@
-//! Startup banner + per-platform webview-debugging hints (dev.py parity).
+//! Startup banner and per-platform webview-debugging hints.
 
 use std::path::Path;
 
 use crate::ansi::{BOLD, CYAN, MAGENTA, RESET, YELLOW};
 
-/// Chrome DevTools Protocol port for WebView2 remote debugging (dev.py §5.16).
+/// Chrome DevTools Protocol port for WebView2 remote debugging.
 pub const CDP_PORT: u16 = 9222;
 pub const VITE_PORT: u16 = 1420;
 

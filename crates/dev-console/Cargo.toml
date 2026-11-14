@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 license = "GPL-3.0-or-later"
-description = "Dev-mode supervisor: runs bridge (elevated) + Vite + GUI with multiplexed colored logs. Builds nothing — the xtask cascade does. Replaces scripts/dev.py (#454)."
+description = "Dev-mode supervisor: runs bridge (elevated) + Vite + GUI with multiplexed colored logs. Builds nothing — the xtask cascade does."
 
 [lints]
 workspace = true
@@ -17,17 +17,17 @@ name = "dev-console"
 path = "src/main.rs"
 
 [dependencies]
-anstream = "1" # strip ANSI when writing the dev-console.log transcript; already in the lockfile (1.0.0, via clap_builder)
+anstream = "1" # strip ANSI when writing the dev-console.log transcript
 anyhow = { workspace = true }
-chrono = { version = "0.4", default-features = false, features = ["clock"] } # local timestamp for the dev-run dir; already in the lockfile
+chrono = { version = "0.4", default-features = false, features = ["clock"] } # local timestamp for the dev-run dir
 futures-util = { version = "0.3", default-features = false, features = ["std"] } # catch_unwind for the teardown funnel
 cosca = { workspace = true, features = ["tokio"] }
 stepstool = { path = "../stepstool" }
 util = { path = "../util" }
 xtask-lib = { path = "../../xtask-lib" }
-rand = "0.10" # match the bridge's pin (crates/bridge/Cargo.toml); already in the lockfile
+rand = "0.10" # match the bridge's pin (crates/bridge/Cargo.toml)
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "io-std", "io-util", "net", "sync", "time"] }
-which = "8" # 8.0.3 current; performs Windows PATHEXT resolution (the npm.cmd trap)
+which = "8" # performs Windows PATHEXT resolution (the npm.cmd trap)
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

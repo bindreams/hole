@@ -4,21 +4,23 @@
 //! Supported attributes:
 //!
 //! - Field: `#[dump(skip)]`, `#[dump(rename = "...")]`,
-//!   `#[dump(secret)]`.
+//!   `#[dump(secret)]`. On the field of a single-field tuple variant only
+//!   `secret` is read; `skip` is ignored there
+//!   ([bindreams/hole#1337](https://github.com/bindreams/hole/issues/1337)).
 //! - Container: `#[dump(rename_all = "kebab-case" | "snake_case")]`.
 //!
 //! ## `rename_all` scope
 //!
 //! `rename_all` applies to **struct field names** and **struct-variant
-//! field names** only. Enum variant names themselves are never rewritten
-//! (use `#[dump(rename = "...")]` on the variant if you need this).
+//! field names** only. Enum variant names are never rewritten, and
+//! `#[dump(rename)]` is read from fields only, not from variants.
 //!
-//! The rename is a plain `_` → `-` substitution — there is no
+//! `kebab-case` is a plain `_` → `-` substitution — there is no
 //! camelCase / PascalCase splitting. A field named `fooBar` stays as
-//! `fooBar` under `kebab-case`; use `#[dump(rename = "foo-bar")]`
-//! explicitly. Raw identifiers (`r#type`) have their `r#` prefix
-//! stripped before the substitution runs, matching what the YAML key
-//! should look like to a reader.
+//! `fooBar`; use `#[dump(rename = "foo-bar")]` explicitly.
+//! `snake_case` leaves names unchanged. Raw identifiers (`r#type`) have
+//! their `r#` prefix stripped from every field key that has no explicit
+//! `rename`, with or without `rename_all`.
 //!
 //! The derive emits absolute paths (`::dump::...`) so it works from any
 //! downstream crate.

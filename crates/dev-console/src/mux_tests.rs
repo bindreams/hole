@@ -42,7 +42,7 @@ fn single_line_entries_pass_through_on_next_anchor() {
     assert_eq!(prev, vec!["2026-01-01T00:00:00Z one".to_string()]);
 }
 
-/// The actual #393 panic-entry shape: a multi-line tracing entry stays one
+/// The panic-entry shape: a multi-line tracing entry stays one
 /// atomic block, flushed by the NEXT anchor.
 #[skuld::test]
 fn multi_line_entry_buffers_until_next_anchor() {
@@ -77,8 +77,8 @@ fn bare_line_without_open_buffer_emits_immediately() {
     assert_eq!(line, "thread 'main' panicked at x");
 }
 
-/// PINNED TRADE-OFF (dev_tests.py:258-285): an anchor-less line arriving
-/// while a buffer IS open is appended to that entry — pinned explicitly so a
+/// An anchor-less line arriving
+/// while a buffer is open is appended to that entry — pinned explicitly so a
 /// future behavior change is noticed.
 #[skuld::test]
 fn bare_line_with_open_buffer_appends_to_entry() {
@@ -91,7 +91,7 @@ fn bare_line_with_open_buffer_appends_to_entry() {
     assert_eq!(f.finish().unwrap().len(), 2);
 }
 
-// Universal newlines (Python `text=True` parity: \n, \r\n, lone \r) ===================================================
+// Universal newlines (\n, \r\n, lone \r) ==============================================================================
 
 #[skuld::test]
 fn splits_lf_crlf_and_lone_cr() {
@@ -112,7 +112,7 @@ fn splits_lf_crlf_and_lone_cr() {
     assert_eq!(pending, b"f");
 }
 
-// Shutdown drain ordering (#568) ======================================================================================
+// Shutdown drain ordering =============================================================================================
 
 /// At shutdown the printer collects post-`enter_drain` entries and emits them
 /// sorted by ISO timestamp (out-of-order arrival -> in-order output), each entry
@@ -158,7 +158,7 @@ async fn shutdown_drain_emits_trailing_entries_in_timestamp_order() {
     );
 }
 
-// Cross-stream atomicity (ports dev_tests.py:288-354) =================================================================
+// Cross-stream atomicity ==============================================================================================
 
 /// Two entry-buffered streams pumped concurrently into one printer must
 /// never interleave a multi-line entry. 10 iterations to surface scheduling
@@ -194,8 +194,8 @@ async fn concurrent_streams_never_split_entries() {
             feed(b_w, "beta"),
             pump_a,
             pump_b,
-            // tokio 1.52 implements AsyncWrite for Vec<u8> (and the &mut
-            // blanket lifts it) — verified against the vendored tokio source.
+            // tokio implements AsyncWrite for Vec<u8>, and the &mut blanket
+            // lifts it.
             crate::mux::printer(
                 rx,
                 &mut sink,
@@ -233,9 +233,8 @@ async fn concurrent_streams_never_split_entries() {
     }
 }
 
-/// Python text-mode parity at EOF: a trailing lone `\r` terminates a line
-/// (possibly empty) — `b"x\n\r"` is ['x', ''] in Python, and dev.py printed
-/// the empty prefixed line. A trailing chunk WITHOUT a terminator still
+/// At EOF a trailing lone `\r` terminates a line (possibly empty):
+/// `b"x\n\r"` prints `x` and then an empty prefixed line. A trailing chunk WITHOUT a terminator still
 /// emits its partial content; a clean terminator-final stream emits nothing
 /// extra.
 #[skuld::test]
@@ -308,7 +307,7 @@ async fn printer_mirrors_blocks_into_transcript() {
 }
 
 /// Per-line mode emits without buffering (Vite has no anchors; buffering
-/// would starve forever — dev.py:182-189).
+/// would starve forever).
 #[skuld::test]
 async fn per_line_mode_emits_unanchored_lines() {
     let (mut w, r) = tokio::io::duplex(4096);

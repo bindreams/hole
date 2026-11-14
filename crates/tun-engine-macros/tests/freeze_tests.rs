@@ -191,9 +191,8 @@ fn documented_struct_constructs() {
 
 #[skuld::test]
 fn compile_fail() {
-    // Runs only when explicitly invoked; skipped if the trybuild env var isn't set.
-    // On CI this runs as part of the test suite — a fresh build verifies each
-    // listed .rs file fails to compile with the expected error.
+    // Each `compile_fail/*.rs` must fail to compile with the diagnostics in its
+    // `.stderr` file; each `compile_pass/*.rs` must compile.
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/compile_fail/*.rs");
     t.pass("tests/compile_pass/*.rs");

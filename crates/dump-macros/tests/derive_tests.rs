@@ -7,8 +7,7 @@
 use dump::{tag, Dump, DumpValue};
 use dump_macros::Dump as DeriveDump;
 
-// Install the workspace test subscriber + panic hook. See
-// `crates/test-observability/` and bindreams/hole#301.
+// Install the workspace test subscriber + panic hook.
 hole_test_observability::register!();
 
 fn main() {
@@ -217,7 +216,7 @@ fn rename_all_on_enum_struct_variant_with_field_override() {
     assert_eq!(
         v.dump(),
         DumpValue::Map(vec![(
-            // Variant name itself is NOT renamed — documented scope decision.
+            // `rename_all` never renames the variant name itself.
             DumpValue::String("TheVariant".into()),
             DumpValue::Map(vec![
                 (DumpValue::String("inner-field".into()), DumpValue::Int(7)),

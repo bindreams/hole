@@ -13,7 +13,7 @@ use serde::ser::{
 use crate::value::tag;
 use crate::DumpValue;
 
-/// Public entry point used by the autoref ladder.
+/// Entry point for the autoref ladder and [`crate::from_serialize`].
 pub(crate) fn to_dump_value<T: Serialize + ?Sized>(value: &T) -> DumpValue {
     match value.serialize(DumpSerializer) {
         Ok(dv) => dv,

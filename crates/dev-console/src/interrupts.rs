@@ -1,7 +1,7 @@
-//! Eagerly-registered interrupt sources: Ctrl+C everywhere, SIGTERM on Unix
-//! (Delta 2). All streams are created at install() — handlers are registered
-//! at construction, so an interrupt at ANY phase routes through orderly
-//! teardown — the dev.py try/finally equivalent. Note tokio signal capture is
+//! Eagerly-registered interrupt sources: Ctrl+C everywhere, SIGTERM on Unix.
+//! All streams are created at install() — handlers are registered at
+//! construction, so an interrupt at ANY phase routes through orderly
+//! teardown. Note tokio signal capture is
 //! process-permanent: once installed, SIGINT no longer kills the process by
 //! default disposition, which is exactly what lets the supervisor own
 //! teardown.

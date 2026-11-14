@@ -2,8 +2,7 @@ use crate::interrupts::Interrupts;
 
 /// A signal raised BETWEEN recv() calls (here: before the first one) must
 /// not be lost — install() registers persistent streams eagerly, and the
-/// watch channel buffers the edge. (The old fresh-ctrl_c()-per-recv design
-/// provably lost these; see the PR discussion.) Unix-gated like the bridge's
+/// watch channel buffers the edge. Unix-gated like the bridge's
 /// sigterm_resolves_shutdown_signal precedent: nextest isolates each test in
 /// its own process, so the raise cannot disturb siblings.
 #[cfg(unix)]
@@ -14,8 +13,8 @@ async fn signal_before_first_recv_is_buffered() {
     // SIGINT stream was registered by install(), replacing the default
     // disposition before the raise.
     assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
-    // Resolves via the buffered event; bounded by the per-test timeout
-    // (class-2 failure-to-human bound).
+    // Resolves via the buffered event; bounded only by the per-test timeout, a failure
+    // bound reported to a human.
     interrupts.recv().await;
 }
 

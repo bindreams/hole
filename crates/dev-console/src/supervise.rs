@@ -1,4 +1,5 @@
-//! The supervision sequence (dev.py main(), with the spec's Deltas).
+//! The supervision sequence: preflight, readiness-gated spawn of bridge, Vite
+//! and GUI, then one teardown funnel.
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
@@ -26,8 +27,8 @@ use crate::steps;
 const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const VITE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const GRACE_TIMEOUT: Duration = Duration::from_secs(10);
-/// dev.py joined its prefix threads with timeout=5 (dev.py:352-354) for the
-/// same reason: the WarnRecovery bridge keeps its pipes open forever.
+/// Bound on each stage of the printer drain: the WarnRecovery bridge keeps its
+/// pipes open forever, so the printer's channel may never close.
 const PRINTER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Whether `child` has exited; `shutdown()` asks it of the bridge only, whose wait reaps it in the supervision arms.
@@ -70,9 +71,9 @@ pub(crate) fn create_run_dir(parent: &Path, name: &str, pid: u32) -> std::io::Re
 }
 
 pub async fn main() -> ExitCode {
-    // FIRST: interrupt ownership (the dev.py try/finally equivalent). From
-    // here on Ctrl+C/SIGTERM never kills us by default disposition — every
-    // phase below watches `interrupts` and routes through teardown/Drops.
+    // FIRST: interrupt ownership. From here on Ctrl+C/SIGTERM never kills us
+    // by default disposition — every phase below watches `interrupts` and
+    // routes through teardown/Drops.
     let mut interrupts = Interrupts::install();
     match run(&mut interrupts).await {
         Ok(code) => code,
@@ -84,8 +85,8 @@ pub async fn main() -> ExitCode {
                 return ExitCode::from(supervision_exit_code(ExitCause::Interrupted));
             }
             if let Some(step) = e.downcast_ref::<steps::StepFailed>() {
-                // dev.py parity: npm/cargo failures exit with the child's
-                // code and no extra line; stage prints its yellow message.
+                // npm/cargo failures exit with the child's code and no extra
+                // line; stage prints its yellow message.
                 if let Some(msg) = &step.message {
                     enote!("{YELLOW}{msg}{RESET}");
                 }
@@ -113,7 +114,7 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
     .context("creating dev-run dir")?;
     crate::transcript::set_global(crate::transcript::Transcript::create(&run_dir.join("dev-console.log")));
 
-    // 1. Privilege policy (dev.py §5.10) ==============================================================================
+    // 1. Privilege policy =============================================================================================
     let euid: Option<u32>;
     #[cfg(unix)]
     {
@@ -148,11 +149,11 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
     let cargo = steps::resolve_tool("cargo")?;
     let npm = steps::resolve_npm()?;
     steps::ensure_node_modules(&npm, interrupts).await?;
-    // No workspace build here: dev-console supervises only (#564). The xtask
+    // No workspace build here: dev-console supervises only. The xtask
     // cascade built everything; a standalone run reuses the existing build,
     // which `stage_bindir` (cargo xtask stage) validates.
 
-    // 3. Per-pid stage (guard registered BEFORE mkdir; dev.py §5.11) ==================================================
+    // 3. Per-pid stage (guard registered BEFORE mkdir) ================================================================
     let stage_guard = steps::StageDirGuard::register(steps::stage_dir_path(std::process::id()));
     steps::stage_bindir(&cargo, stage_guard.path(), interrupts).await?;
 
@@ -163,7 +164,7 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
     let state_dir = std::env::temp_dir().join("hole-dev").join("state");
     std::fs::create_dir_all(&state_dir).context("creating bridge state dir")?;
 
-    // 4. Leaked-vite preflight (Delta 7): vite uses strictPort 1420 ===================================================
+    // 4. Leaked-vite preflight: vite uses strictPort ==================================================================
     if port_in_use(VITE_PORT).await {
         enote!(
             "{YELLOW}Port {VITE_PORT} is already in use — a previous dev run's Vite may have \
@@ -172,7 +173,7 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
 
-    // 5. sudo preflight (POSIX; dev.py §5.8) ==========================================================================
+    // 5. sudo preflight (POSIX) =======================================================================================
     #[cfg(unix)]
     {
         note!("{BOLD}Dev mode needs root for the bridge — caching sudo credentials...{RESET}");
@@ -182,7 +183,7 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
         }
     }
 
-    // 6. grant-access via the production path (dev.py §5.15) ==========================================================
+    // 6. grant-access via the production path =========================================================================
     note!("{BOLD}Granting IPC access (creates hole group, adds user)...{RESET}");
     let ga = grant_access_argv(Os::host(), &bridge_bin.to_string_lossy());
     // Not a supervised child: it runs to completion here and owns no tree.
@@ -195,7 +196,7 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
         return Ok(ExitCode::from(code.clamp(1, 255) as u8));
     }
 
-    // 7. hole-group session gate (POSIX; dev.py §5.14) ================================================================
+    // 7. hole-group session gate (POSIX) ==============================================================================
     #[cfg(unix)]
     {
         let gid = match crate::group_gate::hole_gid() {
@@ -237,8 +238,8 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
 }
 
 /// Spawn-and-supervise with a SINGLE exit funnel: whatever the startup or
-/// steady state produced, `shutdown` runs over every child that exists
-/// (dev.py's `finally`), then the printer is drained (bounded).
+/// steady state produced, `shutdown` runs over every child that exists, then
+/// the printer is drained (bounded).
 async fn supervise_children(
     interrupts: &mut Interrupts,
     npm: &steps::NpmLaunch,
@@ -284,14 +285,14 @@ async fn supervise_children(
     .catch_unwind()
     .await;
     // We are now shutting down: stop streaming so the trailing entries are
-    // collected and emitted in timestamp order (#568). Fired ONCE, before
-    // both the panic-arm shutdown and the normal shutdown.
+    // collected and emitted in timestamp order. Fired ONCE, before both the
+    // panic-arm shutdown and the normal shutdown.
     let _ = enter_drain_tx.send(());
     let outcome: Result<ExitCause> = match caught {
         Ok(outcome) => outcome,
         Err(panic) => {
-            // dev.py's `finally` ran on arbitrary exceptions: tear down the
-            // children (the root bridge above all) before resuming the panic.
+            // Tear down the children (the root bridge above all) before
+            // resuming the panic.
             shutdown(bridge.as_mut(), vite.as_mut(), gui.as_mut()).await;
             std::panic::resume_unwind(panic);
         }
@@ -305,8 +306,7 @@ async fn supervise_children(
     // EOF): the WarnRecovery bridge is deliberately never killed, so its pump
     // can hold its sender forever and `rx` never closes. On that timeout fire
     // `finalize` so the printer still sorts + writes what it collected, then
-    // re-bound the flush so a wedged stdout can't hang teardown (dev.py
-    // join(timeout=5)).
+    // re-bound the flush so a wedged stdout can't hang teardown.
     if tokio::time::timeout(PRINTER_DRAIN_TIMEOUT, &mut printer).await.is_err() {
         let _ = finalize_tx.send(());
         if tokio::time::timeout(PRINTER_DRAIN_TIMEOUT, &mut printer).await.is_err() {
@@ -333,7 +333,7 @@ async fn startup_and_supervise(
     gui_slot: &mut Option<Child>,
 ) -> Result<ExitCause> {
     // Bridge FIRST: the sudo spawns stay back-to-back behind the preflight
-    // cache; Vite's readiness wait can't straddle it (dev.py §5.8).
+    // cache; Vite's readiness wait can't straddle it.
     let ready = ReadyListener::bind().await.context("binding ready listener")?;
     let argv = bridge_argv(
         Os::host(),
@@ -352,26 +352,22 @@ async fn startup_and_supervise(
     }
     // stdin=null: an expired sudo timestamp gets EOF and exits non-zero
     // instead of hanging on an invisible prompt (with the session detach in
-    // spawn_bridge); also the console-corruption discipline every child gets
-    // (dev.py §5.3).
+    // spawn_bridge); also the console-corruption discipline every child gets.
     cmd.stdin(Stdio::null())?;
     cmd.stdout(Stdio::pipe())?;
     cmd.stderr(Stdio::pipe())?;
     let bridge = bridge_slot.insert(spawn_bridge(cmd).context("spawning the bridge")?);
     pump_child_output(bridge, ChildRole::Bridge, StreamMode::EntryBuffered, tx);
 
-    // Ready rendezvous: bridge-exit checked before the token (dev.py polls
-    // proc death first); interrupt anywhere tears down via the funnel. The
-    // sleep is the class-2 human-failure bound for an out-of-process startup
-    // that might never succeed.
+    // Ready rendezvous: bridge-exit checked before the token; interrupt
+    // anywhere tears down via the funnel. The sleep is a failure bound reported
+    // to a human, for an out-of-process startup that might never succeed.
     tokio::select! {
         biased;
         status = bridge.wait() => {
             let status = status?;
-            // Supervisor status lines print directly (not via the mux
-            // printer) — dev.py parity: its prints didn't take the print
-            // lock either; a rare interleave with a child entry is accepted.
-            // dev.py:578-585 (stdout, like dev.py's print):
+            // Supervisor status lines print directly to stdout, not via the mux
+            // printer, so one can interleave with a child entry; that is accepted.
             note!(
                 "{YELLOW}Bridge exited with code {} (sudo credentials may have expired, or a \
                  restrictive sudoers env_check/env_delete rejected --preserve-env){RESET}",
@@ -390,7 +386,7 @@ async fn startup_and_supervise(
     }
 
     // Vite (after the bridge). FORCE_COLOR=1 restores the colors a piped
-    // child disables (Delta 3).
+    // child disables.
     let mut cmd = Command::new();
     cmd.executable(npm.program());
     cmd.args(npm.full_argv(&["run", "dev"]));
@@ -403,8 +399,7 @@ async fn startup_and_supervise(
     pump_child_output(vite, ChildRole::Vite, StreamMode::PerLine, tx);
 
     // biased + exit-arm-first: a dead Vite is reported as such, never as a
-    // false "port up" from an unrelated listener (dev.py:246-248 checks
-    // poll() before each probe round).
+    // false "port up" from an unrelated listener.
     tokio::select! {
         biased;
         status = wait_and_kill_leftovers(vite, "Vite") => {
@@ -422,8 +417,8 @@ async fn startup_and_supervise(
         }
     }
 
-    // GUI (as the invoking user), webview debug plumbing (dev.py §5.16):
-    // append to WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS, never overwrite.
+    // GUI (as the invoking user), webview debug plumbing: append to
+    // WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS, never overwrite.
     let existing = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
     let cdp = format!("--remote-debugging-port={CDP_PORT}");
     let webview_args = if existing.trim().is_empty() {
@@ -449,9 +444,8 @@ async fn startup_and_supervise(
     let gui = gui_slot.insert(cmd.spawn().context("spawning the GUI")?);
     pump_child_output(gui, ChildRole::Gui, StreamMode::EntryBuffered, tx);
 
-    // Steady state: first exit / Ctrl+C / SIGTERM wins (replaces dev.py's
-    // done.wait(0.5) poll loop and reaper threads — tokio makes them events).
-    // The funnel must not tear down a reaped root, hence `slot.take()`.
+    // Steady state: first exit / Ctrl+C / SIGTERM wins. The funnel must not
+    // tear down a reaped root, hence `slot.take()`.
     Ok(tokio::select! {
         status = bridge.wait() => exited("bridge", status),
         status = wait_and_kill_leftovers(vite, "Vite") => {
@@ -467,8 +461,8 @@ async fn startup_and_supervise(
 }
 
 /// Steady-state child exit → cause. A CLEAN exit (e.g. the user quit the
-/// GUI from the tray) ends the session with code 0, dev.py parity; a failed
-/// exit is Delta 1's non-zero path.
+/// GUI from the tray) ends the session with code 0; a failed exit ends it
+/// non-zero.
 fn exited(name: &str, status: Result<std::process::ExitStatus, cosca::error::Error>) -> ExitCause {
     match status {
         Ok(s) if s.success() => {
@@ -486,8 +480,8 @@ fn exited(name: &str, status: Result<std::process::ExitStatus, cosca::error::Err
     }
 }
 
-/// Graceful → bounded wait → policy action, per child (dev.py shutdown(),
-/// §5.7). Tolerates partially-started runs (None slots).
+/// Graceful → bounded wait → policy action, per child. Tolerates
+/// partially-started runs (None slots).
 async fn shutdown(bridge: Option<&mut Child>, vite: Option<&mut Child>, gui: Option<&mut Child>) {
     if bridge.is_none() && vite.is_none() && gui.is_none() {
         return;
@@ -510,8 +504,7 @@ async fn shutdown(bridge: Option<&mut Child>, vite: Option<&mut Child>, gui: Opt
                 crate::transcript::global()
                     .write_line(&format!("bridge group SIGTERM did not reach every member: {e}"));
             }
-            // Class-2 bound: an out-of-process exit that might never come
-            // (10s, dev.py parity).
+            // Class-2 bound: an out-of-process exit that might never come.
             if tokio::time::timeout(GRACE_TIMEOUT, bridge.wait()).await.is_err() {
                 match grace_timeout_action(ChildRole::Bridge, Os::host()) {
                     GraceTimeoutAction::WarnRecovery => enote!("{NETWORK_RESET_WARNING}"),
@@ -619,7 +612,7 @@ pub(crate) async fn teardown_grouped(child: &mut Child, role: ChildRole) {
             // with no cause. Say which it was.
             enote!("{YELLOW}{role:?} did not receive the cooperative signal: {e}{RESET}");
         }
-        // Class-2 bound: out-of-process exit that may never come (10s).
+        // Class-2 bound: out-of-process exit that may never come.
         match root.wait_timeout(GRACE_TIMEOUT).await {
             Ok(true) => {}
             Ok(false) => {
@@ -635,13 +628,12 @@ pub(crate) async fn teardown_grouped(child: &mut Child, role: ChildRole) {
     let _ = child.wait().await;
 }
 
-/// `ContainMode::Session` is the dev.py `start_new_session` parity (dev.py:296):
-/// on POSIX it is `setsid`, detaching the controlling TTY so an expired-timestamp
+/// `ContainMode::Session`: on POSIX it is `setsid`, detaching the controlling TTY so an expired-timestamp
 /// sudo cannot prompt on /dev/tty (it EOFs on the null stdin instead) and making
 /// the child a group leader for the graceful killpg; on Windows it takes the same
 /// root flags as `Strongest`, so the bridge is its own console group inside a
-/// kill-on-close job (a crashed supervisor can no longer leak a routing-active
-/// bridge, Delta 6).
+/// kill-on-close job (a crashed supervisor cannot leak a routing-active
+/// bridge).
 ///
 /// `Nesting::Opaque` on both platforms: the mark would stop the bridge's own
 /// garter from containing its plugin chains, which must nest inside this tree.
@@ -656,12 +648,11 @@ fn spawn_bridge(mut cmd: Command) -> Result<Child, cosca::error::Error> {
     cmd.spawn()
 }
 
-/// Two pumps per child — a DECIDED divergence from dev.py's OS-level
-/// `stderr=subprocess.STDOUT` merge (signed off 2026-06-11): per-stream
-/// entries stay atomic via the single printer, but a child's stdout↔stderr
-/// write order is not preserved. Verified premise: bridge/GUI tracing AND
-/// panic output land on stderr only (crates/common/src/logging.rs), so
-/// multi-line entries never split across the two pipes today.
+/// Two pumps per child, one per pipe: per-stream entries stay atomic via the
+/// single printer, but a child's stdout↔stderr write order is not preserved.
+/// This relies on bridge/GUI tracing AND panic output landing on stderr only
+/// (crates/common/src/logging.rs), so multi-line entries never split across
+/// the two pipes.
 fn pump_child_output(child: &mut Child, role: ChildRole, mode: StreamMode, tx: &mpsc::Sender<Entry>) {
     if let Some(stdout) = child.stdout() {
         tokio::spawn(pump(stdout, mode, role.prefix(), tx.clone()));

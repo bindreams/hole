@@ -1,4 +1,4 @@
-//! ANSI color constants (dev.py parity).
+//! ANSI color constants for status lines and child prefixes.
 pub const CYAN: &str = "\x1b[36m";
 pub const MAGENTA: &str = "\x1b[35m";
 pub const YELLOW: &str = "\x1b[33m";

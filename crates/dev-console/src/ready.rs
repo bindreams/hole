@@ -3,12 +3,12 @@
 //! Bridge: FIRST-PARTY, so a real rendezvous exists — we pre-bind a
 //! localhost TCP listener (no bind race: we bind before the bridge starts),
 //! pass `--ready-notify ADDR/TOKEN`, and the bridge echoes the token only
-//! after `IpcServer::bind` + `apply_socket_permissions` (closes the DACL
-//! race dev.py's socket-file poll had; spec Delta 5).
+//! after `IpcServer::bind` + `apply_socket_permissions`, so readiness never
+//! precedes the socket's permissions.
 //!
 //! Vite: third-party — the only options are probing or output-scraping, and
 //! the output format is unstable. Connect-probe every address `localhost`
-//! resolves to (the hosts-file v4/v6 trap, dev.py §5.5).
+//! resolves to (the hosts-file v4/v6 trap).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -80,8 +80,8 @@ pub(crate) enum ProbeOutcome {
     /// The peer refused — authoritative: nothing is listening (yet).
     Refused,
     /// No answer, so nothing authoritative about the port: the cap elapsed
-    /// (a real class-2 remote endpoint — see the `hosts`-file note below —
-    /// that may never answer), or the connect failed without refusing.
+    /// (a `hosts` file can map `localhost` to an off-box endpoint that may
+    /// never answer), or the connect failed without refusing.
     NoVerdict,
 }
 
@@ -90,11 +90,10 @@ pub(crate) enum ProbeOutcome {
 /// Pins [`util::syn_budget::SynBudget::NoRetransmit`], which requires that a
 /// `NoVerdict` never be taken as an answer. [`wait_for_port`] re-issues; the
 /// single-round [`port_in_use`] settles it by binding the address instead.
-/// On Windows a refused loopback port is then reported in ~0.1 ms instead of
-/// paying the ~2.05 s stock SYN-retransmission budget. The cap still
-/// matters: it bounds a `hosts` file mapping `localhost` off-box to a
-/// class-2 remote endpoint that may never answer, which `NoRetransmit` does
-/// not affect.
+/// On Windows a refused loopback port is then reported at once instead of
+/// paying the stock SYN-retransmission budget. The cap still matters: it
+/// bounds a `hosts` file mapping `localhost` off-box to an endpoint that may
+/// never answer, which `NoRetransmit` does not affect.
 async fn probe_once(addr: std::net::SocketAddr, cap: Duration) -> ProbeOutcome {
     match util::syn_budget::probe(addr, cap, util::syn_budget::SynBudget::NoRetransmit).await {
         util::syn_budget::ProbeOutcome::Listening(_conn) => ProbeOutcome::Listening,
@@ -122,8 +121,8 @@ pub(crate) async fn is_port_held(addr: std::net::SocketAddr) -> bool {
 }
 
 /// One probe round (NOT a wait): is something already listening on `port`?
-/// Used by the Delta-7 leaked-vite preflight — a clean startup must not pay
-/// a polling budget for a port that is supposed to be free.
+/// Used by the leaked-Vite preflight — a clean startup must not pay a polling
+/// budget for a port that is supposed to be free.
 ///
 /// A `NoVerdict` is settled by binding the same address: a bind needs no
 /// SYN, so a leaked Vite whose SYN was dropped still shows up as a bind
@@ -138,7 +137,7 @@ pub async fn port_in_use(port: u16) -> bool {
         ],
     };
     for addr in &addrs {
-        // Same per-attempt cap as wait_for_port (see its comment).
+        // Same per-attempt cap as wait_for_port.
         match probe_once(*addr, Duration::from_millis(500)).await {
             ProbeOutcome::Listening => return true,
             ProbeOutcome::Refused => {}
@@ -151,14 +150,15 @@ pub async fn port_in_use(port: u16) -> bool {
 
 /// Probe until something accepts on `port` via ANY address `localhost`
 /// resolves to (v4 and/or v6), or `budget` elapses. Polls because the OS exposes
-/// no "process N bound port P" event (docs/contributing/testing.md#no-synchronization-by-elapsed-time);
-/// the budget is the human-surfaced failure bound, and the caller's select! on
-/// child-exit short-circuits a dead Vite.
+/// no "process N bound port P" event (docs/contributing/testing.md#no-synchronization-by-elapsed-time).
+/// `budget` is a failure bound reported to a human, not a sync point; the pause
+/// between rounds only paces re-checks within it. The caller's select!
+/// on child-exit short-circuits a dead Vite.
 pub async fn wait_for_port(port: u16, budget: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + budget;
     let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(("localhost", port)).await {
         Ok(a) => a.collect(),
-        // Name-resolution failure: fall back to both loopbacks (dev.py:236-242).
+        // Name-resolution failure: fall back to both loopbacks.
         Err(_) => vec![
             (std::net::Ipv4Addr::LOCALHOST, port).into(),
             (std::net::Ipv6Addr::LOCALHOST, port).into(),
@@ -166,12 +166,12 @@ pub async fn wait_for_port(port: u16, budget: Duration) -> bool {
     };
     while tokio::time::Instant::now() < deadline {
         for addr in &addrs {
-            // 500ms per-attempt cap — dev.py:251 parity (sock.settimeout(0.5)).
+            // Per-attempt cap, so one unanswering address cannot stall the round.
             if probe_once(*addr, Duration::from_millis(500)).await == ProbeOutcome::Listening {
                 return true;
             }
         }
-        // 200ms between rounds (class-2; dev.py:260 parity).
+        // Paces the re-check: the OS announces no bind event, and every round re-probes.
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     false
