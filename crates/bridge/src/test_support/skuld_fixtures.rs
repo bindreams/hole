@@ -100,7 +100,7 @@ pub(crate) struct SsServerHandle {
 
 /// Verify the galoshes binary exists and return its absolute path.
 /// Panics with a clear remediation message if the binary is missing —
-/// per CLAUDE.md, tests must fail loudly on missing dependencies.
+/// a test fails loudly on a missing dependency (docs/contributing/testing.md#fail-do-not-skip).
 ///
 /// Used to point the **server-side** `start_real_ss_server_with_plugin_*`
 /// helpers at galoshes. The **client-side** plugin is resolved by the

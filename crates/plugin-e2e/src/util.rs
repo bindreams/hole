@@ -11,7 +11,7 @@ pub fn rt() -> tokio::runtime::Runtime {
 }
 
 /// Fail loudly if a required plugin binary is missing, with a remediation hint.
-/// Per CLAUDE.md: never silently skip on a missing test dependency.
+/// A test never skips on a missing dependency (docs/contributing/testing.md#fail-do-not-skip).
 pub fn require_binary(path: &Path, remediation: &str) {
     assert!(
         path.is_file(),

@@ -5,7 +5,7 @@ name: Reusable Draft Release
 #
 # The binaries come from ci.yaml (`cargo xtask stage-release`).
 #
-# See CLAUDE.md "Releases" for context.
+# See docs/contributing/maintainers/releases.md for context.
 
 on:
   workflow_call:

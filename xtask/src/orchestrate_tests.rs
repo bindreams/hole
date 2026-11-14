@@ -285,8 +285,8 @@ targets:
 }
 
 // `run_step` tests assume bash is available — Git Bash on Windows runners,
-// system bash on macOS / Linux. These are unconditional: per CLAUDE.md, tests
-// must not silently skip on missing dependencies.
+// system bash on macOS / Linux. These are unconditional: a test
+// must not skip on a missing dependency (docs/contributing/testing.md#fail-do-not-skip).
 
 #[skuld::test]
 fn run_step_bash_succeeds_on_zero_exit() {

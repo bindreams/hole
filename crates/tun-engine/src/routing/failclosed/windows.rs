@@ -645,7 +645,7 @@ impl Condition {
     /// a duplicate on one rather than papering over it.
     ///
     /// One exhaustive match, on the type, so a new variant must answer
-    /// (CLAUDE.md's "per-variant policy lives on the type"). Grouping by
+    /// (per-variant policy lives on the type, docs/contributing/architecture/kill-switch.md#the-decisions). Grouping by
     /// consequence is what would get this wrong: `LoopbackNet` CARRIES an
     /// `IpAddr` and is still fixed, because only the address FAMILY is read
     /// and the family is a property of the key's layer — a V4 key always
@@ -743,8 +743,8 @@ impl StaleKeyPolicy {
     /// The whole rule, in one exhaustive match on the type, because every site
     /// that asked it by comparison — `policy == StaleKeyPolicy::Fail` — would
     /// silently group a future third variant with [`Self::Degrade`], the arm
-    /// that keeps a stale filter. That is CLAUDE.md's "per-variant policy lives
-    /// on the type", and it is enforced by `stale_key_policy_tests`.
+    /// that keeps a stale filter. That is the rule that per-variant policy lives
+    /// on the type (docs/contributing/architecture/kill-switch.md#the-decisions), enforced by `stale_key_policy_tests`.
     ///
     /// One question, asked at both ends of the same decision: the pre-delete's
     /// verdict on a failed delete ([`pre_delete_verdict`]) and [`add_filter`]'s

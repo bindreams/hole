@@ -630,14 +630,14 @@ def test_integration_filtering_against_real_history():
     the script walks (previous-ex-ray-tag..HEAD), so a "hole-only"
     commit outside that range doesn't make the probe vacuously pass.
 
-    Per CLAUDE.md "Tests must never silently skip on missing dependencies":
+    A test never skips on a missing dependency (docs/contributing/testing.md#fail-do-not-skip):
     `uv` and tags are both CI-provisioned, so absence fails loudly.
     """
     import shutil
     import pytest
 
     if shutil.which("uv") is None:
-        pytest.fail("uv not on PATH; CI must provision it (CLAUDE.md coding-style rule).")
+        pytest.fail("uv not on PATH; CI must provision it.")
     repo_root = Path(__file__).resolve().parent.parent
     prev_tag = find_previous_tag(repo_root, "ex-ray", "HEAD")
     if prev_tag is None:

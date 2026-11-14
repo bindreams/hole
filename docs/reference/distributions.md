@@ -21,4 +21,4 @@ Four products ship from this repository. Each is tagged `releases/<product>/v<X.
   client with a server that runs a stock v2ray-plugin, or the other way around. A standalone binary on the same six
   platforms. Apache-2.0.
 
-Build and release steps for contributors are in {src}`CONTRIBUTING.md <CONTRIBUTING.md#releases>`.
+Build and release steps for contributors are in [the maintainers' release page](../contributing/maintainers/releases.md).
