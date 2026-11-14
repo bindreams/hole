@@ -10,14 +10,11 @@
 //! for `PROCESS_QUERY_LIMITED_INFORMATION`).
 //!
 //! A process that can be opened is running when its object is not signalled
-//! ([`has_exited`]): the object is signalled at exit, which is an edge. The
-//! system process list (`NtQuerySystemInformation`) kept an exited process
-//! listed, with a thread left, with no edge (measured for a reader that held
-//! a handle to it), so it decides only for a process that cannot be opened.
-//! There, read as a standard user holding no handle, right after a SYSTEM
-//! process stopped, it was never measured to list the exited process with a
-//! thread left (see "The Disabled service and its record" in
-//! `docs/contributing/architecture/kill-switch-uninstall.md`).
+//! ([`has_exited`]), which is an edge at exit. The system process list
+//! (`NtQuerySystemInformation`) decides only for a process that cannot be
+//! opened. Why that is sound, with its measurements, is in "The Disabled
+//! service and its record" in
+//! `docs/contributing/architecture/kill-switch-uninstall.md`.
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};

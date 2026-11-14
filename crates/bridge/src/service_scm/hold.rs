@@ -372,8 +372,8 @@ impl<P> ProcessHolds<P> {
     /// Read the service and hold the process it names.
     ///
     /// The id is a claim, not an identity. Microsoft documents it valid in
-    /// RUNNING, "may not be valid" in START_PENDING and STOP_PENDING, and "never
-    /// valid" in STOPPED ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks);
+    /// RUNNING, PAUSE_PENDING, PAUSED and CONTINUE_PENDING, "may not be valid" in
+    /// START_PENDING and STOP_PENDING, and "never valid" in STOPPED ([`QueryServiceStatusEx`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks);
     /// [`Observed::reported_pid`]). START_PENDING and STOP_PENDING are states
     /// this code acts on, so a pid read in either may name a process that is not
     /// the service's, and an id may be reused. What makes a hold safe is not the

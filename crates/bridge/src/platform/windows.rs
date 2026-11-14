@@ -445,8 +445,9 @@ pub(crate) fn sweep_marker(log_dir: &Path) {
 /// Sweep the completed cutover's marker, verify it is gone, THEN report `Running`
 /// so the cutover child (which exits on the `Running` edge) exits only after the
 /// marker is gone. A healthy update therefore never presents "marker present plus
-/// driver dead": before this the child is alive (`CutoverDecision::Mask`), after
-/// it the marker is already swept (`CutoverDecision::PassThrough`).
+/// driver dead": before this the child is alive (the GUI's
+/// `CutoverDecision::Mask`, in `crates/hole/src/state.rs`), after it the marker
+/// is already swept (`CutoverDecision::PassThrough`).
 ///
 /// The `read().is_some()` re-check guards the reachable case of an external
 /// process holding the marker open without `FILE_SHARE_DELETE`: reporting
@@ -535,7 +536,9 @@ fn service_log_dir() -> PathBuf {
 /// (warn-and-continue): a SCM hiccup must not fail the install itself.
 /// [`ensure_failure_actions`] is the path that re-opens the service and
 /// propagates errors; the cutover child uses it, which also brings an install
-/// base that predates this config up to date.
+/// base that predates this config up to date. `install` must not call it: the
+/// re-open would race the SCM's propagation of the just-created service, and its
+/// errors would fail the install.
 pub fn install(binary_path: &Path) -> std::io::Result<()> {
     install_as(binary_path, InstallStart::Automatic)
 }

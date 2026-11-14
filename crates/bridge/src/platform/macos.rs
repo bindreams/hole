@@ -252,7 +252,8 @@ fn probe_registration() -> Registration {
 /// what the stop left behind. It does not probe first, and it does not read the
 /// bootout's exit code as the answer: the job can leave launchd between a probe
 /// and the act, and launchd answers a bootout of an absent label with neither 0
-/// nor [`LAUNCHD_NO_SUCH_SERVICE`]. Only a probe taken after the act is about
+/// nor [`LAUNCHD_NO_SUCH_SERVICE`]
+/// (`a_bootout_of_a_label_launchd_does_not_have_fails` measures it). Only a probe taken after the act is about
 /// the world the act left. See the stop step of "The order of an uninstall" in
 /// `docs/contributing/architecture/kill-switch-uninstall.md`.
 ///

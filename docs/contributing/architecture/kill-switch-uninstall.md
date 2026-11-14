@@ -171,8 +171,8 @@ exhaustive match (`RepairStep::of`):
   `PROCESS_QUERY_LIMITED_INFORMATION`). A process that can be opened is running when its object is not signalled, which is an
   edge at exit. The system process list (`NtQuerySystemInformation`) kept an exited process listed, with a thread left, while a
   reader held a handle to it, so it decides only for a process that cannot be opened. For that case it was measured as a
-  standard user holding no handle, right after a SYSTEM process stopped: about 6,500 rounds on the privileged CI runner never
-  listed the exited process with a thread left (`Stamp::is_running`).
+  standard user holding no handle, right after a SYSTEM process stopped: about 6,500 rounds on the privileged CI runner (probe at
+  `50d133c91`, CI run 41817171754) never listed the exited process with a thread left (`Stamp::is_running`).
 - **It never blocks.** A record that cannot be read counts as present, and none of an uninstall, an install, a cutover or a
   connect is blocked by it: a record that could block them is the lockout this design removes.
 - **An administrator's Disable survives every path that is not an explicit enable**: the retirement's restore, the update
