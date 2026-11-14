@@ -104,7 +104,12 @@ impl Placement for MarkerPlacement {
 }
 
 /// The SERVICE log directory (where the privileged bridge writes its logs and
-/// the marker). The one place its per-platform location is spelled.
+/// the marker).
+///
+/// The location is also spelled in `SERVICE_LOG_DIR` (`bridge/src/platform/macos.rs`),
+/// the redaction literals in `util/src/redact.rs`, and the `--log-dir` arguments
+/// in `hole.wxs` (pinned by `the_msi_bridge_actions_log_to_the_service_log_dir`);
+/// a change here changes those too.
 pub fn service_log_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {

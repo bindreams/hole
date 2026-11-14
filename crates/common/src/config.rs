@@ -125,10 +125,12 @@ pub enum Theme {
 ///
 /// The forwarder dials through the local SOCKS5 listener, not through the TUN,
 /// so no filter rule applies to its queries. `PlainTcp`, `Tls` and `Https` go
-/// over TCP and ride through any plugin. `PlainUdp` needs a SOCKS5 UDP
-/// ASSOCIATE, which the listener relays only when the configured plugin carries
-/// UDP (galoshes); with a TCP-only plugin the ASSOCIATE fails and that upstream
-/// is reported as failed. See `docs/contributing/architecture/dns-forwarder.md`.
+/// over TCP and ride through any plugin. `PlainUdp` sends datagrams through a
+/// SOCKS5 UDP ASSOCIATE. The listener always answers the ASSOCIATE, without
+/// involving the plugin, but the datagrams reach the server only when the plugin
+/// carries UDP (galoshes). With a TCP-only plugin they are lost, and the
+/// start-time self-test reports it as `InconclusiveTransport`
+/// (`ForwarderSelfTestFailed`). See `docs/contributing/architecture/dns-forwarder.md`.
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DnsProtocol {

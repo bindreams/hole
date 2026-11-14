@@ -65,7 +65,7 @@ pub(super) fn may_read<Id: PartialEq>(
 pub(super) struct Trail<Id> {
     /// The unprivileged owner of a link the walk followed, if any.
     led_by: Option<Id>,
-    /// Links followed so far.
+    /// Links followed so far. A link met again after its target was walked counts again.
     followed: usize,
     /// How many links a walk may follow: the OS's own bound on a path.
     limit: usize,

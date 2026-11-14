@@ -777,13 +777,13 @@ const SIGNAL_SAFE_PRIMITIVES: &[&str] = &[
 // (module doc, "Why the callback cannot allocate").
 //
 // No behavioural test can stand in for this. The hang needs CI-like
-// allocation pressure; the allocating branch stays green on an idle machine
-// and passes every `crash_marker_*` test in `tests/crash_child.rs`, so a
-// straight revert of the `cfg(windows)` gate on `write_minidump_best_effort`
-// would land silently. The structural scan is
-// the only line of defence, so it covers the WHOLE path and not just
-// `on_crash`'s own frame: a `format!` inside `push_hex` reinstates the
-// deadlock exactly as one inside `on_crash` does.
+// allocation pressure; the allocating branch ran 15/15 green on an idle
+// darwin/arm64 and passes every `crash_marker_*` test in
+// `tests/crash_child.rs`, so a straight revert of the `cfg(windows)` gate on
+// `write_minidump_best_effort` would land silently. The structural scan is the
+// only line of defence, so it covers the WHOLE path and not just `on_crash`'s
+// own frame: a `format!` inside `push_hex` reinstates the deadlock exactly as
+// one inside `on_crash` does.
 //
 // Deliberately strict: a new call of ANY shape fails, because every
 // allocation this crate ever put on the handler path arrived as one

@@ -34,7 +34,8 @@
 //! is followed (a profile moved to another disk); a user's link to a folder the
 //! system or another account owns is refused. The walk follows at most as many
 //! links as the OS itself does in one path (`MAX_LINKS`), which also refuses a
-//! loop, and a folder it makes below a user's link is given to that user. The
+//! loop; a link met again after its target was walked counts again (`Trail`'s
+//! `followed`). A folder it makes below a user's link is given to that user. The
 //! final name of a file operation is never followed. The rule, the bound and the
 //! hand-over are in `docs/contributing/architecture/privileged-folders.md`.
 //!

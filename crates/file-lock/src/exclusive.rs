@@ -73,16 +73,6 @@ mod windows;
 #[cfg(windows)]
 use windows as platform;
 
-// Hooks ===============================================================================================================
-
-/// Called at the start of every acquisition attempt. Empty: nothing hooks it.
-#[inline]
-fn on_acquire_entry() {}
-
-/// Called when a held token's lock is released. Empty: nothing hooks it.
-#[inline]
-fn on_token_drop() {}
-
 // Refusal =============================================================================================================
 
 /// Why an existing lock file was refused.
@@ -240,7 +230,6 @@ impl Exclusive {
     /// real caller owns through the owner rule, which an unprivileged test cannot
     /// otherwise make fail.
     fn try_acquire_as(path: &Path, owner: Option<(u32, u32)>, caller: platform::Caller) -> io::Result<Option<Self>> {
-        on_acquire_entry();
         Ok(platform::open_locked(path, false, owner, caller)?.map(|file| Exclusive { file }))
     }
 
@@ -255,15 +244,8 @@ impl Exclusive {
 
     /// [`Self::acquire`] as `caller`; see [`Self::try_acquire_as`].
     fn acquire_as(path: &Path, owner: Option<(u32, u32)>, caller: platform::Caller) -> io::Result<Self> {
-        on_acquire_entry();
         let file = platform::open_locked(path, true, owner, caller)?.expect("blocking open_locked always returns Some");
         Ok(Exclusive { file })
-    }
-}
-
-impl Drop for Exclusive {
-    fn drop(&mut self) {
-        on_token_drop();
     }
 }
 

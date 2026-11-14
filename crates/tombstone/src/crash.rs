@@ -18,8 +18,10 @@
 //!
 //! No part of Hole should hang the process, even sometimes: not a diagnostics
 //! crate, not anything else. On macOS a native crash therefore leaves the
-//! marker and produces neither an `.ips` nor a minidump. That is a decision,
-//! not a gap and not a TODO. Two sites implement it: `MarkerCrashEvent`'s macOS
+//! marker and produces neither an `.ips` nor a minidump. That is the owner's
+//! ruling, made with that cost put to her and accepted, and not a gap or a
+//! TODO. This crate is observability only: once the marker is on disk the
+//! process has nothing left to contribute. Two sites implement it: `MarkerCrashEvent`'s macOS
 //! `on_crash`, which `_exit`s instead of returning, so the system reporter
 //! never runs; and the `cfg(windows)` on `write_minidump_best_effort`.
 //!

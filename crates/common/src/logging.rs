@@ -738,7 +738,9 @@ pub fn init_dual(
     // The redaction wrap sits under the appender, so every formatted event
     // passes through it whoever authored it — a Hole site, a dependency at
     // the default global `info`, an OS command's argv, or a relayed plugin
-    // line.
+    // line. This is the writer that is a log file; wrapping it is what closes
+    // the leak, and it is the only redaction between any crate's `info!` and
+    // the file.
     //
     // The FILE appender is `lossy(false)`: the proxy-stop teardown burst
     // (SystemRoutes::drop sequence: route commands, state-file clear,
