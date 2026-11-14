@@ -8,10 +8,12 @@ version. The [architecture overview](overview.md#two-modes-one-binary) says how 
 
 ## Node is a build tool
 
-The front end in `ui/` is HTML, CSS and TypeScript. **Node.js runs only at build time**: Vite bundles the front end and
-`tsc` checks it ({src}`package.json`). `crates/hole/tauri.conf.json` points `frontendDist` at `ui/dist`, so the bundle is
-built before the Rust binary and embedded in it. No Node process exists at run time: Tauri draws the window with the
-operating system's web view (WebView2 on Windows, WebKit on macOS), and the app's own code behind the window is Rust.
+The front end in `ui/` is HTML, CSS and TypeScript. **In a release build, Node.js runs only at build time**: Vite bundles the front end
+and `tsc` checks it ({src}`package.json`). `crates/hole/tauri.conf.json` points `frontendDist` at `ui/dist`, so the bundle is
+built before the Rust binary and embedded in it. A shipped app has no Node process: Tauri draws the window with the
+operating system's web view (WebView2 on Windows), and the app's own code behind the window is Rust. A development run
+is the exception: `beforeDevCommand` starts Vite's dev server and the window loads `devUrl` from it
+([development](../development.md)).
 
 ## One instance per session
 
@@ -69,8 +71,9 @@ The menu renders the runtime truth, never persisted config:
 
 Persisted `config.enabled` records the last intent the bridge honoured, and `tray::persist_intended_enabled` is its only
 writer. The tray never renders from it, so a relaunch cannot show "Connected" over no tunnel. The decision to connect at
-launch is not the app's: the bridge makes it at its own boot (`target::startup_should_connect` in
-{src}`crates/bridge/src/target.rs`) from the startup preference the app pushes.
+launch is not the app's: the bridge makes it at its own boot, when `target::resolve_startup_target`
+({src}`crates/bridge/src/target.rs`), called from the reconciler, turns the startup preference the app pushed into the
+target the bridge reconciles toward.
 
 ## The bridge and the app agree on a version
 
@@ -78,8 +81,9 @@ The app and the bridge must never *operate* as a pair of different versions. The
 contract has no version negotiation.
 
 1. **The bridge stamps its build version on every response**, in the `X-Hole-Bridge-Version` header (`build_router` in
-   {src}`crates/bridge/src/ipc.rs`), and serves it at `GET /v1/version`. The value is passed into `IpcServer::bind_with_log_dir`
-   from the `hole` crate, which holds `HOLE_VERSION`.
+   {src}`crates/bridge/src/ipc.rs`), and serves it at `GET /v1/version`. The value is `hole::version::VERSION`, which the `hole` crate
+   reads from the `HOLE_VERSION` build-time variable and passes into the bridge's entry point
+   ({src}`crates/hole/src/cli.rs`), down to `IpcServer::bind_with_log_dir`.
 
 1. **The client compares** that header with its own version on every exchange and returns `ClientError::VersionMismatch`.
    A missing header, from a bridge that predates the stamp, counts as a mismatch. The pooled connection is kept: a

@@ -55,8 +55,8 @@ address. For an id that is not a UUID the hex characters are used in order and p
 
 Arming is keyed by literal, and **the last arm wins**. Re-arming a literal re-points it in place and logs one `info!`
 that names both tokens and neither address, which is what joins the lines of one endpoint across two entries or two
-sessions in a collected bundle. Entries are replaced, never appended, so the automaton stays bounded however many times
-a long-running service arms.
+sessions in a collected bundle. Re-arming a literal adds no entry, so the registry grows only with the number of
+distinct literals a long-running service arms.
 
 ### When a literal collides with Hole's own words
 
@@ -87,7 +87,7 @@ support bundle is scrubbed with the app's registry.
 {src}`crates/common/src/secret_newtype.rs`) implement neither `Display` nor `Deref`. `server_host = %config.server.server`
 is therefore a compile error, and `format!("{}", *addr)` cannot reopen it. `expose()` is the single named exit, so
 `rg '\.expose\(\)'` lists every site that reads a real value. Both carry a hand-written `Debug` that prints
-`<redacted>`, so a derived `Debug` on a container is not a hole, and a `Dump` impl tagged `dump::tag::SECRET`, which
+`ServerAddress(<redacted>)` or `Password(<redacted>)`, so a derived `Debug` on a container is not a hole, and a `Dump` impl tagged `dump::tag::SECRET`, which
 renders as `[REDACTED]`.
 
 That `Display` and `Deref` are **absent** is pinned by compile-fail probes
@@ -120,8 +120,8 @@ So **every such type needs its own `Dump` impl.** They are `ServerEntry`, `AppCo
 variant must say whether it carries a secret.
 
 One type the rule reads as covering is deliberately not covered: `ImportOutcome`. `crates/hole` has no `dump` dependency,
-so nothing there can call `dump!`, and adding the impl would mean adding the capability. All of this is convention backed
-by a test per container. It is not a compiler guarantee, the sink is the backstop for the address, and nothing is behind
+so nothing there can call `dump!`, and adding the impl would mean adding the capability. Each container's `Dump` impl has a test
+that renders it through `dump!` and finds no secret. All of this is convention, not a compiler guarantee: the sink is the backstop for the address, and nothing is behind
 it for the password.
 
 ## Errors that quote their input
@@ -167,12 +167,12 @@ This is not a total guarantee.
    routes' server IP (`recovering routes from crashed run`), and a bridge that reconnects at boot from its persisted
    target arms the resolved IP only, not the configured host, until the app sends a request that arms it.
 1. **`dump!` is convention, not a compiler guarantee**, as above.
-1. **An address in a form no armed literal is a byte-substring of is not redacted**: a percent- or punycode-escaped form
-   from a third-party process, or a non-canonical IPv6 text form from a peer that is not Rust's `std`.
+1. **An address in a form no armed literal is a byte-substring of is not redacted**: a percent-escaped form from a
+   third-party process, a Unicode form that normalises differently from the configured one, or a non-canonical IPv6 text
+   form from a peer that is not Rust's `std`.
 1. **`shadowsocks_service=trace` writes the password to `bridge.log` in clear.** `shadowsocks::ServerConfig` derives
    `Debug` over a cleartext `password: String`, and `shadowsocks_service` renders it: `local/mod.rs` logs
-   `{:?}` of the whole config at `trace` when the local server is constructed, and two `trace!` calls in
-   `local/dns/server.rs` render a server config. `expose()` hands upstream a `String` it is entitled to keep, no newtype
+   `{:?}` of the whole config at `trace` when the local server is constructed. `expose()` hands upstream a `String` it is entitled to keep, no newtype
    on Hole's side can reach that, and the password has no sink-level cure. The directive is not obscure:
    `init_multi`'s own example in {src}`crates/common/src/logging.rs` is
    `HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace`, and `bridge.log` is collected into the support bundle.

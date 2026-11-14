@@ -58,8 +58,9 @@ with the remote server and the plugin chain the practical ceiling.
 Dropping a runtime waits for blocking-pool tasks that are *running*. Nothing reachable on the local-server path has one
 today:
 
-- `shadowsocks`: on Windows its `DnsResolver::System` branch calls a blocking `lookup_host`, but Hole's config never
-  selects it (no ACL, every server address is a `ServerAddr::SocketAddr`).
+- `shadowsocks`: on Windows its default system resolver (`DnsResolver::System`, which Hole's config leaves selected)
+  calls a blocking `lookup_host`. It never runs, because nothing is resolved: every server address is a
+  `ServerAddr::SocketAddr`.
 - `hickory-resolver` and `hickory-proto`, pulled in by `shadowsocks-service`'s default `hickory-dns` feature, which
   `crates/bridge/Cargo.toml` does not disable. On unix `local::Server::new` always builds a hickory system resolver, so
   that code does run on `SsRuntime`, although Hole never asks it to resolve anything. Neither crate has a
@@ -70,7 +71,9 @@ A version bump could add one with no other test going red. `upstream_has_no_bloc
 `spawn_blocking` anywhere, or if `shadowsocks` has any `lookup_host(` call other than the one known site in
 `dns_resolver/resolver.rs`. It is a textual scan, not call-graph reachability: a harmless
 occurrence in a module Hole never reaches turns it red and needs a re-audit, and a rename or alias of either identifier
-defeats it. It is a tripwire for an accidental reintroduction, not a proof.
+defeats it. It is a tripwire for an accidental reintroduction, not a proof. The test finds the dependencies' source
+through `cargo metadata`, so it needs a workspace `cargo` can resolve; where it cannot, fix the environment, not the
+assertion.
 
 ```{dropdown} Test-only: carrying the tracing subscriber onto the runtime
 The per-test subscriber helper asserts that the *ambient* runtime is current-thread, so it cannot see that the proxy's
@@ -80,7 +83,7 @@ installs it on every worker in `on_thread_start`, and clears it in a matching `o
 
 The clearing is the part to keep: the guard's `Drop` is the only place `tracing-core` decrements its process-global
 count of scoped dispatchers. Forgetting the guard leaves that count non-zero for the rest of the test binary, which
-pushes every thread in the process onto tracing's slower path and, past thread teardown, can lose events.
+pushes every thread in the process onto tracing's slower path.
 ```
 
 ## Where to read next

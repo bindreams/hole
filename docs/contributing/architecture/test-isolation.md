@@ -6,7 +6,7 @@ which trait to use, what keeps the rule from eroding, and where a mock lives. Th
 overview](overview.md#the-trait-seams) names the traits; this page is the contract.
 
 A unit test that reached the real `netsh`, `route` or `pfctl` would change the routes of the machine it runs on, and on a
-CI runner that breaks every other job on it. The rule is therefore absolute: **production I/O that changes, or reads, the
+shared CI runner that machine is every other job's machine too. The rule is therefore absolute: **production I/O that changes, or reads, the
 host's network state goes through the seam, including the cleanup in a `Drop`.**
 
 ## The three traits
@@ -40,8 +40,9 @@ would run the real teardown from a unit test, where no mock can see it.
 {src}`clippy.toml` lists the free functions behind each seam as disallowed methods, so a call from anywhere else fails
 the lint:
 
-- `setup_routes` and `teardown_routes` in `tun_engine::routing`. Only `SystemRouting` and `SystemRoutes` call them; crash
-  recovery of routes is the free function `recover_routes`, which the bridge calls directly and not through the trait.
+- `setup_routes` and `teardown_routes` in `tun_engine::routing`. `SystemRouting::install` is the one caller of
+  `setup_routes`. `teardown_routes` has two: `SystemRoutes::drop` and `recover_routes`, the free function for crash
+  recovery of routes, which the bridge calls directly and not through the trait.
 - The Win32 DNS calls `SetInterfaceDnsSettings`, `GetInterfaceDnsSettings` and `DnsFlushResolverCache`. Only the
   `Win32Real` backend in {src}`crates/bridge/src/dns/system/windows.rs` calls them.
 - The FWPM calls that install and remove firewall filters. The sanctioned callers are in

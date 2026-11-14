@@ -28,9 +28,11 @@ a rotation. When neither name can, no line is lost: the active file keeps being 
 succeeds. Only a file that cannot be opened loses lines, and it says so once, on the real stderr.
 
 **The directory is the user's.** When the bridge runs elevated on a user's behalf, its log directory sits in the user's
-profile, so `init_dual` opens it once as a `util::dir::Dir` (no symlink followed, created if missing, handed to the user)
-and `DirRotate` ({src}`crates/common/src/logging/dir_rotate.rs`) does the open, the rotation rename, the legacy-file
-cleanup and the `chown` of each fresh file by a single name inside that handle. A path-based rotator would follow
+profile, so `init_dual` opens it once as a `util::dir::Dir` (a link is followed only under [the ownership-transition
+rule](privileged-folders.md#the-ownership-transition-rule), the final name never; created if missing, handed to the
+user). `DirRotate` ({src}`crates/common/src/logging/dir_rotate.rs`) does the open, the rotation rename and the `chown` of
+each fresh file, and `init_dual` removes the files of the old daily-rotation scheme, each by a single name inside that
+handle. A path-based rotator would follow
 whatever the user swapped in for a component of the path, as root. A directory the walk refuses disables the file sink,
 with one line on the real stderr that carries no path; the bridge keeps running.
 
@@ -54,10 +56,11 @@ the diagnosis.
 | `HOLE_LOG_DIR`    | The log directory.                                                                                          |
 | `RUST_LOG`        | Layered under every sink's directives, so it composes with the variables above.                             |
 
-`HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace` adds the Shadowsocks server's per-relay byte counts (`L2R N bytes, R2L M bytes`), which is how a connection that moved no bytes is diagnosed. It writes at least one trace line per TCP
-connection, so use it for debugging only, and read the warning on it in [server-address
-redaction](redaction.md#limits). `cargo xtask run hole` sets these for you and writes the logs of each run to a directory
-of its own ([Development](../development.md)).
+`HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace` adds the Shadowsocks server's per-relay byte counts
+(`L2R N bytes, R2L M bytes`), which is how a connection that moved no bytes is diagnosed. It writes at least one trace
+line per TCP connection, so use it for debugging only, and read the warning on it in [server-address
+redaction](redaction.md#limits). `cargo xtask run hole` sets the file sink to `trace` for first-party crates, not
+`shadowsocks_service`, and writes the logs of each run to a directory of its own ([Development](../development.md)).
 
 ## The stdio safety net
 
@@ -94,10 +97,10 @@ tracing::warn!(error = &e as &dyn std::error::Error, "what failed");
   the same there.
 - **The type rule.** A variant's `Display` names what this layer failed to do and never formats its `source()`; a cause
   is `#[source]` or `#[from]`. A `Display` that includes its cause prints it twice. A wrapper variant exposes its inner
-  error as its `source()` and is never `#[error(transparent)]`, which forwards `source()` past the inner value so `find`
+  error as its `source()` and is not `#[error(transparent)]`, which forwards `source()` past the inner value so `find`
   and `raw_os_error` cannot reach it. A new wrapper is `#[error("<what failed>")] V(#[source] Inner)` (or `#[from]`). The
   existing `#[error("{0}")]` wrappers are a transitional exception: a logged chain shows their inner text twice until
-  they get text of their own.
+  they get text of their own. `ProxyError::PluginResolve` is `transparent` too.
 - **Reading a chain in code.** Use `util::error` ({src}`crates/util/src/error.rs`: `chain`, `links`, `find`,
   `raw_os_error`) and do not write a `source()` loop by hand. The module doc says what the walks reach.
 - **A value that is not an error stays as it is.** A third-party type with no `std::error::Error` impl, and a `String` made
@@ -118,8 +121,9 @@ goes to `gui.log`. Three mechanisms are sanctioned:
    ({src}`crates/common/src/config.rs`) carries the failing operation and the OS error, never the path, and its `Parse`
    variant carries only a category and a line and column. `save_config` ({src}`crates/hole/src/commands.rs`) logs the
    path with `warn!` and puts the path-free message in the toast.
-1. **A detail-free wire variant, plus a `warn!`**, when the detail itself could carry content: `import_servers_from_file`
-   returns `ImportFailure::SaveFailed` or `CorruptedJson` (no fields) and logs the full error.
+1. **A detail-free wire variant, plus a `warn!`**, when the detail itself could carry content: `import_file`
+   ({src}`crates/hole/src/commands.rs`) returns `ImportFailure::SaveFailed` or `CorruptedJson` (no fields) and logs the
+   full error.
 1. **The redaction registry**, for the configured server address, which no per-site rule can cover.
 
 ## Plugin diagnostics
@@ -140,7 +144,7 @@ into the bridge's log as tracing events from `garter::binary`, so the usual dire
   `loglevel` is always replaced. Their `ech-doh` is replaced only when Hole's value outranks it
   (`hole_ech_doh_outranks`: Hole's resolver answered the bootstrap, or the operator's value names its server by name
   rather than by IP address); otherwise it stands, and Hole's appended copy loses to it, because ex-ray reads the first
-  value of a repeated key. `derive_ech_doh` derives the URL, and the kill-switch cover's resolver permit reads the same
+  value of a repeated key. `derive_ech_doh` derives the URL, and the [kill-switch cover](kill-switch.md)'s resolver permit reads the same
   field. Hole never injects `ech=<mode>`: ex-ray owns the mode.
 
 ## Where to read next

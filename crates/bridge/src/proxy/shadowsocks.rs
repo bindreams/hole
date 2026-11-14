@@ -111,7 +111,7 @@ impl SsRuntime {
 
 impl Drop for SsRuntime {
     fn drop(&mut self) {
-        // Gives every Drop path (exposed paths 3-6, not just stop()) the
+        // Gives every Drop path (not just stop()) the
         // same port-release guarantee — see docs/contributing/architecture/proxy-shutdown.md.
         if let Some(rt) = self.0.take() {
             join_runtime(rt);
