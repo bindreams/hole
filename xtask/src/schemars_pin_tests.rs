@@ -584,8 +584,9 @@ fn check_declared_requirements_passes_when_every_entry_holds_the_pin() {
 /// A third signal, `typify-impl`'s declared requirement, needs a registry and
 /// so does not run here; `cargo xtask check-schemars-pin` covers it in the
 /// `Lint` job and in the `check-schemars-pin` prek hook, which `prek.toml`
-/// gates to commits touching the files this pin lives in. See the module doc
-/// for why the split is by lane rather than by strength.
+/// gates to commits touching the files this pin lives in. See "The schemars
+/// pin" in docs/contributing/testing.md for why the split is by lane rather
+/// than by strength.
 ///
 /// `repo_root()` rather than `env!("CARGO_MANIFEST_DIR")`: this binary runs
 /// from a nextest archive under `--workspace-remap`, where the build-time path

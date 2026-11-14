@@ -27,8 +27,7 @@ fn bare_go_version_is_flagged() {
 }
 
 /// A `go-version-file` is accepted only if it is exactly `GO_VERSION_FILE`; any
-/// other path is flagged, including another `go.mod` that has a `toolchain` line
-/// (the vendored `v2ray-core` one) and a version file such as `.go-version`.
+/// other path is flagged. This test checks one such path, `.go-version`.
 #[skuld::test]
 fn setup_go_pointing_at_another_file_is_flagged() {
     let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/setup-go@v7\n        with:\n          go-version-file: .go-version\n";

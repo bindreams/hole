@@ -111,13 +111,13 @@ pub fn index_blob_hash_or_deleted(cwd: &Path, relative_path: &str) -> Result<Str
 /// `<deleted>` if `HEAD` has no such path — `finish_vendor_bump::run`'s
 /// sentinel-clearing check uses this once a human's own resolution has been
 /// committed (`VENDORING.md` documents the hand-resolution steps: commit
-/// before running `finish-vendor-bump`). Like `index_blob_hash_or_deleted`,
-/// it reads git's object database rather than re-hashing the working tree,
-/// so checkout smudging and `.gitattributes` or `core.autocrlf` differences
-/// between worktrees cannot change the result. `git subrepo commit`'s fold-in
-/// is a tree-level merge, not a checkout-and-rewrite, so a blob the temp
-/// worktree's index recorded and this `HEAD` read in the main worktree agree
-/// for unchanged content on any platform.
+/// before running `finish-vendor-bump`). It reads the blob `HEAD` records
+/// rather than re-hashing the working tree, so checkout smudging and
+/// `.gitattributes` or `core.autocrlf` differences between worktrees cannot
+/// change the result. `git subrepo commit`'s fold-in is a tree-level merge,
+/// not a checkout-and-rewrite, so the hash `index_blob_hash_or_deleted` read
+/// from git-subrepo's conflict worktree and this `HEAD` read in the main
+/// worktree agree for unchanged content on any platform.
 pub fn head_blob_hash_or_deleted(cwd: &Path, relative_path: &str) -> Result<String> {
     resolved_blob_hash_or_deleted(cwd, &format!("HEAD:./{relative_path}"))
 }

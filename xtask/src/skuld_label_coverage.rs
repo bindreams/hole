@@ -204,8 +204,10 @@ fn is_launcher_token(tok: &str) -> bool {
 
 /// Boolean flags `cargo nextest run` accepts that neither `cargo nextest
 /// list` nor `cargo nextest run --no-run` does — nextest rejects both
-/// combinations outright (`--no-run` with `--no-fail-fast` would fail the
-/// `hole-tests` target's build step, so this module strips the flag first). None
+/// combinations outright (`--no-run` with `--no-fail-fast` once broke the
+/// `hole-tests` target's build step). [`to_list_command`] strips them when it
+/// rewrites a run into a list; for a `build:` step, `manifest_tests.rs` rejects
+/// them. None
 /// of these narrow *which* tests a filter selects (that's `-E`'s job, always carried
 /// through), only how a `run` that actually executes tests
 /// schedules/reports the ones it already selected — so dropping them can

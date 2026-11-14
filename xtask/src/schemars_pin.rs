@@ -614,8 +614,8 @@ const RENOVATE_MANIFEST: &str = ".github/renovate.json";
 /// two drifting apart if `PINNED_SERIES` moved without a matching edit here.
 ///
 /// Deliberately textual: this compares two literal version strings, not
-/// Renovate's own selector/rule-merging behaviour — that model was removed
-/// (see the module doc) and this check does not reopen it.
+/// Renovate's own selector/rule-merging behaviour, which is not modelled (see
+/// "The schemars pin" in docs/contributing/testing.md).
 pub fn check_renovate_boundary(renovate_json: &str) -> Result<()> {
     let doc: serde_json::Value =
         serde_json::from_str(renovate_json).context("failed to parse .github/renovate.json")?;
