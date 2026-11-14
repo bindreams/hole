@@ -340,16 +340,15 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 ///
 /// It does NOT assert that a cover is present, since an unproven key is equally
 /// consistent with never having been installed. Three key classes are worded apart.
-/// Two pass the `leftover_keys` gate: [`boot_time_filters_line`] and
-/// [`unenumerated_views_line`]. A filter the OS refused to delete does not:
-/// [`refused_strangers_line`] reads [`Clearance::refused_strangers`], which reads the
-/// unproven set directly, so no sibling or witness evidence can suppress it.
+/// Two pass the `leftover_keys` gate: leftover boot-time filters and views that
+/// could not be enumerated. A filter the OS refused to delete does not:
+/// [`Clearance::refused_strangers`] reads the unproven set directly, so no sibling
+/// or witness evidence can suppress it.
 ///
 /// `running_version` is the build making the report, and the remedy names it: a
 /// key that answered not-found is not live, so no enumeration sees it and only a
 /// build whose list names the key can address it. The running build's list names
 /// every key it installs, so a key a later release adds needs no edit here.
-#[allow(rustdoc::private_intra_doc_links)]
 pub fn release_clearance_report(clearance: &Clearance, running_version: &str) -> Option<String> {
     let mut parts = Vec::new();
     parts.extend(refused_strangers_line(clearance));
@@ -381,7 +380,11 @@ fn refused_strangers_line(clearance: &Clearance) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{}. Boot-time filters are live only between kernel start and Base Filtering Engine          start, so they block nothing now, but one that survives can block egress early in the next boot. A refusal may          be transient: after a reboot, or on a later `hole bridge unlock`, the sweep may delete what it refused. Failing          that, remove each by its key with an elevated tool that calls `FwpmFilterDeleteByKey0` (`netsh wfp` has no          delete verb).",
+        "{}. Boot-time filters are live only between kernel start and Base Filtering Engine \
+         start, so they block nothing now, but one that survives can block egress early in the next boot. A refusal may \
+         be transient: after a reboot, or on a later `hole bridge unlock`, the sweep may delete what it refused. Failing \
+         that, remove each by its key with an elevated tool that calls `FwpmFilterDeleteByKey0` (`netsh wfp` has no \
+         delete verb).",
         refusals.join("; "),
     ))
 }
