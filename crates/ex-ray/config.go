@@ -215,7 +215,7 @@ func tcpKeepAliveParams() (keepAliveParams, error) {
 // does not call it because RegisterDialerController appends and the tests call
 // generateConfig repeatedly.
 //
-// Server mode is skipped: ex-ray's outbound there dials loopback to the server,
+// Server mode is skipped: ex-ray's outbound there dials loopback to ss-server,
 // and a listener is unreachable from a dialer controller anyway.
 func registerTCPKeepAlive() error {
 	if *server {
@@ -359,9 +359,12 @@ func securitySettings(tlsConfig *tls.Config) proto.Message {
 // listens on localAddr:localPort over that transport and forwards to
 // remoteAddr:remotePort.
 //
-// It validates every option it reads itself, whatever main has already
-// checked, because tests call it directly. Error text never contains an option
-// value.
+// It validates for itself, whatever main has already checked, because tests call
+// it directly: the local and remote ports and addresses, mux, fwmark, mode, ech
+// and the tls it needs, cert, certRaw and key against tls, tcp-keepalive and
+// loglevel. host, path, fastOpen and ech-doh get no check here: only
+// parseOptsIntoFlags guards an empty host or path, and ech-doh's form is checked
+// there too (parseURLOption). Error text never contains an option value.
 func generateConfig() (*core.Config, error) {
 	lport, err := validPort(*localPort)
 	if err != nil {
@@ -371,7 +374,8 @@ func generateConfig() (*core.Config, error) {
 	if lport == 0 {
 		return nil, newError("invalid localPort: must not be 0")
 	}
-	// Without this, a `|`-joined list would be parsed as one address.
+	// Rejects a `|`-joined list and any hostname: ParseAddress would take either
+	// as one domain address.
 	if _, ok := canonicalLocalAddr(*localAddr); !ok {
 		return nil, newError("invalid localAddr: must be a single IP literal")
 	}

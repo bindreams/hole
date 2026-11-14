@@ -23,7 +23,6 @@ const sitrepProtocol = "sitrep-1.0.0"
 // The event structs. Field order is the wire order (see the file header).
 
 // helloEvent is the first line ex-ray writes.
-
 type helloEvent struct {
 	Event    string `json:"event"`
 	Protocol string `json:"protocol"`

@@ -19,8 +19,10 @@ func (p keepAliveParams) enabled() bool { return p.IdleSeconds > 0 }
 
 // keepAliveDialerController returns a dialer controller that applies p to every
 // TCP socket before it connects, or nil when p is not enabled. It exists to set
-// the probe count, which v2ray-core's SocketConfig cannot express and which is
-// what shortens the dead-connection bound below the OS default. Non-TCP
+// the probe count, which v2ray-core's SocketConfig cannot express. SocketConfig's
+// idle and interval already take the dead-connection bound far below the OS
+// default; the probe count shortens it further, below the bound Go's own default
+// keepalive gives (its idle and interval, then the OS probe count). Non-TCP
 // setsockopt calls would fail, hence the network check below.
 func keepAliveDialerController(p keepAliveParams) func(network, address string, fd uintptr) error {
 	if !p.enabled() {

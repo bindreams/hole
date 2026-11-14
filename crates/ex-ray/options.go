@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// Rules shared by the parse* Option helpers below, each of which applies one
+// Rules shared by the parse*Option helpers below, each of which applies one
 // option from the parsed SS_PLUGIN_OPTIONS (Args) to a flag:
 //   - An absent key leaves dest as it was: the flag's default, or the value
 //     flag.Parse set from the command line.
@@ -52,7 +52,7 @@ func parseIntOption(opts Args, key string, dest *int) error {
 // no other spelling ("true", "yes") is accepted.
 //
 // An empty value is rejected rather than ignored because garter's
-// Mode::from_plugin_options (crates/garter/src/chain_tests.rs) takes the mere
+// Mode::from_plugin_options (crates/garter/src/chain.rs) takes the mere
 // presence of the `server` key as server mode, whatever its value. Ignoring
 // `server=` would leave ex-ray in client mode while garter swapped the chain's
 // SS_LOCAL and SS_REMOTE variables for server mode.
@@ -86,9 +86,10 @@ func parseEnumOption(opts Args, key string, allowed []string, dest *string) erro
 }
 
 // parseURLOption applies an option to dest if its value is a well-formed https
-// URL. Unlike the other helpers an empty value is valid and clears dest:
-// `ech-doh=` means "no DoH resolver, ECH off" (the flag's own description).
-// A malformed non-empty value is fatal, because v2ray-core only logs a failed
+// URL. Unlike the other helpers an empty value is valid and clears dest: the
+// ech-doh flag's help says "Empty disables ECH.". This helper does not check
+// that against the ech mode: with ech=always an empty ech-doh is a fatal
+// config error (buildTLSConfig). A malformed non-empty value is fatal, because v2ray-core only logs a failed
 // ECH config fetch: a typo'd ech-doh would silently disable ECH with ech=auto,
 // or leave RequireEch armed and unsatisfiable with ech=always, in both cases
 // with ex-ray reporting ready.

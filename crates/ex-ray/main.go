@@ -40,16 +40,17 @@ func failFatal(err error) {
 //
 // A non-nil return is fatal: the caller must emit a `fatal` sitrep and exit
 // non-zero rather than proceed with partially-applied flags. Option values are
-// never echoed in the error. The per-option rules are on the parse*Option
-// helpers (options.go).
+// never echoed in the error. The per-option rules are the shared block at the
+// top of options.go and each parse*Option helper's doc.
 //
 // localAddr/localPort always name the inbound listener this process binds, in
 // both modes:
 //   - client mode: localAddr/localPort come from SS_LOCAL_* (the Shadowsocks
 //     client's plugin-facing endpoint), remoteAddr/remotePort from SS_REMOTE_*.
-//   - server mode: the Shadowsocks server swaps them, so localAddr/localPort take
-//     the SS_REMOTE_* values (the public listen endpoint) and remoteAddr/remotePort
-//     take SS_LOCAL_* (the loopback address of the server to forward into).
+//   - server mode: this function swaps the pairs. SIP003 passes a server-side
+//     plugin its public endpoint in SS_REMOTE_* and the address of the server to
+//     forward into in SS_LOCAL_*, so localAddr/localPort take the SS_REMOTE_*
+//     values and remoteAddr/remotePort take SS_LOCAL_*.
 //
 // Under `*server` a `localAddr` option therefore lands in *remoteAddr and a
 // `remoteAddr` option in *localAddr, likewise for ports.
@@ -249,9 +250,10 @@ func main() {
 	//   - A `|`-joined list: parseLocalAddr splits localAddr on `|` for a
 	//     multi-address listen, but `ready` cannot report more than one.
 	//   - "localhost": v2ray-core's listener rewrites it to 127.0.0.1, so
-	//     reporting the raw value would print "localhost:<port>". Every other
-	//     non-IP hostname already fails in generateConfig ("domain address is not
-	//     allowed for listening").
+	//     reporting the raw value would print "localhost:<port>".
+	// canonicalLocalAddr below rejects every non-IP hostname, not only that one;
+	// v2ray-core's listener would refuse any other with its own "domain address is
+	// not allowed for listening" error.
 	if len(parseLocalAddr(*localAddr)) != 1 {
 		failFatal(errors.New("invalid localAddr: a single listen address is required (the ready sitrep cannot report more than one)"))
 	}
