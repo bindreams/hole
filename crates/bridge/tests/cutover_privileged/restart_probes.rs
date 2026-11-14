@@ -1,4 +1,4 @@
-//! Probe P1 of the service-retirement design: does the SCM's own recovery
+//! Probe P1 (the label in the printed output): does the SCM's own recovery
 //! restart start a service whose start type is DISABLED?
 //!
 //! Microsoft's `ChangeServiceConfig2W` Remarks already answer it ("A queued

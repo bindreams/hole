@@ -49,7 +49,7 @@ fn entry(host: &str, port: u16, method: &str, password: &str) -> ServerEntry {
 
 /// Fast defaults for tests that don't need plugin startup.
 ///
-/// These tests no longer touch the routing table, so tight timeouts are
+/// These tests do not touch the routing table, so tight timeouts are
 /// safe. If CI fails, investigate root cause rather than bumping these.
 fn fast_test_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfig {
     TestConfig {
@@ -174,7 +174,7 @@ fn run_test_returns_dns_failed_for_unresolvable_host() {
 ///
 /// Every supported platform refuses `127.0.0.1:1` — the kernel sends RST.
 /// Windows just bills the connecting socket for its own SYN-retransmission
-/// budget (~2.05 s) before reporting it, which `preflight_timeout` clears
+/// budget before reporting it, which `preflight_timeout` clears
 /// (`server_test::PREFLIGHT_TIMEOUT`); see `util::syn_budget`. So the
 /// verdict is `TcpRefused` everywhere: a branch accepting `TcpTimeout` too
 /// would assert nothing about the classifier under test.
@@ -387,7 +387,7 @@ fn run_test_returns_internal_error_for_unsupported_cipher() {
 /// Test 10: end-to-end happy path through v2ray-plugin (websocket, no TLS).
 ///
 /// Spins up a real shadowsocks server with a server-mode ex-ray (the binary
-/// the friendly `v2ray-plugin` wire name resolves to, #414) in front, then
+/// the friendly `v2ray-plugin` wire name resolves to) in front, then
 /// runs the test runner with `entry.plugin = "v2ray-plugin"`. The runner
 /// spawns its own client-mode ex-ray via [`Plugin::start`], which talks WS
 /// to the server-mode instance, which forwards to the SS server, which
@@ -452,12 +452,12 @@ fn run_test_with_v2ray_plugin_happy_path() {
     });
 }
 
-/// M1 regression: an AEAD-2022 EIH password's `identity_keys` must survive
+/// An AEAD-2022 EIH password's `identity_keys` must survive
 /// [`maybe_start_plugin`]'s address override.
 ///
 /// `svr_cfg.password()` returns only the uPSK half of an EIH password
 /// (`iPSK1:...:uPSK`) — upstream splits the identity keys off into their own
-/// field. Rebuilding the config from that accessor (the pre-fix code) would
+/// field. Rebuilding the config from that accessor would
 /// silently produce a `ServerConfig` with empty `identity_keys`, so a
 /// correctly configured EIH server tested with a plugin would be probed
 /// without its identity headers and reported unreachable. `maybe_start_plugin`

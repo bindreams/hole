@@ -1,5 +1,5 @@
-//! Privileged-lane WIRE-LEVEL no-leak proof for the standing lockdown cover
-//! (#527, PR2). Where the sibling `lockdown_privileged_tests` connect()-probe
+//! Privileged-lane WIRE-LEVEL no-leak proof for the standing lockdown cover.
+//! Where the sibling `lockdown_privileged_tests` connect()-probe
 //! infers no-leak from an Ok/Err on egress, this captures the PHYSICAL egress
 //! NIC and asserts at the wire what did and did not leave the box.
 //!

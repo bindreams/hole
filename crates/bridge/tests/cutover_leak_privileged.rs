@@ -6,8 +6,8 @@
 //!
 //! Every reachability assertion is OUTBOUND egress to a routable IP -- NEVER
 //! loopback. The GitHub Actions Windows runner drops inbound loopback to the test
-//! exe, so a loopback probe cannot distinguish a working cover from a broken one
-//! (the PR1 lesson). IP literals only: the cover blocks DNS, so a hostname
+//! exe, so a loopback probe cannot distinguish a working cover from a broken one.
+//! IP literals only: the cover blocks DNS, so a hostname
 //! connect would fail for the wrong reason.
 //!
 //! Cross-binary serialization of the global WFP/pf/TUN state lives in
@@ -57,8 +57,8 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 // independent of any cutover code path). The load-bearing invariant -- a cutover
 // engages no transient cover, so a failed start cannot brick the host (the
 // Mullvad-#8470 class) -- is enforced STRUCTURALLY: the `cutover::os::CutoverOs`
-// effects trait exposes no cover-mutating method. The privileged version is
-// reported back as needing a real failed-start fixture.
+// effects trait exposes no cover-mutating method. A privileged version needs a
+// real failed-start fixture.
 
 /// The standing lockdown cover's egress block must SURVIVE a `disarm` -- that is
 /// the cutover leak invariant on the real ruleset. The bridge's marker-
@@ -72,16 +72,16 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 /// server permit too). Cleanup fully disengages via the persisted state so the
 /// box is left open.
 ///
-/// (This replaces the originally-planned both-covers recovery egress test, which
-/// could not be made faithful: the macOS transient `engage`'s own `pfctl -f -`
-/// unconditionally replaces whatever ruleset is currently loaded -- standing or
-/// not -- with its own, and
-/// `recover_lockdown(Adopt)` deliberately does not reload the standing ruleset
-/// afterward -- so post-recovery the live ruleset is the transient leftover, and
-/// with a shared permit IP the egress assertions pass regardless of whether
-/// standing-adopt works. The Task-4 reorder invariant it targeted -- lockdown
-/// reconcile BEFORE the transient sweep, the sweep told `standing_held` so it
-/// skips the `/etc/pf.conf` reload -- is proven at the unit level by
+/// (There is no both-covers recovery egress test, because one cannot be made
+/// faithful: the macOS transient `engage`'s own `pfctl -f -` unconditionally
+/// replaces whatever ruleset is currently loaded -- standing or not -- with its
+/// own, and `recover_lockdown(Adopt)` deliberately does not reload the standing
+/// ruleset afterward -- so post-recovery the live ruleset is the transient
+/// leftover, and with a shared permit IP the egress assertions pass regardless
+/// of whether standing-adopt works. The ordering invariant such a test would
+/// target -- lockdown reconcile BEFORE the transient sweep, the sweep told
+/// `standing_held` so it skips the `/etc/pf.conf` reload -- is proven at the
+/// unit level by
 /// `routing_tests::recover_orders_lockdown_before_transient_sweep_and_passes_adopting`.)
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]

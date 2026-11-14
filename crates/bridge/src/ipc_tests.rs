@@ -51,7 +51,6 @@ struct MockProxy {
     /// inside `start()` instead of sleeping a guess-duration. One-shot
     /// per MockProxy (subsequent entries do nothing); the test pattern
     /// is "spawn task A; await entered; act on the parked state."
-    /// See bindreams/hole#383.
     start_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     /// Message for the `fail_start` error. A plugin-chain failure can embed
     /// the resolved server address (garter formats `remote_host` into its
@@ -438,8 +437,7 @@ fn mock_proxy_with_cover_presence(
 /// routing's `release_all_calls` / `fail_release` handles (cloned out BEFORE
 /// `routing` moves into the manager, mirroring `mock_proxy_with_traffic`), so
 /// a test can assert the escape fired and drive a failure. Presence defaults
-/// to `Live` — the escape is now gated on `cover_step`, so a test exercising
-/// `release_all_covers` needs a presence that actually calls for a release.
+/// to `Live`.
 #[allow(clippy::type_complexity)]
 fn mock_proxy_with_release_state() -> (
     Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>,
@@ -572,7 +570,7 @@ async fn consume(resp: http::Response<hyper::body::Incoming>) -> u16 {
 }
 
 /// `X-Hole-Attempt-Id`: the per-attempt idempotency key the GUI mints and sends
-/// on both Start and Cancel; the bridge scopes start-cancellation to it (#465).
+/// on both Start and Cancel; the bridge scopes start-cancellation to it.
 const ATTEMPT_ID_HEADER: &str = "x-hole-attempt-id";
 
 async fn post_start(
@@ -1039,8 +1037,8 @@ fn unblock_error_bodies_carry_no_filesystem_path() {
     }
 
     rt().block_on(async {
-        // The 500 (failed release) case — the only error case unblock has
-        // left, now that the escape never refuses.
+        // The 500 (failed release) case: the only error case unblock has, since
+        // the escape never refuses.
         let path = test_socket_path("unblock-nopath-500");
         let (proxy, _calls, fail_release, _dir) = mock_proxy_with_release_state();
         fail_release.store(true, Ordering::SeqCst);
@@ -1579,8 +1577,8 @@ fn start_failure_returns_error() {
 
 #[skuld::test]
 fn setting_the_target_persists_the_startup_preference() {
-    // #979 — at the IPC layer rather than the pure
-    // save/load round-trip `target_tests.rs` already covers: an actual Start
+    // At the IPC layer rather than the pure save/load round-trip
+    // `target_tests.rs` covers: an actual Start
     // request carrying `x-hole-on-startup` writes the preference, and a
     // fresh `load_startup_preference` (no in-memory state carried over,
     // simulating a bridge restart) reads it back.
@@ -1619,7 +1617,7 @@ fn setting_the_target_persists_the_startup_preference() {
 
 #[skuld::test]
 fn a_start_with_no_startup_preference_leaves_the_persisted_one_alone() {
-    // #979: the CLI has no Settings preference to push and sends no
+    // The CLI has no Settings preference to push and sends no
     // `X-Hole-On-Startup` header at all (distinct from an old client, which
     // omits it not knowing it exists — both look identical on the wire, and
     // are handled identically: nothing pushed). Either way, a Start missing
@@ -2309,7 +2307,7 @@ fn diagnostics_bridge_error_after_failed_start() {
 
         // Trigger a failed start so ProxyManager.last_error is populated.
         // The gateway-failing mock makes default_gateway return Err, which
-        // ProxyManager::start now records via inspect_err.
+        // ProxyManager::start records via inspect_err.
         let resp = post_start(&mut client, &sample_config(), "t").await;
         assert_eq!(resp.status(), 500);
         let _ = resp.into_body().collect().await;
@@ -2326,7 +2324,7 @@ fn diagnostics_bridge_error_after_failed_start() {
     });
 }
 
-/// PII guarantee (#470): a failed start populates `last_error` (which can carry
+/// PII guarantee: a failed start populates `last_error` (which can carry
 /// a path/hostname), but `StatusResponse.error` surfaces only the path-free
 /// death reason — None here, since a failed start is not an out-of-band death.
 /// So the rich error never reaches the GUI toast even though diagnostics see it.
@@ -2808,13 +2806,10 @@ fn concurrent_start_is_rejected_with_conflict() {
 
 #[skuld::test]
 fn stale_prearm_does_not_cancel_unrelated_start() {
-    // #465 regression (the reported P0). Attempt A starts and succeeds; a late
+    // Attempt A starts and succeeds; a late
     // Cancel(A) loses the race and pre-arms (no in-flight start); the frontend's
     // compensating follow-up Stop fires. The NEXT, unrelated Connect (attempt B)
     // must SUCCEED — the stale pre-arm for A can never match B's id.
-    //
-    // This inverts the old `sequential_start_cancel_start_consumes_pre_arm_once`,
-    // which codified the bug (Start→Stop→Cancel→Start returned CANCELLED).
     rt().block_on(async {
         let path = test_socket_path("stale-prearm-unrelated");
         let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
@@ -3527,13 +3522,13 @@ async fn an_outgoing_error_carrying_the_address_is_redacted() {
     assert!(wire.contains(&token), "the outgoing error lost its token: {wire}");
 }
 
-/// M3 (#1033): `handle_reload` must arm and redact exactly as `handle_start`
+/// `handle_reload` must arm and redact exactly as `handle_start`
 /// does. `reload`'s slow path (`stop()` + `start(config)`) runs precisely
 /// when the incoming server differs from the running one — i.e. exactly
 /// when the incoming host has never been armed in this process
 /// (`start_inner` only arms the *resolved IP*, never the configured host).
-/// Before the fix, a failure on that path put the configured address in
-/// clear into both `bridge.log` and this handler's error body.
+/// Unarmed, a failure on that path would put the configured address in clear
+/// into both `bridge.log` and this handler's error body.
 #[skuld::test]
 async fn reload_to_a_different_server_that_fails_is_redacted_in_log_and_response() {
     let (subscriber, writer) = redacting_capture();
@@ -3706,17 +3701,16 @@ fn the_unblock_and_the_start_persist_run_under_the_cover_lock() {
 }
 // Status probe placement ==============================================================================================
 
-/// `handle_status` used to reach cover presence through `pm.cover_presence()`
+/// `handle_status` must not reach cover presence through `pm.cover_presence()`
 /// while holding `state.proxy.lock()`. On macOS that probe forks
-/// `pfctl -s labels`, and the GUI polls status every 5s for the life of the
-/// app — so every poll ran a subprocess inside the same critical section
+/// `pfctl -s labels`, and the GUI polls status periodically for the life of the
+/// app, so every poll would run a subprocess inside the same critical section
 /// `handle_start` and `stop_with` need.
 ///
 /// Asserted structurally rather than by racing two tasks: the runtime version
 /// can only conclude "still serialised" by waiting, and the only way to bound
 /// that wait is a timeout, which this project forbids for synchronisation.
-/// `IpcState` already carries the same `Arc<R>` (added for `handle_unblock`),
-/// so the invariant is simply that this file never takes the manager's route.
+/// `IpcState` already carries the same `Arc<R>`, so the invariant is simply that this file never takes the manager's route.
 #[skuld::test]
 fn status_reads_presence_off_the_routing_handle_not_the_proxy_manager() {
     let ipc_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

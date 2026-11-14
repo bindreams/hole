@@ -5,7 +5,8 @@
 //! every process, so a test reads off what an elevated administrator and
 //! LocalSystem can open and read. Every failure is printed with its Win32 code,
 //! the kind the production code classifies it as, and what each `Basis` table
-//! row does about it, so the per-failure table is read off a run (probe P5).
+//! row does about it, so the per-failure table is read off a run (probe P5, defined in
+//! `crates/bridge/tests/cutover_privileged/sid_probes.rs`).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

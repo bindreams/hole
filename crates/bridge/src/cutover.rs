@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 use tun_engine::routing::failclosed::{Clearance, CoverLock, UnprovenKey};
 
 /// The privileged service's state dir (Windows: `C:\ProgramData\hole\state`),
-/// where the crash-recovery state and the lockdown intent + cover state live.
-/// `unlock` needs it without a running bridge, so it
-/// resolves the same per-platform location `install()` provisions.
+/// where the crash-recovery state and the lockdown intent and cover state live.
+/// `unlock` needs it without a running bridge, so it resolves the same
+/// per-platform location `install()` provisions.
 pub fn service_state_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
@@ -211,26 +211,25 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 }
 
 /// Disengage a standing lockdown cover and clear the persisted intent, with no
-/// running bridge required. The escape hatch must actually disengage or FAIL
-/// LOUD: it disengages FIRST and only flips the intent off after a confirmed
-/// success. A swallowed failure (e.g. run unprivileged) would leave the cover
-/// engaged — egress still blocked — while the intent reads "off", misleading the
-/// user.
+/// running bridge required.
 ///
-/// Refuses outright against a live bridge instance (#840): a running bridge
-/// already reconciles the target itself, and racing it from an unrelated CLI
-/// invocation is exactly the two-writer hazard `BridgeLiveness` exists to
-/// prevent: the state files' own locks are in-process only. The in-app
-/// "Unblock Network" action is the live-bridge equivalent, so refusal names it
-/// as the alternative. The exclusion is structural, not a point-in-time probe:
-/// see [`unlock_with`].
+/// The escape hatch must disengage or FAIL LOUD. A failed disengage returns the
+/// error and leaves the target off, the cover engaged and the intent on; a
+/// swallowed failure (e.g. run unprivileged) would instead leave the cover
+/// engaged, egress still blocked, while the intent reads "off".
+///
+/// Refuses while a bridge is running on the service state dir
+/// ([`service_state_dir`]): a running bridge reconciles the target itself, and the
+/// state files' own locks are in-process only, so racing it from a CLI invocation
+/// would be a two-writer hazard. The refusal names the in-app "Unblock Network"
+/// action, the live-bridge equivalent. A foreground `hole bridge run` on another
+/// state dir (its default is the per-user one) is not seen:
+/// bindreams/hole#1214.
+///
 /// **`Ok` is qualified, and the caller must surface it.** The returned
-/// [`Clearance`] is what the disengage could not prove — on Windows, the two
-/// boot-time twins on any boot where no bridge engaged. This is the ONE
-/// disengage where that matters: the next statement writes the kill-switch
-/// intent off, so there is no next engage to re-arm or re-delete those keys
-/// and nothing will look at them again. `hole bridge unlock` prints
-/// [`release_clearance_report`] for exactly that reason.
+/// [`Clearance`] is what the disengage could not prove (on Windows, the two
+/// boot-time twins on any boot where no bridge engaged). `hole bridge unlock`
+/// prints it with [`release_clearance_report`].
 pub fn unlock() -> std::io::Result<Clearance> {
     let state_dir = service_state_dir();
     unlock_with(&state_dir, |lock| {
@@ -239,22 +238,19 @@ pub fn unlock() -> std::io::Result<Clearance> {
 }
 
 /// `unlock`'s ordering, with the disengage step injected so tests can drive
-/// the cannot-disengage path without touching the host firewall. Liveness
-/// check → target off → disengage → intent flip; the intent flips off ONLY
-/// after the disengage confirms success, and the target is recorded off
-/// before the release call so a reconciler reading it mid-unlock never sees
-/// a stale `Connected`/prior target.
+/// the cannot-disengage path without touching the host firewall.
 ///
-/// The liveness check is [`crate::liveness::BridgeLiveness::try_acquire`] on
-/// the SAME lock a running bridge holds for its whole lifetime, held across
-/// this whole sequence rather than released after the check: a point-in-time
-/// probe (the old `is_running`) can go stale before the first mutation runs,
-/// letting a bridge that starts mid-unlock have its live cover restored away
-/// and its intent flipped off underneath it. Holding the lock instead means
-/// a bridge trying to start during this sequence contends on the same lock
-/// (single-instance is separately enforced by the IPC socket bind, so no
-/// second real bridge is racing this token itself) rather than interleaving
-/// with it.
+/// Liveness check, target off, disengage, clear the auto-connect candidate,
+/// intent off; the first failure returns. The target is recorded off before the
+/// release call, so a reconciler reading it mid-unlock never sees a stale
+/// `Connected`; the intent flips off only after the disengage confirms success.
+///
+/// The liveness check is [`crate::liveness::BridgeLiveness::try_acquire`] on the
+/// lock a bridge on `state_dir` holds for its whole lifetime, and it is held across the
+/// whole sequence rather than released after the check. A point-in-time probe
+/// could go stale before the first mutation, letting a bridge that starts
+/// mid-unlock have its live cover restored away and its intent flipped off
+/// underneath it. A bridge starting during the sequence contends on the same lock.
 fn unlock_with(
     state_dir: &Path,
     disengage: impl FnOnce(&CoverLock) -> std::io::Result<Clearance>,
@@ -276,57 +272,40 @@ fn unlock_with(
         .map_err(|e| std::io::Error::other(format!("could not clear the auto-connect candidate: {e}")))?;
     tun_engine::routing::failclosed::lockdown_state::set_enabled(&lock, false, None)
         .map_err(|e| std::io::Error::other(format!("could not record the lockdown intent off: {e}")))?;
-    // Handed back, never dropped. The intent is now off, so nothing after this
-    // will pre-delete a boot-time key or look at one again — see [`unlock`].
+    // On success the clearance is handed back, never dropped. If the candidate
+    // or the intent write fails, it is lost with the error: bindreams/hole#1325.
     Ok(clearance)
 }
 
-/// The uninstaller's escape: clear EVERY fail-closed cover and record the
-/// target off, with no running bridge.
+/// The uninstaller's escape: clear EVERY fail-closed cover and record the target
+/// off, with no running bridge.
 ///
-/// Wider than [`unlock`], which disengages only the STANDING cover because an
-/// out-of-process clear of the transient one would desync a live bridge's
-/// posture. Uninstall cannot leave that to the in-process escapes: there is no
-/// next bridge start to sweep a transient cover stranded by an earlier crash,
-/// and on Windows the filters are `FWPM_FILTER_FLAG_PERSISTENT` — the Base
-/// Filtering Engine re-adds them every boot, and the uninstaller is about to
-/// delete the only binary that could remove them.
+/// Wider than [`unlock`], which disengages only the standing cover. Like
+/// [`unlock`] it REFUSES against a live bridge instance, so no in-process posture
+/// is left claiming a cover that no longer exists (`release_covers_with` names
+/// which state dirs it probes). The refusal is best-effort: a peer state dir whose
+/// lock cannot be probed is warned about and skipped, and other accounts' dirs
+/// are not probed when enumerating profiles or looking up the real user fails
+/// (bindreams/hole#1326). A caller therefore stops the service first: the MSI
+/// runs `bridge uninstall --keep-covers` before its separate
+/// `bridge release-covers` action.
 ///
-/// The desync hazard is answered structurally, not by ordering: like [`unlock`]
-/// this REFUSES against a live bridge instance, so there is never an
-/// in-process posture to leave claiming a cover that no longer exists.
-/// `bridge uninstall` tears the service down first, which is what frees the
-/// lock for it.
-///
-/// Fatality is deliberately narrower than [`unlock`]'s, because the MSI runs
-/// this `Return="check"`: only the target write and the release itself abort.
-/// The trailing bookkeeping warns instead, since failing there would roll an
-/// uninstall back over a host that is in fact already open — trading a
-/// permanent block for a permanently unremovable product. Recording the target
-/// off BEFORE the release is what makes that safe: whatever happens after, a
-/// later start reconciles toward `Off` and sweeps.
+/// Only the target write and the release itself abort the call: the MSI runs it
+/// `Return="check"`, and failing on the trailing bookkeeping would roll back an
+/// uninstall over a host that is already open. The target is recorded off BEFORE
+/// the release, so whatever fails after, a later start reconciles toward `Off`
+/// and sweeps.
 ///
 /// **`Ok` means "nothing failed", not "the host is clear."** The returned
-/// [`Clearance`] carries the difference and the caller must not collapse it.
-/// A `FWPM_FILTER_FLAG_BOOTTIME` key answers `FWP_E_FILTER_NOT_FOUND` on any
-/// boot where its runtime object is not live — indistinguishable from never
-/// having been installed. On the boot this function matters most (lockdown
-/// armed in an earlier session, the user uninstalls without ever connecting)
-/// every such key answers empty, and a bare `Ok` told the MSI it was safe to
-/// delete the only binary that could act on it.
+/// [`Clearance`] carries the difference and the caller must not collapse it: a
+/// boot-time key answers not-found on any boot where its object is not live. That
+/// is not an error ([`Clearance`] bounds the harm), but the caller prints
+/// [`release_clearance_report`]. A filter the OS REFUSED to delete
+/// ([`Clearance::refused_strangers`]) does not fail the call either; it is
+/// reported with its GUID and code, and arms the boot-time witness
+/// (`bridge-boottime.json`).
 ///
-/// That does NOT make it an error. See [`Clearance`] for the bound on the
-/// harm: a stranded boot-time record blocks egress across the boot→BFE window
-/// only (a bounded window whose length is unmeasured), so failing the
-/// uninstall over it would trade a bounded early-boot block for a permanently
-/// unremovable product — the exact trade the paragraph above refuses for the
-/// bookkeeping. The gate stops claiming proof it does not
-/// have; it does not withhold the uninstall. `hole bridge release-covers`
-/// turns an unproven clearance into something an operator can act on.
-///
-/// A filter the OS REFUSED to delete ([`Clearance::refused_strangers`]) does not fail this call either: a boot-time
-/// filter is live only between kernel start and BFE start, so it is a bounded harm, and failing over a refusal that
-/// may never clear would leave the product unremovable. It is reported with its GUID and code, and arms the witness.
+/// The reasoning is in `docs/contributing/architecture/kill-switch-uninstall.md`.
 pub fn release_covers() -> std::io::Result<Clearance> {
     let state_dir = service_state_dir();
     let others = peer_state_dirs();
@@ -341,70 +320,49 @@ pub fn release_covers() -> std::io::Result<Clearance> {
     )
 }
 
-/// The operator's last word on a cover release, or `None` when the sweep
-/// proved every key it touched empty.
+/// The operator's last word on a cover release, or `None` when the sweep proved
+/// every key it touched empty.
 ///
-/// Pure, so the wording is testable, and living here rather than in the CLI so
-/// `bridge release-covers` and `bridge uninstall` cannot drift into telling
-/// two different stories about the same clearance.
+/// Pure, so the wording is testable, and shared by `bridge release-covers` and
+/// `bridge uninstall` so they cannot tell two stories about one clearance. The
+/// exit code is 0 either way (see [`release_covers`]), so at the one moment
+/// `hole.exe` still exists on an uninstalling host this message IS the
+/// qualification.
 ///
-/// This runs at the one moment `hole.exe` still exists on an uninstalling
-/// host: the exit code is 0 either way (see [`release_covers`] for why an
-/// unproven key must not fail an uninstall), so this message IS the
-/// qualification. Without it the `Ok` is silent again and the installer reads
-/// it as proof.
+/// It reads [`Clearance::leftover_keys`], not [`Clearance::unproven_keys`]: the
+/// twins go unproven on every boot where no bridge engaged, so the unproven set
+/// would fire on essentially every Windows uninstall and carry no information.
+/// `leftover_keys` reports when EITHER the standing cover's `PERSISTENT` siblings
+/// in this sweep (`failclosed::KeyRole`) or the persisted
+/// `failclosed::boottime_witness` says a twin could be outstanding. The union is
+/// load-bearing: the sibling is consumed by the first sweep that removes it, and
+/// the record is lost with a wiped `state_dir`; silence requires losing both.
 ///
-/// It deliberately does NOT assert that a cover is present. An unproven key is
-/// equally consistent with never having been installed — which is what it will
-/// be on almost every uninstall — and crying leftover every time is how the
-/// one host where it is real gets ignored.
+/// It does NOT assert that a cover is present, since an unproven key is equally
+/// consistent with never having been installed. Two kinds of key pass the gate,
+/// worded apart:
+/// - A filter key ([`Clearance::leftover_filters`]) is always a boot-time twin or
+///   stranger here, never a `Persistent` key: an unproven `Persistent` key fails
+///   the sweep, so it never reaches this function as `Ok`. The message states what
+///   such keys are instead of hedging
+///   (`an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name`).
+///   A boot-time stranger whose delete was refused does not fail any sweep; it is
+///   worded on its own line, with its code when the OS gave one, and a remedy.
+/// - A view the sweep could not enumerate ([`Clearance::unenumerated_views`]) is
+///   no filter at all: it is worded as a look that did not happen and names no
+///   `netsh` lookup.
 ///
-/// So it reads [`Clearance::leftover_keys`], not [`Clearance::unproven_keys`].
-/// The twins go unproven on EVERY boot where no bridge engaged, which is what
-/// an ordinary uninstall looks like, so the unproven set alone would fire this
-/// message on essentially every Windows uninstall and carry no information at
-/// all. `leftover_keys` is the same set filtered by the two things that can
-/// still say a twin could be outstanding here — the standing cover's
-/// `PERSISTENT` siblings in this very sweep (`failclosed::KeyRole`) and the
-/// persisted `failclosed::boottime_witness` — reporting when EITHER speaks.
+/// The remedy has to exist. `netsh wfp` is diagnostics-only, with no `delete`
+/// verb (<https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp>),
+/// and removing a WFP filter takes an FWPM call that `RemoveFiles` has just
+/// deleted the only caller of, so the remedy is to put one back. The diagnostic
+/// it names is `show boottimepolicy`; `show filters` excludes a boot-time filter
+/// once BFE has started, i.e. at every moment this message is read.
 ///
-/// `leftover_keys` is a GATE on the whole set, and two kinds of key pass it, worded apart. A filter key
-/// ([`Clearance::leftover_filters`]) is always a boot-time twin or stranger here: a `Persistent` key goes unproven
-/// under exactly one outcome, `failclosed::KeyOutcome::Failed`, which `first_delete_failure` turns into the failure
-/// of a `SweepOutcome::per_kind`, so a clearance holding one reaches `unlock_with`/`release_covers_with` as `Err`
-/// and is dropped by their `?` before any of the three render sites runs. (A boot-time stranger whose delete was
-/// refused is the exception that does not fail any sweep, so it reaches all three sites: it is worded on its own
-/// line, "the OS refused to delete ..." with its code when the OS gave one, and a remedy.) The message
-/// states what such keys are instead of hedging
-/// (`an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name`) — a hedge here describes a
-/// state it is never printed in, in the one message an operator reads after `hole.exe` has been deleted. A view the
-/// sweep could not enumerate ([`Clearance::unenumerated_views`]) is no filter at all: it is worded as a look that did
-/// not happen and names no `netsh` lookup.
-///
-/// The union is not belt-and-braces. The sibling alone is CONSUMED by the
-/// first sweep that removes it, and "turn the kill switch off, then uninstall"
-/// is an ordinary sequence that does exactly that; after it, every sweep reads
-/// the empty sibling set as "no cover was ever here" and this message never
-/// fires again. The record alone is lost by a wiped `state_dir`. Silence
-/// requires losing both.
-///
-/// The remedy it names has to be one that exists. `netsh wfp` is a
-/// **diagnostics-only** context — its verbs are `capture`, `dump`, `help`,
-/// `set` and `show`, with no `delete`
-/// (<https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp>)
-/// — so the message says so outright rather than sending the reader to a
-/// command that cannot help in the one state where they have nothing else.
-/// The diagnostic it does name is `show boottimepolicy`, the subcommand for
-/// exactly this key class; `show filters` lists what is active *now*, which by
-/// definition excludes a boot-time filter once BFE has started, i.e. at every
-/// moment this message is read.
-///
-/// Removing a WFP filter takes an FWPM call, and `RemoveFiles` just deleted
-/// the only caller on the host. So the only honest remedy is to put one back.
-///
-/// `running_version` is the build making the report, and the remedy names it: a key that answered not-found is not
-/// live, so no enumeration sees it and only a build whose list names the key can address it. The running build's
-/// list names every key it installs, so a key a later release adds is covered with no edit here.
+/// `running_version` is the build making the report, and the remedy names it: a
+/// key that answered not-found is not live, so no enumeration sees it and only a
+/// build whose list names the key can address it. The running build's list names
+/// every key it installs, so a key a later release adds needs no edit here.
 pub fn release_clearance_report(clearance: &Clearance, running_version: &str) -> Option<String> {
     let filters: Vec<&str> = clearance.leftover_filters().map(UnprovenKey::label).collect();
     let unenumerated: Vec<&str> = clearance.unenumerated_views().map(UnprovenKey::label).collect();
@@ -546,35 +504,26 @@ fn other_account_state_dirs() -> Vec<PathBuf> {
 /// cannot-release path without touching the host firewall.
 ///
 /// `peers` are the other state dirs a bridge could be alive in; a lock held in
-/// any of them refuses the release just as the service's own does. Every peer
-/// is locked, including one whose dir is not there yet: the exclusion IS this
-/// function, and a peer left unlocked because it looked absent is a peer
-/// nothing excludes. `release_all` sweeps Windows' covers machine-wide, so a
-/// bridge starting under that account mid-release would engage a cover, record
-/// the posture, lose the filters to this sweep, and skip re-engagement on its
-/// next covered start — running uncovered.
+/// any of them refuses the release just as the service's own does. Every peer is
+/// locked, including one whose dir does not exist yet: the exclusion IS this
+/// function, and `release_all` sweeps Windows' covers machine-wide, so a bridge
+/// starting under that account mid-release would engage a cover, record the
+/// posture, lose the filters to this sweep, and skip re-engagement on its next
+/// covered start.
 ///
-/// `try_acquire` creates what it locks, so that costs an empty state dir
-/// holding a lock file on every account that never ran a bridge. **That litter
-/// stays.** Removing it would have to happen after this call releases the peer
-/// locks, and every bridge takes its own with the BLOCKING
-/// `BridgeLiveness::acquire` — so the bridge the exclusion exists to keep out
-/// is *woken by that release*, engages a standing cover, records it, and would
-/// have the record deleted from under it. A persistent WFP cover with no record
-/// is the end state this whole path exists to prevent, and it has no in-band
-/// recovery; an empty directory has no consequence at all. The choice is where
-/// to pay, never whether to lock.
+/// **The litter stays.** `try_acquire` creates what it locks, leaving an empty
+/// state dir holding a lock file on every account that never ran a bridge.
+/// Removing it would have to follow the release of the peer locks, which wakes the
+/// bridge the exclusion exists to keep out: it would engage a standing cover and
+/// have its record deleted from under it, and a persistent WFP cover with no
+/// record has no in-band recovery.
 ///
-/// The same answer covers the service's own state dir, which this does NOT
-/// clean up either. Its records are not this call's: `bridge-routes.json` and
-/// `bridge-dns{,.superseded}.json` are what `scripts/network-reset.py` reads to
-/// undo a leaked bypass route or a rewritten adapter's DNS, and
-/// `bridge-plugins.json` may be deleted only by something that has accounted
-/// for every plugin in it. An uninstall is the moment those become the ONLY
-/// escape. Nor is the directory itself this call's: `install()` pre-creates it
-/// on both platforms, so the only host where `try_acquire` provisions it is one
-/// that never installed — and what stays there is an empty `hole/state`, the
-/// same litter the peers keep.
+/// Likewise it deletes no record in the service's own state dir.
+/// `bridge-routes.json` and `bridge-dns{,.superseded}.json` are what
+/// `scripts/network-reset.py` reads to undo a leaked bypass route or a rewritten
+/// adapter's DNS, and `bridge-plugins.json` may be deleted only by something that
+/// has accounted for every plugin in it; an uninstall is when those become the
+/// only escape. The directory itself is `install()`'s.
 fn release_covers_with(
     state_dir: &Path,
     peers: &[PathBuf],

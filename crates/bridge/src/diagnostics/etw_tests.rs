@@ -7,7 +7,7 @@ use super::*;
 use dump::dump;
 
 // Zeroed GUID — matches no subscribed provider. Useful only for
-// "non-TCPIP" tests since the dispatch provider gate (#393) routes
+// "non-TCPIP" tests since the dispatch provider gate routes
 // anything not-TCPIP to `Emission::Unknown` regardless of event-id.
 fn any_guid() -> GUID {
     GUID::from_u128(0)
@@ -22,7 +22,7 @@ fn tcpip_guid() -> GUID {
 
 /// Winsock-AFD provider GUID. Used by tests that verify AFD events
 /// with TCPIP-colliding IDs (1002, 1004, …) are not misclassified as
-/// TCPIP per the provider gate added in bindreams/hole#393.
+/// TCPIP by the provider gate.
 fn afd_guid() -> GUID {
     GUID::from(AFD_PROVIDER)
 }
@@ -186,7 +186,7 @@ fn dispatch_unknown_event_id_from_tcpip_returns_unknown() {
     assert_eq!(got, Some(Emission::Unknown));
 }
 
-// Provider gate (bindreams/hole#393) ==================================================================================
+// Provider gate =======================================================================================================
 
 #[skuld::test]
 fn dispatch_afd_with_tcpip_colliding_id_returns_unknown() {
@@ -262,9 +262,8 @@ fn dispatch_non_tcpip_provider_with_high_volume_id_short_circuits_to_unknown() {
 
 #[skuld::test]
 fn dispatch_syn_send_event_is_info_not_dropped() {
-    // Event 1004 (TcpTcbSynSend) was previously filtered out by the
-    // `ut:SendPath` kernel-keyword mask. The mask has been removed;
-    // dispatch must produce an info emission for it.
+    // Event 1004 (TcpTcbSynSend) carries `ut:SendPath`, so no kernel keyword
+    // mask may hide it: dispatch must produce an info emission for it.
     let got = dispatch(
         tcpip_guid(),
         tcpip_events::TCB_SYN_SEND,

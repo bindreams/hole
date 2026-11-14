@@ -1,4 +1,4 @@
-//! Probes P4 to P7 of the service-retirement design, on the service SID that
+//! Probes P4 to P7 (the labels in the printed output), on the service SID that
 //! says which process is the service's:
 //!
 //! - P4: the SID derived from the service name equals the OS's, and exists for
