@@ -241,18 +241,14 @@ fn publish_on_commit_brackets_its_load_with_a_generation_change() {
 ///
 /// 25%, sited between the measurement and the cliff:
 ///
-/// - ABOVE: both lanes measured 98.3% (see LAST MEASURED on the test). A runner
-///   would have to fail more than three of every four handshakes to a healthy
-///   anycast host inside 20ms to breach this — a different runner, not
-///   variance. Near-measurement floors are what turn ordinary runner load into
-///   a red, and this repo pays for flakes.
-/// - BELOW: the pool emits one probe per ~1.3-1.4ms, so a 2-3ms window sees ~2
-///   probes and 24 transitions offer ~46 independent chances. At a 5% control
-///   rate the chance of missing every one is already ~10%; at the ~0.08% a
-///   genuine collapse produces it is ~97%. The floor sits ~5x above where the
-///   guard starts failing to detect, and ~4x below where it was measured —
-///   roughly the geometric mean, which is where a threshold with an order of
-///   magnitude of slack on each side belongs.
+/// - ABOVE: a healthy runner lands well above it. A runner would have to fail more than three of every four
+///   handshakes to a healthy anycast host inside 20ms to breach this — a different runner, not variance.
+///   Near-measurement floors are what turn ordinary runner load into a red, and this repo pays for flakes.
+/// - BELOW: the pool emits a probe about every millisecond, so a 2-3ms window sees only a couple of probes and the
+///   transitions offer a few dozen independent chances. At a 5% control rate the chance of missing every one is
+///   already about one in ten; at the near-zero rate a genuine collapse produces it is near certain. The floor sits
+///   well above where the guard starts failing to detect and well below where a healthy runner lands, which is where
+///   a threshold with an order of magnitude of slack on each side belongs.
 const CONTROL_RATE_FLOOR_PCT: f64 = 25.0;
 
 /// How many `pfctl -E` enable references pf holds right now, from `pfctl -s References` (it lists one row per held
@@ -353,17 +349,9 @@ fn count_pf_references(listing: &str) -> usize {
 /// pool's aggregate probe rate), and `.config/nextest.toml` gives this test `success-output` so that line survives a
 /// pass. The printed line says what it means and its caveats.
 ///
-/// Last measured on a green privileged darwin run (the figures go stale; re-measure before relying on them):
-///
-/// | lane  | filtered       | raw (unfiltered) | pool                                              |
-/// |-------|----------------|------------------|---------------------------------------------------|
-/// | arm64 | 191/191 100.0% | 229/233 98.3%    | 496 probes / 16 threads / 658.981375ms = 1329 us   |
-/// | amd64 | 496/496 100.0% | 532/541 98.3%    | 1541 probes / 16 threads / 2.225901559s = 1444 us  |
-///
-/// The raw rate is what [`CONTROL_RATE_FLOOR_PCT`] is set from. The pool column is read against the window being
-/// hunted: that window is not sub-millisecond (`-Fa`'s gap spans the `/etc/pf.os` fingerprint reload plus the rule
-/// parse, and a bare `pfctl -n -f -` round trip measures 2.0 to 2.7ms), so the guard works only while the pool's probe
-/// interval is the same order.
+/// The raw rate is what [`CONTROL_RATE_FLOOR_PCT`] is set from. The pool's probe interval is read against the window
+/// being hunted: that window is not sub-millisecond (`-Fa`'s gap spans the `/etc/pf.os` fingerprint reload plus the
+/// rule parse), so the guard works only while the interval is the same order.
 ///
 /// An attempt is excluded when its window overlaps a load, not merely the instant one commits: the bracket opens before
 /// the child runs and closes after its target is published. A leg with slow attempts against fast transitions would
@@ -544,8 +532,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
                 // `permitted_idx` — decides it. `permitted_idx` only alternates 0/1, so
                 // comparing it before and after an attempt cannot tell "no commit
                 // landed" from "two did": both read the same value. That is a plain
-                // ABA, and the measured figures put it inside the operating range
-                // rather than outside it — an attempt can run the full
+                // ABA, and it is no corner case: an attempt can run the full
                 // `PROBER_TIMEOUT` against a transition period of the same order. The
                 // monotonic `commit_gen`, bumped on BOTH sides of the load that stores
                 // `permitted_idx`, cannot alias: equal generations across the attempt

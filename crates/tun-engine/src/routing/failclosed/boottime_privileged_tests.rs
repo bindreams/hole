@@ -430,7 +430,7 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
         get_code, ERROR_SUCCESS.0,
         "FwpmFilterGetByKey0 on a live boot-time key returned 0x{get_code:08x}, not ERROR_SUCCESS. \
          0x{FWP_E_FILTER_NOT_FOUND_DWORD:08x} (FWP_E_FILTER_NOT_FOUND) is safe but contradicts the \
-         measured claim in this file and in windows.rs — update both. Any OTHER code makes \
+         measured claim in this file and in kill-switch-windows.md — update both. Any OTHER code makes \
          classify_presence answer Indeterminate on a clean host\n{evidence}"
     );
 

@@ -261,7 +261,7 @@ fn the_raw_flag_bits_are_named_only_where_they_cannot_reach_the_boot_window() {
     // The residual the equality form disclosed and could not see:
     // `FWPM_FILTER_FLAGS(0x4)` names no flag symbol. Clippy cannot cover it —
     // `disallowed_types` fires on a type in a signature but not on a bare
-    // tuple-struct construction expression (measured, not assumed) — so the
+    // tuple-struct construction expression — so the
     // set of sources that can materialise the bits is pinned here instead.
     let sources = scanned_sources();
 

@@ -54,7 +54,8 @@
 //!
 //! - The transient restore reloads `/etc/pf.conf`; the lockdown restore reloads the captured snapshot. Neither can
 //!   recover prior `set` options (pf exposes no dump of them), so both restore under pf defaults.
-//! - The `pfctl -E` token is parsed from stderr, its only exposure.
+//! - The `pfctl -E` token is parsed from the `Token : <n>` line `pfctl -E` prints, on stderr or on some hosts stdout
+//!   (`enable_pf_capture_token`); that line is its only exposure.
 
 // Test builds on other hosts compile this module to drive its sequencers; the
 // production `pfctl` entry points have no caller there.
