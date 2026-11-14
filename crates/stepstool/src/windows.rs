@@ -22,7 +22,6 @@ impl Drop for OwnedHandle {
 }
 
 #[derive(Debug, thiserror::Error)]
-// The same message as `scripts/_lib.py`'s `require_elevation`.
 #[error("this script must run from an elevated PowerShell/terminal.")]
 pub struct NotElevated;
 

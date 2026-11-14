@@ -380,7 +380,6 @@ fn stamp_driver_refuses_anything_but_a_present_marker() {
 
 #[skuld::test]
 fn service_log_dir_matches_log_collector_constants() {
-    // Pins each platform's service log directory.
     let d = service_log_dir();
     #[cfg(target_os = "windows")]
     assert!(d.ends_with("hole\\logs") || d.ends_with("hole/logs"), "{d:?}");

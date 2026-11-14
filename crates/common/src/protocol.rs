@@ -303,7 +303,7 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub proxy_http: bool,
     /// Port for the HTTP CONNECT listener when `proxy_http` is enabled.
-    /// Defaults to the same port as [`crate::config::AppConfig::local_port_http`].
+    /// Defaults to the same value as the GUI's `local_port_http` setting.
     /// Must differ from `local_port` when both listeners are enabled
     /// (enforced at bridge start).
     #[serde(default = "proxy_config_defaults::local_port_http")]

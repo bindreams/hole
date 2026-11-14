@@ -47,18 +47,9 @@ fn crash_child_bin() -> std::path::PathBuf {
     )
 }
 
-// Production bound for waiting on a crash_child to exit. It is far above every
-// passing run and exists ONLY as the failure bound surfaced to a human when a
-// child genuinely never exits (the sanctioned no-sleep exception: "awaiting …
-// a child-process exit … where the timeout is the failure bound surfaced to a
-// human," never a bet that N is long enough for the happy path). It is a SAFETY
-// NET, not the fix for the underlying hang: that is addressed structurally in
-// `crash::on_crash`, which on macOS terminates the process itself rather than
-// returning into machinery this process cannot bound. This bound still earns
-// its keep independently: it turns ANY future test-child stall, for ANY reason
-// (a new fault class, a reporter regression, a platform change), into one test
-// failing loudly instead of silently consuming the entire darwin/amd64 job's
-// time limit.
+// Failure bound for a crash_child that never exits, surfaced to a human so a
+// stall fails one test instead of consuming the job's time limit. Far above
+// every passing run; never a bet on happy-path timing.
 #[cfg(feature = "crash-child")]
 const CHILD_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 

@@ -106,8 +106,6 @@ impl Placement for MarkerPlacement {
 /// The SERVICE log directory (where the privileged bridge writes its logs and
 /// the marker).
 ///
-/// The location is also spelled outside this function, in Rust, the MSI and CI
-/// scripts; search for it before moving it.
 pub fn service_log_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
