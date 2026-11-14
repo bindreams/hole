@@ -642,9 +642,8 @@ fn service_key_user_rights() -> u32 {
 /// Proves: a standard user can read a value in the registry key of a service
 /// made by the production `install()` (`KEY_QUERY_VALUE`), so the GUI can tell
 /// an interrupted uninstall's disable from an administrator's. If this fails
-/// the GUI cannot tell the two apart unprivileged, and the design returns to
-/// the owner. Red under: a security descriptor on the key that grants Users
-/// nothing.
+/// the GUI cannot tell the two apart unprivileged, and the design returns to the
+/// owner. Red under: a security descriptor on the key that grants Users nothing.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_the_service_key_lets_an_interactive_user_read_the_record() {
     ProvisionedService::require_no_leftover();

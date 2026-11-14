@@ -1906,7 +1906,7 @@ fn by_name_calls(text: &str) -> Vec<String> {
 
 /// By-name acts on a file that stay, each with its count and why: the file, the call as written, how many, and the
 /// reason. A site not in it is new, and the guard reports it. "Open owner question" is a site whose folder is one a
-/// user may add names to and which waits for a decision of the owner (1134-troyka2.md). The others name whose folder
+/// user may add names to and which waits for a decision of the owner. The others name whose folder
 /// it is: one no user can add names to (the Windows `%ProgramFiles%` folders grant `BUILTIN\Users` read and execute
 /// only; macOS's `/Library`, `/var/log` and `/var/db` are root's), the acting user's own, or a test's.
 const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[

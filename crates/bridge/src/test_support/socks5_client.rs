@@ -150,7 +150,7 @@ const UDP_RETRANSMIT_INTERVAL: Duration = Duration::from_millis(500);
 /// the real bridge SOCKS5 relay and, for the galoshes variant, the whole
 /// ex-ray/galoshes plugin chain — that may never return if the chain is wedged.
 /// Size it to absorb the chain's cold first-datagram latency on a loaded
-/// Windows runner (cf. the ~20s per-leg budgets in `plugin-e2e/src/roundtrip.rs`
+/// Windows runner (cf. the per-leg budgets in `plugin-e2e/src/roundtrip.rs`
 /// for the same chain), never tight enough to fire on a healthy-but-slow round-trip.
 /// The datagram is retransmitted every [`UDP_RETRANSMIT_INTERVAL`] within it.
 pub(crate) async fn socks5_udp_associate(

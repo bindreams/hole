@@ -2,9 +2,10 @@
 //!
 //! The bridge writes each plugin child's `ProcessIdRecord` to a JSON file when
 //! a plugin chain starts and reads it back on startup to reap processes leaked
-//! by a previous crashed run. Mirrors the `routing::state` crash-recovery
-//! pattern. `plugin_recovery` owns the reap and is the only component allowed
-//! to remove records from the file.
+//! by a previous crashed run. `plugin_recovery` owns the reap and is the only
+//! component allowed to remove records from the file. What each state file
+//! records and the order of the startup sweep:
+//! `docs/contributing/architecture/crash-recovery.md`.
 //!
 //! A record pairs the pid with the kernel's own start token, so a recycled pid
 //! never restores to the recorded process — see `cosca::identity`.

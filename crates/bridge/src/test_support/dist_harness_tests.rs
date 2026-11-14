@@ -6,7 +6,7 @@ use super::{BridgeChildLogSource, DistHarness};
 use hole_test_observability::panic_dump::PanicDumpSource;
 use std::path::PathBuf;
 
-/// Build a log body larger than the old 4 KiB tail cap. If the dump
+/// Build a log body larger than a 4 KiB tail cap. If the dump
 /// code regresses to a tail cap below this size, the `SENTINEL_START`
 /// at the front gets cut off while `SENTINEL_END` at the back remains,
 /// and the test will fail.
@@ -14,7 +14,7 @@ fn large_log_body() -> String {
     let mut s = String::with_capacity(8200);
     s.push_str("SENTINEL_START\n");
     // ~8 KiB of line-oriented filler so the start sentinel sits well
-    // outside the old 4 KiB tail window.
+    // outside a 4 KiB tail window.
     for i in 0..200 {
         s.push_str(&format!("filler line {i:03} xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"));
     }

@@ -37,9 +37,8 @@ pub mod wfp;
 #[cfg(target_os = "windows")]
 pub(crate) const WATCH_SUBSTRINGS: &[&str] = &["wintun", "wireguard", "hole-tun"];
 
-/// Truncation ceiling for debug-level per-probe output. 16 KB is large
-/// enough to include a few dozen filter / binding / driver blocks (each
-/// is typically 200-400 chars), small enough not to blow the size-
+/// Truncation ceiling for debug-level per-probe output: large enough for a few
+/// dozen filter / binding / driver blocks, small enough not to blow the size-
 /// rotated bridge log file when multiple snapshots fire in one run.
 #[cfg(target_os = "windows")]
 pub(crate) const DEBUG_OUTPUT_CAP_BYTES: usize = 16 * 1024;

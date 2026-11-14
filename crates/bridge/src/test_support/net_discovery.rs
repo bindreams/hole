@@ -360,8 +360,8 @@ pub(crate) fn probe_tcp(dst: SocketAddr) -> ProbeOutcome {
 /// the in-process ss-server's onward dial to the client's destination leaves
 /// via the same routing table, matches the same `/1` split pair, re-enters
 /// `hole-tun`, and is proxied again — a self-limiting burst up to the
-/// engine's `max_connections` ceiling, but 4096 needless sockets on a runner
-/// shared with the serialized WFP tests.
+/// engine's `max_connections` ceiling, but a pile of needless sockets on a
+/// runner shared with the serialized WFP tests.
 ///
 /// `MatchType::Subnet` matches on the flow's destination IP, so these two
 /// rules cover every flow the router sees.

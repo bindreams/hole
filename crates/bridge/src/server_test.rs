@@ -121,7 +121,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
     // public endpoint is UDP-only, so a raw TCP connect can't validate it (it
     // would always surface as a false TcpRefused/TcpTimeout). The full tunnel
     // handshake below still produces a correct diagnosis for an unreachable
-    // QUIC server. See bindreams/hole#421.
+    // QUIC server.
     if server_endpoint_is_udp(plugin.is_some(), entry.plugin_opts.as_deref(), entry.server.expose()) {
         debug!("server_test: skipping TCP preflight for UDP (quic) server endpoint");
     } else if let Err(out) = preflight(SocketAddr::new(server_ip, entry.server_port), cfg.preflight_timeout).await {
@@ -464,11 +464,9 @@ async fn try_sentinel(
 }
 
 // `server_test_tests` test Hole's own `run_server_test` connectivity tester.
-// They run on every Hole platform (Win+mac): the non-plugin cases are
-// platform-agnostic, and the one plugin case uses BARE ex-ray server mode (no
-// yamux, so no #197 — proven by the interop suite passing on Win+mac). #200
-// (Windows DistHarness flakiness) is closed and does not apply to these
-// in-process tests. Previously Linux-only-gated, so they ran on no CI job. See #435.
+// They run on every Hole platform (Windows and macOS): the non-plugin cases are
+// platform-agnostic, and the one plugin case uses bare ex-ray server mode (no
+// yamux).
 #[cfg(test)]
 #[path = "server_test_tests.rs"]
 mod server_test_tests;

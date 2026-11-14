@@ -81,10 +81,10 @@ use std::net::SocketAddr;
 ///
 /// For the plugin variants it ALSO owns the [`PluginServer`] handle: its
 /// `Drop` cancels the galoshes/ex-ray server chain, so the handle must live
-/// as long as the fixture. Dropping it at setup time (the previous bug)
-/// tore the server subprocess down before any test connected — the bridge
-/// client's WS dial was then refused and every response truncated
-/// (bindreams/hole#518). `None` for the no-plugin `ssserver_none`.
+/// as long as the fixture. Dropping it at setup time would tear the server
+/// subprocess down before any test connected, so the bridge client's WS dial
+/// would be refused and every response truncated. `None` for the no-plugin
+/// `ssserver_none`.
 pub(crate) struct SsServerHandle {
     pub addr: SocketAddr,
     pub method: &'static str,
