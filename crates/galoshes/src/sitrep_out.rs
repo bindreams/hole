@@ -20,9 +20,9 @@ use garter::{ChainReady, SitrepEvent, StartError, Transports};
 /// `ready` event.
 ///
 /// **This is deliberately NOT the inner chain's transport intersection.**
-/// galoshes carries UDP over YAMUX: its outer `YamuxPlugin` hop serves TCP
-/// *and* UDP, while the embedded ex-ray inner hop is a TCP-only SIP003
-/// transport. The chain intersection (`YamuxPlugin` TCP|UDP ∩ ex-ray TCP =
+/// galoshes carries UDP over YAMUX: its outer `YamuxPlugin` hop reports TCP
+/// *and* UDP (it carries UDP as yamux substreams), while the embedded ex-ray
+/// inner hop is a TCP-only SIP003 transport. The chain intersection (`YamuxPlugin` TCP|UDP ∩ ex-ray TCP =
 /// TCP) would therefore lose galoshes' UDP capability. galoshes frames UDP
 /// datagrams over a YAMUX stream and the inner TCP hop carries them
 /// transparently, so the host is told galoshes' own end-to-end capability
