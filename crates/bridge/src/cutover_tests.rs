@@ -1060,6 +1060,71 @@ fn a_report_with_a_filter_and_an_unenumerated_view_words_each_for_what_it_is() {
     );
 }
 
+#[skuld::test]
+fn a_report_with_every_key_class_is_worded_exactly_as_released() {
+    // Pins the whole text, so a change to any class's wording or to how the classes are joined is deliberate.
+    let observation = |key: &'static str, lifetime, outcome, role, code| KeyObservation {
+        key: key.into(),
+        lifetime,
+        outcome,
+        role,
+        code,
+    };
+    let obs = [
+        observation(
+            "lockdown filter",
+            KeyLifetime::Persistent,
+            KeyOutcome::Removed,
+            KeyRole::BootTimeSibling,
+            None,
+        ),
+        observation(
+            "twin-key",
+            KeyLifetime::BootTime,
+            KeyOutcome::NotFound,
+            KeyRole::Plain,
+            None,
+        ),
+        observation(
+            "a-view",
+            KeyLifetime::BootTime,
+            KeyOutcome::Failed,
+            KeyRole::Enumeration,
+            None,
+        ),
+        observation(
+            "a-stranger",
+            KeyLifetime::BootTime,
+            KeyOutcome::Failed,
+            KeyRole::Unlisted,
+            Some(5),
+        ),
+    ];
+    let report = release_clearance_report(
+        &Clearance::from_observations(&obs, ArmingWitness::Unset),
+        RUNNING_VERSION,
+    )
+    .expect("reported");
+
+    let expected = format!(
+        "covers released, but the OS refused to delete a-stranger (code 0x00000005). {REFUSED_STRANGER_REMEDY} \
+         Also, 1 boot-time filter key(s) could not be proven empty: twin-key. \
+         A boot-time filter is live only between kernel start and Base Filtering Engine start, \
+         so a delete-by-key finds nothing on any later boot whether or not a policy record \
+         survives behind it. To check after this uninstall, run `netsh wfp show boottimepolicy` \
+         elevated and look for these keys; if egress is blocked early in boot, that is where it \
+         would show. `netsh wfp` cannot remove one — it has no delete verb, only capture/dump/\
+         help/set/show — and removing a WFP filter takes an FWPM call, which no binary left on this \
+         host can make. Reinstalling this release, {RUNNING_VERSION}, or later (a build can delete a boot-time \
+         key only if its own list names it) and running `hole bridge release-covers` elevated puts back the \
+         only tool that addresses these keys. \
+         Also, the sweep could not enumerate a-view, so a filter another build left there was not looked for. \
+         Running `hole bridge release-covers` elevated again repeats the sweep \
+         (reinstall this release, {RUNNING_VERSION}, or later first if `hole` is gone)."
+    );
+    assert_eq!(report, expected);
+}
+
 // The cutover child and the start-type lock ===========================================================================
 
 /// The child carries the service's SID, so a retirement or install that holds

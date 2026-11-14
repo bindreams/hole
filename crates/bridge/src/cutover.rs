@@ -339,65 +339,75 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// the record is lost with a wiped `state_dir`; silence requires losing both.
 ///
 /// It does NOT assert that a cover is present, since an unproven key is equally
-/// consistent with never having been installed. Two kinds of key pass the gate,
-/// worded apart:
-/// - A filter key ([`Clearance::leftover_filters`]) is always a boot-time twin or
-///   stranger here, never a `Persistent` key: an unproven `Persistent` key fails
-///   the sweep, so it never reaches this function as `Ok`. The message states what
-///   such keys are instead of hedging
-///   (`an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name`).
-///   A boot-time stranger whose delete was refused does not fail any sweep; it is
-///   worded on its own line, with its code when the OS gave one, and a remedy.
-/// - A view the sweep could not enumerate ([`Clearance::unenumerated_views`]) is
-///   no filter at all: it is worded as a look that did not happen and names no
-///   `netsh` lookup.
-///
-/// The remedy has to exist. `netsh wfp` is diagnostics-only, with no `delete`
-/// verb (<https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp>),
-/// and removing a WFP filter takes an FWPM call that `RemoveFiles` has just
-/// deleted the only caller of, so the remedy is to put one back. The diagnostic
-/// it names is `show boottimepolicy`; `show filters` excludes a boot-time filter
-/// once BFE has started, i.e. at every moment this message is read.
+/// consistent with never having been installed. Each key class that passes the
+/// gate is worded apart: `refused_strangers_line`, `boot_time_filters_line`
+/// and `unenumerated_views_line`.
 ///
 /// `running_version` is the build making the report, and the remedy names it: a
 /// key that answered not-found is not live, so no enumeration sees it and only a
 /// build whose list names the key can address it. The running build's list names
 /// every key it installs, so a key a later release adds needs no edit here.
 pub fn release_clearance_report(clearance: &Clearance, running_version: &str) -> Option<String> {
-    let filters: Vec<&str> = clearance.leftover_filters().map(UnprovenKey::label).collect();
-    let unenumerated: Vec<&str> = clearance.unenumerated_views().map(UnprovenKey::label).collect();
     let mut parts = Vec::new();
     if let Some(refused) = refused_strangers_line(clearance) {
         parts.push(format!("{refused}. {REFUSED_STRANGER_REMEDY}"));
     }
-    if !filters.is_empty() {
-        parts.push(format!(
-            "{} boot-time filter key(s) could not be proven empty: {}. \
-             A boot-time filter is live only between kernel start and Base Filtering Engine start, \
-             so a delete-by-key finds nothing on any later boot whether or not a policy record \
-             survives behind it. To check after this uninstall, run `netsh wfp show boottimepolicy` \
-             elevated and look for these keys; if egress is blocked early in boot, that is where it \
-             would show. `netsh wfp` cannot remove one — it has no delete verb, only capture/dump/\
-             help/set/show — and removing a WFP filter takes an FWPM call, which no binary left on this \
-             host can make. Reinstalling this release, {running_version}, or later (a build can delete a boot-time \
-             key only if its own list names it) and running `hole bridge release-covers` elevated puts back the \
-             only tool that addresses these keys.",
-            filters.len(),
-            filters.join(", "),
-        ));
-    }
-    if !unenumerated.is_empty() {
-        parts.push(format!(
-            "the sweep could not enumerate {}, so a filter another build left there was not looked for. \
-             Running `hole bridge release-covers` elevated again repeats the sweep \
-             (reinstall this release, {running_version}, or later first if `hole` is gone).",
-            unenumerated.join(", "),
-        ));
-    }
+    parts.extend(boot_time_filters_line(clearance, running_version));
+    parts.extend(unenumerated_views_line(clearance, running_version));
     if parts.is_empty() {
         return None;
     }
     Some(format!("covers released, but {}", parts.join(" Also, ")))
+}
+
+/// The line for the leftover filter keys ([`Clearance::leftover_filters`]), or `None` when there are none.
+///
+/// Every such key is a boot-time twin or stranger, never a `Persistent` key: an unproven `Persistent` key fails the
+/// sweep, so it never reaches the report as `Ok`. The line states what the keys are instead of hedging
+/// (`an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name`). A boot-time stranger whose
+/// delete was refused does not fail any sweep and is worded by [`refused_strangers_line`].
+///
+/// The remedy has to exist. `netsh wfp` is diagnostics-only, with no `delete` verb
+/// (<https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp>), and removing a WFP
+/// filter takes an FWPM call that `RemoveFiles` has just deleted the only caller of, so the remedy is to put one
+/// back. The diagnostic it names is `show boottimepolicy`; `show filters` excludes a boot-time filter once BFE has
+/// started, i.e. at every moment this message is read.
+fn boot_time_filters_line(clearance: &Clearance, running_version: &str) -> Option<String> {
+    let filters: Vec<&str> = clearance.leftover_filters().map(UnprovenKey::label).collect();
+    if filters.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} boot-time filter key(s) could not be proven empty: {}. \
+         A boot-time filter is live only between kernel start and Base Filtering Engine start, \
+         so a delete-by-key finds nothing on any later boot whether or not a policy record \
+         survives behind it. To check after this uninstall, run `netsh wfp show boottimepolicy` \
+         elevated and look for these keys; if egress is blocked early in boot, that is where it \
+         would show. `netsh wfp` cannot remove one — it has no delete verb, only capture/dump/\
+         help/set/show — and removing a WFP filter takes an FWPM call, which no binary left on this \
+         host can make. Reinstalling this release, {running_version}, or later (a build can delete a boot-time \
+         key only if its own list names it) and running `hole bridge release-covers` elevated puts back the \
+         only tool that addresses these keys.",
+        filters.len(),
+        filters.join(", "),
+    ))
+}
+
+/// The line for the views the sweep could not enumerate ([`Clearance::unenumerated_views`]), or `None` when there
+/// are none.
+///
+/// A view is no filter at all: the line words a look that did not happen and names no `netsh` lookup.
+fn unenumerated_views_line(clearance: &Clearance, running_version: &str) -> Option<String> {
+    let views: Vec<&str> = clearance.unenumerated_views().map(UnprovenKey::label).collect();
+    if views.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the sweep could not enumerate {}, so a filter another build left there was not looked for. \
+         Running `hole bridge release-covers` elevated again repeats the sweep \
+         (reinstall this release, {running_version}, or later first if `hole` is gone).",
+        views.join(", "),
+    ))
 }
 
 /// What the operator can do about filters the OS refused to delete: a refusal may be transient, so the sweep may
