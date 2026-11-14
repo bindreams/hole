@@ -6,8 +6,10 @@ which trait to use, what keeps the rule from eroding, and where a mock lives. Th
 overview](overview.md#the-trait-seams) names the traits; this page is the contract.
 
 A unit test that reached the real `netsh`, `route` or `pfctl` would change the routes of the machine it runs on, and on a
-shared CI runner that machine is every other job's machine too. The rule is therefore absolute: **production I/O that changes, or reads, the
-host's network state goes through the seam, including the cleanup in a `Drop`.**
+shared CI runner that machine is every other job's machine too. The rule is therefore absolute for what changes the
+machine: **production I/O that changes the host's network state goes through the seam, including the cleanup in a
+`Drop`.** Reads are held to it only where they decide something. The Windows WFP and NDIS diagnostic snapshots read host
+state outside the seam (see [what the seam does not cover](#what-the-seam-does-not-cover)).
 
 ## The three traits
 
@@ -25,8 +27,7 @@ host's network state goes through the seam, including the cleanup in a `Drop`.**
 - `Dns` owns pointing the operating system's resolvers at the {term}`TUN` device. `Dns::apply` returns an `Applied` guard.
 
 `ProxyManager` is generic over all three, and `ProxyManager::new_with_dns` is the constructor a test uses to hand it
-all three mocks. A mock keeps its state in an `Arc` that the test clones out before moving the mock into the manager,
-because the manager deliberately has no getter for its proxy or routing provider.
+all three mocks. A mock keeps its state in an `Arc` that the test clones out before moving the mock into the manager.
 
 ## Cleanup goes through the trait too
 
@@ -41,10 +42,15 @@ would run the real teardown from a unit test, where no mock can see it.
 the lint:
 
 - `setup_routes` and `teardown_routes` in `tun_engine::routing`. `SystemRouting::install` is the one caller of
-  `setup_routes`. `teardown_routes` has two: `SystemRoutes::drop` and `recover_routes`, the free function for crash
-  recovery of routes, which the bridge calls directly and not through the trait.
-- The Win32 DNS calls `SetInterfaceDnsSettings`, `GetInterfaceDnsSettings` and `DnsFlushResolverCache`. Only the
-  `Win32Real` backend in {src}`crates/bridge/src/dns/system/windows.rs` calls them.
+  `setup_routes`. `teardown_routes` has two callers, both inside `SystemRouting`'s guard: `SystemRoutes::teardown_with`
+  (what `SystemRoutes::drop` runs) and `SystemRouting::rollback_and_record`, the rollback of a failed install. Crash
+  recovery of routes is a different path: `recover_routes` is a free function that the bridge calls directly and not
+  through the trait, and it does not call `teardown_routes`.
+- The Win32 DNS calls `SetInterfaceDnsSettings`, `GetInterfaceDnsSettings` and `DnsFlushResolverCache`, banned by their
+  `windows` crate paths. Only the `Win32Real` backend in {src}`crates/bridge/src/dns/system/windows.rs` calls them.
+  `DnsFlushResolverCache` is the exception to the guarantee: `windows-rs` does not expose it, so `Win32Real` declares it
+  with an inline `extern` block, and the ban names a path that this declaration does not have. Nothing makes the lint
+  fire on a second caller of that `extern` function.
 - The FWPM calls that install and remove firewall filters. The sanctioned callers are in
   [the kill switch](kill-switch-windows.md) and the DNS-egress confinement.
 - Spawning a process: the spawn of an OS tool goes through `util::system_tool::SystemTool`, and a spawn of anything else
@@ -53,6 +59,15 @@ the lint:
 A legitimate caller takes a per-site `#[allow(clippy::disallowed_methods)]` with a comment. The test
 `proxy_manager_tests_never_spawn_routing_subprocess` is the runtime half: it asserts that start and stop cycles spawn no
 routing subprocess, so a path that bypassed the `Routing` trait shows up there too.
+
+## What the seam does not cover
+
+- **Diagnostics reads on Windows.** `ProxyManager`'s stop path calls the WFP and NDIS post-teardown snapshots
+  (`diagnostics::wfp::log_snapshot`, `diagnostics::ndis::log_snapshot`), and the bridge's foreground startup calls the
+  same two, outside any trait. They run `netsh` and `pnputil` through `SystemTool`, so the lint is satisfied, but they read
+  the real host. A `ProxyManager` test on Windows that stops a session with every trait mocked still runs them.
+  They change nothing.
+- **A second caller of the DNS flush.** See the `DnsFlushResolverCache` item above.
 
 ## `Dns` has two layers
 

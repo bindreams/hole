@@ -87,8 +87,8 @@ support bundle is scrubbed with the app's registry.
 {src}`crates/common/src/secret_newtype.rs`) implement neither `Display` nor `Deref`. `server_host = %config.server.server`
 is therefore a compile error, and `format!("{}", *addr)` cannot reopen it. `expose()` is the single named exit, so
 `rg '\.expose\(\)'` lists every site that reads a real value. Both carry a hand-written `Debug` that prints
-`ServerAddress(<redacted>)` or `Password(<redacted>)`, so a derived `Debug` on a container is not a hole, and a `Dump` impl tagged `dump::tag::SECRET`, which
-renders as `[REDACTED]`.
+`ServerAddress(<redacted>)` or `Password(<redacted>)`, so a derived `Debug` on a container is not a hole. Each also has a `Dump` impl tagged
+`dump::tag::SECRET`, which renders as `!secret [REDACTED]`.
 
 That `Display` and `Deref` are **absent** is pinned by compile-fail probes
 ({src}`crates/common/tests/secret_shape/`, driven by `trybuild` from `the_secret_newtypes_have_no_second_exit`): adding
@@ -115,8 +115,9 @@ are `#[serde(transparent)]`, so the payload's JSON shape is unchanged.
 does not pick per field. A `Serialize` type that transitively holds a `ServerAddress` or a `Password` and has no `Dump`
 of its own is rendered through the serde tree, which shows the inner string, and the newtype's `Dump` is never reached.
 So **every such type needs its own `Dump` impl.** They are `ServerEntry`, `AppConfig`, `ProxyConfig`,
-`TestServerRequest`, `BridgeRequest`, and the bridge's persisted `Target`, `TargetFile`, `PersistedTarget` and
-`StartupPreferenceFile`. The impls of `BridgeRequest` and `AppConfig` are exhaustive with no `_` arm, so a new field or
+`TestServerRequest`, `BridgeRequest`, and the bridge's persisted `TargetFile`, `PersistedTarget` and
+`StartupPreferenceFile`. The bridge's `Target` is not `Serialize`, so the rule does not require its `Dump` impl; it has
+one so that `dump!` reaches `ProxyConfig`'s rather than the `Debug` rung. The impls of `BridgeRequest` and `AppConfig` are exhaustive with no `_` arm, so a new field or
 variant must say whether it carries a secret.
 
 One type the rule reads as covering is deliberately not covered: `ImportOutcome`. `crates/hole` has no `dump` dependency,

@@ -17,7 +17,9 @@ and the bridge from {src}`crates/bridge/src/logging.rs` (`bridge.log`). A comman
 | The app, or a bridge run by hand | `dirs::state_dir()/hole/logs`, else the local data directory: `%LOCALAPPDATA%\hole\logs` on Windows, `~/Library/Application Support/hole/logs` on macOS |
 | The installed service            | `service_log_dir` in {src}`crates/common/src/update_marker.rs`: `%ProgramData%\hole\logs` on Windows, `/var/log/hole` on macOS                          |
 
-`HOLE_LOG_DIR` overrides the directory for the app and for a bridge run by hand. `hole bridge log` reads the installed service's directory by
+`HOLE_LOG_DIR` overrides the directory for the app and for a bridge run by hand, with one exception: a bridge run by hand
+and **elevated on macOS** logs to the invoking user's directory, which beats `HOLE_LOG_DIR`, and only `--log-dir` beats
+that. `hole bridge log` reads the installed service's directory by
 default; point it at a foreground or development bridge with `--log-dir` or `HOLE_LOG_DIR` (see [the bridge
 commands](../bridge-cli.md)).
 
@@ -53,7 +55,7 @@ the diagnosis.
 | `HOLE_BRIDGE_LOG` | The bridge's **file** directives, a comma-separated list. Beats `HOLE_LOG`. Default `hole_bridge=info`.     |
 | `HOLE_LOG`        | The file directives for the app (default `hole=info`) and, when `HOLE_BRIDGE_LOG` is unset, for the bridge. |
 | `HOLE_LOG_STDERR` | The stderr directives. Unset, stderr mirrors the file sink.                                                 |
-| `HOLE_LOG_DIR`    | The log directory.                                                                                          |
+| `HOLE_LOG_DIR`    | The log directory (not honoured by an elevated macOS bridge run by hand, above).                            |
 | `RUST_LOG`        | Layered under every sink's directives, so it composes with the variables above.                             |
 
 `HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace` adds the Shadowsocks server's per-relay byte counts

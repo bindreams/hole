@@ -39,8 +39,8 @@ Two things follow from where the plugin is registered.
   forward-and-exit. [The version handoff](#the-bridge-and-the-app-agree-on-a-version) below does the take-over with an
   explicit exit-wait.
 
-On macOS a click on the dock icon of a running app launches no new process, so single-instance never fires; the app
-handles the `Reopen` run event instead and reveals the dashboard.
+On macOS, opening the bundle again while the app runs (from Finder, Launchpad or Spotlight) launches no new process, so
+single-instance never fires; the app handles the `Reopen` run event instead and reveals the dashboard.
 
 ## The tray menu has one commit point
 
@@ -103,7 +103,7 @@ The relaunch ({src}`crates/hole/src/relaunch.rs`) is an exit-wait handoff: the o
 `HOLE_AWAIT_EXIT_PID` set and blocks on a `READY` line. The successor reads the old process's identity while that process
 is provably alive, prints `READY`, and waits for it to exit. Only then does it launch normally, which wins the
 single-instance lock. Reading the identity before `READY`, plus the start token inside it, is what closes the window in
-which a process id could be reused. `relaunch.rs` carries no `#[cfg]`, and the policy and wiring are table-tested.
+which a process id could be reused. `relaunch.rs` has no platform `#[cfg]` (only `#[cfg(test)]`), and the policy and wiring are table-tested.
 
 Self-heal is **inert** until an update produces a mismatch, and off for development and snapshot builds, which are built
 in lockstep. The swap that produces the mismatch is [the update cutover](update-cutover.md).
