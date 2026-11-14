@@ -196,8 +196,9 @@ pub const LOCKDOWN_PF_LABEL: &str = "hole-lockdown";
 /// Loopback is exempted as in [`build_pf_ruleset`]. The passes lead the filter section, because the `quick` inet6
 /// block would otherwise end evaluation on a `::1` packet. The server and TUN permits go through [`permit`].
 ///
-/// The base rule's [`LOCKDOWN_PF_LABEL`] is load-bearing: it is the only presence evidence for [`lockdown_cover_presence`]
-/// that does not come from `state_dir`. Without it presence is file-only, which cannot produce `Live`.
+/// The base rule's [`LOCKDOWN_PF_LABEL`] is load-bearing: it is the only presence evidence for
+/// [`lockdown_cover_presence`] that does not come from `state_dir`. Without it presence is file-only, which cannot
+/// produce `Live`.
 pub fn build_lockdown_main_ruleset(tun_name: &str, server_ip: IpAddr, nat_snapshot: &str) -> String {
     let proto = "tcp"; // +udp once a UDP-transport plugin lands; egress is TCP-only today.
     format!(
@@ -532,17 +533,17 @@ fn engage_with(
         // canonical baseline rather than leaving it under a stale cover ruleset. No standing cover is being adopted
         // here, so the restore must run.
         //
-        // Known residual: if this call is a transition over a still-live prior cover, that cover blocked right up until
-        // this failed load, and the `/etc/pf.conf` reload below replaces it with the open baseline. `engage` has no
-        // parameter that tells a first engage from a transition, so the warn below fires unconditionally. It is worded
-        // as a possibility because it fires before the restore, and a restore that itself fails leaves the host behind
-        // the prior cover.
+        // Known residual (bindreams/hole#1004, open): if this call is a transition over a still-live prior cover,
+        // that cover blocked right up until this failed load, and the `/etc/pf.conf` reload below replaces it with
+        // the open baseline. `engage` has no parameter that tells a first engage from a transition, so the warn below
+        // fires unconditionally. It is worded as a possibility because it fires before the restore, and a restore
+        // that itself fails leaves the host behind the prior cover.
         tracing::warn!(
             "the transient cover's ruleset failed to load; restoring /etc/pf.conf, which REPLACES \
              whatever ruleset was live. If this engage was a TRANSITION over a still-live prior \
              cover, that cover was blocking the host until this instant and the restore below \
-             REOPENS it; a restore that fails instead logs its own failure below and leaves the \
-             host behind that prior cover"
+             REOPENS it (bindreams/hole#1004); a restore that fails instead logs its own failure \
+             below and leaves the host behind that prior cover"
         );
         ops.transient_restore(&token);
         return Err(e);
@@ -709,9 +710,13 @@ fn persist_baseline(
 /// Engage the standing lockdown cover. Persist-before-mutate, no `-Fa`. It ensures pf is enabled (`engage_pf_action`
 /// on the `pfctl -s info` read), so the ruleset never loads into a disabled, inert pf. The three cases:
 ///
-/// - `FreshEnable` (no persisted state): `pfctl -E` and capture the token, snapshot `pfctl -sr` and `pfctl -sn`, persist both before mutating.
-/// - `ReuseToken` (adopt re-engage, pf still enabled): reuse the persisted token and snapshots. Re-running `-sr` and `-sn` would snapshot our own lockdown ruleset as the host's.
-/// - `Reenable` (adopt re-engage, pf disabled by a reboot): the token is stale, so `pfctl -E` for a fresh one and re-persist it under the same host snapshot. Otherwise the ruleset loads into a disabled pf and the cover is inert while reported active.
+/// - `FreshEnable` (no persisted state): `pfctl -E` and capture the token, snapshot `pfctl -sr` and `pfctl -sn`,
+///   persist both before mutating.
+/// - `ReuseToken` (adopt re-engage, pf still enabled): reuse the persisted token and snapshots. Re-running `-sr` and
+///   `-sn` would snapshot our own lockdown ruleset as the host's.
+/// - `Reenable` (adopt re-engage, pf disabled by a reboot): the token is stale, so `pfctl -E` for a fresh one and
+///   re-persist it under the same host snapshot. Otherwise the ruleset loads into a disabled pf and the cover is inert
+///   while reported active.
 ///
 /// Then load the main ruleset via `pfctl -f -`. The load is last in every case: it must not precede
 /// `capture_and_persist`'s snapshot, and a cold engage has no window that reordering could close (module doc).

@@ -173,7 +173,7 @@ preference); the row names the ones that matter. Where the platforms differ, the
 | **T1**  | A connect that builds a tunnel (the app's Connect, or the boot connect)                                                                                  | `standing_cover_expected()`: the intent is `On`, or this run adopted a cover and the intent is not `Off`. `Unreadable` with no adopted cover answers no                                      | Yes: installed after the routes, or re-engaged in place when one is adopted. No: nothing is installed and a cover already in force is left as it is                                                                                                                                                                                                                                                                                                                      |
 | **T2**  | A connect in SOCKS-only mode                                                                                                                             | Nothing                                                                                                                                                                                      | Unchanged: none is installed and an adopted one is not refreshed ([#1291](https://github.com/bindreams/hole/issues/1291))                                                                                                                                                                                                                                                                                                                                                |
 | **T3**  | A connect fails before the install step                                                                                                                  | Nothing                                                                                                                                                                                      | Unchanged: a cover already in force stays                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| **T4**  | The install itself fails                                                                                                                                 | Platform                                                                                                                                                                                     | Windows: the transaction aborts and an adopted cover stays as it was. macOS: a failed ruleset load restores the host before the install returns, and that also removes an adopted or recorded cover ([#1296](https://github.com/bindreams/hole/issues/1296))                                                                                                                                                                                                             |
+| **T4**  | The install itself fails                                                                                                                                 | Platform                                                                                                                                                                                     | Windows: the transaction aborts and an adopted cover stays as it was. macOS: a failed ruleset load restores the host before the install returns, and that also removes an adopted or recorded cover ([#1296](https://github.com/bindreams/hole/issues/1296)), and a failed load of the transient cover's ruleset reloads `/etc/pf.conf` over a still-live prior cover ([#1004](https://github.com/bindreams/hole/issues/1004))                                           |
 | **T5**  | Windows only: the install commits and the read-back of the boot-time filters then fails                                                                  | Nothing                                                                                                                                                                                      | In force with no guard over it, and the connect fails. Ways out: T11 and T12 while the bridge runs, T13 and T14 once the service is stopped, and T16 at the next bridge start when the startup-resolved target is `Off` ([#1292](https://github.com/bindreams/hole/issues/1292))                                                                                                                                                                                         |
 | **T6**  | A connect fails after the install                                                                                                                        | Nothing                                                                                                                                                                                      | Released by `release_failed_start_cover`, whatever the intent. The code does this on purpose, so a failed connect with Lockdown on can leave the host open                                                                                                                                                                                                                                                                                                               |
 | **T7**  | Disconnect, or Exit (the app sends a Stop), while a session is running                                                                                   | `UserStopped`; the target becomes `Off`                                                                                                                                                      | Released, whatever the intent and the presence say                                                                                                                                                                                                                                                                                                                                                                                                                       |
@@ -319,31 +319,32 @@ Run `sudo launchctl bootout system/com.hole.bridge`, then `sudo hole bridge unlo
 
 ## The release contract
 
-`failclosed::release_all` is the function behind Unblock and untick (T11, T12) and behind the sweep of `release-covers`.
+`failclosed::release_all` is the function behind untick and Unblock (T11, T12) and behind the sweep of `release-covers`.
 It makes five promises, and each exists because a weaker one strands a user.
 
 1. **Unconditional.** It never probes the live cover to decide whether to act, and a clean host returns `Ok`. On macOS
-   "clean host" is read from Hole's own state file (`StateFile::Absent`), because pf has no query for who holds a ruleset.
-   A state file lost under a live cover (an external wipe of the state directory, not a corrupt file) is therefore
-   indistinguishable from a clean host, and the call answers `Ok` without touching pf. This is a
-   [disclosed residual](kill-switch-recovery.md#disclosed-residuals).
+   "clean host" is read from Hole's own state file (`StateFile::Absent`), because pf has no query for who holds a
+   ruleset. A state file lost under a live cover (an external wipe of the state directory, not a corrupt file) is
+   therefore indistinguishable from a clean host, and the call answers `Ok` without touching pf. This is a [disclosed
+   residual](kill-switch-recovery.md#disclosed-residuals).
 1. **Total.** It clears both cover kinds. Clearing one would leave a user with no way out.
 1. **No short-circuit.** Every clear is attempted before any failure is examined. The only early return is a Windows
    engine-open failure, where nothing could have been issued.
-1. **No false success over a detected cover.** `Ok` means every cover the call could detect is cleared. The converse does
-   not hold: it may answer `Err` over a host that is in fact open. The asymmetry is deliberate, because a false `Err`
-   keeps the escape on the tray menu and the intent armed, while a false `Ok` over a detected cover is the lockout the
-   function exists to remove. Promise 1's lost state file is the one `Ok` over a blocked host, and it is no violation:
-   the cover left no evidence to detect. `Ok` is also qualified, by the `Clearance` it carries
-   ([What `Ok` proves](kill-switch-uninstall.md#what-ok-proves)).
-1. **Bookkeeping is best-effort, except the state-file clear.** The macOS `pfctl -X` refcount drop and the Windows
-   sublayer and provider delete log a warning on failure: once the host's rules are restored, a refcount that will not
-   drop blocks nothing, and a record kept for it would fail the same way on every retry. A cover's state-file clear is
-   skipped whenever that cover's restore did not confirm, because the file is the cover's only record, and clearing it
-   after an unconfirmed restore would make the next call read a clean host while the block persists. After a confirmed
-   restore, a clear that cannot write is that cover's error. macOS orders the two so `pfctl -X` never runs while a
-   record names its token ([Release](kill-switch-macos.md#release)). A record that could not be read is kept, after its
-   restore, and the answer is an error.
+1. **No false success over a detected cover.** `Ok` means every cover the call could detect is cleared. The converse
+   does not hold: it may answer `Err` over a host that is in fact open. The asymmetry is deliberate, because a false
+   `Err` keeps the escape on the tray menu and the intent armed, while a false `Ok` over a detected cover is the lockout
+   the function exists to remove. Promise 1's lost state file is the one `Ok` over a blocked host, and it is no
+   violation: the cover left no evidence to detect. `Ok` is also qualified, by the `Clearance` it carries ([What `Ok`
+   proves](kill-switch-uninstall.md#what-ok-proves)).
+1. **Bookkeeping is best-effort, except the state-file clear.** The macOS `pfctl -X` refcount drop logs a warning on
+   failure, and the Windows sublayer and provider deletes discard their codes and log nothing: once the host's rules are
+   restored, a refcount that will not drop or an empty container left behind blocks nothing, and a record kept for it
+   would fail the same way on every retry. A cover's state-file clear is skipped whenever that cover's restore did not
+   confirm, because the file is the cover's only record, and clearing it after an unconfirmed restore would make the
+   next call read a clean host while the block persists. After a confirmed restore, a clear that cannot write is that
+   cover's error. macOS orders the two so `pfctl -X` never runs while a record names its token
+   ([Release](kill-switch-macos.md#release)). A record that could not be read is kept, after its restore, and the answer
+   is an error.
 
 Windows keeps no cover state file: the filter set is compiled-in fixed GUIDs, so nothing there can be corrupt or
 version-skewed.
@@ -392,6 +393,12 @@ named under that table.
 - A restart under the kill switch on macOS has to look the server up again, and the ruleset passes only TCP to the
   server's address, so a hostname server can leave the restart failing and the block in force
   ([#1286](https://github.com/bindreams/hole/issues/1286)).
+- On macOS, a failed load of the transient cover's ruleset over a still-live prior cover reloads `/etc/pf.conf` and so
+  reopens the host that cover was blocking; `engage` cannot tell a first engage from a transition, so its warning is
+  worded as a possibility ([#1004](https://github.com/bindreams/hole/issues/1004)).
+- On macOS, the lockdown ruleset permits the TUN by `utunN` name and the kernel reuses those names, so a crashed
+  bridge's stale permit can be inherited by another interface of the same name, and nothing reclaims it
+  ([#1315](https://github.com/bindreams/hole/issues/1315)).
 - Two bridges with different state directories can run at once, and the cover's Windows filters are machine-wide, so one
   can sweep or overwrite the other's cover ([#878](https://github.com/bindreams/hole/issues/878)).
 ```

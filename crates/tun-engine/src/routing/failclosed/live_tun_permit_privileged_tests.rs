@@ -4,17 +4,17 @@
 //! dropped) but engages against an interface picked only to exercise the resolve path: macOS uses a name that matches
 //! nothing, Windows a live-but-irrelevant loopback alias. Neither proves the permit is sensitive to the interface it
 //! names. A rule naming the wrong live interface (the realistic failure with a kernel-assigned macOS TUN name, or a
-//! stale or duplicate Windows adapter) yields a kill switch that blocks everything while the UI reports it armed and the
-//! tunnel Running.
+//! stale or duplicate Windows adapter) yields a kill switch that blocks everything while the UI reports it armed and
+//! the tunnel Running.
 //!
 //! This module opens two real TUN devices and drives one probe route through the first. Four phases per platform:
 //!
 //! 1. **Control** (no cover): the probe must surface on the device. This proves the harness, not the cover.
 //! 2. **Positive**: engage the real cover naming device 1 (the one carrying the route). The probe (UDP and a TCP SYN)
 //!    must be permitted, a non-permitted host still blocked, and the server IP still reachable.
-//! 3. **Mutation**: re-engage naming device 2, a second live interface that is not the one carrying the traffic. The same
-//!    probes must now be dropped. This is the anti-vacuity mechanism: a permit that wrongly matched any live TUN-shaped
-//!    interface would pass phase 2 and also pass phase 3.
+//! 3. **Mutation**: re-engage naming device 2, a second live interface that is not the one carrying the traffic. The
+//!    same probes must now be dropped. This is the anti-vacuity mechanism: a permit that wrongly matched any live
+//!    TUN-shaped interface would pass phase 2 and also pass phase 3.
 //! 4. **Restore**: with nothing engaged, the probe surfaces again and the non-permitted host is reachable.
 //!
 //! Every phase's negative rests on the FIFO ordering of one device's frame queue: a probe sent while covered has its
@@ -27,8 +27,8 @@
 //!
 //! ## The mid-stream proof (macOS)
 //!
-//! `macos_live_tun_permit_cover_carries_a_mid_stream_segment_after_a_state_purge` reuses this module's devices, route and
-//! frame reader to ask whether a cover permit is stateless enough to carry a segment of an already-established flow
+//! `macos_live_tun_permit_cover_carries_a_mid_stream_segment_after_a_state_purge` reuses this module's devices, route
+//! and frame reader to ask whether a cover permit is stateless enough to carry a segment of an already-established flow
 //! after pf's state table is purged. It completes a TCP handshake by hand (reading the kernel's SYN off the device and
 //! writing a crafted SYN-ACK back), so the flow exists with no peer and no internet. See that test's doc for its legs.
 //!
@@ -932,9 +932,9 @@ fn abort_mid_stream(stream: tokio::net::TcpStream) {
 /// segment of a flow it names across the engage's host-wide `pfctl -F states` purge.
 ///
 /// Everything else behind that claim is `pfctl -vn` text: that a bare `pass` normalizes to `flags S/SA keep state` and
-/// that `no state` suppresses it. This module's neighbours prove the same property for `lo0`, which is `set skip`-exempt
-/// and so says nothing about a permit on a real interface. This test shows the kernel delivering a mid-stream segment on
-/// a non-`lo0` permit after a purge.
+/// that `no state` suppresses it. This module's neighbours prove the same property for `lo0`, which is `set
+/// skip`-exempt and so says nothing about a permit on a real interface. This test shows the kernel delivering a
+/// mid-stream segment on a non-`lo0` permit after a purge.
 ///
 /// Three legs, in this order:
 ///

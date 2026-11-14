@@ -473,8 +473,8 @@ fn every_lockdown_filter_is_swept_under_the_lifetime_it_is_installed_with() {
     // an object; `swept_lockdown_keys` records what a delete of that object's key proves. A filter added
     // `FWPM_FILTER_FLAG_BOOTTIME` whose key is swept as `Persistent` makes `release_all` report a proof of removal it
     // never observed, and the MSI deletes `hole.exe` on the strength of it. One `LOCKDOWN_BOOTTIME_TWINS` entry feeds
-    // both sites for the twins; this asserts it for every lockdown filter, including the App-ID ones, whose two lists are
-    // built independently.
+    // both sites for the twins; this asserts it for every lockdown filter, including the App-ID ones, whose two lists
+    // are built independently.
     let spec = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
     let swept: std::collections::HashMap<GUID, FilterLifetime> = swept_lockdown_keys()
         .into_iter()
@@ -1117,8 +1117,8 @@ fn a_disengage_releases_the_lockdown_kind_only_when_every_delete_held() {
 // What `bridge unlock` hands back -------------------------------------------------------------------------------------
 //
 // `disengage_lockdown` returns a `Clearance`, not a bare `Ok`: `unlock` exists so there is no next engage.
-// `cutover::unlock_with` writes the intent OFF in the statement after it, and the pre-delete that would clear the key runs
-// only from `engage_lockdown`, which an off intent prevents. So the verdict has to travel.
+// `cutover::unlock_with` writes the intent OFF in the statement after it, and the pre-delete that would clear the key
+// runs only from `engage_lockdown`, which an off intent prevents. So the verdict has to travel.
 
 #[skuld::test]
 fn a_disengage_that_found_nothing_still_reports_what_it_could_not_prove() {
@@ -1165,10 +1165,10 @@ fn a_disengage_over_a_live_cover_hands_back_something_to_say() {
 
 #[skuld::test]
 fn a_disengage_that_failed_still_carries_the_sibling_it_already_removed() {
-    // At the Windows fold that produces the evidence. Every delete is issued before any code is read, so a third code from
-    // one app-id permit says nothing about the block-all sibling whose delete succeeded a few entries earlier. That
-    // sibling is gone from the host either way, and its `Removed` is the only live evidence any later sweep could have
-    // had. The verdict fails and the observation travels; returning early on the failure would lose both.
+    // At the Windows fold that produces the evidence. Every delete is issued before any code is read, so a third code
+    // from one app-id permit says nothing about the block-all sibling whose delete succeeded a few entries earlier.
+    // That sibling is gone from the host either way, and its `Removed` is the only live evidence any later sweep could
+    // have had. The verdict fails and the observation travels; returning early on the failure would lose both.
     let mut swept = sweep_answering(FWP_E_FILTER_NOT_FOUND_DWORD, ERROR_SUCCESS.0);
     let denied = swept
         .iter_mut()
@@ -1292,8 +1292,8 @@ fn a_sweep_that_watched_the_twins_go_proves_the_whole_list_empty() {
     // The other half, over the real sweep lists: an uninstall on the boot that engaged, the MSI stopping the bridge and
     // running `release-covers` while the twins are still live, so every key answers `ERROR_SUCCESS`. Nothing is left
     // unproven, the twins included, under the purge assumption on `KeyLifetime::BootTime` that
-    // `boottime_privileged_tests` measures the delete removing the live object for. The silence is about keys this sweep
-    // watched being deleted, not about keys nobody measured.
+    // `boottime_privileged_tests` measures the delete removing the live object for. The silence is about keys this
+    // sweep watched being deleted, not about keys nobody measured.
     let swept: Vec<(SweptKey, u32)> = swept_lockdown_keys()
         .into_iter()
         .chain(swept_transient_keys())

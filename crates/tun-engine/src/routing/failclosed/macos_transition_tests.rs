@@ -360,10 +360,10 @@ fn count_pf_references(listing: &str) -> usize {
 /// | arm64 | 191/191 100.0% | 229/233 98.3%    | 496 probes / 16 threads / 658.981375ms = 1329 us   |
 /// | amd64 | 496/496 100.0% | 532/541 98.3%    | 1541 probes / 16 threads / 2.225901559s = 1444 us  |
 ///
-/// The raw rate is what [`CONTROL_RATE_FLOOR_PCT`] is set from. The pool column is read against the window being hunted:
-/// that window is not sub-millisecond (`-Fa`'s gap spans the `/etc/pf.os` fingerprint reload plus the rule parse, and a
-/// bare `pfctl -n -f -` round trip measures 2.0 to 2.7ms), so the guard works only while the pool's probe interval is the
-/// same order.
+/// The raw rate is what [`CONTROL_RATE_FLOOR_PCT`] is set from. The pool column is read against the window being
+/// hunted: that window is not sub-millisecond (`-Fa`'s gap spans the `/etc/pf.os` fingerprint reload plus the rule
+/// parse, and a bare `pfctl -n -f -` round trip measures 2.0 to 2.7ms), so the guard works only while the pool's probe
+/// interval is the same order.
 ///
 /// An attempt is excluded when its window overlaps a load, not merely the instant one commits: the bracket opens before
 /// the child runs and closes after its target is published. A leg with slow attempts against fast transitions would

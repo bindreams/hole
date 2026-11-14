@@ -1180,7 +1180,7 @@ fn a_failed_unwind_of_a_failed_persist_still_returns_the_original_error_and_logs
     );
 }
 
-/// The transition residual must fire audibly, not silently.
+/// The transition residual (bindreams/hole#1004) must fire audibly, not silently.
 ///
 /// `engage_with`'s failed-load path calls `transient_restore`, which reloads
 /// `/etc/pf.conf` — the fully-open baseline — over whatever ruleset was live.
@@ -1218,7 +1218,7 @@ fn a_failed_transient_load_warns_that_the_restore_reopens_the_host() {
     );
     let log = writer.snapshot();
     assert!(
-        log.contains("TRANSITION"),
+        log.contains("bindreams/hole#1004"),
         "the restore that reopens the host must name the residual it is: {log}"
     );
     // The warn is emitted BEFORE `transient_restore`, so it may not report the

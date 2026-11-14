@@ -11,9 +11,9 @@
 //! listener times out even with no cover. Outbound to a routable IP works on the runner.
 //!
 //! They run on the elevated `tun` lane only: the `TUN` label gates them so the unprivileged `SKULD_LABELS="!tun"` pass
-//! excludes them and the `SKULD_LABELS="tun"` pass runs them (Windows under CI's elevated token, macOS under `sudo`). They
-//! are not `#[ignore]`d and do not skip on missing privilege: a default `cargo nextest` run on an unelevated box fails
-//! loud, and opting out is the explicit `!tun` filter.
+//! excludes them and the `SKULD_LABELS="tun"` pass runs them (Windows under CI's elevated token, macOS under `sudo`).
+//! They are not `#[ignore]`d and do not skip on missing privilege: a default `cargo nextest` run on an unelevated box
+//! fails loud, and opting out is the explicit `!tun` filter.
 //!
 //! Cross-binary serialization for the global WFP/pf/TUN state these touch lives in `.config/nextest.toml`
 //! (`global_net_state` test-group); skuld serializes across binaries too but does not own nextest's thread budget.
@@ -25,9 +25,9 @@
 //!
 //! The permitted, resolver and non-permitted targets must be addresses this host does not itself own (see `RESOLVER`'s
 //! doc: on macOS/BSD a self-served target is silently exempted by `set skip on lo0` whether or not the resolver rule
-//! works). That leaves a live-network dependency; `RESOLVER` shares PERMITTED's anycast network, and the resolver-permit
-//! assertions cross-check against PERMITTED at the same instant so a general outage is not reported as "the permit
-//! failed".
+//! works). That leaves a live-network dependency; `RESOLVER` shares PERMITTED's anycast network, and the
+//! resolver-permit assertions cross-check against PERMITTED at the same instant so a general outage is not reported as
+//! "the permit failed".
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::cover_oracle::{held_covers, permit_scenario};

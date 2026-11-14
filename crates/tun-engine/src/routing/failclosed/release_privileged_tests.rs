@@ -61,12 +61,12 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 /// unwind. `disarm` leaves no guard, so without this a failed assertion
 /// leaves the runner globally fail-closed.
 ///
-/// It does not discard the release's verdict. This guard clears a system-wide block-all it may be the last thing able to
-/// clear, on the exit path of a test that had already decided something was wrong, so a failure here is the difference
-/// between a tidied host and one left with no egress. Swallowing it would make "the sweep silently removed nothing" and
-/// "the sweep worked" the same observation, the failure class `release_all`'s "never a false success" promise rules out.
-/// It panics (failing the test) when it can, and prints when it cannot: a panic during an unwind aborts the process,
-/// taking every other verdict in this serialized lane with it.
+/// It does not discard the release's verdict. This guard clears a system-wide block-all it may be the last thing able
+/// to clear, on the exit path of a test that had already decided something was wrong, so a failure here is the
+/// difference between a tidied host and one left with no egress. Swallowing it would make "the sweep silently removed
+/// nothing" and "the sweep worked" the same observation, the failure class `release_all`'s "never a false success"
+/// promise rules out. It panics (failing the test) when it can, and prints when it cannot: a panic during an unwind
+/// aborts the process, taking every other verdict in this serialized lane with it.
 struct ReleaseOnDrop(std::path::PathBuf);
 impl Drop for ReleaseOnDrop {
     fn drop(&mut self) {

@@ -2,7 +2,8 @@
 //!
 //! Every test here drives at least two sweeps over one `state_dir`. A single observation slice cannot express "an
 //! earlier sweep removed the sibling", so a suite built from single slices cannot see a gate that goes permanently
-//! silent after one ordinary user action. `#[cfg]`-free like `clearance_tests`: the pure folds run on every lane.
+//! silent after one ordinary user action. `#[cfg]`-free like `clearance_tests`: the hazard is Windows-only and its proof
+//! must not live only on Windows, so the pure folds run on every lane.
 
 use std::path::Path;
 
@@ -104,9 +105,9 @@ fn dir() -> tempfile::TempDir {
 
 #[skuld::test]
 fn a_sweep_that_consumed_the_sibling_leaves_a_later_one_able_to_report() {
-    // End to end: the user arms the kill switch in one boot, reboots (BFE re-adds the persistent half from its own store;
-    // the twin's runtime object is gone), turns the switch off, and later uninstalls. Sweep 1 is the one sweep in the
-    // lifecycle that can see the evidence, and it also deletes it. Sweep 2 is the uninstall gate, running when
+    // End to end: the user arms the kill switch in one boot, reboots (BFE re-adds the persistent half from its own
+    // store; the twin's runtime object is gone), turns the switch off, and later uninstalls. Sweep 1 is the one sweep
+    // in the lifecycle that can see the evidence, and it also deletes it. Sweep 2 is the uninstall gate, running when
     // `RemoveFiles` is about to delete the only binary that could issue an FWPM delete. Reading the empty sibling set
     // as "no cover was ever here" is what made that silent.
     let state = dir();
@@ -155,8 +156,8 @@ fn a_host_that_never_armed_a_twin_stays_silent_across_every_sweep() {
 fn arming_then_unblocking_in_one_boot_clears_the_record_and_stays_clear() {
     // The most ordinary kill-switch lifecycle: arm the switch, then hit "Unblock Network" (or turn it off) in the same
     // boot, then uninstall later. The unblock deletes a live twin and gets `ERROR_SUCCESS` back. This sequence is quiet
-    // because of the purge assumption (`KeyLifetime::BootTime`): the silence is about a twin somebody watched go, not one
-    // nobody measured. What still cannot go quiet is an empty answer
+    // because of the purge assumption (`KeyLifetime::BootTime`): the silence is about a twin somebody watched go, not
+    // one nobody measured. What still cannot go quiet is an empty answer
     // (`an_empty_sibling_set_never_clears_a_recorded_twin`).
     let state = dir();
     arm(state.path());
@@ -184,10 +185,10 @@ fn arming_then_unblocking_in_one_boot_clears_the_record_and_stays_clear() {
 
 #[skuld::test]
 fn an_uninstall_on_the_boot_that_armed_the_twin_watched_it_go() {
-    // Arm the kill switch, then uninstall straight away. The MSI stops the bridge and runs `release-covers` while the twins
-    // are still live, so every key, sibling and twin alike, answers `ERROR_SUCCESS`. The gate is the sweep doing the
-    // removing, so no persisted record could rescue this one; the twin's own delete has to be conclusive. Under the purge
-    // assumption it is, and `RemoveFiles` deleting the binary afterwards strands nothing.
+    // Arm the kill switch, then uninstall straight away. The MSI stops the bridge and runs `release-covers` while the
+    // twins are still live, so every key, sibling and twin alike, answers `ERROR_SUCCESS`. The gate is the sweep doing
+    // the removing, so no persisted record could rescue this one; the twin's own delete has to be conclusive. Under the
+    // purge assumption it is, and `RemoveFiles` deleting the binary afterwards strands nothing.
     let state = dir();
     arm(state.path());
 
@@ -237,9 +238,9 @@ fn the_engage_records_the_twin_before_any_sweep_could_have_seen_it() {
 
 #[skuld::test]
 fn a_failed_sweep_that_already_removed_the_sibling_still_records_what_it_saw() {
-    // Both Windows sweeps issue every delete before inspecting any code, so `Err` arrives after the sibling's own delete
-    // succeeded: the sibling is gone from the host and its `Removed` is in the observation set. Returning early on the
-    // failure would throw that away and consume both evidence sources in one act.
+    // Both Windows sweeps issue every delete before inspecting any code, so `Err` arrives after the sibling's own
+    // delete succeeded: the sibling is gone from the host and its `Removed` is in the observation set. Returning early
+    // on the failure would throw that away and consume both evidence sources in one act.
     //
     // The state dir starts empty on purpose: this is the host for which the sibling is the fallback (an OS in-place
     // reset, a profile migration, a user deleting the folder), so the record has to be created here, not merely
@@ -562,19 +563,19 @@ fn item_body<'a>(src: &'a str, head: &str) -> &'a str {
 
 #[skuld::test]
 fn the_engage_arms_the_record_at_the_commit_and_nowhere_downstream_of_it() {
-    // Source tripwire, the technique and the reason of `windows_tests`'
-    // `neither_engage_discards_its_pre_delete_codes`: no fixture can make a real `FwpmTransactionCommit0` succeed and the
-    // read-back after it fail, and that run is the only one where this ordering is observable. The privileged lane's
-    // `..._every_engage_rearms_the_twins_...` asserts `load(dir) == Armed` after an engage that already returned `Ok`, so
-    // it cannot tell "recorded at the commit" from "recorded after the read-back". It lives here for the reason this
-    // module's doc gives: the proof must not live only on Windows.
+    // Source tripwire, the technique and the reason of `windows_tests`' `neither_engage_discards_its_pre_delete_codes`:
+    // no fixture can make a real `FwpmTransactionCommit0` succeed and the read-back after it fail, and that run is the
+    // only one where this ordering is observable. The privileged lane's `..._every_engage_rearms_the_twins_...` asserts
+    // `load(dir) == Armed` after an engage that already returned `Ok`, so it cannot tell "recorded at the commit" from
+    // "recorded after the read-back". It lives here rather than beside that guard: the hazard is Windows-only, and its
+    // proof must not live only on Windows.
     //
     // What it holds: `commit_and_record` is one step because the fact the record describes becomes true when the commit
-    // returns `ERROR_SUCCESS`, and every later statement can fail over a cover that still stands. Moving the record down
-    // beside `verify_boottime_twins`, so it "only goes in once the twins are confirmed", reads as more careful and
+    // returns `ERROR_SUCCESS`, and every later statement can fail over a cover that still stands. Moving the record
+    // down beside `verify_boottime_twins`, so it "only goes in once the twins are confirmed", reads as more careful and
     // loses the record on a read-back failure: the host then holds a committed, in-force boot-time block-all with
-    // nothing recorded, and when its persistent sibling is later cleared by something that is not a sweep, no sweep ever
-    // held the evidence to copy.
+    // nothing recorded, and when its persistent sibling is later cleared by something that is not a sweep, no sweep
+    // ever held the evidence to copy.
     let src = include_str!("windows.rs");
 
     let engage = item_body(src, "pub fn engage_lockdown(");

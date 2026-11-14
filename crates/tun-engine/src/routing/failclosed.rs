@@ -295,7 +295,9 @@ pub fn recover_lockdown(lock: &CoverLock, decision: crate::routing::CoverRecover
 /// crash could authorize an unrelated wintun adapter while the kill switch reads armed. A running bridge's own TUN
 /// resolves, so this never deletes a permit a live bridge relies on.
 ///
-/// A no-op on macOS, whose lockdown ruleset matches the TUN by literal interface name, which the OS does not reassign.
+/// A no-op on macOS, which has no such reclaim. Its lockdown ruleset matches the TUN by literal interface name, and the
+/// kernel reuses `utunN` names, so a stale permit can be inherited by another interface that receives the same name
+/// ([#1315](https://github.com/bindreams/hole/issues/1315)).
 pub fn reclaim_stale_tun_permit(lock: &CoverLock, tun_name: &str) {
     #[cfg(target_os = "windows")]
     platform::reclaim_stale_tun_permit(lock, &luid::SystemLuidResolver, tun_name);
@@ -345,11 +347,11 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 ///    [`Clearance::is_proven`] is the narrower claim that every empty answer proved its key empty, which a
 ///    [`KeyLifetime::BootTime`] key answering [`KeyOutcome::NotFound`] does not. The uninstall gate must read the
 ///    narrower one.
-/// 5. **Bookkeeping is best-effort, except the state-file clear.** A failing `pfctl -X` or Windows sublayer/provider
-///    delete only logs. A cover's state-file clear is skipped whenever its restore did not confirm, and after a
-///    confirmed restore a clear that cannot write is that cover's error. macOS clears the record before it drops the
-///    token, and drops the token only if the clear took the record. A record that could not be read is kept, after
-///    its restore, and the answer is an error.
+/// 5. **Bookkeeping is best-effort, except the state-file clear.** A failing `pfctl -X` only logs; the Windows sublayer
+///    and provider deletes discard their codes and log nothing. A cover's state-file clear is skipped whenever its
+///    restore did not confirm, and after a confirmed restore a clear that cannot write is that cover's error. macOS
+///    clears the record before it drops the token, and drops the token only if the clear took the record. A record that
+///    could not be read is kept, after its restore, and the answer is an error.
 ///
 /// Windows keeps no cover state file: the filter set is compiled-in fixed GUIDs, so only GUID sweeps run there.
 pub fn release_all(lock: &CoverLock) -> Result<Clearance, RoutingError> {
@@ -376,10 +378,11 @@ pub enum KeyLifetime {
     /// still provisioned behind it. "Not found" proves nothing.
     ///
     /// A watched removal ([`KeyOutcome::Removed`] → [`KeyObservation::proves_empty`]) is treated as proof, on the
-    /// unmeasured assumption that `FwpmFilterDeleteByKey0` purges the policy record along with the runtime object.
-    /// A stranded record blocks egress across the boot-to-BFE window only (unmeasured, and possibly worse for a host
+    /// unmeasured assumption that `FwpmFilterDeleteByKey0` purges the policy record along with the runtime object. A
+    /// stranded record blocks egress across the boot-to-BFE window only (unmeasured, and possibly worse for a host
     /// whose boot itself needs egress, where the block can keep the boot from reaching the BFE start that lifts it),
-    /// which is why an unproven key does not fail a release but must never read as proof. See docs/contributing/architecture/kill-switch-windows.md#evidence-about-a-boot-time-key.
+    /// which is why an unproven key does not fail a release but must never read as proof. See
+    /// docs/contributing/architecture/kill-switch-windows.md#evidence-about-a-boot-time-key.
     BootTime,
 }
 
@@ -554,8 +557,9 @@ impl KeyObservation {
 /// `Ok` from a sweep means no delete failed. It does not mean every key is demonstrably empty: a
 /// [`KeyLifetime::BootTime`] key answering [`KeyOutcome::NotFound`] fits both "never installed" and "installed in an
 /// earlier boot, record still provisioned". The verdict carries that qualification, which a bare `Ok` would drop and
-/// the MSI would read as safe to delete the binary (docs/contributing/architecture/kill-switch-uninstall.md#what-ok-proves).
-/// It does not fail the release; see [`KeyLifetime::BootTime`] for the bound on the harm.
+/// the MSI would read as safe to delete the binary
+/// (docs/contributing/architecture/kill-switch-uninstall.md#what-ok-proves). It does not fail the release; see
+/// [`KeyLifetime::BootTime`] for the bound on the harm.
 ///
 /// It carries two independent answers. [`Self::is_proven`] is what the sweep proved: false on every Windows sweep
 /// run on a boot where no bridge engaged. [`Self::leftover_keys`] is what is worth telling an operator, which is
@@ -1082,7 +1086,8 @@ mod live_tun_permit_privileged_tests;
 mod boottime_privileged_tests;
 
 // Privileged-lane proof of the version-independent boot-time sweep against the real firewall: a provider-filtered
-// enumeration returns boot-time filters at every layer, and a full sweep removes an unrecognised one and nothing else. Gated identically to `boottime_privileged_tests` above.
+// enumeration returns boot-time filters at every layer, and a full sweep removes an unrecognised one and nothing else.
+// Gated identically to `boottime_privileged_tests` above.
 #[cfg(all(test, target_os = "windows"))]
 #[path = "failclosed/provider_sweep_privileged_tests.rs"]
 mod provider_sweep_privileged_tests;

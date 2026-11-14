@@ -1,14 +1,14 @@
 //! Tripwire: the `FWPM_FILTER_FLAG_BOOTTIME` bit may be produced in exactly one place, the one that cannot produce it
 //! without a [`super::KeyLifetime`].
 //!
-//! `FilterLifetime` (`failclosed/windows.rs`) is a newtype over `KeyLifetime` whose only flag accessor reads the variant
-//! the sweep records, and the twins' key, layer and lifetime come from one table that both `build_lockdown_spec` and
-//! `swept_lockdown_keys` read. Installing a boot-time filter without classifying its key is therefore not expressible
-//! through the type. What the type cannot enforce is that it is the only way in: nothing stops a future source from naming
-//! `FWPM_FILTER_FLAG_BOOTTIME` itself and going around. So the scan asserts the flag is named by exactly one production
-//! source, the one that defines the mapping. That source is found by its definition, never by a path, so moving it
-//! re-anchors the guard instead of silently widening it. A boot-time filter that reaches the firewall any other way names
-//! the flag and fires this.
+//! `FilterLifetime` (`failclosed/windows.rs`) is a newtype over `KeyLifetime` whose only flag accessor reads the
+//! variant the sweep records, and the twins' key, layer and lifetime come from one table that both
+//! `build_lockdown_spec` and `swept_lockdown_keys` read. Installing a boot-time filter without classifying its key is
+//! therefore not expressible through the type. What the type cannot enforce is that it is the only way in: nothing
+//! stops a future source from naming `FWPM_FILTER_FLAG_BOOTTIME` itself and going around. So the scan asserts the flag
+//! is named by exactly one production source, the one that defines the mapping. That source is found by its definition,
+//! never by a path, so moving it re-anchors the guard instead of silently widening it. A boot-time filter that reaches
+//! the firewall any other way names the flag and fires this.
 //!
 //! ## Residual: raw flag bits
 //!
@@ -20,10 +20,10 @@
 //!    written there cannot reach the boot window. The exemption is anchored to that flag, not a path, so
 //!    `dns_confine/windows.rs` falls back under the rule if it stops naming it. Its granularity is the file, not the
 //!    session: a source keeps the exemption for every raw-bit write in it while it opens one dynamic session, so a
-//!    second, non-dynamic engine added to the same file would write `0x4` unseen. Narrowing that needs the scan to tie a
-//!    flags construction to the engine it is spent on, which is dataflow, not lexing.
-//! 2. `FwpmFilterAdd0` is clippy-`disallowed_methods` with exactly those two sanctioned sites, so bits materialised in a
-//!    third source have nowhere to be spent.
+//!    second, non-dynamic engine added to the same file would write `0x4` unseen. Narrowing that needs the scan to tie
+//!    a flags construction to the engine it is spent on, which is dataflow, not lexing.
+//! 2. `FwpmFilterAdd0` is clippy-`disallowed_methods` with exactly those two sanctioned sites, so bits materialised in
+//!    a third source have nowhere to be spent.
 //! 3. Inside the one non-dynamic site, `add_filter` takes its flags from `f.lifetime.filter_flags()` and there is no
 //!    other assignment to `FWPM_FILTER0::flags`.
 //!
@@ -36,9 +36,9 @@
 //! `FwpmFilterAdd0` too, and `clippy.toml` names both sites.
 //!
 //! It scans identifiers in lexed code, so renaming the symbol at its `use` does not hide it
-//! (`an_aliased_boot_time_flag_still_fires_the_tripwire`), and neither does spacing, a comment of any shape, or a string
-//! literal. The failclosed modules' docs discuss both symbols at length, and a guard that counted prose would fire on
-//! documentation alone.
+//! (`an_aliased_boot_time_flag_still_fires_the_tripwire`), and neither does spacing, a comment of any shape, or a
+//! string literal. The failclosed modules' docs discuss both symbols at length, and a guard that counted prose would
+//! fire on documentation alone.
 
 use std::path::{Path, PathBuf};
 

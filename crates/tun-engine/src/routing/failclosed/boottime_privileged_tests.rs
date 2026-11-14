@@ -1,27 +1,27 @@
 //! Privileged-lane measurement of what WFP does with a boot-time filter, on the real firewall, with no reboot.
 //!
 //! `FWPM_FILTER_FLAG_BOOTTIME` is the one part of the standing lockdown cover whose lifecycle Microsoft's documentation
-//! does not settle. Six questions decide whether a boot-time twin of the block-all floor is safe to ship, and all six are
-//! answerable here (`lockdown_privileged_tests.rs` and `release_privileged_tests.rs` drive the real
+//! does not settle. Six questions decide whether a boot-time twin of the block-all floor is safe to ship, and all six
+//! are answerable here (`lockdown_privileged_tests.rs` and `release_privileged_tests.rs` drive the real
 //! `FwpmFilterAdd0`/`FwpmFilterDeleteByKey0` on this lane):
 //!
 //! 1. **Does WFP accept a boot-time filter that references our persistent provider and sublayer?** Boot-time policy is
 //!    provisioned before the Base Filtering Engine, which also provisions persistent providers and sublayers, so such a
 //!    filter may be rejected at add time or accepted with its containers rewritten.
 //! 2. **What containers does the accepted filter carry?** Read back, not assumed: a NULL provider or the default
-//!    sublayer would make sweeping boot-time filters by provider enumeration impossible and put them outside the cover's
-//!    weight arbitration. The template names no provider (`boottime_probe::enum_boottime`), so this shows the stored
-//!    record carries our `providerKey`, not that a `BOOTTIME_ONLY` template filtered by it returns the filter; that half
-//!    is `provider_sweep_privileged_tests`'.
+//!    sublayer would make sweeping boot-time filters by provider enumeration impossible and put them outside the
+//!    cover's weight arbitration. The template names no provider (`boottime_probe::enum_boottime`), so this shows the
+//!    stored record carries our `providerKey`, not that a `BOOTTIME_ONLY` template filtered by it returns the filter;
+//!    that half is `provider_sweep_privileged_tests`'.
 //! 3. **Does `FwpmFilterDeleteByKey0` remove it?** The default view excludes boot-time filters, so a delete that never
-//!    saw the filter would answer `FWP_E_FILTER_NOT_FOUND`, which `first_delete_failure` whitelists. That would be a false
-//!    `Ok` from `release_all` over a host that is still blocked.
+//!    saw the filter would answer `FWP_E_FILTER_NOT_FOUND`, which `first_delete_failure` whitelists. That would be a
+//!    false `Ok` from `release_all` over a host that is still blocked.
 //! 4. **What does a by-key GET say about a live boot-time filter?** `lockdown_cover_presence` queries the twins' GUIDs,
 //!    and `classify_presence` turns any code that is neither `ERROR_SUCCESS` nor the literal `FWP_E_FILTER_NOT_FOUND`
 //!    into `Indeterminate`. Measured: `ERROR_SUCCESS`.
-//! 5. **Does every engage re-arm the twins, or only the first?** A re-add of a fixed key hits `FWP_E_ALREADY_EXISTS` and
-//!    `ok_or_exists` reports `Ok`; under the "disabled" reading of BFE startup the kill switch would cover one boot and
-//!    then stop. Asserted by effect, on WFP's `filterId`, by
+//! 5. **Does every engage re-arm the twins, or only the first?** A re-add of a fixed key hits `FWP_E_ALREADY_EXISTS`
+//!    and `ok_or_exists` reports `Ok`; under the "disabled" reading of BFE startup the kill switch would cover one boot
+//!    and then stop. Asserted by effect, on WFP's `filterId`, by
 //!    `boottime_global_net_state_every_engage_rearms_the_twins_instead_of_reporting_already_exists`, which engages the
 //!    real kill switch (see its doc).
 //! 6. **Is a live boot-time filter out of the default filter view?** The twins' softness is sound only because the two
@@ -37,13 +37,14 @@
 //! What this cannot answer: every observation is made inside one boot, and no reboot-capable elevated lane exists. A
 //! pass says nothing about whether the kernel enforces the filter in the boot-to-BFE window, whether the by-key delete
 //! purges the underlying boot-time record (assumed by `KeyObservation::proves_empty`), or whether the record is
-//! re-provisioned at later boots (docs/contributing/architecture/kill-switch-windows.md#what-is-measured-and-what-is-not).
-//! `netsh wfp show boottimepolicy` is the manual cross-check for the purge; [`PolicyDump`] captures it, and only that it
-//! ran is asserted.
+//! re-provisioned at later boots
+//! (docs/contributing/architecture/kill-switch-windows.md#what-is-measured-and-what-is-not). `netsh wfp show
+//! boottimepolicy` is the manual cross-check for the purge; [`PolicyDump`] captures it, and only that it ran is
+//! asserted.
 //!
 //! Gated to the elevated `tun` lane like `lockdown_privileged_tests`. COUPLED NAMES: `.config/nextest.toml`'s
-//! `global_net_state` filter matches the `boottime_global_net_state_` prefix; renaming without updating it drops the test
-//! from the group.
+//! `global_net_state` filter matches the `boottime_global_net_state_` prefix; renaming without updating it drops the
+//! test from the group.
 
 #![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
@@ -116,10 +117,10 @@ impl Drop for DeleteProbesOnDrop {
 /// `netsh wfp show boottimepolicy`, the OS's own view of the boot-time policy record: what is provisioned at the next
 /// boot, as opposed to the live FWPM object every other read here returns.
 ///
-/// Nothing asserts on its content. Whether the command reports the policy that will apply at the next boot or a snapshot
-/// of the one that applied at this one is not documented, so an assertion on what it says could fail for a reason that
-/// has nothing to do with the filter. Its execution is asserted, by [`Self::require_ran`], and only that: it spawned and
-/// exited zero, so a `netsh` that never ran is not mistaken for a green run.
+/// Nothing asserts on its content. Whether the command reports the policy that will apply at the next boot or a
+/// snapshot of the one that applied at this one is not documented, so an assertion on what it says could fail for a
+/// reason that has nothing to do with the filter. Its execution is asserted, by [`Self::require_ran`], and only that:
+/// it spawned and exited zero, so a `netsh` that never ran is not mistaken for a green run.
 ///
 /// An assertion on the content could not settle the open premise anyway. Whether a by-key delete purges the boot-time
 /// policy record is a question about what applies before BFE starts at the next boot, and `netsh wfp` is an FWPM client
@@ -387,11 +388,11 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
     //
     // Microsoft documents the bit as a provider property ("a provider's filters are disabled when the BFE starts if the
     // provider has no associated Windows service name, or if the associated service is not set to auto-start") and as
-    // unsettable at add time (`FWPM_FILTER0`). This filter was added moments ago by this process, so BFE has not started
-    // since and the bit cannot be set on it. What is checked is that WFP honours its own add-time rule. A pass is not
-    // evidence that Hole's provider survives a BFE start, which needs a provider that outlived a reboot; no single-boot
-    // lane can produce one. A clear bit does not decide "removed" versus "disabled" for boot-time filters either, which
-    // is why `lockdown_pre_delete_guids` re-arms under both readings.
+    // unsettable at add time (`FWPM_FILTER0`). This filter was added moments ago by this process, so BFE has not
+    // started since and the bit cannot be set on it. What is checked is that WFP honours its own add-time rule. A pass
+    // is not evidence that Hole's provider survives a BFE start, which needs a provider that outlived a reboot; no
+    // single-boot lane can produce one. A clear bit does not decide "removed" versus "disabled" for boot-time filters
+    // either, which is why `lockdown_pre_delete_guids` re-arms under both readings.
     assert!(
         !probe.is_disabled(),
         "FWPM_FILTER_FLAG_DISABLED is set on a filter added moments ago, which Microsoft says \
@@ -418,11 +419,12 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
     // Q4: what a by-key GET says about a live boot-time filter; it decides whether the twins' GUIDs in
     // `lockdown_cover_presence`'s probe are free.
     //
-    // Measured: `ERROR_SUCCESS`. `FwpmFilterGetByKey0` sees a live boot-time filter, though it has no boot-time opt-in as
-    // enumeration does, so a host holding only the twins reads `Live` and not `Absent`. A `FWP_E_FILTER_NOT_FOUND` would
-    // also be safe (`classify_presence` answers `Live` on any success), so if this ever fails with not-found, correct
-    // this sentence. What must never appear is a third code: `classify_presence` returns `Absent` only when every code is
-    // the literal not-found, so a third code on a boot-time key would flip an otherwise-clean host to `Indeterminate`.
+    // Measured: `ERROR_SUCCESS`. `FwpmFilterGetByKey0` sees a live boot-time filter, though it has no boot-time opt-in
+    // as enumeration does, so a host holding only the twins reads `Live` and not `Absent`. A `FWP_E_FILTER_NOT_FOUND`
+    // would also be safe (`classify_presence` answers `Live` on any success), so if this ever fails with not-found,
+    // correct this sentence. What must never appear is a third code: `classify_presence` returns `Absent` only when
+    // every code is the literal not-found, so a third code on a boot-time key would flip an otherwise-clean host to
+    // `Indeterminate`.
     let (get_code, _) = get_after_add.expect("FwpmEngineOpen0 must succeed on the elevated lane");
     assert_eq!(
         get_code, ERROR_SUCCESS.0,
@@ -442,10 +444,10 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
 /// A boot-time filter is spent by the boot it covered, so an engage that only *adds* it arms the kill switch exactly
 /// once.
 ///
-/// The twins carry fixed keys, so a re-add hits `FWP_E_ALREADY_EXISTS`, which `ok_or_exists` treats as success. Under the
-/// "removed" reading of what BFE does at startup that costs nothing. Under the "disabled" reading the object survives
-/// with its key occupied, the add short-circuits, and the twin protecting the next boot is a disabled leftover. `Ok`
-/// either way, so no assertion on the result could tell the two apart.
+/// The twins carry fixed keys, so a re-add hits `FWP_E_ALREADY_EXISTS`, which `ok_or_exists` treats as success. Under
+/// the "removed" reading of what BFE does at startup that costs nothing. Under the "disabled" reading the object
+/// survives with its key occupied, the add short-circuits, and the twin protecting the next boot is a disabled
+/// leftover. `Ok` either way, so no assertion on the result could tell the two apart.
 ///
 /// This asserts the re-add by effect on the real firewall. `filterKey` is ours and fixed; `filterId` is WFP's, assigned
 /// per object, and only a genuine delete-then-add changes it. The persistent block-all beside the twin is the control:
@@ -602,10 +604,10 @@ fn boottime_global_net_state_every_engage_rearms_the_twins_instead_of_reporting_
         );
     }
 
-    // The DISABLED bit on the persistent half, checked for the same narrow reason as on the boot-time half: these filters
-    // were added moments ago, so BFE has not started since, and Microsoft says the bit "cannot be set when adding new
-    // filters". This asserts that rule holds. It is not a check that Hole's `serviceName`-less provider survives a BFE
-    // start (kill-switch-windows.md records that as open).
+    // The DISABLED bit on the persistent half, checked for the same narrow reason as on the boot-time half: these
+    // filters were added moments ago, so BFE has not started since, and Microsoft says the bit "cannot be set when
+    // adding new filters". This asserts that rule holds. It is not a check that Hole's `serviceName`-less provider
+    // survives a BFE start (kill-switch-windows.md records that as open).
     for (guid, _, flags) in &second_floor {
         assert_eq!(
             flags & windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER_FLAG_DISABLED.0,

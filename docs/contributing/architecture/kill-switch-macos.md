@@ -63,6 +63,9 @@ The load is last in every case, so it cannot overwrite a snapshot that has not b
 a record is first written means there is no pre-lockdown ruleset left to capture, so the record says so
 (`main_snapshot_captured: false`) and a restore reloads `/etc/pf.conf`. A failed load restores the host before it returns, which also removes a cover that was already in force (T4 in
 [Transitions](kill-switch.md#transitions)), and the caller, which is fail-fatal, aborts the start.
+When the failed load is the transient cover's over a still-live prior cover, that restore reopens the host the prior
+cover was blocking ([#1004](https://github.com/bindreams/hole/issues/1004)); the warning the engage logs says so as a
+possibility, because `engage` cannot tell a first engage from a transition.
 
 `pfctl -E` is refcounted: Hole's token is Hole's hold on pf being enabled. The token is parsed from the line
 `Token : <n>` that `pfctl -E` prints, on stderr or on some hosts stdout; that line is the only place pf exposes it.

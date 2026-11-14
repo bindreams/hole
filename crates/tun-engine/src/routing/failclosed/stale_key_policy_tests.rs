@@ -1,9 +1,10 @@
 //! Tripwire: per-variant [`StaleKeyPolicy`] policy lives on the type.
 //!
 //! The rule, that a decision keyed to an enum variant belongs in one exhaustive match on that type
-//! (docs/contributing/architecture/kill-switch.md#the-decisions), is test-enforced for `SessionEvent` and `CoverPresence`
-//! (`crates/bridge/src/reconciler_tests.rs`) and here. A site that writes `== StaleKeyPolicy::Fail` silently groups any
-//! future variant with `Degrade`, the fail-open arm, which keeps a stale filter rather than aborting the engage.
+//! (docs/contributing/architecture/kill-switch.md#the-decisions), is test-enforced for `SessionEvent` and
+//! `CoverPresence` (`crates/bridge/src/reconciler_tests.rs`) and here. A site that writes `== StaleKeyPolicy::Fail`
+//! silently groups any future variant with `Degrade`, the fail-open arm, which keeps a stale filter rather than
+//! aborting the engage.
 //!
 //! An exhaustive `match` on the type is not the hazard: a third variant is a compile error there. What this forbids is
 //! deciding from one variant by comparison (`==`, `!=`, `matches!`, a lone match arm, an `if let`/`while let`/let-else,
@@ -16,15 +17,15 @@
 //!
 //! It is a line scan over a fixed set of deciding tokens. Four classes are handled explicitly, each with a fixture: a
 //! decision rustfmt wrapped ([`is_bare_variant`]); a comparison spelled as an assertion or a `PartialEq` method
-//! ([`line_decides`]); a variant import or a rename of the type ([`renames_the_type`]); and an `impl` nested in a `mod`,
-//! whose exemption is bounded by its own indentation ([`item_span`]).
+//! ([`line_decides`]); a variant import or a rename of the type ([`renames_the_type`]); and an `impl` nested in a
+//! `mod`, whose exemption is bounded by its own indentation ([`item_span`]).
 //!
 //! What it does not see:
 //!
 //! * Binding the variant to a local (`let fail = StaleKeyPolicy::Fail; … if policy == fail`), which is dataflow, not
 //!   lexing.
-//! * A comparison by a callable the token list does not name (`[StaleKeyPolicy::Fail].contains(&p)`, a helper taking two
-//!   policies). The list is extended by adding to it, never by inference.
+//! * A comparison by a callable the token list does not name (`[StaleKeyPolicy::Fail].contains(&p)`, a helper taking
+//!   two policies). The list is extended by adding to it, never by inference.
 //! * An `impl` whose body shares a line with its head: its exemption runs to the next closing brace at its indentation.
 //!   rustfmt does not produce this shape.
 //!
@@ -258,9 +259,8 @@ fn stale_key_policy_lives_on_the_type_not_at_call_sites() {
 
 #[skuld::test]
 fn the_guard_fires_on_a_call_site_and_stays_quiet_inside_the_type() {
-    // Non-vacuity, asserted against the scan rather than by mutating a real
-    // source. The first block is the shape `add_filter` must not take; the second is the exhaustive match that must stay
-    // legal.
+    // Non-vacuity, asserted against the scan rather than by mutating a real source. The first block is the shape
+    // `add_filter` must not take; the second is the exhaustive match that must stay legal.
     let offending = "\
 fn add_filter(policy: StaleKeyPolicy) {
     debug_assert!(boot_time || policy == StaleKeyPolicy::Fail);
