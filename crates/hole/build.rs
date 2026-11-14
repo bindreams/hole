@@ -350,8 +350,8 @@ fn generate_tray_icons(icons_dir: &Path) {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
 
-    // Delete every `tray-*.rgba` in OUT_DIR; the match arms below regenerate the
-    // current ones. include_bytes! cites only the current names, so files left
+    // Delete every `tray-*.rgba` in OUT_DIR; on Windows and macOS the match arms
+    // below regenerate the current ones, and on any other target none are made. include_bytes! cites only the current names, so files left
     // under other names by a previous incremental build would silently bloat
     // OUT_DIR.
     if let Ok(read) = std::fs::read_dir(&out_dir) {

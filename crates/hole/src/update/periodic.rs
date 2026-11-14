@@ -7,7 +7,7 @@ use super::check::check_for_update;
 use super::UpdateState;
 
 /// How long the checker waits between checks.
-const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+pub const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Start the periodic update checker.
 ///

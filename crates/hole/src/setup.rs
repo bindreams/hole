@@ -682,18 +682,21 @@ pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Err
 ///   `uninstall()`s enforce the same rule at their own level.
 /// - **The release is unconditional**: never gated on
 ///   `has_anything_to_uninstall`, never skipped because an earlier step failed.
-///   The MSI runs it `Return="check"`, so a failed release aborts the uninstall
-///   before `RemoveFiles` deletes the only binary that could remove a
-///   persistent WFP filter. Releasing against a bridge this run failed to stop
+///   The MSI does not reach this release: it passes `keep_covers` and releases
+///   through its separate `bridge release-covers` action, which is
+///   `Return="check"`, so a failed release aborts the uninstall before
+///   `RemoveFiles` deletes the only binary that could remove a persistent WFP
+///   filter. Releasing against a bridge this run failed to stop
 ///   is safe: that bridge holds its liveness lock, so `release_covers` cannot
 ///   take it and refuses rather than desyncing the bridge's posture.
 /// - **Every failure surfaces.** The steps do not short-circuit each other and
 ///   the report names all of them.
-/// - **`keep_covers` skips the release entirely.** Its one caller is the MSI's
-///   major-upgrade path (`RemoveExistingProducts`), which must tear the old
-///   service down so its image can be replaced without disarming the kill
-///   switch: the standing cover holds the update-cutover gap and the new bridge
-///   re-adopts it.
+/// - **`keep_covers` skips the release entirely.** Its one caller is the MSI,
+///   on every removal. On an uninstall its `bridge release-covers` action
+///   releases instead. On a major upgrade (`RemoveExistingProducts`) nothing
+///   releases: the old service is torn down so its image can be replaced, the
+///   standing cover holds the update-cutover gap, and the new bridge re-adopts
+///   it.
 fn uninstall_bridge_with<Hold>(
     keep_covers: bool,
     hold: impl FnOnce() -> std::io::Result<Hold>,

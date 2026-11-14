@@ -188,15 +188,15 @@ pub(crate) enum BridgeAction {
     },
     /// Stop and remove the bridge service
     Uninstall {
-        /// Internal (the MSI's major-upgrade path): tear the service down but
-        /// leave every fail-closed cover engaged and the kill switch armed.
-        /// The standing cover is what holds the update-cutover gap.
+        /// Internal, passed by the MSI on every removal: tear the service down
+        /// but leave every fail-closed cover engaged and the kill switch armed.
+        /// On an uninstall the MSI's separate `bridge release-covers` action
+        /// then releases them; a major upgrade skips that action, and the
+        /// standing cover holds the update-cutover gap.
         ///
-        /// Hidden: it leaves an engaged cover in force with no service to
-        /// release it. A hand-run still has `hole` on disk, so `hole bridge
-        /// unlock` or `hole bridge release-covers` releases the cover; the
-        /// hazard is the MSI's uninstall path, which deletes the binary and
-        /// would leave the cover with nothing to release it.
+        /// Hidden because the MSI is its only sanctioned caller: a hand-run
+        /// leaves an engaged cover in force until `hole bridge release-covers`
+        /// releases it.
         #[arg(long, hide = true)]
         keep_covers: bool,
         /// Override the log directory (the MSI passes the one directory every

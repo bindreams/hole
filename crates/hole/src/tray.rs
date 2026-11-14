@@ -417,8 +417,7 @@ fn build_tray_menu(
         transition.is_none(),
         None::<&str>,
     )?;
-    // Shown whenever `CoverPresence::is_present` holds (`escape_items`) —
-    // which includes the uncertain `Indeterminate`/`Unreachable` readings —
+    // Shown whenever `CoverPresence::is_present` holds (`escape_items`),
     // whether or not anything is running.
     let unblock = MenuItem::with_id(app, ID_UNBLOCK, UNBLOCK_ITEM_LABEL, transition.is_none(), None::<&str>)?;
     let autostart = CheckMenuItem::with_id(app, ID_AUTOSTART, "Start at Login", true, false, None::<&str>)?;
@@ -671,9 +670,10 @@ async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<
 
 /// Whether a connect attempt may surface UI that demands a decision: the
 /// bridge-install prompt, the UAC/elevation prompt, an error modal.
-/// `Forbidden` is the deliberate no-prompt retry (the blocked-state Retry, a
-/// tray click): it must fail passively into the tray's Disconnected state. The
-/// blocked state itself is not reachable today (bindreams/hole#1270).
+/// `Forbidden` fails passively, with no install prompt, UAC or modal, and
+/// leaves the tray in its blocked state. Its one caller is the blocked-state
+/// Retry ([`connect_silently`]); the blocked state is not reachable today
+/// (bindreams/hole#1270).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Prompts {
     Allowed,
