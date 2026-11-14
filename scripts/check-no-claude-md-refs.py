@@ -8,9 +8,12 @@ by this script. The match ignores case, since the name resolves on case-insensit
 filesystems.
 
 Exempt: the agent files themselves (any `CLAUDE.md` or `CLAUDE.local.md`, anything
-under a `.claude` folder), this script, and an entry of a release config's
+under a `.claude` folder), this script, the docs checker that link-checks the map
+(`scripts/validate-docs.py`), and an entry of a release config's
 `include_paths` list that is exactly `- CLAUDE.md` (it names a path whose changes
 belong in the release notes, not a reference to read).
+
+A path that is not a regular file, or cannot be read, is named on stderr and not scanned.
 """
 
 import fnmatch
@@ -22,6 +25,7 @@ NEEDLE = re.compile(r"claude\.md", re.IGNORECASE)
 AGENT_BASENAMES = frozenset({"claude.md", "claude.local.md"})
 AGENT_FOLDER = ".claude"
 SELF = "scripts/check-no-claude-md-refs.py"
+LINK_CHECKER = "scripts/validate-docs.py"
 RELEASE_CONFIG = ".github/release-*.yaml"
 INCLUDE_PATHS_KEY = "include_paths"
 INCLUDE_PATHS_ENTRY = "- claude.md"
@@ -33,18 +37,17 @@ def posix(path: str) -> str:
 
 def is_exempt_file(path: str) -> bool:
     parts = path.split("/")
-    return path == SELF or parts[-1].lower() in AGENT_BASENAMES or AGENT_FOLDER in parts[:-1]
+    return path in (SELF, LINK_CHECKER) or parts[-1].lower() in AGENT_BASENAMES or AGENT_FOLDER in parts[:-1]
 
 
 def top_level_key(line: str) -> str | None:
-    """Return the mapping key a column-0 line opens, or None when the line opens none."""
     if not line or line[0] in " \t#-" or ":" not in line:
         return None
     return line.split(":", 1)[0].strip()
 
 
 def scan(path: str, text: str) -> list[int]:
-    """Return the 1-based line numbers in `text` that are references, given the file's repo-relative `path`."""
+    """Line numbers in `text` that refer to the agent file."""
     path = posix(path)
     if is_exempt_file(path):
         return []
@@ -65,9 +68,14 @@ def main(argv: list[str]) -> int:
     failed = False
     for name in argv:
         path = Path(name)
-        if not path.is_file():
+        try:
+            if not path.is_file():
+                print(f"{posix(name)}: not scanned (not a regular file)", file=sys.stderr)
+                continue
+            text = path.read_bytes().decode("utf-8", errors="replace")
+        except OSError as error:
+            print(f"{posix(name)}: not scanned ({error})", file=sys.stderr)
             continue
-        text = path.read_bytes().decode("utf-8", errors="replace")
         for number in scan(name, text):
             print(f"{posix(name)}:{number}: refers to the agent instructions file")
             failed = True
@@ -105,6 +113,11 @@ def test_exempts_the_agent_files() -> None:
 
 def test_exempts_the_script_itself() -> None:
     assert scan("scripts/check-no-claude-md-refs.py", 'NEEDLE = "CLAUDE.md"\n') == []
+
+
+def test_exempts_the_docs_checker_that_link_checks_the_map() -> None:
+    assert scan("scripts/validate-docs.py", "CLAUDE.md\n") == []
+    assert scan("scripts/other.py", "CLAUDE.md\n") == [1]
 
 
 def test_exempts_agent_files_by_basename_and_folder_at_any_depth() -> None:
@@ -173,9 +186,30 @@ def test_main_prints_path_and_line_and_fails(tmp_path) -> None:
     assert r.stdout.strip().endswith("a.rs:2: refers to the agent instructions file")
 
 
-def test_main_passes_on_clean_files_and_skips_non_files(tmp_path) -> None:
+def test_main_passes_on_clean_files(tmp_path) -> None:
     good = tmp_path / "a.rs"
     good.write_text("// nothing\n")
-    r = subprocess.run([sys.executable, __file__, str(good), str(tmp_path / "missing")], capture_output=True, text=True)
+    r = subprocess.run([sys.executable, __file__, str(good)], capture_output=True, text=True)
     assert r.returncode == 0
-    assert r.stdout == ""
+    assert r.stdout == "" and r.stderr == ""
+
+
+def test_main_reports_a_path_it_cannot_scan_on_stderr_and_scans_the_rest(tmp_path) -> None:
+    good = tmp_path / "a.rs"
+    good.write_text("// CLAUDE.md\n")
+    missing = tmp_path / "missing"
+    args = [sys.executable, __file__, str(missing), str(tmp_path), str(good)]
+    r = subprocess.run(args, capture_output=True, text=True)
+    assert r.returncode == 1
+    assert r.stdout.strip().endswith("a.rs:1: refers to the agent instructions file")
+    assert f"{posix(str(missing))}: not scanned" in r.stderr
+    assert f"{posix(str(tmp_path))}: not scanned" in r.stderr
+
+
+def test_main_reports_a_path_whose_stat_fails_instead_of_crashing(monkeypatch, capsys) -> None:
+    def deny(self):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(Path, "is_file", deny)
+    assert main(["crates/hole/.cache"]) == 0
+    assert "crates/hole/.cache: not scanned (" in capsys.readouterr().err

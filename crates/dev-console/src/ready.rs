@@ -150,11 +150,10 @@ pub async fn port_in_use(port: u16) -> bool {
 }
 
 /// Probe until something accepts on `port` via ANY address `localhost`
-/// resolves to (v4 and/or v6), or `budget` elapses. External-event exception
-/// (docs/contributing/testing.md#no-synchronization-by-elapsed-time): the subprocess is out-of-process, the OS
-/// exposes no "process N bound port P" event, so we poll; the budget is the
-/// human-surfaced failure bound, and the caller's select! on child-exit
-/// short-circuits a dead Vite.
+/// resolves to (v4 and/or v6), or `budget` elapses. Polls because the OS exposes
+/// no "process N bound port P" event (docs/contributing/testing.md#no-synchronization-by-elapsed-time);
+/// the budget is the human-surfaced failure bound, and the caller's select! on
+/// child-exit short-circuits a dead Vite.
 pub async fn wait_for_port(port: u16, budget: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + budget;
     let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(("localhost", port)).await {

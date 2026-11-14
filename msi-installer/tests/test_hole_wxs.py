@@ -1167,7 +1167,7 @@ _QUALIFIED_PARAGRAPH = """\
          delete. A reinstall brings that caller back; it must then release the
          cover (`hole bridge release-covers`, or Unblock Network)."""
 
-_PRE_PR_LEAVE_NETWORK_BLOCKED_PARAGRAPH = """\
+_UNQUALIFIED_LEAVE_NETWORK_BLOCKED_PARAGRAPH = """\
          LEAVE_NETWORK_BLOCKED is the escape from the escape: Return="check"
          means a release that can never succeed (BFE stopped, hole.exe
          quarantined) would otherwise make the product permanently
@@ -1183,13 +1183,13 @@ def test_the_guards_reject_the_wording_they_exist_to_delete() -> None:
     guards and a revert to comment scope, where the qualifier and the remedy
     in the first paragraph answer for every paragraph after it.
     """
-    comment = _QUALIFIED_PARAGRAPH + "\n\n" + _PRE_PR_LEAVE_NETWORK_BLOCKED_PARAGRAPH
+    comment = _QUALIFIED_PARAGRAPH + "\n\n" + _UNQUALIFIED_LEAVE_NETWORK_BLOCKED_PARAGRAPH
 
-    assert _netsh_claims_without_qualifier(comment) == [_PRE_PR_LEAVE_NETWORK_BLOCKED_PARAGRAPH], (
+    assert _netsh_claims_without_qualifier(comment) == [_UNQUALIFIED_LEAVE_NETWORK_BLOCKED_PARAGRAPH], (
         "a `netsh wfp` claim must be qualified where it is made; a qualifier in an earlier "
         "paragraph of the same comment does not answer for it"
     )
-    assert _leave_network_blocked_claims_without_remedy(comment) == [_PRE_PR_LEAVE_NETWORK_BLOCKED_PARAGRAPH], (
+    assert _leave_network_blocked_claims_without_remedy(comment) == [_UNQUALIFIED_LEAVE_NETWORK_BLOCKED_PARAGRAPH], (
         "the LEAVE_NETWORK_BLOCKED remedy must be named where the property is named; 'reinstall' in "
         "an earlier paragraph of the same comment does not answer for it"
     )

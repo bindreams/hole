@@ -153,10 +153,11 @@ always_run = true
 [[repos.hooks]]
 id = "check-no-claude-md-refs"
 name = "no file points at the agent instructions file"
-# Code and docs must stand on their own. The script's docstring lists the exemptions.
 entry = "python scripts/check-no-claude-md-refs.py"
 language = "python"
 types = ["text"]
+# File checks only: at commit-msg it would reject a message that names the file.
+stages = ["pre-commit", "manual"]
 
 [[repos.hooks]]
 id = "format-section-comments"

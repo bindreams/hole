@@ -8,7 +8,7 @@ name: Reusable Publish Release
 #   dry-run           — garter only: `cargo publish --dry-run` then exit
 #                       without touching crates.io or the GitHub release
 #
-# See #321 (introduction) and docs/contributing/maintainers/releases.md for context.
+# See docs/contributing/maintainers/releases.md for context.
 
 on:
   workflow_call:

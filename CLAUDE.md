@@ -6,8 +6,7 @@ is both the unprivileged Tauri GUI (no args) and the privileged bridge
 (`hole bridge run`, root/SYSTEM).
 
 This file is the agent-facing map: one line per area, each linking the docs page that
-holds it. The page is the authoritative source; read it before editing the area. Product and
-install: [README.md](README.md). Everything else: [docs/index.md](docs/index.md).
+holds it. Product and install: [README.md](README.md). Everything else: [docs/index.md](docs/index.md).
 
 **IMPORTANT:** NEVER PIPE TESTS TO `tail`! ALWAYS SET A TIMEOUT FOR THE SHELL COMMAND! Tests are known to hang, you WILL get stuck and WILL not have information to debug why if you tail.
 
@@ -17,7 +16,8 @@ install: [README.md](README.md). Everything else: [docs/index.md](docs/index.md)
   [overview](docs/contributing/architecture/overview.md#two-modes-one-binary)
 - **Single-instance app.** One app instance per `com.hole.app` lock; the lock's scope differs by platform. →
   [app process](docs/contributing/architecture/app-process.md#one-instance-per-session)
-- **UDP drop policy.** A UDP flow that resolves to `Proxy` on a TCP-only plugin is dropped, never bypassed. →
+- **UDP drop policy.** A UDP flow that resolves to `Proxy` on a TCP-only plugin is dropped, never bypassed:
+  bypassing leaks it outside the encrypted tunnel. →
   [datapath](docs/contributing/architecture/datapath.md#udp-is-dropped-never-bypassed)
 - **TUN naming.** The running device's name has one runtime source, `TunIdentity`. →
   [TUN device](docs/contributing/architecture/tun-device.md#the-device-name-has-one-source)
@@ -31,7 +31,8 @@ install: [README.md](README.md). Everything else: [docs/index.md](docs/index.md)
   [DNS forwarder](docs/contributing/architecture/dns-forwarder.md#how-the-operating-system-reaches-it)
 - **Listener selection.** `build_ss_config` rejects invalid listener combinations up front. →
   [datapath](docs/contributing/architecture/datapath.md#the-listener-the-datapath-dials)
-- **Bridge trait seam.** OS-mutating bridge I/O goes through the `Proxy`, `Routing` and `Dns` traits. →
+- **Bridge trait seam.** OS-mutating bridge I/O, `Drop` cleanup included, goes through the `Proxy`, `Routing` and
+  `Dns` traits, never the raw free functions (clippy-enforced). →
   [test isolation](docs/contributing/architecture/test-isolation.md)
 - **Datapath test seams.** Router and datapath seams make the drop path and the TUN loop testable without the OS. →
   [testing](docs/contributing/testing.md#which-lane-proves-what)
@@ -39,11 +40,13 @@ install: [README.md](README.md). Everything else: [docs/index.md](docs/index.md)
   [plugin binaries](docs/contributing/architecture/plugin-binaries.md)
 - **Proxy shutdown contract.** `stop()` returns only once the listener sockets are closed. →
   [proxy shutdown](docs/contributing/architecture/proxy-shutdown.md)
-- **Cooperative cancellation.** A cancel travels by token, not by dropping a future. →
-  [cancellation](docs/contributing/architecture/cancellation.md)
+- **Cooperative cancellation.** A cancel travels by token, not by dropping a future; no fresh
+  `CancellationToken::new()` in `crates/bridge/src/` (clippy-enforced). →
+  [cancellation](docs/contributing/architecture/cancellation.md#one-cancel-mechanism-tokens)
 - **Native-crash observability.** The `tombstone` crate writes a crash marker that the next start sweeps. →
   [native crashes](docs/contributing/architecture/native-crashes.md)
-- **Route ownership.** Teardown and recovery delete only the routes `bridge-routes.json` records as installed. →
+- **Route ownership.** Teardown and recovery delete only the routes `bridge-routes.json` records as installed; a
+  route whose install failed belongs to whoever holds it now. →
   [route ownership](docs/contributing/architecture/route-ownership.md)
 - **Route-command failure policy.** Install is fatal and teardown is best-effort, enforced by types. →
   [route failure policy](docs/contributing/architecture/route-failure-policy.md)
@@ -55,29 +58,19 @@ install: [README.md](README.md). Everything else: [docs/index.md](docs/index.md)
   [galoshes transport](docs/contributing/architecture/galoshes-transport.md#the-mux-default)
 - **Fail-closed covers.** The kill switch's standing cover outlives the bridge; the transient cover is dormant, and only its leftovers are swept. →
   [kill switch](docs/contributing/architecture/kill-switch.md)
-- **Server-address redaction.** The configured address is replaced by a token before any log, toast or bundle. →
+- **Server-address redaction.** The configured address is replaced by a token before any log, toast or bundle.
+  Hole never writes the address or the password: no `Display` on `ServerAddress` or `Password`
+  (compiler-enforced), `.expose()` is the only exit, and a `Serialize` type holding one needs its own `Dump`. →
   [redaction](docs/contributing/architecture/redaction.md)
 - **File lock and state files.** Cross-process locks and state-file writers go through `util::dir::Dir` handles. →
   [file lock](docs/contributing/architecture/file-lock.md)
 - **Logging and plugin diagnostics.** Log destinations, `HOLE_BRIDGE_LOG` directives and the plugin tap. →
   [logging](docs/contributing/architecture/logging.md)
-- **Releases, rollback, signing key, icons.** →
+- **Releases, rollback, signing key, icons, uninstall refusal.** →
   [maintainers](docs/contributing/maintainers/index.md)
 
 ## Invariants you must not break
 
-- **UDP-proxy flows DROP, never bypass** — bypassing leaks the flow outside the
-  encrypted tunnel.
-  [→](docs/contributing/architecture/datapath.md#udp-is-dropped-never-bypassed)
-- **Bridge OS I/O goes through the `Proxy`/`Routing`/`Dns` traits**, including
-  `Drop` cleanup — never the raw free functions (clippy-enforced).
-  [→](docs/contributing/architecture/test-isolation.md)
-- **Cooperative cancel tokens only** — no fresh `CancellationToken::new()` in
-  `crates/bridge/src/` (clippy-enforced).
-  [→](docs/contributing/architecture/cancellation.md#one-cancel-mechanism-tokens)
-- **Delete only recorded routes** — a route whose install failed belongs to
-  whoever holds it now; deleting it takes down another VPN's tunnel.
-  [→](docs/contributing/architecture/route-ownership.md)
 - **Ephemeral ports via `bind_ephemeral`, never raw `free_port`** — the retry is
   unbounded by design, no budget (clippy-enforced).
   [→](docs/contributing/architecture/contention-and-ports.md#port-allocation)
@@ -102,21 +95,11 @@ install: [README.md](README.md). Everything else: [docs/index.md](docs/index.md)
   `util::dir::Dir` (or `ReadDir`, for code that only reads), never a path call,
   and never `canonicalize` the path first.
   [→](docs/contributing/architecture/privileged-folders.md)
-- **Hole never writes the server address or the password** — no `Display` on
-  `ServerAddress` or `Password` (compiler-enforced), `.expose()` is the only
-  exit from either, and every `Serialize` type transitively holding one needs
-  its own `Dump` impl.
-  [→](docs/contributing/architecture/redaction.md#prevention-by-type)
-
-## macOS CI is the scarce resource
-
-2 darwin jobs per PR (one per arch) against a small shared pool; the Windows and Linux legs finish long
-before them. Queue depth scales with the number of concurrent branches, not their size. Land
-what is open before starting more.
 
 ## Pointers
 
-- Product, install → [README.md](README.md)
+- macOS CI is a small shared pool; land what is open before starting more →
+  [CI](docs/contributing/ci.md#the-macos-runners-are-a-shared-pool)
 - User-facing CLI, distributions → [docs/reference/cli.md](docs/reference/cli.md),
   [docs/reference/distributions.md](docs/reference/distributions.md)
 - Setup, build, development, testing, CI, commit messages, dev/admin CLI →
@@ -128,9 +111,5 @@ what is open before starting more.
   [CI](docs/contributing/ci.md) ·
   [commit messages](docs/contributing/commit-messages.md) ·
   [dev/admin CLI](docs/contributing/bridge-cli.md))
-- Architecture →
-  [docs/contributing/architecture/](docs/contributing/architecture/overview.md)
-- Releases, rollback, signing key, icons, uninstall refusal →
-  [docs/contributing/maintainers/](docs/contributing/maintainers/index.md)
 - Emergency network reset (`scripts/network-reset.py`) →
   [development](docs/contributing/development.md)
