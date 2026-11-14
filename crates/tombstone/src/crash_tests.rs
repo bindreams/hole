@@ -2,8 +2,7 @@
 
 use crate::crash::{format_marker_into, parse_marker, MarkerRecord};
 
-// Smoke test: the crate compiles and the public API is reachable. Replaced
-// with real per-fault-class + sweep tests in later tasks.
+// Smoke test: the crate compiles and the public API is reachable.
 #[skuld::test]
 fn module_is_linkable() {
     // `attach` and `sweep` are the public surface; reference them so a
@@ -772,20 +771,19 @@ const SIGNAL_SAFE_PRIMITIVES: &[&str] = &[
     "Some",
 ];
 
-// The macOS handler path must not ALLOCATE — the cause of the #842 hang, and
-// the one property this PR's `_exit` does NOT by itself provide. A thread
-// Mach-suspended inside `malloc` never releases the allocator lock, so an
-// allocation on the handler thread can block forever: measured 8 hangs in 10
+// The macOS handler path must not ALLOCATE, which the `_exit` does not by itself
+// guarantee. A thread Mach-suspended inside `malloc` never releases the
+// allocator lock, so an allocation on the handler thread can block forever
 // (module doc, "Why the callback cannot allocate").
 //
 // No behavioural test can stand in for this. The hang needs CI-like
 // allocation pressure; the allocating branch ran 15/15 green on an idle
 // darwin/arm64 and passes every `crash_marker_*` test in
 // `tests/crash_child.rs`, so a straight revert of the `cfg(windows)` gate on
-// `write_minidump_best_effort` would land silently. The structural scan is
-// the only line of defence, so it covers the WHOLE path and not just
-// `on_crash`'s own frame: a `format!` inside `push_hex` reinstates the
-// deadlock exactly as one inside `on_crash` does.
+// `write_minidump_best_effort` would land silently. The structural scan is the
+// only line of defence, so it covers the WHOLE path and not just `on_crash`'s
+// own frame: a `format!` inside `push_hex` reinstates the deadlock exactly as
+// one inside `on_crash` does.
 //
 // Deliberately strict: a new call of ANY shape fails, because every
 // allocation this crate ever put on the handler path arrived as one
@@ -841,9 +839,8 @@ fn is_frontier(name: &str) -> bool {
 }
 
 // The frontier is only transitive if no allowlist can name something the
-// frontier does not scan. Without this, MF3's defect comes straight back:
-// `on_crash` allowlisted two functions nobody scanned, and an allocation
-// inside either of them was invisible.
+// frontier does not scan. Without this, an allowlisted function nobody scans
+// could allocate unseen.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn frontier_allowlists_are_closed() {

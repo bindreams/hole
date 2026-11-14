@@ -15,7 +15,7 @@ harness = false
 
 [features]
 # Passthrough to tombstone's dev-only minidump writer. NON-DEFAULT; only
-# dev/test build paths (build.yaml hole / hole-tests) enable it. See #438.
+# dev/test build paths (build.yaml hole / hole-tests) enable it.
 crash-dumps = ["tombstone/crash-dumps"]
 
 [dependencies]
@@ -64,7 +64,7 @@ typify = "0.6"
 # `typify::TypeSpace`, and typify does not re-export schemars, so this must be
 # the series typify speaks — `typify-impl` requires `^0.8.22`. 0.9 and 1.x both
 # made the `schema` module private, so a bump fails the build script with E0603
-# (#379, closed as upstream-blocked; oxidecomputer/typify#886 upstream) — that
+# (oxidecomputer/typify#886 upstream) — that
 # compile failure is the real enforcement, unconditionally. See
 # xtask/src/schemars_pin.rs's module doc (PINNED_SERIES) for what keeps this
 # line, that doc, and .github/renovate.json's allowedVersions rule in sync.

@@ -4,7 +4,7 @@ use crate::plugin;
 fn lookup_v2ray_plugin_returns_descriptor() {
     let desc = plugin::lookup("v2ray-plugin").expect("v2ray-plugin should be known");
     assert_eq!(desc.name, "v2ray-plugin");
-    // The friendly wire name resolves to the `ex-ray` binary (#414).
+    // The friendly wire name resolves to the `ex-ray` binary.
     assert_eq!(desc.binary_name, "ex-ray");
     assert!(desc.user_visible);
 }

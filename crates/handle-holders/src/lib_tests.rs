@@ -22,7 +22,7 @@ fn find_holders_missing_file_returns_empty() {
 /// Lives in `handle-holders`, not `test-observability`, because it
 /// must run inside a CONSUMER crate's test binary — test-observability's
 /// own ctor lives in the crate itself and doesn't exercise the same
-/// linkage path. See bindreams/hole#301.
+/// linkage path.
 #[skuld::test]
 fn hole_test_observability_ctor_fired_in_this_binary() {
     let subscriber = tracing_subscriber::registry();
@@ -31,7 +31,6 @@ fn hole_test_observability_ctor_fired_in_this_binary() {
         result.is_err(),
         "set_global_default succeeded — the hole-test-observability ctor did NOT \
          install a global subscriber in this binary. The register!() macro at \
-         crates/handle-holders/src/lib.rs may have been DCE'd by the linker. \
-         See bindreams/hole#301."
+         crates/handle-holders/src/lib.rs may have been DCE'd by the linker."
     );
 }

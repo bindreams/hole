@@ -295,10 +295,9 @@ fn claim_writes_mode_0644() {
     assert_eq!(mode & 0o777, 0o644, "root bridge must write a GUI-readable marker");
 }
 
-// The cross-uid proof that `owner` reaches the PUBLISHED marker inode (through
-// the rename of `claim`) needs real root to give the file to another uid; a self-chown here would be vacuous (the temp is already
-// self-owned). It rides the root lane in
-// `crates/hole/tests/elevated_ownership_privileged.rs`.
+// The cross-uid proof that `owner` reaches the PUBLISHED marker inode (through the rename of `claim`) needs real
+// root to give the file to another uid; a self-chown here would be vacuous (the temp is already self-owned). It
+// rides the root lane in `crates/hole/tests/elevated_ownership_privileged.rs`.
 
 #[skuld::test]
 fn stamp_driver_replaces_the_driver_and_leaves_a_readable_marker() {
@@ -381,8 +380,6 @@ fn stamp_driver_refuses_anything_but_a_present_marker() {
 
 #[skuld::test]
 fn service_log_dir_matches_log_collector_constants() {
-    // Pins the dedup: the resolver must equal the dirs the GUI's log_collector
-    // hardcodes (so the GUI reads the same place the bridge writes).
     let d = service_log_dir();
     #[cfg(target_os = "windows")]
     assert!(d.ends_with("hole\\logs") || d.ends_with("hole/logs"), "{d:?}");

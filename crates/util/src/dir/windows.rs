@@ -238,7 +238,7 @@ pub(super) fn enable_restore_privilege() -> io::Result<()> {
 
 // Path resolution -----------------------------------------------------------------------------------------------------
 
-/// How many links one walk follows: Windows' own bound on the reparse points of a path (63).
+/// How many links one walk follows: Windows' own bound on the reparse points of a path.
 const MAX_LINKS: usize = 63;
 
 /// The NT path of the root directory a Windows path starts at, and the names below it.

@@ -1,11 +1,9 @@
-//! Load-time quarantine and gated saving for the GUI config file (#467).
+//! Load-time quarantine and gated saving for the GUI config file.
 //!
-//! `AppConfig::load` used to map a missing file to defaults and anything else
-//! to an error — which the GUI discarded (`unwrap_or_default`), so the next
-//! save overwrote the corrupt file, destroying the user's servers and
-//! passwords. `ConfigStore` makes that impossible: a corrupt/unreadable
-//! `config.json` is quarantined to a timestamped `.bak` before defaults are
-//! used, and if quarantine fails, saving is blocked for the session.
+//! A corrupt or unreadable `config.json` is quarantined to a timestamped `.bak`
+//! before defaults are used, and if quarantine fails, saving is blocked for the
+//! session, so a save cannot overwrite the user's servers and passwords. See
+//! `docs/contributing/architecture/config-recovery.md`.
 
 use crate::config::{AppConfig, ConfigError};
 use std::fs;
@@ -87,8 +85,8 @@ impl ConfigStore {
         }
 
         // Config load is the first site in any process that holds a server
-        // address, so arming here precedes every log line that could carry
-        // one — including the recovery `error!` above's successors.
+        // address, so arming here precedes every later log line that could
+        // carry one.
         crate::logging::redact_arm::arm_config(&config);
 
         let save_blocked = matches!(&recovery, Some(r) if r.backup.is_err());

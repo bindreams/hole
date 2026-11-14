@@ -214,8 +214,9 @@ pub fn ip_family(ip: IpAddr) -> &'static str {
     }
 }
 
-/// `"global"`, `"private"`, `"loopback"` or `"link_local"` — the axis this
-/// repo's actual diagnoses turned on (#541 loopback bypass, #770 handshake).
+/// `"global"`, `"private"`, `"loopback"` or `"link_local"` — the scope of an
+/// address, the axis a diagnosis can still turn on once the address itself is
+/// redacted.
 pub fn ip_scope(ip: IpAddr) -> &'static str {
     match ip {
         IpAddr::V4(v4) if v4.is_loopback() => "loopback",

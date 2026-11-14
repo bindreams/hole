@@ -284,7 +284,7 @@ fn load_maps_io_failure_to_unreadable_never_corrupt() {
     }
 }
 
-/// What the next CI hit shows: the text of the error that failed the read,
+/// What a CI hit shows: the text of the error that failed the read,
 /// not only its kind.
 #[skuld::test]
 fn a_failed_read_logs_the_error_text() {

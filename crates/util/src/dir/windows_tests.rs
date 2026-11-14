@@ -126,9 +126,9 @@ impl Drop for RemoveOnDrop {
 
 #[skuld::test]
 fn a_folder_the_caller_may_pass_through_but_not_read_the_acl_of_is_walked_through() {
-    // `%SystemRoot%\Temp` lets an ordinary user traverse it and add to it, but not read its permissions, so the
-    // by-path walk this replaced got through it (a `HOLE_LOG_DIR` there is a real setting of the GUI). A walk that
-    // asks every folder for `READ_CONTROL` fails there as an ordinary user and passes as an administrator.
+    // `%SystemRoot%\Temp` lets an ordinary user traverse it and add to it, but not read its permissions, and a
+    // `HOLE_LOG_DIR` there is a real setting of the GUI. A walk that asks every folder for `READ_CONTROL` fails there
+    // as an ordinary user and passes as an administrator.
     let temp = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot names the Windows folder")).join("Temp");
     let made = temp.join(format!("hole-dir-test-acl-{}", std::process::id()));
     let _remove = RemoveOnDrop(made.clone());

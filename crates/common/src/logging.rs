@@ -26,8 +26,8 @@
 //   hook.
 // - **File appender** is `.lossy(false)` — the teardown burst MUST land
 //   on disk for diagnostics. A wedged disk blocks every thread that logs,
-//   with no limit, once the `buffered_lines_limit` default (128k events)
-//   is full; the buffer only delays that.
+//   with no limit, once the writer's default `buffered_lines_limit` is full;
+//   the buffer only delays that.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -303,12 +303,9 @@ fn redirect_one(stream: Stream) -> io::Result<(JoinHandle<()>, WorkerGuard, Box<
     let (read_end, write_end) = os_pipe::pipe()?;
 
     redirect_fd(stream, &write_end)?;
-    // After redirect_fd, FD/HANDLE points to the pipe write end. Drop the
-    // PipeWriter wrapper carefully: on Unix `dup2` already cloned the FD
-    // (the original `write_end` FD can be closed), but on Windows
-    // `SetStdHandle` adopts the handle by reference and we must NOT close it
-    // here. `redirect_fd` handles the platform-specific lifetime via
-    // `mem::forget` where needed.
+    // After redirect_fd, the standard stream points at its own copy of the pipe
+    // write end (`dup2` on Unix, a duplicated handle on Windows), so dropping
+    // `write_end` closes only the original.
     drop(write_end);
 
     let thread = std::thread::Builder::new()
@@ -360,8 +357,7 @@ fn redirect_fd(stream: Stream, write_end: &os_pipe::PipeWriter) -> io::Result<()
     }
 
     unsafe { SetStdHandle(std_handle, dup)? };
-    // The kernel + child-process layer now reference `dup`. We never close it
-    // explicitly; it's reclaimed at process exit.
+    // `dup` is never closed explicitly; it is reclaimed at process exit.
     Ok(())
 }
 
@@ -528,7 +524,7 @@ pub(crate) fn install_panic_hook_for_tests() {
 /// Install the tracing-emitting panic hook (chains before stdlib default).
 /// Idempotent — subsequent calls in the same process are no-ops.
 ///
-/// Called from production `init_multi` and from
+/// Called from production `init_dual` and from
 /// `hole-test-observability`'s ctor; safe to invoke from both because
 /// the `PANIC_HOOK_INSTALLED` AtomicBool ensures only one hook is
 /// chained per process.
@@ -630,10 +626,10 @@ where
 
 /// Initialize logging with one caller-supplied filter directive (both sinks).
 ///
-/// Thin wrapper around [`init_dual`] preserved for callers that only have
-/// one directive to pass. Creates `log_dir` if it doesn't exist; returns a
-/// guard that must be held for the process lifetime to ensure logs are
-/// flushed and the relay reader threads stay alive.
+/// A wrapper over [`init_multi`] for a caller with one directive. Creates
+/// `log_dir` if it doesn't exist; returns a guard that must be held for the
+/// process lifetime to ensure logs are flushed and the relay reader threads
+/// stay alive.
 pub fn init(
     log_dir: &Path,
     kind: &'static str,
@@ -654,8 +650,8 @@ pub fn init(
 /// Use this rather than [`init`] when the caller wants to honor a
 /// comma-separated env var like
 /// `HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace` —
-/// `init` accepts only one directive and silently dropping the rest is the
-/// kind of thing that hides production diagnostics (#248).
+/// `init` accepts only one directive, and silently dropping the rest hides
+/// production diagnostics.
 pub fn init_multi<I>(
     log_dir: &Path,
     kind: &'static str,
@@ -682,6 +678,10 @@ where
 /// is layered next; the sink's directives are layered on top; finally
 /// `hole::logging=debug` is pinned so the logging subsystem itself emits
 /// lifecycle events.
+///
+/// `kind` labels the native-crash marker. `owner` is the `(uid, gid)` the log
+/// directory and each rotated file are handed to; `None` (the unprivileged GUI)
+/// leaves ownership alone.
 pub fn init_dual(
     log_dir: &Path,
     kind: &'static str,
@@ -729,16 +729,6 @@ pub fn init_dual(
         redirect_stdio_to_tracing().expect("stdio redirect failed")
     };
 
-    // The FILE appender is `lossy(false)`: the proxy-stop teardown burst
-    // (SystemRoutes::drop sequence — route commands, state-file clear,
-    // Remove-NetAdapter — emitted in tens of ms) must never be silently
-    // truncated, or `bridge.log` loses the diagnostic for a teardown that
-    // broke the user's network. Trade-off: a wedged disk (full filesystem,
-    // OneDrive sync stall, AV scan) blocks every thread that logs, with no
-    // limit, once `buffered_lines_limit` (default 128k events) is full.
-    //
-    // The STDERR non-blocking writer keeps `lossy(true)`: a wedged
-    // terminal (Ctrl+S on a console session) MUST NOT block the bridge.
     // Each rotation hands the fresh root-owned active file back to the real user
     // (`owner`; `None` leaves it alone).
     let owned: Box<dyn Write + Send> = match dir {
@@ -748,17 +738,28 @@ pub fn init_dual(
     // The redaction wrap sits under the appender, so every formatted event
     // passes through it whoever authored it — a Hole site, a dependency at
     // the default global `info`, an OS command's argv, or a relayed plugin
-    // line. This is the writer that is a log file; wrapping it is what
-    // closes the leak.
+    // line. This is the writer that is a log file; wrapping it is what closes
+    // the leak, and it is the only redaction between any crate's `info!` and
+    // the file.
+    //
+    // The FILE appender is `lossy(false)`: the proxy-stop teardown burst
+    // (SystemRoutes::drop sequence: route commands, state-file clear,
+    // Remove-NetAdapter) must never be silently truncated, or `bridge.log`
+    // loses the diagnostic for a teardown that broke the user's network.
+    // Trade-off: a wedged disk (full filesystem, OneDrive sync stall, AV scan)
+    // blocks every thread that logs, with no limit, once the writer's default
+    // `buffered_lines_limit` is full.
     let (file_nb, file_guard) = NonBlockingBuilder::default()
         .lossy(false)
         .finish(util::redact::RedactingWriter::new(owned));
+    // The STDERR non-blocking writer keeps `lossy(true)`: a wedged terminal
+    // (Ctrl+S on a console session) MUST NOT block the bridge.
     let (stderr_nb, stderr_guard) = NonBlockingBuilder::default()
         .lossy(true)
         .finish(util::redact::RedactingWriter::new(original_stderr));
 
     use tracing_subscriber::util::SubscriberInitExt;
-    // Sanctioned by clippy.toml `disallowed_methods` (see #301): the ONE
+    // Sanctioned by clippy.toml `disallowed_methods`: the ONE
     // production `try_init` workspace-wide. Tests use `register!()`.
     #[allow(clippy::disallowed_methods)]
     if let Err(e) = compose_subscriber(file_nb, stderr_nb, file_directives, stderr_directives).try_init() {
@@ -769,13 +770,13 @@ pub fn init_dual(
 
     install_panic_hook();
 
-    // Native-crash observability (bindreams/hole#438). Installed AFTER the
+    // Native-crash observability. Installed AFTER the
     // panic hook (disjoint paths: panics unwind into the hook with the heap
     // intact; native faults are caught here). Idempotent + best-effort;
     // never panics. `kind` labels the marker; `log_dir` is user-readable
     // even for the elevated bridge.
     //
-    // #572: the crash marker is written by the signal handler at crash time
+    // The crash marker is written by the signal handler at crash time
     // (signal-safe context — no chown). It is transient, lives in the
     // user-owned log dir, and is swept on next start, so it is left
     // root-owned on purpose rather than chowned from an unsafe context.

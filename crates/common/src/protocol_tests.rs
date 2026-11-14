@@ -58,7 +58,7 @@ fn bridge_request_start_json_roundtrip() {
 #[skuld::test]
 fn bridge_request_start_on_startup_defaults_for_old_clients() {
     // An older GUI serializes Start without `on_startup`; it must decode to
-    // `None` (#979: "no preference pushed", exactly like a genuinely absent
+    // `None` ("no preference pushed", exactly like a genuinely absent
     // `X-Hole-On-Startup` header) via serde's `#[serde(default)]`, not to
     // `Some(StartupBehavior::default())` — an old client's silence must not
     // be read as an explicit push of the wire default.
@@ -504,10 +504,9 @@ fn tunnel_mode_serializes_as_snake_case() {
 
 #[skuld::test]
 fn proxy_config_parses_without_tunnel_mode_field() {
-    // Wire compat: the existing GUI does not send `tunnel_mode`. Parsing
-    // must succeed and yield the default (Full). This is the test that
-    // prevents an accidental #[serde(default)] removal from silently
-    // breaking every deployed GUI the next time the bridge is updated.
+    // Wire compat: a client that omits `tunnel_mode` must parse and yield the
+    // default (Full). This is the test that prevents an accidental
+    // #[serde(default)] removal from silently breaking every such client.
     let json = r#"{
         "server": {
             "id": "x",
@@ -627,7 +626,7 @@ fn proxy_config_diagnostic_plugin_tap_defaults_on_legacy_payload() {
 #[skuld::test]
 fn proxy_config_defaults_on_deserialize() {
     // Legacy client omitting the listener-selection fields: must default to
-    // SOCKS5-on, HTTP-off, local_port_http=4074. Wire-level backward-compat
+    // SOCKS5-on, HTTP-off, the default local_port_http. Wire-level backward-compat
     // contract — do not change without a migration plan.
     let json = r#"{
         "server": {

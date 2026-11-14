@@ -45,11 +45,9 @@ use crate::error::DeviceError;
 mod windows_tests;
 
 /// How long to wait for the interface's IPv6 half to appear. The wait blocks on
-/// an IP Helper notification rather than polling. This is the sanctioned
-/// timeout: it bounds an external event that may never happen (with IPv6 unbound
-/// the kernel never publishes the interface), and expiry is read as "the
-/// interface has no IPv6 half" ([`Appearance::NeverAppeared`]). That reading is
-/// contested: bindreams/hole#1301. Set to match the `tun` crate's
+/// an IP Helper notification rather than polling. Expiry is read as "the
+/// interface has no IPv6 half" ([`Appearance::NeverAppeared`]); taking elapsed
+/// time as proof of absence is a defect, bindreams/hole#1301. Set to match the `tun` crate's
 /// `wait_for_interface_timeout` default for the IPv4 half.
 const IPV6_INTERFACE_BUDGET: Duration = Duration::from_secs(5);
 

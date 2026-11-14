@@ -2,7 +2,7 @@
 // `HOLD_FILE`, writes a single byte to stdout to signal "I have the
 // handle now", then blocks on stdin EOF. The parent test reads the
 // signal byte (no sleep-based wait), runs its assertions, then closes
-// stdin via `child.kill()` — read_to_string returns and we exit.
+// stdin; the read returns and we exit.
 
 use std::io::{Read, Write};
 
@@ -14,7 +14,7 @@ fn main() {
     std::io::stdout().write_all(b"ready\n").expect("write ready");
     std::io::stdout().flush().expect("flush ready");
 
-    // Block until parent closes stdin (typically via kill). No sleep.
+    // Block until the parent closes stdin. No sleep.
     let mut buf = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut buf);
 }
