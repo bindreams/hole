@@ -74,7 +74,7 @@ fn no_matching_rule_falls_back_to_proxy() {
     );
 }
 
-// Gitignore semantics: worked example from the design spec ============================================================
+// Gitignore semantics: a later matching rule wins =====================================================================
 
 #[skuld::test]
 fn worked_example_a_example_com_proxied() {
@@ -185,7 +185,7 @@ fn ip_only_connection_no_ip_rule_falls_back_to_proxy() {
     assert_eq!(decide(&rs, &conn("9.9.9.9", 443, None)).action, FilterAction::Proxy);
 }
 
-// Three locked default rules (matches the UI's planned behavior) ======================================================
+// The three locked default rules the UI ships =========================================================================
 
 #[skuld::test]
 fn three_locked_default_rules_pass_everything_through() {

@@ -18,11 +18,10 @@ mod windows_timing_logs {
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
-    /// `Win32Real::flush` calls the `DnsFlushResolverCache` FFI inline
-    /// (ms-scale). This test guards that it stays inline (no subprocess
-    /// detach) by asserting it returns quickly. Calls `Win32Real` directly
-    /// — production reaches this exact call through `SystemDnsApplied`'s
-    /// `flush` on shutdown.
+    /// `Win32Real::flush` calls the `DnsFlushResolverCache` FFI inline. This
+    /// test guards that it stays inline (no subprocess detach) by asserting it
+    /// returns quickly. Calls `Win32Real` directly; production reaches this
+    /// call through `SystemDnsApplied`'s `flush` on shutdown.
     #[skuld::test]
     fn flush_returns_quickly() {
         let start = std::time::Instant::now();

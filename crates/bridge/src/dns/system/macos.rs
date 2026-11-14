@@ -1,30 +1,22 @@
-//! macOS `networksetup`-based system DNS apply / restore.
+//! macOS system DNS: the `networksetup` backend for the upgrade sweep and the
+//! cache flush, and the steering seam `apply_macos` publishes DNS through.
 //!
-//! Identifier is the *network service* name (e.g. "Wi-Fi") as reported by
-//! `networksetup -listallnetworkservices`. This is what the set/get DNS
-//! subcommands accept directly, avoiding a separate name-to-GUID lookup
-//! via `scutil`.
+//! [`MacDnsBackend`] identifies an adapter by *network service* name (e.g.
+//! "Wi-Fi", as `networksetup -listallnetworkservices` reports it), which is
+//! what the `networksetup` DNS subcommands accept. It is never given an
+//! interface name such as `hole-tun`. It mirrors
+//! `super::windows::WinDnsBackend` as a test seam: production goes through
+//! [`Networksetup`]; unit tests substitute `MockMacBackend` via
+//! [`crate::dns::system::SystemDns::new_with_mac_backend`]. Apply steers DNS
+//! via [`MacDnsSteerer`] instead (see [`crate::dns::system`]).
 //!
-//! [`MacDnsBackend`] — the **inner test seam**, mirroring
-//! `super::windows::WinDnsBackend` and the `Routing` precedent from
-//! [bindreams/hole#165](https://github.com/bindreams/hole/issues/165).
-//! Production goes through [`Networksetup`]; unit tests substitute
-//! `MockMacBackend` via [`crate::dns::system::SystemDns::new_with_mac_backend`].
-//! `get_settings` / `set_servers` / `restore` / `restore_family` are used
-//! ONLY by `crate::dns::recovery`'s upgrade sweep now — `apply_macos` no
-//! longer calls `set_servers` (refs #868; see
-//! [`crate::dns::system`]'s module doc), because that identifier type is a
-//! *service* name, and `apply_macos` was handing it `hole-tun`, an
-//! *interface* name: a guaranteed no-op. It now steers DNS via
-//! [`MacDnsSteerer`] instead.
-//!
-//! [`MacDnsSteerer`] / [`SteeringHandle`] — the apply-path seam, mirroring
-//! `super::windows::DnsConfiner`'s shape but not its `Box<dyn Any + Send>`
-//! erasure: `DnsApplied::shutdown` needs to *call* `withdraw`
-//! (confirmable, not `Drop`-only — Decided-without-asking #6), not merely
-//! hold and drop the guard. Production goes through [`RealMacDnsSteerer`],
-//! backed by `tun_engine::dns_steer::engage`; unit tests substitute a mock
-//! via [`crate::dns::system::SystemDns::new_with_mac_backend`].
+//! [`MacDnsSteerer`] / [`SteeringHandle`] are the apply-path seam. They
+//! mirror `super::windows::DnsConfiner` except that they do not erase the
+//! guard to `Box<dyn Any + Send>`: `DnsApplied::shutdown` must *call*
+//! `withdraw` so a failure is confirmable, not only drop the guard.
+//! Production goes through [`RealMacDnsSteerer`], backed by
+//! `tun_engine::dns_steer::engage`; unit tests substitute a mock via
+//! [`crate::dns::system::SystemDns::new_with_mac_backend`].
 
 use std::io;
 use std::net::IpAddr;
@@ -49,17 +41,18 @@ use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
 pub trait MacDnsBackend: Send + Sync + 'static {
     /// Capture the v4 + v6 DNS state of `service`. Returns `Ok(None)`
     /// when the service does not exist; returns `Err` only on unexpected
-    /// `networksetup` failures. Used only by the upgrade sweep now.
+    /// `networksetup` failures. Used only by the upgrade sweep.
     fn get_settings(&self, service: &str) -> io::Result<Option<DnsPriorAdapter>>;
 
     /// Set the DNS resolvers on `service` to `servers`. `networksetup`
-    /// accepts mixed v4/v6 lists in one call.
+    /// accepts mixed v4/v6 lists in one call. No production caller: apply
+    /// steers DNS through [`MacDnsSteerer`].
     fn set_servers(&self, service: &str, servers: &[IpAddr]) -> io::Result<()>;
 
     /// Restore BOTH families of the captured prior DNS state for
     /// `adapter` in a single `networksetup -setdnsservers` invocation.
-    /// Used only by the upgrade sweep now, and only when both families'
-    /// evidence supports a restore.
+    /// No production caller: the upgrade sweep restores per family through
+    /// [`Self::restore_family`].
     fn restore(&self, adapter: &DnsPriorAdapter) -> io::Result<()>;
 
     /// Restore ONE family, preserving whatever is CURRENTLY live for the

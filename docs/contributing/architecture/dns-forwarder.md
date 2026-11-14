@@ -28,8 +28,9 @@ the Shadowsocks listener can only relay when the plugin carries UDP.
 
 **The endpoint.** UDP/53 reaches `LocalDnsEndpoint` before the filter decision does
 ([the cascade](datapath.md#the-cascade)). TCP port 53 does not: it takes the ordinary cascade to the real resolver, so the user's
-rule for that address decides (`Proxy` goes over the tunnel, `Bypass` leaves from the real interface, `Block` drops). The
-endpoint refuses TCP by contract (`debug_assert!`), since port 53 over TCP is not necessarily DNS.
+rule for that address decides (`Proxy` goes over the tunnel, `Bypass` leaves from the real interface, `Block` drops). On
+Windows a `Bypass` TCP/53 flow fails, because the confinement below refuses the connect out the physical adapter
+([#1317](https://github.com/bindreams/hole/issues/1317)). The endpoint refuses TCP by contract (`debug_assert!`), since port 53 over TCP is not necessarily DNS.
 
 `DnsConfig::default()` is enabled and uses DoH with its default resolvers. A config with no DNS
 section gets the default, so the forwarder is enabled. With `enabled` and an empty `servers`,
@@ -55,7 +56,10 @@ differs.
    the opposite lifetime from [the kill-switch cover](kill-switch-windows.md#the-filter-set), on purpose; the reason is
    there.
 1. **Set servers.** The resolver addresses are set on the adapter, IPv4 and IPv6 separately, each family from its own
-   configured resolvers. A family with none is left untouched, never cleared.
+   configured resolvers. A family with none is left untouched, never cleared: clearing it would revert it to the
+   DHCP-assigned resolver, an on-link router outside the tunnel. The adapter is addressed by the LUID of the device this
+   process opened, never by alias: the alias is the name Hole requested, and a concurrent bridge's adapter can answer to
+   it.
 
 `Dispatcher::new` also gives `hole-tun` the lowest interface metric (`TUNNEL_INTERFACE_METRIC`) so Windows prefers the
 resolver Hole advertises over a physical adapter's. Only port 53 is confined: DNS over TLS on port 853 is not.
@@ -107,7 +111,8 @@ DNS hijack into a dead tunnel with the GUI reporting *Running*; `start_blocks_on
 `run_forwarder_self_test` sends an `example.com` A query through `try_forward` once, giving each resolver
 `TUNNEL_QUERY_TIMEOUT`, the same call and bound `forward` makes at run time, so the gate can never be looser than the
 forwarder. There is no retry: with two or more resolvers a single walk already dials each, and a retry would only add
-cost to slow but working tunnels. Success is any well-formed reply that is not SERVFAIL; NXDOMAIN counts, since it proves
+cost to slow but working tunnels. This is a trade-off: with a single configured resolver a retry would be the only
+second independent dial, and the gate forgoes it, so one slow attempt there fails the start. Success is any well-formed reply that is not SERVFAIL; NXDOMAIN counts, since it proves
 the path. The walk races the cancel token and drops on cancel.
 
 **Reading a failure.** `classify_failure` turns what the run observed into the claim the error may make. Each claim rests
@@ -141,6 +146,11 @@ network (`implicates_plugin_transport`).
 refused connect. It takes the per-upstream budget as a parameter and callers must pass it rather than wrap the call in
 their own `timeout`: an outer timer that fires first drops the future before the upstream's own deadline, so nothing is
 classified and nothing is logged. A walk costs at most `servers × budget`.
+
+The tunnel's bound, `TUNNEL_QUERY_TIMEOUT`, is a considered constant, not a derivation. One attempt on the shipped
+DoH-with-ECH configuration is nine serialized round trips, which took about 1.05 s on the reference link the bound was
+sized for, so the bound admits a link roughly nine times slower. The direct bound, `DIRECT_UPSTREAM_TIMEOUT`, prices the
+bootstrap's three round trips with no plugin, so it is the smaller of the two.
 
 The DoH bootstrap resolver also uses `try_forward`, with `DIRECT_UPSTREAM_TIMEOUT`, so `BootstrapError` can tell a user
 that something is intercepting TLS (a certificate chain that did not verify, decided by `is_trust_chain_rejection`) from a

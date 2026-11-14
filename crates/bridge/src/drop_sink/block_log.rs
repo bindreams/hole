@@ -8,6 +8,8 @@ const SUPPRESS_DURATION: std::time::Duration = std::time::Duration::from_secs(1)
 
 type BlockKey = (u32, SocketAddr);
 
+/// Suppresses repeated log lines for the same `(rule_index, dst)` within a window. Bounded: it remembers the
+/// most recent keys only, so a flood of distinct destinations cannot grow it.
 pub struct BlockLog {
     cache: LruCache<BlockKey, Instant>,
 }

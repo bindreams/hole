@@ -21,10 +21,9 @@ const METHODS: &[&[u8]] = &[
     b"CONNECT ",
 ];
 
-/// Maximum bytes scanned for the `Host:` header. We don't want to
-/// chase pathologically long header sections. In production the
-/// upstream peek caps the buffer at 2048 bytes, so this bound only
-/// engages for direct callers/tests.
+/// Maximum bytes scanned for the `Host:` header, so a pathologically long
+/// header section is not chased. The dispatcher's peek buffer is smaller, so
+/// this bound only engages for direct callers and tests.
 const MAX_SCAN: usize = 4096;
 
 /// Try to extract the `Host` header value from a buffer that starts

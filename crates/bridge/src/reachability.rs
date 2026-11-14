@@ -12,25 +12,32 @@ use tokio::net::{lookup_host, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-// Per-phase budgets bound the total while preserving the connect-vs-first-flight
-// verdict split: a connect timeout stays `TcpTimeout` (nothing answered the SYN
-// at all), a first-flight no-response stays `Blocked` (a real block). One outer
-// timeout would conflate them. A closed port is NOT this case — it refuses, and
-// CONNECT_DEADLINE is above `util::syn_budget::REFUSAL_COST` so that refusal is
-// reported as `TcpRefused`. Non-QUIC worst case ≈ CONNECT_DEADLINE +
-// FIRSTFLIGHT_DEADLINE = 6s.
+// Each phase has its own budget rather than one outer timeout, which would conflate the two verdicts: a connect
+// timeout is `TcpTimeout` (nothing answered the SYN), a first-flight no-response is `Blocked`. CONNECT_DEADLINE is
+// above `util::syn_budget::REFUSAL_COST` so that a closed port, which refuses, is reported as `TcpRefused` and not
+// as a timeout. The non-QUIC worst case is CONNECT_DEADLINE + FIRSTFLIGHT_DEADLINE.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(3); // TCP connect (DNS resolve precedes it)
 const _: () = assert!(CONNECT_DEADLINE.as_millis() > util::syn_budget::REFUSAL_COST.as_millis());
 const FIRSTFLIGHT_DEADLINE: Duration = Duration::from_secs(3); // TLS/HTTP first-flight read
 const QUIC_DEADLINE: Duration = Duration::from_secs(6); // whole quinn connect
 
+/// What the out-of-band probe concluded about the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReachabilityVerdict {
+    /// The server answered at the probed layer.
     Reachable,
+    /// The host name did not resolve.
     DnsFailed,
+    /// The server refused the TCP connection (closed port).
     TcpRefused,
+    /// Nothing answered the TCP connect, or it failed with any error other than
+    /// a refusal: an unreachable host or network, a local firewall's denial and
+    /// a reset all map here too, so the toast reads "timed out" for them
+    /// (bindreams/hole#1319).
     TcpTimeout,
+    /// The connect succeeded (or QUIC was sent) but no first-flight byte came back: reset, timeout or clean EOF.
     Blocked,
+    /// The probe could not run or could not be classified (cancelled, malformed options, local failure).
     Inconclusive,
 }
 
@@ -76,20 +83,16 @@ pub(crate) fn classify_transport(
     if !has_plugin {
         return Ok(ProbeTransport::Raw);
     }
-    // `split_plugin_options`, not `parse_plugin_options`: the latter maps a
-    // bare key and an explicit `key=` to the same decoded `""`, but ex-ray's
-    // own `Args.Get`/`main.go` do NOT treat them the same for `path` (see
-    // below) — only `OptionSegment::raw` can tell bare from valued apart.
+    // `split_plugin_options`, not `parse_plugin_options`: the latter decodes a bare key and an explicit `key=` to the
+    // same `""`, but ex-ray treats them differently for `path` (below).
     let segments = plugin_opts
         .map(garter::split_plugin_options)
         .transpose()?
         .unwrap_or_default();
     let get = |k: &str| segments.iter().find(|s| s.key == k).map(|s| s.value.clone());
     let has = |k: &str| segments.iter().any(|s| s.key == k);
-    // The probe's first-flight SNI/Host is the connect target (the DoH-resolved
-    // IP — IP-SNI): a failure-only diagnostic must not emit the domain in
-    // cleartext, and the real tunnel hides it via ECH, so a domain-SNI probe
-    // would test a path the client never uses.
+    // The first-flight SNI/Host is the connect target, the DoH-resolved IP: the probe must not emit the domain in
+    // cleartext, and the real tunnel hides it via ECH, so a domain-SNI probe would test a path the client never uses.
     let sni = server_host.to_string();
     if get("mode").as_deref() == Some("quic") {
         return Ok(ProbeTransport::Quic { sni });
@@ -99,15 +102,10 @@ pub(crate) fn classify_transport(
     }
     Ok(ProbeTransport::PlainWs {
         host: sni,
-        // Mirrors what ex-ray actually puts on the wire for the two shapes
-        // ex-ray itself accepts: an ABSENT `path` key uses the flag default
-        // "/"; a present key reads `exray_value` (a BARE `path` decodes as
-        // "1", matching `Args.Add`). An explicit `path=` (empty value) is
-        // NOT one of those shapes — ex-ray's own
-        // `parseStringOption(..., emptyOK=false)` (options.go) rejects it as
-        // a config error before ever building a websocket.Config, so there
-        // is no wire behavior to mirror here; "/" is this classifier's own
-        // graceful fallback for an input ex-ray would refuse to start on.
+        // Mirrors ex-ray's wire behavior for the two shapes it accepts: an absent `path` uses the flag default "/";
+        // a present key reads `exray_value` (a bare `path` decodes as "1", matching `Args.Add`). An explicit `path=`
+        // is a config error in ex-ray (`parseStringOption` with `emptyOK=false`, options.go), so there is no wire
+        // behavior to mirror; "/" is this probe's own fallback.
         path: normalize_ws_path(match segments.iter().find(|s| s.key == "path") {
             None => "/".into(),
             Some(s) => s.exray_value().to_string(),
@@ -115,6 +113,10 @@ pub(crate) fn classify_transport(
     })
 }
 
+/// Probe the server out of band and classify why a connect may have failed. The probe's transport follows the
+/// plugin options (raw TCP, TLS or plain WebSocket first flight, or QUIC). Cancelling `cancel` yields
+/// [`ReachabilityVerdict::Inconclusive`]. `host` is expected to be the DoH-resolved IP; it is logged only as `token`
+/// plus its family and scope.
 pub async fn probe_server_reachability(
     host: &str,
     port: u16,
@@ -123,12 +125,8 @@ pub async fn probe_server_reachability(
     plugin_opts: Option<&str>,
     cancel: &CancellationToken,
 ) -> ReachabilityVerdict {
-    // A malformed options string means the transport can't be classified,
-    // and guessing wrong in either direction (TCP vs UDP) produces an
-    // actively false confident verdict — unlike `server_endpoint_is_udp`'s
-    // preflight-skip decision, there is no safe default transport to probe
-    // with here, so this best-effort diagnostic stays a graceful Result
-    // (Inconclusive) rather than an assertion.
+    // Malformed options leave the transport unclassifiable, and a wrong guess (TCP vs UDP) gives a confidently false
+    // verdict. There is no safe default transport, so the answer is `Inconclusive`.
     let transport = match classify_transport(has_plugin, plugin_opts, host) {
         Ok(t) => t,
         Err(e) => {
@@ -143,8 +141,7 @@ pub async fn probe_server_reachability(
         _ = cancel.cancelled() => ReachabilityVerdict::Inconclusive,
         v = probe_inner(host, port, &transport) => v,
     };
-    // `host` is the DoH-resolved IP by design (see `classify_transport`), so
-    // it is logged as the entry's token plus its shape, never as itself.
+    // `host` is the server address, so it is logged as the entry's token plus its shape, never as itself.
     let ip = host.parse::<std::net::IpAddr>().ok();
     debug!(
         server = token,
@@ -187,7 +184,8 @@ pub(crate) enum ConnectResult {
 /// Resolve (when `host` is not a literal IP) then TCP-connect within `deadline`.
 /// A resolve miss is [`ConnectResult::DnsFailed`]; a `ConnectionRefused` is
 /// [`ConnectResult::Refused`]; an elapsed `deadline` or any other connect error
-/// is [`ConnectResult::Timeout`]; success carries the stream.
+/// is [`ConnectResult::Timeout`], and that error is discarded, not logged
+/// (bindreams/hole#1319); success carries the stream.
 pub(crate) async fn resolve_and_connect(host: &str, port: u16, deadline: Duration) -> ConnectResult {
     if host.parse::<IpAddr>().is_err() {
         let resolved = match lookup_host((host, port)).await {
@@ -329,7 +327,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ByteSniff<S> {
 
 /// Drive a no-verify QUIC handshake. Any peer response (handshake or a peer-origin
 /// `ConnectionError`) ⇒ Reachable; a local-only failure ⇒ Inconclusive; timeout /
-/// silence ⇒ Blocked. The match arms below enumerate each variant.
+/// silence ⇒ Blocked.
 async fn probe_quic(host: &str, port: u16, sni: &str) -> ReachabilityVerdict {
     use quinn::{ClientConfig, ConnectionError, Endpoint};
     let addr = match lookup_host((host, port)).await {

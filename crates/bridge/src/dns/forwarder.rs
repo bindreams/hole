@@ -8,6 +8,8 @@
 //!
 //! IPv6 server entries are skipped (with a deduplicated WARN) when the
 //! upstream interface has no IPv6 connectivity.
+//!
+//! The design is in `docs/contributing/architecture/dns-forwarder.md`.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
@@ -154,15 +156,12 @@ pub enum ForwardFailure {
 /// `!Clone`, so `UpstreamErr` cannot be `Clone` — consumed once on the
 /// log path.
 ///
-/// At 136 bytes it travels as [`ForwardResult`]'s boxed `Err`: the
-/// transports return it through five nested `async fn` frames, so unboxed
-/// it would widen every future on the DNS path to carry a failure that is
-/// almost never taken. `?` boxes on its own via `impl<T> From<T> for
-/// Box<T>`; only the tail expressions wrap explicitly. Boxing is also why
-/// growing this struct no longer trips `clippy::result_large_err` —
-/// [`ForwardResult`]'s own size assertion is the guard that actually
-/// matters; the assertion below is a secondary budget so growth here stays
-/// deliberate.
+/// It travels as [`ForwardResult`]'s boxed `Err`: the transports return it
+/// through five nested `async fn` frames, so unboxed it would widen every
+/// future on the DNS path to carry a failure that is almost never taken. `?`
+/// boxes on its own via `impl<T> From<T> for Box<T>`; only tail expressions
+/// wrap explicitly. The size budget below keeps growth deliberate; the lint
+/// rationale for boxing is on [`ForwardResult`].
 #[derive(Debug)]
 pub struct UpstreamErr {
     pub layer: UpstreamLayer,
@@ -278,24 +277,21 @@ impl UpstreamErr {
     }
 }
 
-/// `UpstreamErr` once travelled unboxed in a `Result` and crept past
-/// `clippy::result_large_err`'s 128-byte default on some target platforms
-/// but not others, so whether CI went red depended only on which toolchain
-/// happened to run — see [`ForwardResult`] for the actual fix. This struct
-/// itself was left at its size rather than shrunk, so this budget exists
-/// purely to keep further growth deliberate: nothing else will catch it now.
-/// Box a new field into its own allocation to keep this flat, or raise the
-/// number if the growth is intentional.
+/// Size budget for [`UpstreamErr`], so growth is deliberate: box a new field
+/// into its own allocation to keep this flat, or raise the number if the
+/// growth is intentional. It is not what keeps `clippy::result_large_err`
+/// quiet; see [`ForwardResult`].
 const _: () = assert!(
     std::mem::size_of::<UpstreamErr>() <= 136,
-    "UpstreamErr grew past its 136-byte budget — see the doc comment above"
+    "UpstreamErr grew past its size budget; see the doc comment above"
 );
 
 /// The `Result` every DNS-forward transport (`forward_one` and its four
-/// per-protocol callees) returns. Boxing the error here, not shrinking
-/// `UpstreamErr`, is what keeps `clippy::result_large_err` from firing
-/// again; this assertion enforces that structurally on every compile,
-/// rather than leaving it to whichever clippy a contributor happens to run.
+/// per-protocol callees) returns. Boxing the error here, rather than shrinking
+/// [`UpstreamErr`], keeps `clippy::result_large_err` from firing: its fixed
+/// threshold is crossed by the unboxed error on some targets only. The
+/// assertion enforces the boxing on every compile instead of leaving it to
+/// whichever target's clippy a contributor runs.
 pub(crate) type ForwardResult = Result<Vec<u8>, Box<UpstreamErr>>;
 const _: () = assert!(
     std::mem::size_of::<ForwardResult>() <= 128,
@@ -515,16 +511,17 @@ const DNS_PORT_HTTPS: u16 = 443;
 /// that then fails every query.
 ///
 /// A considered constant, not a derivation: one attempt on the shipped
-/// DoH-with-ECH configuration is nine serialized round trips, measured at
-/// ~1.05s on the link this was sized for, so 10s admits a link roughly nine
-/// times slower.
+/// DoH-with-ECH configuration is nine serialized round trips, and the bound
+/// leaves a margin for a link many times slower than a healthy one. The
+/// measurement behind it is in
+/// `docs/contributing/architecture/dns-forwarder.md#failure-reporting-and-budgets`.
 pub(crate) const TUNNEL_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Also a floor: a budget under the refusal cost cannot report a refusal at
 // all. `forward_one`'s timer would fire first and type a refused upstream
 // `Timeout` / `ConnectTimeout` — "the tunnel is still coming up" — instead of
 // `Connect` / `Unreachable`, which is what `TAP_DISABLED_HINT` sends the
-// reader to read. `DIRECT_UPSTREAM_TIMEOUT` clears it too, at 3s.
+// reader to read. `DIRECT_UPSTREAM_TIMEOUT` clears it too.
 const _: () = assert!(TUNNEL_QUERY_TIMEOUT.as_millis() > util::syn_budget::REFUSAL_COST.as_millis());
 
 /// The bound on one DoH exchange over a DIRECT connector — the bootstrap's
@@ -612,7 +609,7 @@ pub struct DnsForwarder {
     /// cannot change without a reconfigure; log-first-1-forever is
     /// correct there.
     ipv6_skip_logged: Mutex<HashSet<IpAddr>>,
-    /// Cumulative upstream bytes — see `UpstreamBytes`. Written by
+    /// Cumulative upstream activity — see [`UpstreamActivity`]. Written by
     /// `forward_one` on every attempt, read by snapshot/diff.
     upstream_read: AtomicU64,
     upstream_written: AtomicU64,
@@ -1080,10 +1077,9 @@ fn split_https_url(url: &str) -> io::Result<(String, String)> {
 fn build_tls_config() -> ClientConfig {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    // Use the explicit `ring` provider. rustls 0.23 removed the implicit
-    // global default; builder() panics when multiple/zero crypto providers
-    // are feature-enabled and none is globally installed. We feature-gate
-    // `ring` via workspace deps, so pass it directly.
+    // Use the explicit `ring` provider: rustls has no implicit global default,
+    // and `builder()` panics when several or no crypto providers are enabled
+    // and none is installed globally.
     let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
         .expect("ring provider supports default protocol versions")
@@ -1229,8 +1225,19 @@ pub(crate) fn answered_or_servfail(
 }
 
 /// Build a SERVFAIL response from an incoming query. Preserves the
-/// transaction ID, question section, and QDCOUNT; zeros all
-/// answer/authority/additional counts; sets QR=1, RA=1, RCODE=2.
+/// transaction ID; zeros all answer/authority/additional counts; sets QR=1,
+/// RA=1, RCODE=2.
+///
+/// QDCOUNT is copied verbatim but at most the first question is, so a query
+/// with QDCOUNT above 1 gets a header promising more questions than the reply
+/// carries (bindreams/hole#1318).
+///
+/// Panics on a query whose first QNAME is terminated but is not followed by
+/// the 4 bytes of qtype/qclass, or whose compression pointer lacks its second
+/// byte: `question_end` does not bounds-check the end it returns, so the
+/// question slice runs past the datagram (bindreams/hole#1320). A query whose
+/// QNAME is not terminated at all is delimited as `None` and gets no
+/// question.
 pub fn synthesize_servfail(query: &[u8]) -> Vec<u8> {
     // DNS header is 12 bytes: ID(2) | flags(2) | QDCOUNT(2) | ANCOUNT(2) |
     // NSCOUNT(2) | ARCOUNT(2). If the query is shorter than that, we can
@@ -1258,10 +1265,9 @@ pub fn synthesize_servfail(query: &[u8]) -> Vec<u8> {
     reply.extend_from_slice(&qdcount);
     // Zero ANCOUNT / NSCOUNT / ARCOUNT.
     reply.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-    // Copy question section if present (everything after the 12-byte
-    // header up to the end of question, identified by the first 0 label +
-    // 4 bytes of qtype/qclass). Safe fallback: copy the rest of the query
-    // verbatim if we can't find the question terminator.
+    // Copy the question section if present: everything after the 12-byte
+    // header up to the end of the question (the first 0 label plus 4 bytes of
+    // qtype/qclass). A question `question_end` cannot delimit is omitted.
     if query.len() > 12 {
         if let Some(qend) = question_end(&query[12..]) {
             reply.extend_from_slice(&query[12..12 + qend]);
@@ -1271,7 +1277,10 @@ pub fn synthesize_servfail(query: &[u8]) -> Vec<u8> {
 }
 
 /// Find the end of the first question section relative to the question
-/// start. Returns `None` on malformed input.
+/// start. Returns `None` for a QNAME that is not terminated within `q`. The
+/// returned end is not checked against `q.len()`: it may lie past `q`'s end
+/// when qtype/qclass (or a pointer's second byte) is missing
+/// (bindreams/hole#1320).
 fn question_end(q: &[u8]) -> Option<usize> {
     let mut i = 0;
     loop {

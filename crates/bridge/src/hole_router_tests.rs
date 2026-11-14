@@ -1,10 +1,9 @@
 //! Unit tests for [`HoleRouter`].
 //!
-//! The trait-based refactor makes dispatch unit-testable without a real
-//! TUN device: the cascade's `resolve_endpoint` is driven directly over
-//! a table of `(FilterAction, L4Proto, dst, proxy_udp, bypass_v6)` rows
-//! and asserts which endpoint (or drop reason) the cascade chose. Real
-//! socket plumbing is exercised indirectly by the ProxyManager e2e
+//! The cascade's `resolve_endpoint` is driven directly, without a TUN
+//! device, over a table of `(FilterAction, L4Proto, dst, proxy_udp,
+//! bypass_v6)` rows, asserting which endpoint (or drop reason) it chose.
+//! Real socket plumbing is exercised indirectly by the ProxyManager e2e
 //! tests.
 
 use super::*;

@@ -1,12 +1,14 @@
 //! `HoleRouter` — hole's [`tun_engine::Router`] impl.
 //!
-//! Wires two [`Endpoint`] mechanisms plus a [`DropSink`] into the filter engine and
-//! TUN dispatch shape of `tun-engine`:
+//! Wires two [`Endpoint`] mechanisms, an optional in-tunnel DNS interceptor and a
+//! [`DropSink`] into the filter engine and TUN dispatch shape of `tun-engine`:
 //!
 //! - `proxy`: [`Socks5Endpoint`] —
 //!   flows that should go through the SS tunnel.
 //! - `bypass`: [`InterfaceEndpoint`] —
 //!   flows that should egress via the real upstream interface.
+//! - `local_dns`: [`LocalDnsEndpoint`] —
+//!   UDP/53 flows, answered in-process instead of reaching the cascade.
 //! - `drops`: [`LoggingDropSink`] —
 //!   records flows the cascade refused to carry. Nothing serves them.
 //!
@@ -19,23 +21,22 @@
 //!
 //! ## Per-flow dispatch
 //!
-//! 1. TCP only: peek ≤ 2 KiB and run the TLS SNI / HTTP Host sniffer to
-//!    recover a domain (see [`crate::filter::sniffer`]). UDP has no peek
-//!    equivalent and always matches on IP.
+//! 1. TCP only: peek the start of the payload and run the TLS SNI / HTTP Host
+//!    sniffer to recover a domain (see [`crate::filter::sniffer`]). UDP has no
+//!    peek equivalent and always matches on IP.
 //! 2. Build a [`ConnInfo`] and run [`crate::filter::engine::decide`].
 //! 3. Cascade the `FilterAction` + flow shape to a concrete endpoint via
-//!    [`HoleRouter::resolve_endpoint`], recording any drop reason on the
-//!    [`DropSink`].
+//!    [`HoleRouter::resolve_endpoint`] (UDP/53 goes to `local_dns` first, ahead
+//!    of the action), recording any drop reason on the [`DropSink`].
 //! 4. Call `endpoint.serve_tcp` or `endpoint.serve_udp`.
 //!
 //! ## UDP-drop privacy invariant
 //!
 //! `FilterAction::Proxy` + UDP + `!proxy.supports_udp()` resolves to a
 //! drop, **not** to `&self.bypass`. This is deliberate: falling back to
-//! the clear-text bypass would leak UDP outside the encrypted tunnel,
-//! violating the user's VPN expectation. Users who need tunneled UDP
-//! should configure a UDP-capable plugin (galoshes). The drop is
-//! recorded on the [`DropSink`].
+//! the clear-text bypass would leak UDP outside the encrypted tunnel.
+//! Tunneled UDP needs a UDP-capable plugin (galoshes). The drop is recorded
+//! on the [`DropSink`]. See `docs/contributing/architecture/datapath.md`.
 
 use std::io;
 use std::net::SocketAddr;
@@ -167,11 +168,9 @@ impl HoleRouter {
         rule_index: Option<u32>,
     ) -> Dispatch<'_> {
         let rule_index = rule_index.unwrap_or(0);
-        // Intercept UDP/53 *before* the action cascade — a LocalDnsEndpoint
-        // takes precedence over any FilterAction decision. This ensures
-        // the forwarder answers even for flows whose rule would otherwise
-        // Block/Bypass/Proxy (e.g. a user rule `Block 8.8.8.8` still sends
-        // Chrome's hardcoded-DoH DNS through the local forwarder).
+        // UDP/53 is intercepted before the action cascade: a `LocalDnsEndpoint` takes precedence over any
+        // `FilterAction`, so the forwarder answers even where a rule would Block, Bypass or Proxy the flow (a
+        // `Block 8.8.8.8` rule still sends an app's hard-coded DNS through it).
         if l4 == L4Proto::Udp && dst.port() == 53 {
             if let Some(local) = self.local_dns.as_deref() {
                 return Dispatch::Endpoint(local);
@@ -246,9 +245,8 @@ impl HoleRouter {
     async fn dispatch_tcp(&self, flow: &mut TcpFlow, dst: SocketAddr) -> io::Result<()> {
         let current_rules = self.rules.load();
 
-        // Sniffer peek — only when domain rules exist. Recovers TLS SNI or
-        // HTTP Host from the first ≤ 2 KiB of payload so domain-based rules
-        // can match.
+        // Sniffer peek, only when domain rules exist: recovers TLS SNI or HTTP Host
+        // from the first `PEEK_BUF_SIZE` bytes so domain rules can match.
         let mut domain: Option<String> = None;
         if current_rules.has_domain_rules {
             // `flow.peek` handles the sniffer-concurrency cap internally
