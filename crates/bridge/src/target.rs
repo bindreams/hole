@@ -108,7 +108,7 @@ impl dump::Dump for PersistedTarget {
 /// them is a policy bug, not a representation nicety.
 ///
 /// Holds a [`ProxyConfig`], which transitively holds a `ServerAddress` — see
-/// [`Dump`](dump::Dump) below and `CONTRIBUTING.md#server-address-redaction`.
+/// [`Dump`](dump::Dump) below and `docs/contributing/architecture/redaction.md`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Target {
     /// The file parsed at the current schema and records no connection.
