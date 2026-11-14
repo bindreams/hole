@@ -5,8 +5,7 @@
 
 initial_release: |
   Initial release of the standalone `galoshes` SIP003u plugin for
-  shadowsocks server operators. See #291 for the four-track release
-  decoupling rationale.
+  shadowsocks server operators.
 
 include_paths:
   # crates/garter/** is not listed: garter changes belong in garter release

@@ -72,17 +72,9 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 /// server permit too). Cleanup fully disengages via the persisted state so the
 /// box is left open.
 ///
-/// (There is no both-covers recovery egress test, because one cannot be made
-/// faithful: the macOS transient `engage`'s own `pfctl -f -` unconditionally
-/// replaces whatever ruleset is currently loaded -- standing or not -- with its
-/// own, and `recover_lockdown(Adopt)` deliberately does not reload the standing
-/// ruleset afterward -- so post-recovery the live ruleset is the transient
-/// leftover, and with a shared permit IP the egress assertions pass regardless
-/// of whether standing-adopt works. The ordering invariant such a test would
-/// target -- lockdown reconcile BEFORE the transient sweep, the sweep told
-/// `standing_held` so it skips the `/etc/pf.conf` reload -- is proven at the
-/// unit level by
-/// `routing_tests::recover_orders_lockdown_before_transient_sweep_and_passes_adopting`.)
+/// The both-covers recovery ordering is covered at unit level by
+/// `routing_tests::recover_orders_lockdown_before_transient_sweep_and_passes_adopting`;
+/// an egress test here could not tell standing-adopt from its absence.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {

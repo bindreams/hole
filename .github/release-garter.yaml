@@ -6,8 +6,7 @@
 initial_release: |
   Initial release of `garter`, the SIP003u plugin-chain runner library
   + `garter` CLI binary for plugin developers. Library is published to
-  crates.io; CLI ships as a 6-platform binary via GitHub release. See
-  #291 for the four-track release decoupling rationale.
+  crates.io; CLI ships as a 6-platform binary via GitHub release.
 
 include_paths:
   - crates/garter/**

@@ -173,13 +173,12 @@ entry = "ty check"
 language = "python"
 types = ["python"]
 pass_filenames = false
-# ty 0.0.62 regressed `unresolved-import` (ignores `ty.toml`'s
-# `rules.unresolved-import = "ignore"`) and added false-positive
-# `invalid-argument-type` findings. Pinned so a new release can't
-# break every push.
+# ty 0.0.62+ ignores `ty.toml`'s `rules.unresolved-import = "ignore"` and
+# reports false-positive `invalid-argument-type` findings. Pinned so a new
+# release can't break every push.
 #
-# That regression is still present as of 0.0.65: PEP 723 scripts
-# (scripts/generate-release-notes.py, scripts/sign-release.py) no longer
+# PEP 723 scripts
+# (scripts/generate-release-notes.py, scripts/sign-release.py) therefore no longer
 # inherit the root ty.toml's unresolved-import ignore, so their imports
 # must resolve for real. pathspec/PyYAML are the scripts' own PEP 723
 # deps; pytest is their inline test runner (supplied here the same way

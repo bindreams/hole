@@ -260,9 +260,8 @@ allow-invalid = true  # the `windows` crate is a Windows-only dependency; other 
 # that root, and in-flight work observing only that fresh token cannot
 # be preempted.
 #
-# Scope is workspace-wide (clippy.toml is workspace-rooted, no per-crate
-# override in cargo today); ex-Galoshes crates that legitimately spawn
-# their own root tokens carry a module-level `#![allow]`. The sanctioned
+# The ban is workspace-wide; a crate that legitimately roots its own tokens
+# carries a module-level `#![allow]`. The sanctioned
 # bridge-side production sites are enumerated in the `reason =` string
 # below; each carries a per-site `#[allow]` + comment citing this rule.
 
@@ -418,12 +417,8 @@ allow-invalid = true
 
 # The enumeration family is the ONLY read that can see a BOOT-TIME filter:
 # `FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` selects a view the by-key and default
-# enumeration reads both exclude. That makes it the API a provider-scoped sweep
-# of boot-time leftovers is built out of, and the reason the
-# boot-time tripwire's residual chain can argue raw `FWPM_FILTER_FLAG_BOOTTIME`
-# bits materialised outside `build_lockdown_spec` have nowhere to be spent.
-# Neither holds if the family can be called from anywhere. Same two sanctioned
-# sites as the rest of FWPM; `enum_boottime` in `failclosed/windows.rs` carries
+# enumeration reads both exclude, so it stays confined to the two sanctioned
+# sites of the rest of FWPM; `enum_boottime` in `failclosed/windows.rs` carries
 # the per-site `#[allow]`. The layer family is the other half of the sweep's
 # read: the layers it enumerates are listed from the engine, not hardcoded.
 

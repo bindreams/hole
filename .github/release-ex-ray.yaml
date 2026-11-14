@@ -5,7 +5,7 @@
 
 initial_release: |
   Initial release of `ex-ray` as a standalone Hole-published track.
-  ex-ray is the first-party v2ray-core SIP003 shim (#414). It ships
+  ex-ray is the first-party v2ray-core SIP003 shim. It ships
   the same six-platform matrix as galoshes and garter.
 
 include_paths:

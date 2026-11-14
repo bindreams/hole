@@ -262,9 +262,7 @@ targets:
     # from `build:` by exactly this flag —
     # `tests_targets_run_matches_build_minus_no_run` (xtask) checks
     # "run == build minus --no-run, plus RUN_ONLY_FLAGS", not plain equality.
-    # `ci_test_hole_steps_match_the_hole_tests_target` (xtask) holds every
-    # `hole-` nextest step in ci.yaml — including the non-TUN one — to
-    # this exact `run:` command, so all three carry the flag too.
+    # ci.yaml's `hole-` nextest steps must match this `run:` command, flag included.
     run: >
       cargo nextest run --no-default-features --features tombstone/crash-dumps,tombstone/crash-child --no-fail-fast
       -E 'package(hole) + package(hole-bridge) + package(hole-common)
@@ -344,8 +342,8 @@ targets:
     # ex-ray's own Go tests only -- no vendored packages. Separate from
     # `ex-ray-tests` so it can run on windows and darwin without also dragging
     # upstream v2ray-core's suites onto runners they have never been exercised
-    # on. This is what gives keepalive_{windows,darwin}.go CI teeth: they are
-    # build-tagged, so a linux-only lane would never even compile them.
+    # on. keepalive_{windows,darwin}.go are build-tagged, so a linux-only lane
+    # never compiles them; this target runs on all three.
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     run:
@@ -357,7 +355,7 @@ targets:
     # `*-tests` targets' --no-run/run split. prek runs golangci-lint (govet) on
     # the ex-ray wrapper but excludes third_party/v2ray-core and runs no tests at
     # all; this target and `ex-ray-unit-tests` are what EXERCISE Go tests. It
-    # gives the ECH fail-closed gate CI teeth: ex-ray's buildTLSConfig (ech /
+    # runs the ECH fail-closed gate: ex-ray's buildTLSConfig (ech /
     # ech-doh flags, exit-23) plus the patched vendored packages that carry the
     # gate/refuse/round-trip + ECH-retry tests (tls incl. utls, quic, hysteria2,
     # transportcommon). Scoped to the ECH-touching packages, not the whole
@@ -394,8 +392,8 @@ targets:
 
   clippy-ex-galoshes:
     # Hole crates use windows/macos cfg-gates that don't compile on linux or
-    # windows/arm64; on those platforms scope clippy to the ex-Galoshes
-    # crates only via -p filters. The two clippy- targets together cover the
+    # windows/arm64; on those platforms scope clippy to the crates that do
+    # compile there via -p filters. The two clippy- targets together cover the
     # full 6-platform CI matrix without overlap.
     platforms: [linux/amd64, linux/arm64, windows/arm64]
     run: cargo clippy -p garter -p garter-bin -p galoshes -p plugin-e2e -p util -p file-lock -p stepstool -p dev-console --all-targets --features garter/test-utils -- -D warnings
@@ -425,8 +423,7 @@ targets:
           environment: { RUSTDOCFLAGS: "-D warnings" }
 
   doc-ex-galoshes:
-    # `clippy-ex-galoshes`'s legs. The crate set is every one that compiles there:
-    # all but `hole`, `hole-bridge` and `tun-engine`.
+    # `clippy-ex-galoshes`'s legs.
     # Private items as in `doc-hole`, except for the published `garter`.
     platforms: [linux/amd64, linux/arm64, windows/arm64]
     run:

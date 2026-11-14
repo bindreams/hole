@@ -7,9 +7,8 @@
 # exists on the branch. The script emits this verbatim instead of the
 # usual since-last-tag listing.
 initial_release: |
-  Initial release of the `hole` track. See #291 for the four-track
-  release decoupling rationale and docs/contributing/maintainers/releases.md
-  for the versioning scheme.
+  Initial release of the `hole` track. See
+  docs/contributing/maintainers/releases.md for the versioning scheme.
 
 # A commit is included in this track's notes if it modified any file
 # matching one of these globs. Globs use gitignore semantics via the
