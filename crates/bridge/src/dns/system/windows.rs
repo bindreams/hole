@@ -12,11 +12,7 @@
 //!   Production goes through [`Win32Real`]; unit tests substitute
 //!   `MockBackend` via [`crate::dns::system::SystemDns::new_with_backend`].
 //!   The trait surface uses bridge types only (no `windows::*` types) so
-//!   the mock does not depend on the Win32 crate. `get_settings` and
-//!   `restore_family` serve only `crate::dns::recovery`'s upgrade sweep
-//!   (`restore` has no production caller); the bridge itself neither
-//!   captures nor blind-restores. `set_servers` and `flush` are the
-//!   `Dns::apply` path.
+//!   the mock does not depend on the Win32 crate.
 //!
 //! - [`DnsConfiner`] — the same seam, one layer up, for
 //!   `tun_engine::dns_confine::engage`: production goes through

@@ -1,6 +1,6 @@
 //! DNS crash recovery: the evidence-gated upgrade sweep.
 //!
-//! The bridge no longer writes `bridge-dns.json`; DNS is confined to
+//! The bridge does not write `bridge-dns.json`; DNS is confined to
 //! `hole-tun` (see `tun_engine::dns_confine`), which persists nothing. What
 //! remains is the one place a write to another adapter is still correct:
 //! undoing an older build's upstream-adapter DNS rewrite after that build
@@ -76,8 +76,10 @@ fn settled(outcome: system::FamilyOutcome, advertised_totally_empty: bool) -> bo
 }
 
 /// Clean up system DNS settings left behind by an older build's crashed run.
-/// Best-effort: errors are logged at `warn` and nothing is returned. Uses the
-/// real platform backend; tests drive [`recover_dns_config_with`] with a mock,
+/// Best-effort: nothing is returned. A file that cannot be cleared or
+/// superseded is logged at `warn`; the `io::Error` behind a family's
+/// `Failed` outcome is discarded, so only the outcome reaches the per-adapter
+/// `info` line (bindreams/hole#1321). Uses the real platform backend; tests drive [`recover_dns_config_with`] with a mock,
 /// since the write side needs elevation against a real adapter.
 pub fn recover_dns_config(state_dir: &Path) {
     #[cfg(target_os = "windows")]

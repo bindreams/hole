@@ -160,11 +160,8 @@ pub enum ForwardFailure {
 /// through five nested `async fn` frames, so unboxed it would widen every
 /// future on the DNS path to carry a failure that is almost never taken. `?`
 /// boxes on its own via `impl<T> From<T> for Box<T>`; only tail expressions
-/// wrap explicitly. Boxing is also what keeps `clippy::result_large_err`
-/// quiet: this struct's size crosses that lint's fixed threshold on some
-/// targets only, so an unboxed `Err` made the lint's outcome depend on which
-/// target ran it. [`ForwardResult`]'s size assertion enforces the boxing; the
-/// assertion below is a secondary budget so growth here stays deliberate.
+/// wrap explicitly. The size budget below keeps growth deliberate; the lint
+/// rationale for boxing is on [`ForwardResult`].
 #[derive(Debug)]
 pub struct UpstreamErr {
     pub layer: UpstreamLayer,
@@ -1228,13 +1225,19 @@ pub(crate) fn answered_or_servfail(
 }
 
 /// Build a SERVFAIL response from an incoming query. Preserves the
-/// transaction ID and QDCOUNT, and copies the first question; zeros all
-/// answer/authority/additional counts; sets QR=1, RA=1, RCODE=2.
+/// transaction ID; zeros all answer/authority/additional counts; sets QR=1,
+/// RA=1, RCODE=2.
 ///
-/// QDCOUNT is copied from the query but at most the first question is, and
-/// none when it cannot be delimited. A query with QDCOUNT above 1, or a
-/// malformed first question, therefore gets a header that promises more
-/// questions than the reply carries (bindreams/hole#1318).
+/// QDCOUNT is copied verbatim but at most the first question is, so a query
+/// with QDCOUNT above 1 gets a header promising more questions than the reply
+/// carries (bindreams/hole#1318).
+///
+/// Panics on a query whose first QNAME is terminated but is not followed by
+/// the 4 bytes of qtype/qclass, or whose compression pointer lacks its second
+/// byte: `question_end` does not bounds-check the end it returns, so the
+/// question slice runs past the datagram (bindreams/hole#1320). A query whose
+/// QNAME is not terminated at all is delimited as `None` and gets no
+/// question.
 pub fn synthesize_servfail(query: &[u8]) -> Vec<u8> {
     // DNS header is 12 bytes: ID(2) | flags(2) | QDCOUNT(2) | ANCOUNT(2) |
     // NSCOUNT(2) | ARCOUNT(2). If the query is shorter than that, we can
@@ -1264,7 +1267,7 @@ pub fn synthesize_servfail(query: &[u8]) -> Vec<u8> {
     reply.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
     // Copy the question section if present: everything after the 12-byte
     // header up to the end of the question (the first 0 label plus 4 bytes of
-    // qtype/qclass). If the question cannot be delimited it is omitted.
+    // qtype/qclass). A question `question_end` cannot delimit is omitted.
     if query.len() > 12 {
         if let Some(qend) = question_end(&query[12..]) {
             reply.extend_from_slice(&query[12..12 + qend]);
@@ -1274,7 +1277,10 @@ pub fn synthesize_servfail(query: &[u8]) -> Vec<u8> {
 }
 
 /// Find the end of the first question section relative to the question
-/// start. Returns `None` on malformed input.
+/// start. Returns `None` for a QNAME that is not terminated within `q`. The
+/// returned end is not checked against `q.len()`: it may lie past `q`'s end
+/// when qtype/qclass (or a pointer's second byte) is missing
+/// (bindreams/hole#1320).
 fn question_end(q: &[u8]) -> Option<usize> {
     let mut i = 0;
     loop {

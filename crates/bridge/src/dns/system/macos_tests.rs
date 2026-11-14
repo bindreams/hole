@@ -29,7 +29,7 @@ use super::{MacDnsBackend, MacDnsSteerer, SteeringHandle};
 use crate::dns::system::{Dns, DnsApplied, DnsError, RoutedFamilies, SystemDns};
 use crate::dns_state::{DnsPrior, DnsPriorAdapter};
 
-// MockBackend (flush only — apply never reaches get/set/restore any more) =============================================
+// MockBackend (flush only; apply never reaches get/set/restore) =======================================================
 
 struct MockBackend {
     flush_calls: AtomicUsize,
@@ -48,7 +48,7 @@ impl MacDnsBackend for MockBackend {
         unreachable!("apply never calls get_settings")
     }
     fn set_servers(&self, _service: &str, _servers: &[IpAddr]) -> io::Result<()> {
-        unreachable!("apply must not call set_servers any more — see macos.rs's module doc")
+        unreachable!("apply must not call set_servers (see macos.rs's module doc)")
     }
     fn restore(&self, _adapter: &DnsPriorAdapter) -> io::Result<()> {
         unreachable!("apply never calls restore")

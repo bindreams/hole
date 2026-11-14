@@ -160,11 +160,11 @@ impl Dispatcher {
         // Give hole-tun the lowest possible interface metric so Windows
         // prefers whatever resolver Hole advertises over the physical
         // adapter's (#846's positive half; the negative half is
-        // `tun_engine::dns_confine`). IPv4 absence is fatal — a v4 row must
+        // `tun_engine::dns_confine`). IPv4 absence is fatal: a v4 row must
         // exist for an adapter that was just created. IPv6 absence is
-        // logged and accepted: the host may have IPv6 off, or the v6 row
-        // may not have appeared yet — see `tun_engine::net::metric`'s
-        // module doc for why that race is reported, not asserted away.
+        // logged and accepted: `Device::build` already waited for the IPv6
+        // half, so a missing row follows from `Assigned::Ipv6StackAbsent`
+        // (see `tun_engine::net::metric`'s module doc).
         #[cfg(target_os = "windows")]
         {
             use tun_engine::net::metric::{set_interface_metric, Family, MetricOutcome, TUNNEL_INTERFACE_METRIC};

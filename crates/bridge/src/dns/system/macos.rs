@@ -7,10 +7,7 @@
 //! interface name such as `hole-tun`. It mirrors
 //! `super::windows::WinDnsBackend` as a test seam: production goes through
 //! [`Networksetup`]; unit tests substitute `MockMacBackend` via
-//! [`crate::dns::system::SystemDns::new_with_mac_backend`]. Its
-//! `get_settings` and `restore_family` serve only
-//! `crate::dns::recovery`'s upgrade sweep, `flush` serves apply and shutdown,
-//! and `set_servers` and `restore` have no production caller. Apply steers DNS
+//! [`crate::dns::system::SystemDns::new_with_mac_backend`]. Apply steers DNS
 //! via [`MacDnsSteerer`] instead (see [`crate::dns::system`]).
 //!
 //! [`MacDnsSteerer`] / [`SteeringHandle`] are the apply-path seam. They
@@ -48,7 +45,8 @@ pub trait MacDnsBackend: Send + Sync + 'static {
     fn get_settings(&self, service: &str) -> io::Result<Option<DnsPriorAdapter>>;
 
     /// Set the DNS resolvers on `service` to `servers`. `networksetup`
-    /// accepts mixed v4/v6 lists in one call.
+    /// accepts mixed v4/v6 lists in one call. No production caller: apply
+    /// steers DNS through [`MacDnsSteerer`].
     fn set_servers(&self, service: &str, servers: &[IpAddr]) -> io::Result<()>;
 
     /// Restore BOTH families of the captured prior DNS state for

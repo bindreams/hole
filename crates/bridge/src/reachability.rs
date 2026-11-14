@@ -184,7 +184,8 @@ pub(crate) enum ConnectResult {
 /// Resolve (when `host` is not a literal IP) then TCP-connect within `deadline`.
 /// A resolve miss is [`ConnectResult::DnsFailed`]; a `ConnectionRefused` is
 /// [`ConnectResult::Refused`]; an elapsed `deadline` or any other connect error
-/// is [`ConnectResult::Timeout`]; success carries the stream.
+/// is [`ConnectResult::Timeout`], and that error is discarded, not logged
+/// (bindreams/hole#1319); success carries the stream.
 pub(crate) async fn resolve_and_connect(host: &str, port: u16, deadline: Duration) -> ConnectResult {
     if host.parse::<IpAddr>().is_err() {
         let resolved = match lookup_host((host, port)).await {

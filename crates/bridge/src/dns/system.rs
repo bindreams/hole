@@ -139,18 +139,16 @@ pub trait DnsApplied: Send + 'static {
 /// Errors returned from [`Dns::apply`].
 #[derive(Debug, thiserror::Error)]
 pub enum DnsError {
-    /// The cancel token fired during `apply`. A Windows confinement has been
-    /// dropped. A macOS steering key has been withdrawn on a best-effort basis
-    /// (`Cosmetic`; the result is ignored), so a failed withdraw can leave it
-    /// published until the bridge exits.
+    /// The cancel token fired during `apply`; any confinement or steering key
+    /// was released (a failed macOS withdraw is best-effort and may leave the
+    /// key published until the bridge exits).
     #[error("DNS apply cancelled")]
     Cancelled,
 
-    /// Setting the resolver IPs on `hole-tun` failed (Windows), the steering
-    /// key could not be published, or no advertised resolver's address
-    /// family is routed (macOS). Also a panicked or cancelled blocking step
-    /// (`phase::run`'s `JoinError`), the Windows confine engage included, which
-    /// surfaces here and not as [`DnsError::Confine`]. Always fatal (see the
+    /// Setting resolvers (Windows), publishing the steering key, or a panicked
+    /// or cancelled blocking step failed, or no advertised resolver's address
+    /// family is routed (macOS). A panicked or cancelled confine engage is
+    /// reported here, not as [`DnsError::Confine`]. Always fatal (see the
     /// module doc).
     #[error("DNS apply failed: {0}")]
     Io(#[from] io::Error),
@@ -594,6 +592,11 @@ pub enum FamilyOutcome {
 /// `advertised_family_subset` must already be filtered to the family this
 /// call is judging (the caller splits `DnsState.advertised` by family
 /// before calling — the union is not comparable to a live per-family read).
+///
+/// Check-then-act: the live setting is read and compared, then the prior is
+/// written, with nothing atomic between. A change landing in that window is
+/// overwritten. An error from the read or the write is discarded and the
+/// outcome is `Failed`; nothing logs it (bindreams/hole#1321).
 #[cfg(target_os = "windows")]
 pub(crate) fn restore_family_if_ours(
     backend: &dyn windows::WinDnsBackend,
@@ -628,6 +631,8 @@ pub(crate) fn restore_family_if_ours(
     }
 }
 
+/// The macOS counterpart of the Windows `restore_family_if_ours`, with the same
+/// check-then-act window and discarded error.
 #[cfg(target_os = "macos")]
 pub(crate) fn restore_family_if_ours(
     backend: &dyn macos::MacDnsBackend,

@@ -69,9 +69,12 @@ succeed, so the newer file's recorded priors may already be Hole's own dead reso
 to the user's original DNS.
 
 The sweep assumes one bridge reads `bridge-dns.json` at a time, and the single-instance guarantee behind that is not
-airtight, so a second reader must be harmless. It is: a family is written only while its live setting still equals what
-the old build advertised, and the write is to the recorded prior, so two readers cannot write conflicting values. Each
-reader ends by deleting or superseding the file, and both treat a file the other already moved as done.
+airtight, so a second reader should be harmless. Two readers cannot write conflicting values, because every write is the
+recorded prior, and each reader ends by deleting or superseding the file and treats a file the other already moved as
+done. The gate itself is check-then-act: a family's live setting is read and compared, then the prior is written, and
+the OS DNS APIs offer no compare-and-set. A change by DHCP, the user or another VPN that lands between the read and the
+write is overwritten with the recorded prior, and a second concurrent reader widens that window. This is a known gap
+(bindreams/hole#1321).
 
 A confinement held by a bridge that is alive but unreachable has no file-based release. It ends only with its owning
 process, and the escape below stops that process.

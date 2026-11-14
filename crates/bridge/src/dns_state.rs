@@ -1,5 +1,5 @@
 //! Persisted DNS state: a read-only escape hatch for a `bridge-dns.json` an
-//! older build left behind. The bridge no longer writes this file; DNS egress
+//! older build left behind. The bridge does not write this file; DNS egress
 //! is confined by `tun_engine::dns_confine`, whose process-scoped session
 //! persists nothing. What remains is [`load`], [`clear`] and [`supersede`],
 //! used once per file by [`crate::dns::recovery`]'s upgrade sweep, and the
@@ -7,7 +7,7 @@
 //! the evidence supports it, undone.
 //!
 //! Assumes one bridge at a time reads the file. The single-instance guarantee
-//! behind that is not airtight; why a second reader is harmless is argued in
+//! behind that is not airtight; what a second reader can and cannot do is in
 //! `docs/contributing/architecture/crash-recovery.md` (section DNS), which also
 //! describes the sweep.
 
@@ -66,12 +66,9 @@ pub struct DnsPriorAdapter {
 /// a reader can extract it without branching on `kind`.
 ///
 /// It is the adapter's friendly name, not a LUID or GUID, because names
-/// survive reboots. Windows restore resolves the alias to a LUID and then a
-/// GUID on every call (no `netsh`); macOS passes the service name to
-/// `networksetup`. An adapter renamed or removed since the capture is not
-/// found, so its families read as `SkippedNotOurs`: nothing is written, the
-/// file is superseded rather than deleted, and the warn names
-/// `scripts/network-reset.py` (see `crate::dns::recovery`).
+/// survive reboots. Windows restore resolves the alias to a LUID, then a GUID,
+/// on every call; macOS passes the service name to `networksetup`. A renamed or
+/// removed adapter reads as `SkippedNotOurs` (see `crate::dns::recovery`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AdapterId {
@@ -118,7 +115,7 @@ util::assert_contiguous!(DnsState);
 
 // I/O =================================================================================================================
 //
-// No `save` — the bridge no longer writes this file (see the module doc).
+// No `save`: the bridge does not write this file (see the module doc).
 // Only `load`, `clear`, and `supersede` remain, all for the upgrade sweep.
 
 /// The legacy DNS record's file.
