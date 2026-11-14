@@ -15,7 +15,7 @@ use crate::galoshes::build_args;
 #[skuld::test]
 fn crash_dumps_opt_in_adds_the_feature_only_for_windows() {
     // `.dmp` is a Windows-only branch: `minidump-writer` is declared under
-    // `[target.'cfg(windows)'.dependencies]`, and since #842 the macOS
+    // `[target.'cfg(windows)'.dependencies]`, and the macOS
     // `on_crash` has no dump branch at all (crates/tombstone/src/crash.rs
     // module doc).
     assert_eq!(

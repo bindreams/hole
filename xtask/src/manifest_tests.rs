@@ -763,8 +763,7 @@ fn hole_dmg_tests_builds_dmg_once() {
 
 /// [`tests_targets_run_matches_build_minus_no_run`]'s invariant, pulled out so
 /// it is directly testable against synthetic command lines rather than only
-/// through the production `build.yaml` (bindreams/hole#961: the inline-equality
-/// version this replaced could not be exercised against a case it got wrong).
+/// through the production `build.yaml`.
 ///
 /// `run` must equal `build` with `--no-run` removed and zero or more of
 /// [`RUN_ONLY_FLAGS`] added — not plain equality-minus-`--no-run`, because
@@ -898,8 +897,8 @@ fn tests_targets_run_matches_build_minus_no_run() {
 
 #[skuld::test]
 fn hole_run_is_dev_mode_build_and_launch() {
-    // #564: dev-console builds nothing. `hole.run` rebuilds galoshes WITH
-    // crash-dumps (dev-only #438 minidumps, kept out of release/--all by living
+    // dev-console builds nothing. `hole.run` rebuilds galoshes WITH
+    // crash-dumps (dev-only minidumps, kept out of release/--all by living
     // in a run-only step) then launches the cascade-built dev-console binary
     // directly (no rebuild → it cannot overwrite its own running exe).
     let yaml = include_str!("../../build.yaml");
@@ -922,7 +921,7 @@ fn hole_run_is_dev_mode_build_and_launch() {
         ]
     );
 
-    // #438 defense: the crash-dumps env must live ONLY on a run step, never any
+    // The crash-dumps env must live ONLY on a run step, never any
     // target's build cascade (which `--all` and the release installers execute).
     for target in m.iter() {
         for step in &target.build {
@@ -931,7 +930,7 @@ fn hole_run_is_dev_mode_build_and_launch() {
             };
             assert!(
                 !environment.contains_key("HOLE_CRASH_DUMPS"),
-                "HOLE_CRASH_DUMPS must not appear in any build step (target {:?}, #438)",
+                "HOLE_CRASH_DUMPS must not appear in any build step (target {:?})",
                 target.name
             );
         }

@@ -30,7 +30,7 @@ def staged_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     Derived from `cargo xtask bindir-names` (the single source of truth) so the
     build->package->extract round-trip is a true conformance run, not a
-    hand-maintained list that can drift (#512). Non-zero bytes so the embedded
+    hand-maintained list that can drift. Non-zero bytes so the embedded
     cabinet has data and the relocated-extract test finds files post-extraction.
     """
     d = tmp_path_factory.mktemp("stage")
@@ -203,8 +203,8 @@ def test_sequence_uninstall_order(decompiled_tree: ET.ElementTree) -> None:
     The service is deregistered before the covers are released, so the release
     runs against a dead bridge (an out-of-process clear under a live one
     desyncs its cover posture). PathRemove trails the release because
-    BridgeRelease is Return='check' and PathRemove has no rollback partner
-    (bindreams/hole#1003). BridgeUninstallRollback leads, because a rollback
+    BridgeRelease is Return='check' and PathRemove has no rollback partner.
+    BridgeUninstallRollback leads, because a rollback
     action is scripted before the deferred action it undoes.
     """
     entries = _get_decompiled_sequence_map(decompiled_tree)
@@ -248,7 +248,7 @@ def test_arp_product_icon_in_msi(decompiled_tree: ET.ElementTree) -> None:
 
     MSI-side mirror of test_hole_wxs.py::test_arp_product_icon_defined.
     Without ARPPRODUCTICON, Windows shows a generic installer icon in
-    Add/Remove Programs (#359).
+    Add/Remove Programs.
     """
     pkg = decompiled_tree.getroot().find("wix:Package", NS)
     assert pkg is not None
@@ -262,7 +262,7 @@ def test_arp_product_icon_in_msi(decompiled_tree: ET.ElementTree) -> None:
             arp_property = prop
             break
     assert arp_property is not None, (
-        "Decompiled MSI has no ARPPRODUCTICON property. ARP entry will show a generic installer icon (#359)."
+        "Decompiled MSI has no ARPPRODUCTICON property. ARP entry will show a generic installer icon."
     )
 
     value = arp_property.get("Value", "")
@@ -280,7 +280,7 @@ def test_decompiled_msi_cab_is_embedded(decompiled_tree: ET.ElementTree) -> None
     `wix msi decompile` translates the on-disk Cabinet='#name.cab' embedded
     marker back to source form: it strips the '#' and emits EmbedCab='yes'
     on each <Media>. Absence of EmbedCab='yes' on the decompiled XML means
-    the MSI ships external cabs and breaks for end users (#357 — v0.1.0).
+    the MSI ships external cabs and breaks for end users.
     """
     pkg = decompiled_tree.getroot().find("wix:Package", NS)
     assert pkg is not None
@@ -300,7 +300,7 @@ def test_built_msi_has_no_external_cab(built_msi: Path) -> None:
 
     External cabs land in the same directory as the .msi with a name like
     'cab1.cab'. End users who download only the .msi then get 'Source file
-    not found: cab1.cab' at install time (#357 — v0.1.0).
+    not found: cab1.cab' at install time.
     """
     siblings = list(built_msi.parent.glob("*.cab"))
     assert not siblings, (
@@ -318,7 +318,7 @@ def test_msi_admin_extract_works_when_separated_from_build_dir(
     Copy the .msi alone to a fresh directory (no cab siblings) and run
     `msiexec /a` — administrative install, read-only extract, no admin
     rights, no system mutation. External-cab MSIs fail here with the same
-    'cab1.cab not found' error that broke v0.1.0 (#357).
+    'cab1.cab not found' error.
     """
     relocated_dir = tmp_path_factory.mktemp("relocated")
     relocated = Path(shutil.copy(built_msi, relocated_dir / "hole.msi"))
@@ -453,7 +453,7 @@ def test_decompiled_has_win10_launch_condition(decompiled_tree: ET.ElementTree) 
     a `<Launch>` element (WiX v4+ schema) or a legacy
     `<Condition Message="...">CONDITION_TEXT</Condition>` form. Accept
     either shape; assert the condition text mentions WIN10BUILD and
-    19041. See bindreams/hole#397.
+    19041.
     """
     pkg = _decompiled_package(decompiled_tree)
 
@@ -471,7 +471,7 @@ def test_decompiled_has_win10_launch_condition(decompiled_tree: ET.ElementTree) 
 
     assert found_conditions, (
         "Decompiled MSI has no LaunchCondition referencing WIN10BUILD. The "
-        "#397 Windows-version gate is missing from the built MSI."
+        "The Windows-version gate is missing from the built MSI."
     )
     assert any("19041" in c for c in found_conditions), (
         f"LaunchCondition(s) found referencing WIN10BUILD but none gate on 19041. Conditions: {found_conditions}"

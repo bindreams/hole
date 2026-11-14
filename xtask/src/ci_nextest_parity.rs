@@ -6,7 +6,7 @@
 //! binaries. Cargo keys that reuse on
 //! the resolved feature set, so a step missing one `--features` flag rebuilds the
 //! whole workspace instead — silently, staying green at roughly twice the wall
-//! clock, which is how #720 went unnoticed.
+//! clock.
 //!
 //! [`TestJob`] therefore reports the chain, not just the commands: the build.yaml
 //! target the job's `cargo xtask build` step names, and each nextest run to

@@ -2,8 +2,7 @@
 //! actually RUN tests for?
 //!
 //! Backs the `every_workspace_crate_runs_in_ci` conformance test, which fails CI
-//! if a workspace crate's tests run on no platform — the "orphaned test" class
-//! (recent: #519 util, #522 tombstone, this issue's #526 hole-test-observability).
+//! if a workspace crate's tests run on no platform — the "orphaned test" class.
 //!
 //! The analysis is per-COMMAND, not per-`run:`-block: each `run:` script is a
 //! multi-statement shell snippet (`mkdir -p target/debug && cargo nextest run …`),

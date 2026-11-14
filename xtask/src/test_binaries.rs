@@ -2,7 +2,7 @@
 //!
 //! Cargo names compiled test binaries `target/<profile>/deps/<crate>-<hash>.exe`.
 //! The hash churns on every rebuild, so Windows Firewall re-prompts every time
-//! a test binary binds a non-loopback socket (bindreams/hole#210).
+//! a test binary binds a non-loopback socket.
 //!
 //! `stage_test_binaries` runs `cargo test --no-run --workspace --message-format=json`,
 //! parses the artifact stream, and copies each test executable into

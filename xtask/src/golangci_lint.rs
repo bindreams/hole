@@ -152,7 +152,7 @@ pub fn ensure(repo_root: &Path) -> Result<PathBuf> {
         return Ok(bin_path);
     }
 
-    // Ceiling against a runaway server; the archives are ~40 MiB.
+    // Size ceiling against a runaway server.
     let archive_bytes = crate::download::fetch_verified(
         &format!("golangci-lint v{VERSION}"),
         &asset.url(),

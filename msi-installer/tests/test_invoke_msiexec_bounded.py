@@ -164,7 +164,7 @@ def test_wedge_throws_within_bound_and_emits_all_diagnostics(tmp_path: Path) -> 
         assert header in combined, f"missing diagnostic header {header!r} in output:\n{combined}"
     assert WEDGE_THROW in combined
 
-    # Cluster 2: the stand-in process must actually be killed, not left running.
+    # The stand-in process must actually be killed, not left running.
     match = re.search(r"killed process id\(s\): (\d+)", combined)
     assert match, f"no 'killed process id(s)' confirmation in output:\n{combined}"
     killed_pid = match.group(1)
@@ -181,7 +181,7 @@ def test_wedge_throws_within_bound_and_emits_all_diagnostics(tmp_path: Path) -> 
 
 
 def test_wedge_still_emits_diagnostics_and_throws_when_log_read_fails(tmp_path: Path) -> None:
-    """Cluster 1: a probe that genuinely fails (log held open with no sharing,
+    """A probe that genuinely fails (log held open with no sharing,
     reproducing a live msiexec still writing under `/l*vx`) must not swallow
     the remaining diagnostics or the wedge `throw`."""
     log_path = tmp_path / "wedge.log"

@@ -190,7 +190,7 @@ def _accept_wix_eula(wix_exe: Path, version: str) -> None:
         )
 
 
-# Pause between download attempts: 1 s doubling to 30 s, with jitter.
+# Pause between download attempts: exponential, capped, with jitter.
 _DOWNLOAD_WAIT = wait_exponential_jitter(initial=1, max=30)
 
 

@@ -50,7 +50,7 @@ def validate_sha256sums(path: Path, expected: set) -> None:
     """Assert SHA256SUMS covers exactly `expected`, one well-formed line each.
 
     Derived from the release's own asset list rather than a count, so adding a
-    platform or artifact needs no change here (#682).
+    platform or artifact needs no change here.
     """
     lines = [line for line in path.read_text().splitlines() if line.strip()]
 
@@ -176,8 +176,8 @@ def test_normalize_tag_invalid():
         normalize_tag("abc")
 
 
-# The 0.5.0 asset set: three installers plus the three update archives added in
-# #659. A hardcoded count went stale on exactly this change (#682).
+# A release asset set: three installers plus the three update archives. A
+# hardcoded asset count would go stale whenever the set changes.
 SIGNABLE_ASSETS = [
     "hole-0.5.0-darwin-amd64.dmg",
     "hole-0.5.0-darwin-amd64.tar.gz",

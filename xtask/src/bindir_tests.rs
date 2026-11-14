@@ -22,8 +22,7 @@ fn fake_repo() -> tempfile::TempDir {
     let root = dir.path();
 
     // target/{debug,release}/hole{.exe} (+ debug symbols per platform).
-    // The PDB / dSYM is staged so panic backtraces resolve. See
-    // bindreams/hole#393.
+    // The PDB / dSYM is staged so panic backtraces resolve.
     for profile in ["debug", "release"] {
         let target = root.join("target").join(profile);
         fs::create_dir_all(&target).unwrap();
@@ -70,8 +69,7 @@ fn bindir_contains_expected_files() {
 
     // Exact-equality assertion is intentional. Adding a new file to
     // bindir_files() will fail this test, forcing the change to be
-    // acknowledged here. That is the whole point of the regression test —
-    // see issue #143.
+    // acknowledged here. That is the whole point of the regression test.
     #[cfg(target_os = "windows")]
     assert_eq!(
         names,
@@ -106,7 +104,7 @@ fn bindir_uses_correct_profile_dir() {
     );
 
     // Sidecar paths are profile-independent (they live in .cache/, not target/).
-    // Look up by name rather than index because debug symbols (added in #393)
+    // Look up by name rather than index because debug symbols
     // shift the ex-ray slot off index 1 on Windows/macOS.
     let debug_sidecar = debug_files.iter().find(|f| f.dest_name.starts_with("ex-ray")).unwrap();
     let release_sidecar = release_files
