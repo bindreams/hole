@@ -163,8 +163,9 @@ fn spawn_and_rendezvous() -> (std::process::Child, std::net::TcpStream, std::net
     (parent, parent_conn.unwrap(), child_conn.unwrap(), child_pid.unwrap())
 }
 
-/// The real #568 regression: SIGINT delivered to a launcher WHILE it waits must
-/// not kill the launcher; it keeps waiting and returns the child's exit code.
+/// SIGINT delivered to the launcher while it waits on its child must not kill it: it keeps
+/// waiting and returns the child's exit code. Without that, Ctrl+C returns the shell prompt
+/// before the child has finished tearing down.
 #[cfg(unix)]
 #[skuld::test]
 fn parent_survives_sigint_and_forwards_child_exit() {

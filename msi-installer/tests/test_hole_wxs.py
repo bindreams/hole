@@ -287,7 +287,7 @@ def test_arp_product_icon_defined(package: ET.Element) -> None:
     """ARPPRODUCTICON must reference a declared <Icon> Id.
 
     Without this property, Windows's Add/Remove Programs UI falls back
-    to a generic gray installer-box icon for the Hole entry (#359).
+    to a generic gray installer-box icon for the Hole entry.
     """
     icon_ids = {icon.get("Id", "") for icon in package.iter(f"{{{NS['wix']}}}Icon")}
     arp_property = None
@@ -297,7 +297,7 @@ def test_arp_product_icon_defined(package: ET.Element) -> None:
             break
     assert arp_property is not None, (
         "Missing <Property Id='ARPPRODUCTICON'>. Without it, the Add/Remove "
-        "Programs entry shows a generic installer icon (#359)."
+        "Programs entry shows a generic installer icon."
     )
     value = arp_property.get("Value", "")
     assert value in icon_ids, (
@@ -310,7 +310,7 @@ def test_media_template_embeds_cab(package: ET.Element) -> None:
     """<Package> must declare <MediaTemplate EmbedCab='yes'>.
 
     Without it, WiX v4+ defaults to external cabinets, which makes the
-    .msi unusable when downloaded alone (#357 — v0.1.0).
+    .msi unusable when downloaded alone.
     """
     template = package.find("wix:MediaTemplate", NS)
     assert template is not None, (
@@ -325,7 +325,7 @@ def test_media_template_embeds_cab(package: ET.Element) -> None:
 
 # Launch-condition tests ===============================================================================================
 #
-# Hole's #397 DNS refactor uses `SetInterfaceDnsSettings`, which is
+# Hole's DNS bridge uses `SetInterfaceDnsSettings`, which is
 # missing on Windows builds older than 19041 (version 2004, May 2020).
 # The MSI must refuse to install on older builds rather than letting
 # the bridge crash at first proxy-start.
@@ -337,14 +337,14 @@ def test_win10build_property_uses_registry_search(package: ET.Element) -> None:
     The Windows-version gate (Launch condition) reads from the
     `CurrentBuildNumber` registry value, which is a `REG_SZ` whose
     numeric content WiX's expression evaluator can compare as an
-    integer. The bridge requires build >= 19041 (#397).
+    integer. The bridge requires build >= 19041.
     """
     win10build = None
     for prop in package.iter(f"{{{NS['wix']}}}Property"):
         if prop.get("Id") == "WIN10BUILD":
             win10build = prop
             break
-    assert win10build is not None, "Missing <Property Id='WIN10BUILD'> — #397 launch condition cannot evaluate"
+    assert win10build is not None, "Missing <Property Id='WIN10BUILD'> — the launch condition cannot evaluate"
 
     search = win10build.find("wix:RegistrySearch", NS)
     assert search is not None, "<Property Id='WIN10BUILD'> must contain a <RegistrySearch> child"
@@ -369,7 +369,7 @@ def test_launch_condition_requires_build_19041(package: ET.Element) -> None:
     on older builds where an old install already exists.
     """
     launches = list(package.iter(f"{{{NS['wix']}}}Launch"))
-    assert launches, "No <Launch> condition in hole.wxs — #397 Windows-version gate missing"
+    assert launches, "No <Launch> condition in hole.wxs — Windows-version gate missing"
 
     matches = [el for el in launches if "WIN10BUILD" in (el.get("Condition") or "")]
     assert len(matches) == 1, (
@@ -425,9 +425,8 @@ def test_uninstall_cas_return_ignore(package: ET.Element) -> None:
     A leftover PATH entry or an undeleted service is untidy. A leftover
     fail-closed cover is a permanently blocked host: the WFP filters are
     persistent, the Base Filtering Engine re-adds them every boot, and
-    RemoveFiles is about to delete the only binary that could remove them
-    (bindreams/hole#1003). That one failure is worth aborting for, so
-    BridgeRelease is deliberately Return='check' and asserted separately by
+    RemoveFiles is about to delete the only binary that could remove them.
+    That one failure is worth aborting for, so BridgeRelease is deliberately Return='check' and asserted separately by
     test_bridge_release_blocks_uninstall_on_failure.
     """
     cas = _ca_map(package)
@@ -443,7 +442,7 @@ def test_uninstall_cas_return_ignore(package: ET.Element) -> None:
             )
 
 
-# Major-upgrade scheduling (bindreams/hole#1003) =======================================================================
+# Major-upgrade scheduling =============================================================================================
 #
 # `RemoveExistingProducts` has four legal placements and they differ in exactly
 # the two properties this product depends on: whether a failed upgrade can
@@ -524,7 +523,7 @@ def test_major_upgrade_removes_the_old_product_before_the_new_files_land(package
     )
 
 
-# Fail-closed cover release (bindreams/hole#1003) ======================================================================
+# Fail-closed cover release ============================================================================================
 
 
 def test_bridge_release_blocks_uninstall_on_failure(package: ET.Element) -> None:
@@ -597,7 +596,7 @@ def test_bridge_uninstall_has_a_rollback_partner(package: ET.Element) -> None:
     (BridgeRelease) is Return='check' — so a failed release rolls the uninstall
     back over a product whose service is already gone. Without a rollback
     partner the product is still installed but no longer running, and nothing
-    restores it (bindreams/hole#1003).
+    restores it.
 
     MSI ignores a rollback action's return value, so this can only add
     recovery, never block one.
@@ -828,7 +827,7 @@ def test_main_feature_wraps_all_component_groups(package: ET.Element) -> None:
 #
 # Guards the staging->packaging boundary: every file `cargo xtask stage` puts
 # in BINDIR must have a <File> in hole.wxs, or WiX silently drops it from the
-# MSI. This is exactly how galoshes went missing (#512).
+# MSI.
 
 
 def _wxs_bindir_file_basenames(package: ET.Element) -> set[str]:
@@ -857,7 +856,7 @@ def test_wxs_files_match_canonical_bindir(package: ET.Element) -> None:
 
 
 def test_galoshes_component_exists(package: ET.Element) -> None:
-    """galoshes.exe must ship in the MSI (#512)."""
+    """galoshes.exe must ship in the MSI."""
     comp = _find_component(package, "Galoshes")
     assert comp is not None, "Component 'Galoshes' is required to ship the galoshes plugin"
     file_elem = next(
@@ -1078,7 +1077,7 @@ def test_verifyreadydlg_back_publishes_to_shortcutsdlg(package: ET.Element) -> N
     )
 
 
-# Rationale comments (bindreams/hole#1003) =============================================================================
+# Rationale comments ===================================================================================================
 
 # Substrings that make a `netsh wfp` mention honest rather than a remedy.
 _NETSH_IS_NOT_A_REMEDY = ("no delete verb", "cannot remove", "diagnostics-only")
@@ -1177,7 +1176,7 @@ _UNQUALIFIED_LEAVE_NETWORK_BLOCKED_PARAGRAPH = """\
 
 
 def test_the_guards_reject_the_wording_they_exist_to_delete() -> None:
-    """Both guards, against the exact mutation that used to slip past them.
+    """Both guards, against the exact mutation a search of the whole comment block would miss.
 
     Not a fixture for its own sake: it is the only thing standing between the
     guards and a revert to comment scope, where the qualifier and the remedy

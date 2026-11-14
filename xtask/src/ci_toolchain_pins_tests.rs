@@ -26,9 +26,8 @@ fn bare_go_version_is_flagged() {
     assert!(found[0].why.contains("go-version-file"), "{found:?}");
 }
 
-/// The release workflow used to point at `go.mod` and get the `go` directive
-/// (1.25.5) because there was no `toolchain` line; the path is right, so this
-/// must stay clean now that the directive exists.
+/// A `go-version-file` is accepted only if it is exactly `GO_VERSION_FILE`; any
+/// other path is flagged. This test checks one such path, `.go-version`.
 #[skuld::test]
 fn setup_go_pointing_at_another_file_is_flagged() {
     let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/setup-go@v7\n        with:\n          go-version-file: .go-version\n";
@@ -96,7 +95,7 @@ fn reader_with_no_preceding_checkout_in_a_job_is_flagged() {
     assert_eq!(found[0].depends_on_if, None);
 }
 
-/// The likeliest way to reintroduce #859's shape: a reader placed above the
+/// The likeliest way to break the pin read: a reader placed above the
 /// checkout it was meant to follow. At the point the reader runs, no
 /// checkout has happened yet in this job, regardless of what comes later.
 #[skuld::test]
@@ -131,7 +130,7 @@ fn node_version_file_input_is_a_direct_reader() {
 }
 
 /// An install step consuming a read step's output, gated differently from
-/// that read step, is #859's second broken pairing — independent of any
+/// that read step, is a second broken pairing — independent of any
 /// checkout, and present even inside a single composite action's own steps.
 #[skuld::test]
 fn consumer_of_a_readers_output_gated_differently_is_flagged() {

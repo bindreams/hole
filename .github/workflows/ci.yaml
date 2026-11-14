@@ -899,7 +899,7 @@ jobs:
       # silently ignored rather than reported anywhere this repo can see. This
       # catches that the config is schema-valid; it says nothing about whether a
       # given rule actually applies to a given dependency — see
-      # xtask/src/schemars_pin.rs's module doc for why that's not verified here.
+      # docs/contributing/testing.md ("The schemars pin") for why that's not verified here.
       #
       # Runs on the Node 24 that `package.json` pins, which is what Renovate's
       # `engines` asks for.

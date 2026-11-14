@@ -7,7 +7,7 @@
 
   Interactive flow (WixUI_InstallDir + custom ShortcutsDlg):
     Welcome → License (GPL-3.0) → InstallDir picker → Shortcuts → VerifyReady
-  Silent (/quiet) skips the UI; defaults preserve current behavior:
+  Silent (/quiet) skips the UI and takes the defaults:
     INSTALL_START_MENU=1, INSTALL_DESKTOP_ICON=0.
 
   Build:   cd msi-installer && uv run build
@@ -29,8 +29,7 @@
          because the standing cover is what holds the update-cutover gap. That
          is only survivable if a FAILED upgrade puts the old product back: the
          covers are persistent WFP filters the Base Filtering Engine re-adds
-         every boot, and hole.exe is the only thing that can remove them
-         (bindreams/hole#1003).
+         every boot, and hole.exe is the only thing that can remove them.
 
          WiX's default, `afterInstallValidate`, removes the old product in a
          separate transaction — a failed upgrade leaves the machine with

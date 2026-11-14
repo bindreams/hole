@@ -3,9 +3,10 @@
 //!
 //! The declared-requirement cases below are mutation proofs: each one starts
 //! from `metadata()`'s synthetic two-package `cargo metadata` shape with a
-//! single field changed to the shape that would silently reopen
-//! bindreams/hole#379, asserting that the guard notices. The Renovate rule
-//! itself is no longer modelled here — see the module doc for why.
+//! single field changed to the shape that would silently readmit a
+//! `schemars` the build cannot compile against, asserting that the guard
+//! notices. The Renovate rule itself is not modelled here (`docs/contributing/testing.md`,
+//! "The schemars pin").
 
 use crate::schemars_pin::{
     check_declared_requirements, check_local_pin, check_renovate_boundary, declared_schemars_requirements,
@@ -66,7 +67,7 @@ fn a_requirement_confined_to_the_series_admits_nothing_beyond_it() {
     }
 }
 
-/// The mutation at the heart of bindreams/hole#379: a range that still names a
+/// The mutation at the heart of the guard: a range that still names a
 /// bound, still parses, still reads like a pin — and readmits schemars 1.x.
 ///
 /// `^1.0.2` and `>=1.4, <1.5` are here because they are the reason this asks
@@ -122,9 +123,8 @@ fn a_widened_requirement_is_reported_with_the_version_it_readmits() {
 /// The reported version *is* the finding — it is what a maintainer reads and
 /// acts on — so a range that cannot be shown to reach past the pin must not be
 /// decorated with a version it does not accept. `<=0.9.0-alpha` is the input
-/// that broke this: its interval was computed with the pre-release dropped, no
-/// candidate in it matched, and the fallback reported the series boundary
-/// regardless.
+/// that pins this: an interval computed with the pre-release dropped matches no
+/// candidate, and must not fall back to reporting the series boundary.
 #[skuld::test]
 fn a_reported_version_is_never_fabricated() {
     for req in [
@@ -168,8 +168,8 @@ fn a_reported_version_is_never_fabricated() {
 }
 
 /// A range whose bounds cross admits nothing, so it admits nothing *beyond the
-/// pin* either. It is still broken — it blocks every 0.8.x patch — but that
-/// finding is no longer this module's to report; see the module doc.
+/// pin* either. It is still broken — it blocks every 0.8.x patch — but it is
+/// not a widening, which is what this module reports.
 #[skuld::test]
 fn a_self_contradictory_range_is_not_reported_as_widening() {
     assert_eq!(requirement_admits_beyond_pin(">=2.0, <1.0").unwrap(), None);
@@ -576,16 +576,17 @@ fn check_declared_requirements_passes_when_every_entry_holds_the_pin() {
 /// 2. `crates/common/Cargo.toml` still names the series `PINNED_SERIES` does.
 ///
 /// This does not check whether `.github/renovate.json`'s `allowedVersions`
-/// rule would actually be applied by Renovate — that model was removed; see
-/// the module doc for why. The rule is best-effort noise suppression, and the
+/// rule would actually be applied by Renovate — that model was removed;
+/// `docs/contributing/testing.md` ("The schemars pin") says why. The rule is best-effort noise suppression, and the
 /// enforcement that actually matters is `crates/common/build.rs` failing to
 /// compile with `E0603` on a bump past `PINNED_SERIES`.
 ///
 /// A third signal, `typify-impl`'s declared requirement, needs a registry and
 /// so does not run here; `cargo xtask check-schemars-pin` covers it in the
 /// `Lint` job and in the `check-schemars-pin` prek hook, which `prek.toml`
-/// gates to commits touching the files this pin lives in. See the module doc
-/// for why the split is by lane rather than by strength.
+/// gates to commits touching the files this pin lives in. See "The schemars
+/// pin" in docs/contributing/testing.md for why the split is by lane rather
+/// than by strength.
 ///
 /// `repo_root()` rather than `env!("CARGO_MANIFEST_DIR")`: this binary runs
 /// from a nextest archive under `--workspace-remap`, where the build-time path

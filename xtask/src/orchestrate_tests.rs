@@ -622,7 +622,7 @@ fn cli_run_requires_target_positional() {
     );
 }
 
-// ===== {exe} token + relative-program resolution (run_step, #564) ====================================================
+// ===== {exe} token + relative-program resolution (run_step) ==========================================================
 
 #[skuld::test]
 fn substitute_exe_maps_token_to_host_suffix() {
@@ -639,7 +639,7 @@ fn substitute_exe_maps_token_to_host_suffix() {
 fn resolve_program_absolutizes_relative_paths_against_repo_root() {
     let root = Path::new(if cfg!(windows) { r"C:\repo" } else { "/repo" });
     // Relative path WITH separators → joined to repo_root. `Command::current_dir`
-    // does not affect relative *program* resolution (#564).
+    // does not affect relative *program* resolution.
     assert_eq!(
         resolve_program("target/debug/dev-console", root),
         root.join("target/debug/dev-console")

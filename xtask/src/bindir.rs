@@ -10,8 +10,6 @@
 //! `cargo xtask stage`; the installer-manifest conformance tests derive their
 //! expected payload from `bindir_dest_names` (via `cargo xtask bindir-names`)
 //! so the manifests cannot silently drift.
-//!
-//! See issue #143 for the motivation.
 
 use std::path::{Path, PathBuf};
 

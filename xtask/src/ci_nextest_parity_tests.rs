@@ -244,8 +244,8 @@ jobs:
     assert_eq!(test_job(ci, "j", None).expect("analyze").runs.len(), 1);
 }
 
-/// `NEXTEST_PROFILE` picks a per-lane nextest profile (bindreams/hole#999's
-/// non-tun/tun split) without perturbing the compared command text, whether
+/// `NEXTEST_PROFILE` picks a per-lane nextest profile (the non-tun/tun split)
+/// without perturbing the compared command text, whether
 /// stated as step-level `env:` or inline under `sudo env …`.
 #[skuld::test]
 fn nextest_profile_is_fingerprint_neutral() {

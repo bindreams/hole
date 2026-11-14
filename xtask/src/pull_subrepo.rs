@@ -497,31 +497,22 @@ fn git_common_dir(repo_root: &Path) -> Result<PathBuf> {
 }
 
 /// Replicates git-subrepo's own recovery formula for a squash-merge-stale
-/// `.gitrepo` `parent` (its own error message suggests exactly this SHA):
-/// the last commit that touched the `.gitrepo` file's `commit =` line,
-/// walked back one parent. This candidate is always an ancestor of HEAD by
-/// construction (it comes from `git log` starting at HEAD).
+/// `.gitrepo` `parent` (its error message suggests exactly this SHA): the last
+/// commit that touched the `.gitrepo` file's `commit =` line, walked back one
+/// parent. The candidate comes from `git log` starting at HEAD, so it is an
+/// ancestor of HEAD by construction.
 ///
-/// Verified against only HEAD, not also against `.gitrepo`'s recorded
-/// `commit` field: read the installed git-subrepo's own `subrepo:branch()`
-/// (the function that raises the "is not an ancestor" error this fixup
-/// exists to satisfy) — it performs exactly the same single
-/// `merge-base --is-ancestor $subrepo_parent HEAD` check before proceeding,
-/// never one against the `.gitrepo` `commit` field. Matching what
-/// git-subrepo itself actually validates is correct and sufficient for the
-/// retry to succeed; a second check against a field with no established
-/// operational meaning in this comparison would validate a requirement
-/// git-subrepo doesn't have.
+/// It is verified against HEAD only, never against `.gitrepo`'s recorded `commit`
+/// field: git-subrepo's `subrepo:branch()`, which raises the "is not an ancestor"
+/// error this fixup exists to satisfy, performs the same single
+/// `merge-base --is-ancestor $subrepo_parent HEAD` check and no other.
 ///
-/// The is-ancestor check below is still a real, always-on `bail!` rather than a
-/// `debug_assert!` despite that guarantee: it's the sole guard immediately
-/// before an irreversible committed write in unattended CI, where a
-/// silently compiled-away check (debug_assert! is a no-op in release
-/// builds) is the wrong trade. The two earlier `bail!`s (no commit found;
-/// root commit with no parent) are unreachable through any real `git
-/// subrepo` lifecycle — `git subrepo clone` refuses cloning into an empty
-/// repo, and `.gitrepo` only exists once a commit introduced its `commit =`
-/// line.
+/// The is-ancestor check is a real, always-on `bail!`, not a `debug_assert!`: it
+/// is the sole guard before an irreversible committed write in unattended CI,
+/// and release builds compile `debug_assert!` away. The two earlier `bail!`s (no
+/// commit found; root commit with no parent) are unreachable through any real
+/// `git subrepo` lifecycle: `git subrepo clone` refuses an empty repo, and
+/// `.gitrepo` only exists once a commit introduced its `commit =` line.
 ///
 /// Returns the SHA of the fixup commit it creates.
 fn fix_stale_parent(repo_root: &Path, subdir: &str) -> Result<String> {

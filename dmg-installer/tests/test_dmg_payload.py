@@ -1,8 +1,8 @@
 """DMG payload conformance + debug-symbol parity checks for the built Hole.app.
 
-These guard issue #512 (a canonical BINDIR file silently dropped from the DMG)
-and #512 defer-1 (hole.dSYM must ship next to the binary so production panic
-backtraces resolve at runtime — parity with the Windows hole.pdb).
+These guard against a canonical BINDIR file silently dropped from the DMG, and
+require hole.dSYM to ship next to the binary so production panic backtraces
+resolve at runtime (parity with the Windows hole.pdb).
 """
 
 import plistlib
@@ -24,7 +24,7 @@ _HOLE_VERSION_TIMEOUT_SECS = 60
 
 
 def test_dmg_ships_full_canonical_bindir(installed_app: Path) -> None:
-    """Every file the macOS bundle must hold ships in the .app payload (#512).
+    """Every file the macOS bundle must hold ships in the .app payload.
 
     Derives the expected set from the single source of truth so a future bindir
     addition nobody wired into the Tauri config fails here. We scan Contents/MacOS
@@ -79,7 +79,7 @@ def test_bundle_is_menu_bar_app(installed_app: Path) -> None:
 
 
 def test_dsym_is_sibling_of_binary(installed_app: Path) -> None:
-    """hole.dSYM must sit next to the hole binary in Contents/MacOS (#512 defer-1).
+    """hole.dSYM must sit next to the hole binary in Contents/MacOS.
 
     std's backtrace symbolizer (library/backtrace `Mapping::new`) reads the
     running binary's Mach-O UUID, scans the binary's parent directory for any
@@ -136,12 +136,12 @@ def test_dsym_uuid_matches_binary(installed_app: Path) -> None:
     assert binary_uuids <= dwarf_uuids, (
         f"binary UUID(s) {binary_uuids} not all present in dSYM DWARF UUID(s) {dwarf_uuids}; "
         f"std's backtrace symbolizer would skip the dSYM and panic frames would render "
-        f"<unknown> (#393)"
+        f"<unknown>"
     )
 
 
 def test_shipped_version_is_exact(installed_app: Path, tmp_path: Path) -> None:
-    """The shipped binary reports exactly the version `cargo xtask version` gives this tree, without `.dirty` (#1066).
+    """The shipped binary reports exactly the version `cargo xtask version` gives this tree, without `.dirty`.
 
     Both sides come from the same version logic, so this checks the stamp, not
     which version a tree should carry. The binary is run (`hole version`, the
@@ -176,7 +176,7 @@ def test_shipped_version_is_exact(installed_app: Path, tmp_path: Path) -> None:
 
 def test_build_leaves_tracked_files_unmodified() -> None:
     """The Tauri CLI rewrites tracked files (e.g. `crates/hole/Cargo.toml`) before
-    compiling, which dirties the tree and the shipped version (#1066).
+    compiling, which dirties the tree and the shipped version.
     Requires a clean checkout.
     """
     result = subprocess.run(

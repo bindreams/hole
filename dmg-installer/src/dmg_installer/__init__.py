@@ -4,7 +4,7 @@ Locates the DMG produced by `cargo xtask build hole-dmg`, mounts it, and
 exposes the installed `Hole.app` to pytest fixtures so we can assert that
 its code signature is internally consistent (the symptom that produces
 "Hole.app is damaged and can't be opened" on Gatekeeper-quarantined
-installs — see issue #364).
+installs).
 
 Usage: `uv run --directory dmg-installer pytest -v`
 """

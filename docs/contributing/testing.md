@@ -102,6 +102,46 @@ A hook rejects `Command::new("cargo")` in test code. A concurrent `cargo build`
 replaces the binaries a sibling test is about to spawn. Tests find prebuilt binaries through `CARGO_BIN_EXE_*` or the
 locators xtask provides.
 
+### The schemars pin
+
+`crates/common/build.rs` generates the wire types through `typify`. `typify` takes `schemars` schemas but does not
+re-export `schemars`, so Hole must name a `schemars` version, and it must be the one `typify` speaks. `schemars` 0.9
+and 1.x made the `schema` module private, so any bump past 0.8 fails that build script with `E0603`. That compile error
+is the real protection: a wrong pin never ships.
+
+Cargo and Renovate cannot see it coming. Several semver-incompatible `schemars` versions already coexist in the tree
+(`serde_with` declares more than one as optional features), so a bump resolves cleanly and fails only at compile time.
+`.github/renovate.json` carries an `allowedVersions` rule that suppresses the proposal. It is best-effort: if it is
+malformed or shadowed, the worst case is a reopened Renovate PR that `E0603` refuses, never a broken build. Beyond the
+`renovate-config` CI step's schema validation, nothing checks that Renovate applies it, and nothing should: a
+hand-rolled model of Renovate's rule resolution (which selectors reach `schemars`, name matching, negation, merging of
+nested rules) chases a moving upstream, and the model would need guarding as much as the rule it guards.
+
+The checks split by lane, not by strength. `typify-impl`'s declared requirement could run in the archive lane:
+`Test tooling` has network, and a cold-`CARGO_HOME` `cargo metadata --locked` was measured there at 16.5 s, exit 0. It
+does not, because a conformance test is the wrong place for a registry round trip and this repo's tests never shell out
+to cargo (a prek hook enforces it). So the tracked-file checks run in the tests, and the registry check runs in the
+`Lint` job and the `check-schemars-pin` prek hook.
+
+What the check ({src}`xtask/src/schemars_pin.rs`) guards is the upstream fact that `typify` still requires 0.8. A pin is
+correct only while that holds, and left as a comment it would outlive the fact silently: a suppressed update produces
+no signal. The check reads two signals, and neither subsumes the other:
+
+- The requirement `typify-impl` declares, read through `cargo metadata`. It catches upstream widening to admit 1.x
+  alongside 0.8, which leaves a locked version untouched.
+- The version `Cargo.lock` resolved. It catches upstream being forced off 0.8, or `schemars` leaving `typify-impl`'s
+  normal dependencies.
+
+`schemars_pin_still_tracks_typify` checks what tracked files show (the lock and the local pin); tests do not shell out to
+cargo. `cargo xtask check-schemars-pin` adds the declared requirement and the Renovate boundary, and runs where a
+registry exists: as a prek hook gated by `files`, and in the `lint` CI step. Neither compares `crates/common/Cargo.toml`
+against `typify`, because a mismatch already fails the build script.
+
+When the check fires, the answer may not be a bump. `typify`'s maintainer plans to replace the `schemars` types with
+its own IR (oxidecomputer/typify#886), which changes the shape of `build.rs` rather than the version. Once the pin is
+unnecessary, delete the `allowedVersions` rule, the `schemars` comment in `crates/common/Cargo.toml`, the module and its
+hook.
+
 ### Tests that change global network state
 
 The `global_net_state` group in
