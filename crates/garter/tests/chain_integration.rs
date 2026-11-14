@@ -1271,7 +1271,7 @@ async fn auto_surfaces_fatal() {
 /// the direct child. mock-plugin (grandchild mode) spawns a long-lived grandchild
 /// that inherits its stdio (mimicking galoshes→ex-ray). After `cancel` + teardown
 /// the grandchild must be dead — otherwise it leaks (and on Windows, holding the
-/// inherited host pipe, hangs the host at runtime-drop; see bindreams/hole#197).
+/// inherited host pipe, hangs the host at runtime-drop).
 #[skuld::test]
 async fn force_kill_reaps_descendant_tree() {
     let mock_path = mock_plugin_path();
@@ -1332,7 +1332,7 @@ async fn force_kill_reaps_descendant_tree() {
     // bytes read are a bug. If the tree-kill fails, the grandchild keeps the
     // connection open and this read blocks until the nextest per-test timeout
     // (the sanctioned class-2 bound) — at which point the inherited host pipe is
-    // still held, exactly the #197 leak this test guards against.
+    // still held, exactly the leak this test guards against.
     let mut buf = [0u8; 1];
     match grandchild_conn.read(&mut buf).await {
         Ok(0) => {} // clean EOF: the grandchild's socket closed on death.
@@ -1350,7 +1350,7 @@ async fn force_kill_reaps_descendant_tree() {
 }
 
 // Install the workspace test subscriber + panic hook. See
-// `crates/test-observability/` and bindreams/hole#301.
+// `crates/test-observability/`.
 hole_test_observability::register!();
 
 /// A `log_sink` sees every line the child writes, including the ones the sitrep

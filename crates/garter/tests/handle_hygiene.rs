@@ -2,9 +2,9 @@
 //! EVERY handle currently marked inheritable — not only the ones nominated as its
 //! stdio. A grandchild whose own stdio was redirected elsewhere can therefore still
 //! hold a duplicate of its grandparent's stdout write end, and the supervisor reading
-//! that pipe never sees EOF (bindreams/hole#197). That invariant has no test in this
-//! repo or in cosca (filed upstream as bindreams/cosca#103), and this is the change
-//! that could break it.
+//! that pipe never sees EOF. This test is the only guard on the invariant that a
+//! cosca spawn naming its program does not leak that write end: cosca has no test
+//! for it either (open as bindreams/cosca#103).
 //!
 //! The two legs differ only in HOW the grandchild is spawned. The control leg uses
 //! `std::process::Command`, which scopes nothing, and must observe the leak; the real
@@ -97,7 +97,7 @@ async fn contained_spawn_keeps_the_host_pipe_out_of_a_grandchild() {
             .expect("the grandchild reports its verdict");
         assert_eq!(
             verdict, "held",
-            "the #197 hazard no longer reproduces even through an unscoped spawn, so the real leg's EOF would prove nothing"
+            "the hazard no longer reproduces even through an unscoped spawn, so the real leg's EOF would prove nothing"
         );
 
         let mut sentinel = [0u8; 8];

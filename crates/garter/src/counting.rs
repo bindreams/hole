@@ -12,9 +12,7 @@
 //! distinguishes "upstream sent nothing for the whole connection" from
 //! "upstream sent some bytes then closed."
 //!
-//! Lives in `garter` (Apache-2.0) so both the bridge's DNS path and the
-//! `TapPlugin` decorator can share it without an Apache → GPL → Apache
-//! dependency cycle.
+//! Shared by `TapPlugin` and by embedders that count a stream's bytes.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};

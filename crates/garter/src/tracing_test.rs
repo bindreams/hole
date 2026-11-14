@@ -6,13 +6,13 @@
 //! worker thread that has no subscriber, so its events are dropped.
 //! Tests that install a subscriber as their assertion target therefore
 //! require a *current-thread* runtime so spawned tasks stay on the
-//! caller's thread. See [bindreams/hole#302](https://github.com/bindreams/hole/issues/302).
+//! caller's thread.
 //!
 //! This module exposes [`set_default_in_current_thread`], a thin
 //! wrapper that performs the runtime-flavor check before delegating to
 //! `tracing::subscriber::set_default`. Workspace-wide clippy
 //! `disallowed_methods` rules force all callers through this helper.
-//! [`captured`] (behind `test-utils`) builds on it for the common case of
+//! `captured` (behind `test-utils`) builds on it for the common case of
 //! running a closure and reading what it logged.
 //!
 //! **Limitation.** If the helper is invoked from a sync context that
@@ -48,8 +48,7 @@ where
             "set_default_in_current_thread called from a multi-thread tokio runtime — \
              set_default is thread-local; tokio::spawn'd tasks would run on worker \
              threads without the subscriber. Use Builder::new_current_thread() or \
-             #[skuld::test] async fn (which builds a current-thread runtime). \
-             See https://github.com/bindreams/hole/issues/302",
+             #[skuld::test] async fn (which builds a current-thread runtime).",
         );
     }
     #[allow(clippy::disallowed_methods)] // canonical wrapper — see module doc

@@ -157,7 +157,7 @@ async fn describe_shutdown(grandchild: &mut cosca::tokio::Child) -> String {
     format!("code={code}")
 }
 
-/// Middle level of the std-handle hygiene probe (bindreams/hole#197): spawn a copy
+/// Middle level of the std-handle hygiene probe: spawn a copy
 /// of ourselves with every stdio slot redirected to null, handing it the numeric
 /// value of OUR stdout handle, then exit at once — so the only process that can
 /// still be holding the host's pipe is the grandchild.
@@ -237,7 +237,7 @@ async fn run_hygiene_grandchild(
     let mut control = TcpStream::connect(addr).await?;
 
     let verdict = if is_pipe {
-        // Exactly the #197 leak: a grandchild writing down the host's stdout pipe,
+        // The leak under test: a grandchild writing down the host's stdout pipe,
         // whose reader would never see EOF while this process lives. `ManuallyDrop`
         // keeps holding it, so the test's EOF assertion is about this process's death.
         let mut host_pipe = std::mem::ManuallyDrop::new(unsafe {
