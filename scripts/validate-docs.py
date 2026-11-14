@@ -8,7 +8,7 @@ versions line carries the real manifest versions and that no substitution was
 left unrendered. Also checks every `{src}` link in `docs/`: its path must be
 tracked in the repository and, for a Markdown target, its `#anchor` must match a
 heading there (GitHub's slug rules). A code fence that is never closed is
-reported in a page, a target and the README. Pages are read as MyST reads them,
+reported in a page, a target, the README and CLAUDE.md. Pages are read as MyST reads them,
 targets and the README as GitHub does, with parsers pinned in
 `docs/requirements.txt` rather than in this script.
 
@@ -16,11 +16,14 @@ Every link in a tracked README (the root's and each crate's) that starts with
 `https://hole.readthedocs.io/en/latest/` must be the site root or `<page>.html`,
 where `docs/<page>.md` is tracked in the repository.
 
+The root `CLAUDE.md` is a map of links into the repository: each repository-relative
+link must name a tracked path and, for a Markdown target, a heading anchor.
+
 Usage, from the repository root:
     uv run --with-requirements docs/requirements.txt scripts/validate-docs.py
     uv run --with-requirements docs/requirements.txt scripts/validate-docs.py --links-only
 
-`--links-only` runs the `{src}` and README link checks without the build.
+`--links-only` runs the `{src}`, README and CLAUDE.md link checks without the build.
 """
 
 import functools
@@ -68,6 +71,12 @@ CODE_REGION_RE = re.compile(r"<(pre|code)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNOR
 # Sphinx's `explicit_title_re`, which its extlinks role splits a target with. The
 # target is used as written: no strip, and `<path>` without a title is a path.
 SRC_TITLED_RE = re.compile(r"^(.+?)\s*(?<!\x00)<([^<]*?)>$", re.DOTALL)
+
+# The agent map is a root file made of links into the repository.
+AGENT_MAP = "CLAUDE.md"
+
+# A link target that leaves the repository: `https:`, `mailto:`.
+URL_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
 
 # A README link into the published site: the page path after `/en/latest/`, if any.
 SITE_BASE = "https://hole.readthedocs.io/en/latest/"
@@ -268,6 +277,27 @@ def unclosed_fence_problem(where: str) -> str:
     return f"{where}: code fence is never closed; it hides the rest of the file"
 
 
+def link_problem(
+    repo_root: Path, tracked: frozenset[str], where: str, label: str, path: str, anchor: str, anchored: set[str]
+) -> str | None:
+    """The problem with one link target, or None.
+
+    The path names a tracked file or a directory holding one; a `.md` target's `anchor`
+    must be a heading slug of that file, and such a target is added to `anchored`.
+    """
+    if path not in tracked and not any(name.startswith(path.rstrip("/") + "/") for name in tracked):
+        return f"{where}: {label} path is not tracked in the repository: {path!r}"
+    if not anchor or not path.endswith(".md") or path not in tracked:
+        return None
+    target_file = repo_root / path
+    if not target_file.is_file():
+        return f"{where}: {label} path is tracked but missing on disk: {path!r}"
+    anchored.add(path)
+    if anchor not in read_target(target_file).slugs:
+        return f"{where}: {label} anchor matches no heading in {path!r}: {anchor!r}"
+    return None
+
+
 def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
     """Problems with the `{src}` links of every page under `docs/`.
 
@@ -291,17 +321,41 @@ def src_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
             target = titled.group(2) if titled else token.content
             location, _, anchor = target.partition("#")
             path, query, _ = location.partition("?")
-            is_dir = any(name.startswith(path.rstrip("/") + "/") for name in tracked)
-            if path not in tracked and not is_dir:
-                problems.append(f"{where}:{number}: {{src}} path is not tracked in the repository: {path!r}")
-            elif anchor and not query and path.endswith(".md") and path in tracked:
-                target_file = repo_root / path
-                if not target_file.is_file():
-                    problems.append(f"{where}:{number}: {{src}} path is tracked but missing on disk: {path!r}")
-                    continue
-                anchored.add(path)
-                if anchor not in read_target(target_file).slugs:
-                    problems.append(f"{where}:{number}: {{src}} anchor matches no heading in {path!r}: {anchor!r}")
+            problem = link_problem(
+                repo_root, tracked, f"{where}:{number}", "{src}", path, "" if query else anchor, anchored
+            )
+            if problem:
+                problems.append(problem)
+    for path in sorted(anchored):
+        for number in read_target(repo_root / path).unclosed_fences:
+            problems.append(unclosed_fence_problem(f"{path}:{number}"))
+    return problems
+
+
+def agent_map_link_problems(repo_root: Path, tracked: frozenset[str]) -> list[str]:
+    """Problems with the repository-relative links of the root `CLAUDE.md`.
+
+    A link whose target has a URL scheme is not checked. The others are read as GitHub
+    reads them: from the repository root, a `#anchor` alone naming a heading of the file itself.
+    """
+    problems = []
+    anchored: set[str] = set()
+    agent_file = repo_root / AGENT_MAP
+    if not agent_file.is_file():
+        return [f"{AGENT_MAP}: missing on disk"]
+    for number, token in leaf_tokens(github_parser(), agent_file.read_text(encoding="utf-8"), directives=False):
+        if token.type == "unclosed_fence":
+            problems.append(unclosed_fence_problem(f"{AGENT_MAP}:{number}"))
+        if token.type not in ("link_open", "image"):
+            continue
+        href = str(token.attrGet("href") or token.attrGet("src") or "")
+        if URL_SCHEME_RE.match(href):
+            continue
+        path, _, anchor = href.partition("#")
+        problem = link_problem(repo_root, tracked, f"{AGENT_MAP}:{number}", "link", path or AGENT_MAP, anchor, anchored)
+        if problem:
+            problems.append(problem)
+    anchored.discard(AGENT_MAP)  # Its own unclosed fences are reported above.
     for path in sorted(anchored):
         for number in read_target(repo_root / path).unclosed_fences:
             problems.append(unclosed_fence_problem(f"{path}:{number}"))
@@ -380,7 +434,11 @@ def main() -> int:
         return 2
 
     tracked = tracked_files()
-    problems = src_link_problems(REPO_ROOT, tracked) + readme_link_problems(REPO_ROOT, tracked)
+    problems = (
+        src_link_problems(REPO_ROOT, tracked)
+        + readme_link_problems(REPO_ROOT, tracked)
+        + agent_map_link_problems(REPO_ROOT, tracked)
+    )
     if sys.argv[1:] == ["--links-only"]:
         report(problems)
         return 1 if problems else 0
@@ -676,6 +734,41 @@ def test_src_roles_after_front_matter_are_checked(tmp_path: Path) -> None:
 
     assert len(problems) == 1
     assert "a.md:5" in problems[0]
+
+
+def _agent_map_repo(root: Path, claude: str, files: dict[str, str]) -> frozenset[str]:
+    """Write a CLAUDE.md and `files` under `root`; every one of them is tracked."""
+    _write_files(root, {"CLAUDE.md": claude, **files})
+    return frozenset({"CLAUDE.md", *files})
+
+
+def test_agent_map_links_accept_tracked_paths_anchors_and_urls(tmp_path: Path) -> None:
+    claude = "# Map\n\n[a](docs/a.md#some-heading) [d](docs/dir/) [self](#map) [web](https://x.invalid/y.md#z)\n"
+    tracked = _agent_map_repo(tmp_path, claude, {"docs/a.md": "## Some heading\n", "docs/dir/f.md": ""})
+
+    assert agent_map_link_problems(tmp_path, tracked) == []
+
+
+def test_agent_map_links_report_a_missing_path_and_a_wrong_anchor(tmp_path: Path) -> None:
+    claude = "# Map\n[gone](docs/gone.md)\n[a](docs/a.md#other)\n[self](#nope)\n```\n[ignored](docs/x.md)\n```\n"
+    tracked = _agent_map_repo(tmp_path, claude, {"docs/a.md": "## Some heading\n"})
+
+    problems = agent_map_link_problems(tmp_path, tracked)
+
+    assert len(problems) == 3
+    assert "CLAUDE.md:2" in problems[0] and "'docs/gone.md'" in problems[0]
+    assert "CLAUDE.md:3" in problems[1] and "'other'" in problems[1]
+    assert "CLAUDE.md:4" in problems[2] and "'nope'" in problems[2]
+
+
+def test_agent_map_links_report_an_unclosed_fence_once_and_a_missing_file(tmp_path: Path) -> None:
+    assert agent_map_link_problems(tmp_path, frozenset()) == ["CLAUDE.md: missing on disk"]
+
+    tracked = _agent_map_repo(tmp_path, "# Map\n[self](#map)\n```\nnever closed\n", {})
+
+    problems = agent_map_link_problems(tmp_path, tracked)
+
+    assert len(problems) == 1 and "CLAUDE.md:3" in problems[0]
 
 
 def test_readme_links_accept_pages_and_the_site_root(tmp_path: Path) -> None:

@@ -18,5 +18,7 @@ drives the builds and the test runs.
 Reference pages: [building in detail](build.md), [the installers](installers.md) and [the bridge and proxy
 commands](bridge-cli.md).
 
+Cutting a release, rolling one back, and the signing key are in [the maintainers' pages](maintainers/index.md).
+
 How Hole is put together is in the [architecture overview](architecture/overview.md), which links the pages on the
 layers, the TUN device, routing and [the kill switch](architecture/kill-switch.md).

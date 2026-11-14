@@ -281,7 +281,8 @@
          `netsh wfp` is diagnostics-only — capture, dump, help, set, show, and
          no delete verb — and removing a WFP filter takes an FWPM call, whose
          only caller on the host is the hole.exe this uninstall is about to
-         delete. Reinstalling Hole is the way back (#1003).
+         delete. A reinstall brings that caller back; it must then release the
+         cover (`hole bridge release-covers`, or Unblock Network).
 
          Return="check", uniquely among the uninstall CAs: a failed release
          MUST abort and roll the uninstall back, leaving hole.exe in place, and
@@ -300,8 +301,10 @@
          quarantined) would otherwise make the product permanently
          unremovable. Only the value "1" skips the release. Secure="yes" so
          the value survives into the server-side execute sequence under UAC.
-         Documented in RELEASE-OPS.md as a last resort; it leaves every cover
-         in place, and reinstalling Hole is the way back. -->
+         Documented in docs/contributing/maintainers/uninstall-gate.md as a last
+         resort; it leaves every cover in place. Reinstalling Hole alone usually
+         does not clear one: the reinstalled bridge must release it
+         (`hole bridge release-covers`, or Unblock Network). -->
     <Property Id="LEAVE_NETWORK_BLOCKED" Secure="yes" />
 
     <CustomAction

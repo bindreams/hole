@@ -26,8 +26,8 @@
 //!
 //! ## Fail-loud, never skip
 //!
-//! Per CLAUDE.md, tests fail loudly on missing dependencies, never silently
-//! skip. Each test asserts its required binaries `is_file()` up front with a
+//! Tests fail loudly on missing dependencies and never skip
+//! (docs/contributing/testing.md#fail-do-not-skip). Each test asserts its required binaries `is_file()` up front with a
 //! remediation hint (`cargo xtask ex-ray` / `provision-upstream-v2ray`).
 //!
 //! ## Gate

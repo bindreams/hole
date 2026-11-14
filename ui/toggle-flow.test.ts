@@ -5,7 +5,7 @@
 // and the user's direction is transmitted as explicit start/stop intent
 // on the wire (#462).
 //
-// Sync-invariant note (CLAUDE.md §"Synchronization invariant"): this
+// Synchronization note (docs/contributing/testing.md#no-synchronization-by-elapsed-time): this
 // test uses `vi.useFakeTimers()` + `vi.getTimerCount()` to assert the
 // structural absence of any pending timer after the synchronous
 // prelude. It is NOT a sleep-as-wait — the wall clock is irrelevant;

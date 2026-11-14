@@ -395,8 +395,8 @@ fn run_test_returns_internal_error_for_unsupported_cipher() {
 /// [`ServerTestOutcome::Reachable`].
 ///
 /// **Skip-on-missing rule**: if the ex-ray binary is not built, the test
-/// panics with a clear instruction. Per CLAUDE.md: fail loudly, never
-/// silently skip on missing dependencies.
+/// panics with a clear instruction: a test fails loudly on a missing
+/// dependency and never skips (docs/contributing/testing.md#fail-do-not-skip).
 ///
 /// `labels = [PORT_ALLOC]` + `serial = PORT_ALLOC`: this test has the same
 /// async plugin-bind TOCTOU as the `ssserver_ws/ws_tls/quic` fixtures, but

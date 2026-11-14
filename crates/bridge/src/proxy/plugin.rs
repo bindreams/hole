@@ -468,11 +468,11 @@ async fn await_ready(
     tokio::select! {
         biased;
         _ = start_cancel.cancelled() => Err(ProxyError::Cancelled),
-        // sync-exception(external-event, CLAUDE.md class 2): READINESS_TIMEOUT is the
-        // terminal failure-to-human bound for a plugin subprocess that may never become
-        // ready (wedged child); it is NOT intra-process sync. Cooperative cancel via the
-        // biased cancel arm above is the primary escape; this timeout only bounds the
-        // genuinely-stuck case.
+        // sync-exception(external-event; docs/contributing/testing.md#no-synchronization-by-elapsed-time):
+        // READINESS_TIMEOUT is the terminal failure-to-human bound for a plugin subprocess
+        // that may never become ready (wedged child); it is NOT intra-process sync.
+        // Cooperative cancel via the biased cancel arm above is the primary escape; this
+        // timeout only bounds the genuinely-stuck case.
         r = tokio::time::timeout(READINESS_TIMEOUT, ready_rx) => match r {
             Ok(Ok(Ok(chain_ready))) => Ok(chain_ready),
             // The only retryable start class: a plugin reported it could
