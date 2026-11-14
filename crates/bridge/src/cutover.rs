@@ -330,8 +330,9 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// qualification.
 ///
 /// Leftover boot-time filters are gated by [`Clearance::leftover_keys`], not
-/// reported off [`Clearance::unproven_keys`]: the twins go unproven on every boot where no bridge engaged, so the unproven set
-/// would fire on essentially every Windows uninstall and carry no information.
+/// [`Clearance::unproven_keys`]: the twins go unproven on every boot where no
+/// bridge engaged, so the unproven set would fire on essentially every Windows
+/// uninstall and carry no information.
 /// `leftover_keys` reports when EITHER the standing cover's `PERSISTENT` siblings
 /// in this sweep (`failclosed::KeyRole`) or the persisted
 /// `failclosed::boottime_witness` says a twin could be outstanding. The union is
@@ -339,11 +340,10 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// the record is lost with a wiped `state_dir`; silence requires losing both.
 ///
 /// It does NOT assert that a cover is present, since an unproven key is equally
-/// consistent with never having been installed. Three key classes are worded
-/// apart, and only the filters are gated: a view that could not be enumerated is
-/// always reported, and a filter the OS refused to delete is read off the unproven
-/// set ([`Clearance::refused_strangers`]), so no sibling or witness evidence can
-/// suppress either.
+/// consistent with never having been installed. Only the filters are gated. A
+/// view that could not be enumerated is always reported, and a refused filter
+/// ([`Clearance::refused_strangers`]) is read off the unproven set, so no sibling
+/// or witness evidence can suppress either.
 ///
 /// `running_version` is the build making the report, and the remedy names it: a
 /// key that answered not-found is not live, so no enumeration sees it and only a
@@ -365,8 +365,8 @@ pub fn release_clearance_report(clearance: &Clearance, running_version: &str) ->
 ///
 /// Each names its label (it carries the filter's GUID), and its code when the OS gave one. The line always ends in
 /// an operator remedy: a refusal may be transient, so a later sweep may succeed; failing that, an external tool,
-/// since `netsh wfp` has no delete verb. It names no build, so it takes no `running_version`. A refusal does not fail
-/// any sweep and is worded apart from [`boot_time_filters_line`] because the filter is known to exist.
+/// since `netsh wfp` has no delete verb. A refusal does not fail any sweep and is worded apart from
+/// [`boot_time_filters_line`] because the filter is known to exist.
 fn refused_strangers_line(clearance: &Clearance) -> Option<String> {
     let refusals: Vec<String> = clearance
         .refused_strangers()
@@ -392,8 +392,7 @@ fn refused_strangers_line(clearance: &Clearance) -> Option<String> {
 ///
 /// Every such key is a boot-time twin or stranger, never a `Persistent` key: an unproven `Persistent` key fails the
 /// sweep, so it never reaches the report as `Ok`. The line states what the keys are instead of hedging
-/// (`an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name`). A boot-time stranger whose
-/// delete was refused does not fail any sweep and is worded by [`refused_strangers_line`].
+/// (`an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name`).
 ///
 /// The remedy has to exist. `netsh wfp` is diagnostics-only, with no `delete` verb
 /// (<https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp>), and removing a WFP

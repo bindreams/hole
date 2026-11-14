@@ -209,7 +209,7 @@ const RETRANSMIT_WARN_THRESHOLD: u32 = 3;
 /// `Drop` stops and joins the timer thread, reads the statistics one last time,
 /// then stops the session ([`EtwGuard::stop_session`]). If the kernel confirmed
 /// the session reclaimed, it joins the processing thread so the callback drains
-/// its queue; otherwise it detaches the thread (see [Drain on Drop](#drain-on-drop)).
+/// its queue.
 ///
 /// # Drop's added wait
 ///
@@ -521,8 +521,7 @@ fn start_consumer_named_with_spawn(
         .build();
 
     // Split-lifecycle: start session without the internal processing
-    // thread so we own the join handle. See "Drain on Drop" on
-    // `EtwGuard`.
+    // thread so we own the join handle. See `EtwGuard`'s "Drain on Drop".
     //
     // Buffer sizing: with all TCPIP keywords enabled, per-connect event
     // volume is high (SendPath included). The default `buffer_size` risks
