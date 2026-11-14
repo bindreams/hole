@@ -129,7 +129,7 @@ export function isDirty() {
 
 // Polling =============================================================================================================
 
-/** Poll proxy status; scheduled by `init`. */
+/** Poll proxy status. */
 async function pollProxyStatus() {
   // Capture the filters epoch before the round-trip; a mutation during the
   // fetch invalidates the response's invalid_filters indices.
@@ -268,9 +268,8 @@ function setupEventListeners(): Promise<unknown> {
     running: boolean;
     error: string | null;
   }>("proxy-state-changed", (event) => {
-    // The event also carries the lockdown and blocked-state fields; this
-    // listener reads only these three, because the dashboard has no blocked
-    // state (bindreams/hole#625).
+    // The event also carries lockdown and blocked-state fields that the
+    // dashboard ignores: it has no blocked state (bindreams/hole#625).
     // Pass `error` so a death observed first (or only) via the event still
     // surfaces the exactly-once toast — the tray reconciler can be the poller
     // that commits the death.

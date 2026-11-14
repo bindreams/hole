@@ -428,9 +428,8 @@ fn external_bridge_denied_toast_is_actionable() {
 
 /// The startup-connect decision lives in the bridge
 /// (`hole_bridge::target::startup_should_connect`); the GUI has no copy of it.
-/// Same idiom as
-/// `the_standing_cover_field_has_exactly_one_reader`: a name reappearing in
-/// non-test GUI source would mean a second decider crept back in.
+/// Same idiom as `the_standing_cover_field_has_exactly_one_reader`: a name
+/// reappearing in non-test GUI source would mean a second decider crept back in.
 #[skuld::test]
 fn the_gui_no_longer_decides() {
     let needle = "startup_should_connect";

@@ -417,8 +417,7 @@ fn build_tray_menu(
         transition.is_none(),
         None::<&str>,
     )?;
-    // Shown whenever `CoverPresence::is_present` holds (`escape_items`),
-    // whether or not anything is running.
+    // Built unconditionally; `escape_items` decides whether it is shown.
     let unblock = MenuItem::with_id(app, ID_UNBLOCK, UNBLOCK_ITEM_LABEL, transition.is_none(), None::<&str>)?;
     let autostart = CheckMenuItem::with_id(app, ID_AUTOSTART, "Start at Login", true, false, None::<&str>)?;
     // Checked tracks intent; the warning label covers the enabled-but-inactive
@@ -670,8 +669,9 @@ async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<
 
 /// Whether a connect attempt may surface UI that demands a decision: the
 /// bridge-install prompt, the UAC/elevation prompt, an error modal.
-/// `Forbidden` fails passively, with no install prompt, UAC or modal, and
-/// leaves the tray in its blocked state. Its one caller is the blocked-state
+/// `Forbidden` fails passively, with no install prompt, UAC or modal; the
+/// resulting state is whatever the bridge reports (see [`connect_silently`]).
+/// Its one caller is the blocked-state
 /// Retry ([`connect_silently`]); the blocked state is not reachable today
 /// (bindreams/hole#1270).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -896,8 +896,7 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
             info!("tray: retry clicked from the blocked state");
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
-                // The retry is not covered (see `connect_silently`'s doc): a failed
-                // attempt can fail the host open rather than re-block it.
+                // See `connect_silently`'s doc for how a failed retry ends.
                 match connect_silently(&app_handle).await {
                     Ok(outcome) => info!(?outcome, "blocked-state retry settled"),
                     Err(reason) => info!(%reason, "blocked-state retry did not connect"),
@@ -1554,9 +1553,8 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
 /// this loop (`BridgeLink::send` commits synchronously). The immediate first
 /// tick doubles as the startup reconcile.
 ///
-/// Startup auto-connect is not this loop's concern: the bridge decides and
-/// applies it at its own boot, before any GUI runs. This poll is purely
-/// presentational.
+/// Startup auto-connect is not this loop's concern: it is the bridge's own
+/// decision, applied at each bridge boot. This poll is purely presentational.
 pub fn spawn_status_reconciler(app: &AppHandle, _settled: LaunchWindowsSettled) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {

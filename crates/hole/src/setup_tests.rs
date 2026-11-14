@@ -1138,8 +1138,9 @@ fn the_start_type_hold_is_wired_to_both_elevated_changes() {
     );
 }
 
-/// The stop must not be conditional on a registration record. A severed `ensure_stopped` leaves nothing stopping the
-/// bridge, and the release then refuses forever.
+/// The stop must not be conditional on a registration record. A severed
+/// `ensure_stopped` leaves nothing stopping the bridge, and the release then
+/// refuses forever.
 #[skuld::test]
 fn the_bridge_stop_is_wired_ahead_of_every_deregistration() {
     let pattern = regex::Regex::new(r"\bensure_stopped\s*\(").expect("regex must compile");

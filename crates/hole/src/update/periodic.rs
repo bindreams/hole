@@ -11,8 +11,9 @@ pub const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from
 
 /// Start the periodic update checker.
 ///
-/// Checks immediately on launch, then every [`UPDATE_CHECK_INTERVAL`]. Once an update is found,
-/// publishes it to `UpdateState` and calls `on_update_found`, then stops.
+/// Checks immediately on launch, then every [`UPDATE_CHECK_INTERVAL`]. Once an
+/// update is found, publishes it to `UpdateState` and calls `on_update_found`,
+/// then stops.
 pub fn start_update_checker(app: AppHandle, on_update_found: impl Fn(&AppHandle, &super::UpdateInfo) + Send + 'static) {
     tauri::async_runtime::spawn(async move {
         loop {

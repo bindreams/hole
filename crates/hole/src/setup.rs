@@ -666,7 +666,7 @@ pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Err
 
 /// `uninstall_bridge`'s ordering, with the five effects injected so tests can
 /// drive it without touching SCM/launchd or the host firewall. The reasons for
-/// the order are in `docs/contributing/architecture/kill-switch-uninstall.md#the-order-of-an-uninstall`.
+/// the order are in `docs/contributing/architecture/kill-switch-uninstall.md`.
 ///
 /// - **The start-type lock is held for the whole run.** `hold` is taken before
 ///   the stop and kept until this returns, so no repair or enable runs between

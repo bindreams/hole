@@ -202,9 +202,9 @@ fn launch_gui(show_dashboard: bool) {
             // immediate first tick is the startup resync against the
             // bridge's actual state.
             tray::spawn_proxy_state_sync(app.handle());
-            // Startup auto-connect is the bridge's own decision: it applies its
-            // persisted `on_startup` preference at its own boot, before any GUI
-            // runs, so the GUI has nothing to arm here.
+            // Startup auto-connect is the bridge's own decision, applied from its
+            // persisted `on_startup` preference at each bridge boot; the GUI
+            // arms nothing.
             platform::on_setup(app)?;
             // Registrations written before the dashboard flag existed carry no
             // arguments and would open a window at login. Best-effort: never
