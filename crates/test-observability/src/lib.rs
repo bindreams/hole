@@ -29,23 +29,21 @@
 //! * Single ownership for the `pub use ::ctor;` re-export and the
 //!   `register!` macro.
 //!
-//! ## Avoiding the #147 LogTracer perf trap
+//! ## Avoiding the `LogTracer` perf trap
 //!
 //! `tracing_subscriber::fmt().init()` (and any `SubscriberInitExt::try_init`)
 //! calls `tracing_log::LogTracer::init()` as a side effect. That sets
 //! `log::max_level()` to `Trace` and routes every `log::debug!` /
 //! `log::trace!` from `shadowsocks-service`, `tokio`, `mio`, `hyper`
-//! through tracing — the per-event allocation in `tracing-log` tipped
-//! `server_test_tests` (real localhost TCP + 5 s timeouts) into CI
-//! timeout on GH Actions Windows runners. We install via the bare
+//! through tracing. That per-event allocation in `tracing-log` pushed
+//! `server_test_tests` (real localhost TCP, 5 s timeouts) into a timeout on
+//! GitHub Actions Windows runners. We install via the bare
 //! `tracing::subscriber::set_global_default` (not `try_init`), but the
 //! load-bearing safeguard is the EnvFilter default: the noisy
 //! third-party namespaces stay at `info` so their `log::trace!` /
 //! `log::debug!` events are level-rejected at `Dispatch::enabled()`
-//! before `tracing-log` allocates an `Event`.
-//!
-//! See bindreams/hole#147 for the regression constraint behind the
-//! EnvFilter-default safeguard.
+//! before `tracing-log` allocates an `Event`. `lib_tests.rs` pins that
+//! rejection.
 
 use std::io::Write;
 use std::sync::Once;
@@ -143,9 +141,7 @@ pub fn install() {
         if std::env::var_os("HOLE_LOGGING_TEST_KIND").is_some() {
             return;
         }
-        // SAFETY: ctor runs pre-main, single-threaded. The workspace
-        // has no other ctor that reads env vars (grep-verified for
-        // `ctor::declarative::ctor!` / `ctor::ctor`).
+        // SAFETY: see `install`'s doc: this runs before any other thread starts.
         if std::env::var_os("RUST_BACKTRACE").is_none() {
             unsafe { std::env::set_var("RUST_BACKTRACE", "full") };
         }
@@ -185,10 +181,9 @@ pub fn install() {
         // SubscriberInitExt::try_init() — so we do not call
         // LogTracer::init() ourselves. The EnvFilter handles noisy
         // third-party log events whether or not LogTracer ends up
-        // installed by another code path. See #147.
+        // installed by another code path.
         //
-        // If a foreign global subscriber was installed before our ctor
-        // (linker-order race, unlikely but theoretically possible),
+        // If a foreign global subscriber was installed before our ctor,
         // fail loud to stderr rather than silently swallow — this
         // crate's whole purpose is to NOT drop diagnostics silently.
         if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
@@ -203,10 +198,8 @@ pub fn install() {
         // stdlib default. Idempotent via its own AtomicBool, so
         // safe alongside the production caller `init_multi` (which also calls `install_panic_hook`).
         // Gated to Mac/Windows because `hole-common` only compiles
-        // on those platforms (see this crate's Cargo.toml); on
-        // Linux/etc. (where ex-Galoshes crates get clippy-checked
-        // and transitively pull in this crate via dev-deps) the
-        // stdlib default panic hook + `RUST_BACKTRACE=full` above
+        // on those platforms (see this crate's Cargo.toml); elsewhere
+        // the stdlib default panic hook + `RUST_BACKTRACE=full` above
         // is the fallback diagnostic.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         hole_common::logging::install_panic_hook();
@@ -215,8 +208,7 @@ pub fn install() {
         // hole_common tracing-emit hook (which chains over libtest's
         // panic printer). Test-support consumers register sources
         // via `panic_dump::register(Arc<dyn PanicDumpSource>)` —
-        // no per-consumer hook installation needed. See
-        // bindreams/hole#303.
+        // no per-consumer hook installation needed.
         panic_dump::install_panic_hook_once();
     });
 }

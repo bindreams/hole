@@ -42,7 +42,9 @@ impl DumpValue {
     }
 }
 
-/// Blessed tag names that trigger specific formatter behavior.
+/// Blessed tag names. Only [`SECRET`] and [`ELIDED`] change how the
+/// formatter renders a node; the others render as ordinary tags and
+/// document what the inner value holds.
 ///
 /// Tags matching `^[a-z][a-z0-9_-]*$` are reserved for this crate.
 /// User-defined tags should start with an uppercase ASCII letter or use
@@ -52,7 +54,8 @@ pub mod tag {
     pub const SECRET: &str = "secret";
     /// Inner value must be a `String` describing what was elided.
     pub const ELIDED: &str = "elided";
-    /// Inner value must be a `Map` with entries `value`, `shown`, `total`.
+    /// Inner value is a `Map` with entries `value`, `shown`, `total`. Reserved:
+    /// nothing in this crate produces it.
     pub const TRUNCATED: &str = "truncated";
     /// Inner value must be a `String` from `format!("{:?}", x)`. Used by
     /// the Debug-fallback rung of the autoref ladder.

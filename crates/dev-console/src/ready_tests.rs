@@ -35,7 +35,8 @@ async fn ready_listener_ignores_wrong_token_and_keeps_waiting() {
 /// THE load-bearing JoinSet property: an open-but-silent connection must not
 /// wedge the wait. A serial accept→read design hangs here (the mute conn is
 /// queued first and never sends); the per-connection-task design resolves on
-/// the real token regardless. Bounded by the per-test timeout (class-2).
+/// the real token regardless. Bounded only by the per-test timeout, a failure bound reported to a
+/// human.
 #[skuld::test]
 async fn ready_listener_survives_a_mute_connection() {
     let listener = ReadyListener::bind().await.unwrap();
@@ -63,11 +64,10 @@ async fn port_probe_finds_v4_listener() {
     assert!(wait_for_port(port, std::time::Duration::from_secs(5)).await);
 }
 
-/// The v6-only case dev.py §5.5 guards: a listener on ::1 only must still be
-/// found (hosts-file ordering can make Vite's `localhost` bind v6-only).
-/// Loud-fail by design if ::1 is unavailable — all six GitHub-hosted runner
-/// images have IPv6 loopback; a runner without it should break this test,
-/// not skip it.
+/// The v6-only case: a listener on ::1 only must still be found (hosts-file
+/// ordering can make Vite's `localhost` bind v6-only). Loud-fail by design if
+/// ::1 is unavailable: every GitHub-hosted runner image has IPv6 loopback, so a
+/// runner without it should break this test, not skip it.
 #[skuld::test]
 async fn port_probe_finds_v6_only_listener() {
     let Ok(l) = std::net::TcpListener::bind("[::1]:0") else {

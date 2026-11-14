@@ -1,8 +1,7 @@
 //! Cross-implementation interop tests: prove ex-ray is wire-compatible with
 //! genuine upstream shadowsocks/v2ray-plugin in BOTH directions.
 //!
-//! ex-ray (the first-party v2ray-core shim that replaced the vendored
-//! v2ray-plugin, #414) claims to be "wire-compatible with stock v2ray-plugin
+//! ex-ray (the first-party v2ray-core shim) claims to be "wire-compatible with stock v2ray-plugin
 //! both ways." A self-test (ex-ray↔ex-ray) cannot substantiate that claim — it
 //! only proves ex-ray agrees with itself. These tests run a REAL cross-process
 //! round-trip against a PINNED upstream v2ray-plugin build, sending real bytes
@@ -143,7 +142,7 @@ fn interop_stock_client_ex_ray_server() {
 // QUIC interop ========================================================================================================
 
 /// QUIC cross-impl tests, mirroring the websocket trio over the QUIC transport
-/// (`mode=quic`) — the path #421 unblocked. Two of three directions run; the
+/// (`mode=quic`). Two of three directions run; the
 /// stock-as-QUIC-server direction is `#[ignore]`d (bindreams/hole#428).
 ///
 /// **Non-Windows gate.** QUIC mandates TLS, and these tests present a
@@ -152,17 +151,16 @@ fn interop_stock_client_ex_ray_server() {
 /// non-Windows; on Windows `getCertPool` returns the bare system store and
 /// drops the custom cert, so a self-signed server cert fails with "certificate
 /// signed by unknown authority". Production is unaffected (real CA-signed QUIC
-/// servers verify against the OS store with no custom cert). See bindreams/hole#421.
+/// servers verify against the OS store with no custom cert).
 ///
 /// Like `assert_roundtrip`, readiness is deterministic via the launcher's
 /// sitrep `ready`: ex-ray UDP-probes its own QUIC inbound before reporting
-/// ready (bindreams/hole#421), so `start_real_ss_server_with_plugin_quic`
+/// ready, so `start_real_ss_server_with_plugin_quic`
 /// returns only once the server is accepting. A single roundtrip therefore
 /// suffices — no retry, no time budget, no sleep. (A TCP `wait_for_port` would
 /// not work here regardless: the public endpoint is UDP-only and a TCP poll
-/// can't observe a UDP listener.) Every *active* QUIC test below uses ex-ray as
-/// the server; the lone stock-as-QUIC-server direction is `#[ignore]`d (#428),
-/// so `ReadinessMode::Auto`'s sitrep path always drives readiness here.
+/// can't observe a UDP listener.) Every active QUIC test below uses ex-ray as
+/// the server, so `ReadinessMode::Auto`'s sitrep path always drives readiness here.
 #[cfg(not(target_os = "windows"))]
 mod quic {
     use super::{require_binary, rt, start_fake_sentinel, PORT_ALLOC};
@@ -212,7 +210,7 @@ mod quic {
 
     /// QUIC self-consistency: ex-ray on BOTH ends. Needs only `cargo xtask
     /// ex-ray`. Proves ex-ray's own QUIC server binds a UDP listener and a full
-    /// client→server→sentinel round-trip works — the regression #421 fixed.
+    /// client→server→sentinel round-trip works.
     #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
     fn interop_quic_ex_ray_both_ends() {
         let ex_ray = locate_ex_ray();
@@ -246,8 +244,8 @@ mod quic {
     }
 
     /// QUIC cross-impl direction 2: stock-v2ray-plugin CLIENT talking to an
-    /// ex-ray QUIC SERVER. Proves ex-ray's QUIC server wire output (the path
-    /// #421 unblocked) is understood by genuine upstream v2ray-plugin.
+    /// ex-ray QUIC SERVER. Proves ex-ray's QUIC server wire output is
+    /// understood by genuine upstream v2ray-plugin.
     #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
     fn interop_quic_stock_client_ex_ray_server() {
         let ex_ray = locate_ex_ray();
