@@ -1,9 +1,8 @@
 // Garter-based plugin lifecycle management.
 //
-// Replaces shadowsocks-service's built-in `PluginConfig` spawning with
-// Garter's `BinaryPlugin` + `ChainRunner`, giving us structured log
-// capture, SIP003u-compliant graceful shutdown, and future chain
-// composition support.
+// Plugins run through Garter's `BinaryPlugin` + `ChainRunner` rather than
+// shadowsocks-service's built-in `PluginConfig` spawning, which gives structured
+// log capture, SIP003u-compliant graceful shutdown, and chain composition.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -154,7 +153,7 @@ struct ChainTask {
 
 impl ChainTask {
     /// Cancel the chain, abort its task and wait until the runner is gone. The plugins get no grace period: garter's
-    /// own drain would hold a cancelled start, and a stop, for up to 12 s. The abort drops each plugin's task,
+    /// own drain would hold a cancelled start, and a stop, for its whole drain bound. The abort drops each plugin's task,
     /// possibly after this returns; a plugin's child goes when its task is dropped.
     async fn end(mut self) {
         self.cancel.cancel();
@@ -203,7 +202,7 @@ fn runtime_dir_env(plugin: &BundledPlugin) -> Option<(&'static str, String)> {
 /// propagate immediately. `bind_ephemeral`'s in-process probe step (run
 /// before each `op` call) is what catches the Windows excluded-range
 /// race class here, before the subprocess spawn. The residual
-/// probe-drop-to-subprocess-bind TOCTOU is tracked in bindreams/hole#304.
+/// probe-drop-to-subprocess-bind TOCTOU is open, bindreams/hole#304.
 #[allow(clippy::too_many_arguments)] // bundling into a struct adds more noise than the warning; matches spawn_plugin_runner_at below.
 pub async fn start_plugin_chain(
     plugin: &BundledPlugin,
@@ -266,7 +265,7 @@ pub async fn start_plugin_chain(
             }
             // The chain never became a `PluginChain`, so nothing downstream can
             // reach its ring. "exited before becoming ready" and "did not become
-            // ready within 30s" carry no detail of their own, and the plugin's
+            // ready" carry no detail of their own, and the plugin's
             // own last lines are the only account of why — emit them here, once,
             // after every bind retry has had its say.
             crate::proxy::plugin_log::warn_recent(&log);
@@ -348,14 +347,14 @@ fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
 }
 
 /// Single-attempt plugin-runner spawn. Constructs `BinaryPlugin`
-/// (with optional `pid_sink`), wraps in `TapPlugin` when
-/// `HOLE_BRIDGE_PLUGIN_TAP=1`, builds the `ChainRunner`, spawns it,
-/// and awaits readiness with a 30-second timeout. The chain's task is owned
+/// (with optional `pid_sink`), wraps in `TapPlugin` when the tap is enabled
+/// ([`resolve_tap_source`]), builds the `ChainRunner`, spawns it,
+/// and awaits readiness, bounded by `READINESS_TIMEOUT`. The chain's task is owned
 /// by a [`ChainTask`] from the spawn on: a failure ends it before it returns
 /// (see [`ready_or_end`]), and the future being dropped ends it, so a retried attempt by `bind_ephemeral` doesn't
 /// leak the previous attempt's task. On success returns `(task, ready_addr, transports)`
 /// — the caller wraps these in a [`PluginChain`]. The `transports` is the
-/// sitrep-reported end-to-end transport set (#414), threaded into the
+/// sitrep-reported end-to-end transport set, threaded into the
 /// bridge's UDP-drop policy.
 ///
 /// A plugin `StartError::BindConflict` (the only retryable start class)
@@ -486,7 +485,10 @@ async fn await_ready(
                 Err(ProxyError::Plugin(format!("plugin failed to start: {detail}")))
             }
             Ok(Err(_)) => Err(ProxyError::Plugin("plugin exited before becoming ready".into())),
-            Err(_) => Err(ProxyError::Plugin("plugin did not become ready within 30s".into())),
+            Err(_) => Err(ProxyError::Plugin(format!(
+                "plugin did not become ready within {}s",
+                READINESS_TIMEOUT.as_secs()
+            ))),
         },
     }
 }
@@ -508,7 +510,7 @@ async fn await_ready(
 ///   races we can in-band classify; the in-process probe step inside
 ///   `bind_ephemeral` already catches Windows excluded-range
 ///   disagreements before the subprocess spawn (stderr-based
-///   classification of subprocess bind failures is bindreams/hole#304).
+///   classification of subprocess bind failures is open, bindreams/hole#304).
 /// - [`ProxyError::Cancelled`] (bridge cancel observed mid-spawn)
 ///   — a non-bind-race `io::Error::other`; the outer `start_plugin_chain`
 ///   distinguishes it via `cancel.is_cancelled()` to re-emit the
@@ -608,20 +610,13 @@ pub(crate) fn ech_doh_will_reach_ex_ray(
 }
 
 /// Which `ech-doh` value ex-ray will actually dial for this exact
-/// `(plugin, opts, ech_doh)` triple — a PURE query, no logging. Shares
-/// [`classify_ech_doh`] with `inject_plugin_directives`, so the "will
-/// something fetch an ECH config, and whose value" question and the actual
-/// plugin spawn read the exact same parse and the exact same outrank
-/// decision (they cannot drift the way two independent re-derivations of
-/// the parse + `hole_ech_doh_outranks` could), WITHOUT also
-/// re-triggering `inject_plugin_directives`'s `tracing::warn!` calls: this
-/// is queried once per start attempt from the permit-derivation path
-/// (`ProxyManager::start_cancellable`), and the eventual plugin spawn calls
-/// `inject_plugin_directives` again for real — calling that function here
-/// too would double-emit every ECH-posture warning on every start. A
-/// malformed `opts` string reads as `None` too — the same input that would
-/// make `inject_plugin_directives` return `Err`, so the plugin chain never
-/// starts and nothing ech-doh-shaped ever reaches ex-ray.
+/// `(plugin, opts, ech_doh)` triple: a PURE query, no logging. It shares
+/// [`classify_ech_doh`] with `inject_plugin_directives`, so the permit
+/// derivation and the plugin spawn read the same parse and the same outrank
+/// decision, but it does not re-trigger `inject_plugin_directives`'s
+/// `tracing::warn!` calls. A malformed `opts` string reads as
+/// `None` too: the same input makes `inject_plugin_directives` return `Err`,
+/// so the plugin chain never starts.
 pub(crate) fn effective_ech_doh(
     plugin: &PluginDescriptor,
     opts: Option<&str>,
@@ -664,149 +659,26 @@ pub(crate) fn derive_ech_doh(
     derived
 }
 
-/// ex-ray's own default for the `host` option
-/// (`crates/ex-ray/config.go:65`: `flag.String("host", "cloudfront.com", ...)`)
-/// — a real DOMAIN, not "no SNI". An absent `host` segment is NOT the same
-/// as an unreachable config; see `ex_ray_default_host_matches_vendored_config_go`
-/// for the executable pin against the vendored Go source (can't run the Go
-/// code itself, but a text-level assertion still fails loudly if the
-/// literal ever changes there without a matching edit here).
+/// ex-ray's own default for the `host` option (`crates/ex-ray/config.go`) — a
+/// real DOMAIN, not "no SNI". An absent `host` segment is NOT the same as an
+/// unreachable config. `ex_ray_default_host_matches_vendored_config_go` pins it
+/// against the vendored Go source by text.
 const EX_RAY_DEFAULT_HOST: &str = "cloudfront.com";
 
-/// Whether ex-ray's own config-build step — `parseOptsIntoFlags`
-/// (options.go, main.go), `registerTCPKeepAlive` + `generateConfig`
-/// (config.go), run before `server.Start()` — would REJECT this segment set
-/// outright, in which case the whole plugin process exits (23) before it
-/// dials anything at all, ECH-config fetch included. Returns the rejecting
-/// key, first-wins (matching `Args.Get`) among segments sharing a key,
-/// checked in ex-ray's OWN evaluation order below so the diagnostic names
-/// the key ex-ray itself would report first — the cover-permit /
-/// reachability side only needs `.is_some()`, order-independent.
+/// Whether ex-ray's config build would REJECT this segment set outright: the plugin then exits before it dials
+/// anything, ECH-config fetch included. Mirrors `parseOptsIntoFlags` (options.go, main.go), `registerTCPKeepAlive`
+/// and `generateConfig` (config.go) and `core.New`, checking in ex-ray's own order. Returns the first rejecting key;
+/// among segments sharing a key the first wins, as `Args.Get` does.
 ///
-/// `parseOptsIntoFlags` shares one rule across every option it validates: an
-/// ABSENT key is a no-op (the flag keeps its default); any PRESENT value —
-/// an explicitly empty one included — must be well-formed or the option is
-/// fatal. Checked in `parseOptsIntoFlags`'s own order:
-/// - `mux` (`parseIntOption`): a present value `strconv.Atoi` can't parse
-///   (non-numeric, or explicitly empty) is fatal — galoshes appends `mux=0`
-///   and ex-ray is first-wins, so an operator's own unparseable `mux=` must
-///   not silently win over it and leave Mux.Cool on.
-/// - `tcp-keepalive` (`parseIntOption`): same parse rule as `mux`.
-/// - `tls` (`parseBoolOption`): a present value other than `"1"` is fatal —
-///   a presence-only flag with no wider "truthy" vocabulary.
-/// - `host`/`path` (`parseStringOption`, `emptyOK=false`): a present but
-///   EXPLICITLY EMPTY value is fatal — unlike `cert`/`certRaw`/`key`
-///   (`emptyOK=true`, disclosed below), empty has no documented meaning for
-///   these two. [`ech_fetch_is_reachable`] relies on this rather than
-///   modeling its own fallback for an empty `host=` — see that function's
-///   doc.
-/// - `server`/`fastOpen`/`__android_vpn` (`parseBoolOption`): same
-///   present-value rule as `tls`.
-/// - `fwmark` (`parseIntOption`): same parse rule as `mux`.
-/// - `ech` is a CLOSED enum (`parseEnumOption`) — validated
-///   UNCONDITIONALLY here, not only when TLS is enabled: `generateConfig`
-///   separately rejects `ech=always` with TLS not enabled (below), the
-///   TLS-dependent half of `ech`'s validation.
-/// - `ech-doh` (`parseURLOption`): empty is a documented no-op ("disables
-///   ECH"), but a present, non-empty value that isn't a well-formed
-///   `https://` URL with a host is fatal. Checked only when the CONFIG's
-///   own value is what ex-ray will actually read: Hole's own injection
-///   (always well-formed by construction) strips it whenever
-///   [`ech_doh_displaces`] is true.
-///
-/// Then `registerTCPKeepAlive` and main()'s own pre-`generateConfig` guards:
-/// - `tcp-keepalive`, again: a value that parsed above is now range-checked
-///   against `tcpKeepAliveParams`' `0..=32767` — EXCEPT under a `server`
-///   segment: `registerTCPKeepAlive` returns early for `*server`, without
-///   range-checking; server mode's own range check is unconditional inside
-///   `generateConfig` instead, much later (below).
-/// - `localPort` (main.go's cross-assign + `validPort` ==
-///   `net.PortFromString`): must be an unsigned base-10 literal `<=65535`
-///   and not `0` — `0` is otherwise valid syntax
-///   (`net.PortFromString("0")` succeeds) but ex-ray cannot honor
-///   OS-assigned-port semantics. Under a `server` segment, main.go
-///   cross-assigns the `remotePort` KEY here instead of `localPort` — but
-///   both keys share this exact rule, so which one is checked never
-///   changes the verdict, only (irrelevantly) which literal key name a
-///   hypothetical diagnostic would cite; not worth branching on.
-/// - `localAddr` (main.go's cross-assign + `canonicalLocalAddr`): must be a
-///   single (`|`-free) IP literal — a domain or a `|`-joined multi-address
-///   list is fatal, since the sitrep's `ready` event can report only one
-///   `listen` address. Under a `server` segment, main.go cross-assigns the
-///   `remoteAddr` KEY to `*localAddr` — UNLIKE the port pair above, this
-///   rule genuinely differs from `remoteAddr`'s own (below), so which key
-///   is checked against which rule swaps under `server`.
-///
-/// Then `generateConfig`:
-/// - `remotePort`, same rule and same server-mode key-swap non-issue as
-///   `localPort` above, checked here instead.
-/// - `remoteAddr`: must not normalize to an empty domain or the unspecified
-///   IP (`0.0.0.0`/`::`) — freedom's destination override would otherwise
-///   dial nowhere honestly. Under a `server` segment, checked against the
-///   `localAddr` KEY instead (swapped with the bullet above, same
-///   cross-assign).
-/// - `mux`, again: a value that parsed above is now range-checked against
-///   `uint32Opt`'s `0..=u32::MAX`.
-/// - `fwmark`, same range check as `mux`.
-/// - `mode` is a CLOSED enum (`switch *mode`): outside `websocket`/`quic`
-///   is fatal.
-/// - `ech=always` with TLS not enabled is fatal — the TLS-dependent half of
-///   `ech`'s validation (above): a valid-vocabulary `ech=always` with no
-///   `tls` and no `mode=quic` promises fail-closed ECH it cannot deliver.
-/// - `cert`/`certRaw`/`key` present (non-empty) with TLS not enabled is
-///   fatal too — the material would otherwise be silently never read.
-/// - `tcp-keepalive`, again, under a `server` segment ONLY (the
-///   `registerTCPKeepAlive`-position check above skips it there): the same
-///   `0..=32767` range check `generateConfig` itself runs unconditionally,
-///   regardless of `*server`.
-/// - `ech=always` additionally requires a non-empty RESOLVED `ech-doh`
-///   (`buildTLSConfig`, reached only `if *tlsEnabled`) — the value ex-ray
-///   actually receives once Hole's own injection wins or loses against the
-///   operator's; see [`resolved_ech_doh_is_empty`] for why that is
-///   recomputed rather than shared with [`classify_ech_doh`].
-///
-/// Then `core.New`, once `generateConfig` has fully succeeded:
-/// - `mux`, a THIRD time: a non-zero `Concurrency` outside `1..=1024` on
-///   the websocket transport only (`quic`'s mux is never read).
-///
-/// `mux`/`fwmark` are each checked TWICE (parse, then range) at their own
-/// two real positions above — no order fidelity is relaxed for these two.
-/// `tcp-keepalive` is checked twice too, but at ONE OF TWO MUTUALLY
-/// EXCLUSIVE positions depending on `server` (never both), not the same
-/// position regardless of mode.
-///
-/// **Not modeled, and why it's safe not to:** `loglevel` is ALSO fatal when
-/// explicitly empty (`parseStringOption`) or unrecognized (`logConfig`) —
-/// but `inject_plugin_directives` ALWAYS strips the operator's own
-/// `loglevel` and appends `loglevel=debug`, unconditionally, whether or not
-/// Hole's `ech-doh` wins. No value from `segments` (read pre-injection
-/// here) ever reaches ex-ray unmodified, so modeling it would produce a
-/// FALSE fatal for a config that starts fine in practice — the opposite of
-/// the over-permit risk this gate exists to close.
-///
-/// **Disclosed, deliberately unmodeled:** `cert`/`certRaw`/`key`'s CONTENT
-/// (a readable, well-formed X509 pair) requires filesystem I/O this
-/// otherwise-pure gate doesn't perform — only their presence-without-TLS is
-/// checked above. `server`'s `localAddr`/`remoteAddr` cross-assign IS
-/// modeled (the two bullets above); its `mux`-concurrency exemption is
-/// modeled too (`core.New` bullet below). What stays unmodeled: whether
-/// ex-ray's OWN v2ray-core dependency even performs the DoH fetch this gate
-/// reasons about for a server listener at all — `GetTLSConfig` is called
-/// directly for server listeners too (their own doc: "only server
-/// listeners... call this directly"), and `ApplyECH` doesn't itself branch
-/// on `*server`, but `ech_fetch_is_reachable`'s empty-stripped-SNI fallback
-/// specifically models `tls.WithDestination`, a CLIENT-DIAL option
-/// (`websocket/dialer.go`) with no evident server-listener equivalent in
-/// this vendored source — modeling that with confidence needs tracing
-/// v2ray-core's server-listener construction path, not attempted here.
-/// Hole never spawns ex-ray as a server regardless, so an operator would
-/// have to hand-author `server` into their own `plugin_opts` to reach any
-/// of this.
+/// Not modelled (reasons: the ECH-config reachability gate in docs/contributing/architecture/kill-switch.md):
+/// - `loglevel`: `inject_plugin_directives` always replaces it.
+/// - `cert`/`certRaw`/`key` content: needs file I/O; only presence without TLS is checked.
+/// - Whether a `server`-mode listener performs the ECH fetch at all.
 fn ex_ray_fatal_config_error(
     segments: &[garter::OptionSegment<'_>],
     ech_doh: Option<&crate::dns::ech::EchDoh>,
 ) -> Option<&'static str> {
-    // parseOptsIntoFlags, in its own internal order.
+    // parseOptsIntoFlags, in its own internal order. `mux`, `tcp-keepalive` (parseIntOption): must parse.
     for key in ["mux", "tcp-keepalive"] {
         if segments
             .iter()
@@ -816,6 +688,7 @@ fn ex_ray_fatal_config_error(
             return Some(key);
         }
     }
+    // `tls` (parseBoolOption): a present value must be "1".
     if segments
         .iter()
         .find(|s| s.key == "tls")
@@ -823,6 +696,7 @@ fn ex_ray_fatal_config_error(
     {
         return Some("tls");
     }
+    // `host`, `path` (parseStringOption, emptyOK=false): present but empty is fatal.
     for key in ["host", "path"] {
         if segments
             .iter()
@@ -832,6 +706,7 @@ fn ex_ray_fatal_config_error(
             return Some(key);
         }
     }
+    // `server`, `fastOpen`, `__android_vpn` (parseBoolOption).
     for key in ["server", "fastOpen", "__android_vpn"] {
         if segments
             .iter()
@@ -841,6 +716,7 @@ fn ex_ray_fatal_config_error(
             return Some(key);
         }
     }
+    // `fwmark` (parseIntOption): must parse.
     if segments
         .iter()
         .find(|s| s.key == "fwmark")
@@ -848,12 +724,15 @@ fn ex_ray_fatal_config_error(
     {
         return Some("fwmark");
     }
+    // `ech` (parseEnumOption): closed vocabulary, checked whether or not TLS is on.
     let ech = segments.iter().find(|s| s.key == "ech").map(ex_ray_flag_value);
     if let Some(v) = ech {
         if !matches!(v, "never" | "auto" | "always") {
             return Some("ech");
         }
     }
+    // `ech-doh` (parseURLOption): a non-empty value must be an https URL with a host. Checked only when the
+    // config's value is the one ex-ray reads; Hole's own (well-formed) value replaces it when it displaces it.
     if let Some(s) = segments.iter().find(|s| s.key == "ech-doh") {
         let v = ex_ray_flag_value(s);
         if !v.is_empty() && !ech_doh_displaces(segments, ech_doh) && !ex_ray_value_is_https_url(v) {
@@ -861,8 +740,7 @@ fn ex_ray_fatal_config_error(
         }
     }
 
-    // registerTCPKeepAlive + main()'s own pre-generateConfig guards.
-    // Server-mode tcp-keepalive split — see this fn's doc.
+    // registerTCPKeepAlive: `tcp-keepalive` range check, skipped under `server` (generateConfig repeats it below).
     let server_present = segments.iter().any(|s| s.key == "server");
     if !server_present
         && segments.iter().find(|s| s.key == "tcp-keepalive").is_some_and(|s| {
@@ -873,6 +751,8 @@ fn ex_ray_fatal_config_error(
     {
         return Some("tcp-keepalive");
     }
+    // main.go validPort (`net.PortFromString`, nonzero) for `localPort`; under `server` the `remotePort` key is
+    // cross-assigned here, but both share this rule.
     if segments
         .iter()
         .find(|s| s.key == "localPort")
@@ -880,12 +760,8 @@ fn ex_ray_fatal_config_error(
     {
         return Some("localPort");
     }
-    // main.go's cross-assign sends a `localAddr` OPTION to `*remoteAddr`
-    // under `*server` — so the KEY validated against `*localAddr`'s own
-    // rule (a single IP literal) is `remoteAddr`, not `localAddr`, in that
-    // mode. The two rules genuinely differ (unlike the port pair below,
-    // where both directions share one rule), so the swap changes the
-    // verdict.
+    // main.go's cross-assign: under `*server` the `remoteAddr` KEY feeds `*localAddr`, so the two address keys swap
+    // rules. (The port pair shares one rule, so it needs no swap.) `localAddr` rule: canonicalLocalAddr.
     let (local_addr_key, remote_addr_key) = if server_present {
         ("remoteAddr", "localAddr")
     } else {
@@ -899,7 +775,7 @@ fn ex_ray_fatal_config_error(
         return Some(local_addr_key);
     }
 
-    // generateConfig.
+    // generateConfig: `remotePort`, same rule as `localPort`.
     if segments
         .iter()
         .find(|s| s.key == "remotePort")
@@ -907,6 +783,7 @@ fn ex_ray_fatal_config_error(
     {
         return Some("remotePort");
     }
+    // generateConfig: `remoteAddr` must not normalize to an empty domain or an unspecified IP.
     if segments
         .iter()
         .find(|s| s.key == remote_addr_key)
@@ -914,6 +791,7 @@ fn ex_ray_fatal_config_error(
     {
         return Some(remote_addr_key);
     }
+    // generateConfig: `mux`, `fwmark` range check (uint32Opt).
     for key in ["mux", "fwmark"] {
         if segments.iter().find(|s| s.key == key).is_some_and(|s| {
             !ex_ray_flag_value(s)
@@ -923,6 +801,7 @@ fn ex_ray_fatal_config_error(
             return Some(key);
         }
     }
+    // generateConfig: `mode` is a closed enum.
     let mode = segments.iter().find(|s| s.key == "mode").map(ex_ray_flag_value);
     if let Some(v) = mode {
         if !matches!(v, "websocket" | "quic") {
@@ -930,6 +809,7 @@ fn ex_ray_fatal_config_error(
         }
     }
     let tls_enabled = segments.iter().any(|s| s.key == "tls") || mode == Some("quic");
+    // generateConfig: `ech=always` without TLS, and cert material without TLS.
     if ech == Some("always") && !tls_enabled {
         return Some("ech");
     }
@@ -942,7 +822,7 @@ fn ex_ray_fatal_config_error(
     if !tls_enabled && cert_material_present {
         return Some("cert");
     }
-    // The `*server` case skipped above — checked here instead.
+    // generateConfig: the `tcp-keepalive` range check the `server` case skipped above.
     if server_present
         && segments.iter().find(|s| s.key == "tcp-keepalive").is_some_and(|s| {
             !ex_ray_flag_value(s)
@@ -952,12 +832,12 @@ fn ex_ray_fatal_config_error(
     {
         return Some("tcp-keepalive");
     }
+    // buildTLSConfig: `ech=always` needs a non-empty resolved `ech-doh`.
     if ech == Some("always") && tls_enabled && resolved_ech_doh_is_empty(segments, ech_doh) {
         return Some("ech-doh");
     }
 
-    // core.New, once generateConfig has fully succeeded (doc: mux, a third
-    // time; skipped alongside the server residual).
+    // core.New: websocket `mux` concurrency must be 0 or within the Mux.Cool limit (quic never reads it).
     if mode != Some("quic") && !server_present {
         let mux = segments
             .iter()
@@ -1016,7 +896,7 @@ fn ex_ray_parses_as_uint32(v: &str) -> Option<u32> {
 /// set, independent of which `ech-doh` value would win. Neither the cover
 /// permit, the residual-stall warning, nor `inject_plugin_directives`'s own
 /// ECH-posture logging may treat a fetch that provably cannot happen as one
-/// that will — three independent conditions, each first-wins (matching
+/// that will — four independent conditions, each first-wins (matching
 /// `Args.Get`):
 /// - [`ex_ray_fatal_config_error`] is `Some` — the whole plugin process
 ///   exits before it ever starts, so no dial of any kind happens. This also
@@ -1044,9 +924,8 @@ fn ex_ray_parses_as_uint32(v: &str) -> Option<u32> {
 ///   and `WithDestination` only ever fills an ALREADY-`""` `ServerName`
 ///   from the dial destination — so the empty-after-strip case reaches
 ///   `ApplyECH` with `remoteAddr` as its SNI, same first-wins rule as every
-///   other key here (third_party/v2ray-core/transport/internet/tls/
-///   config.go:20,173-183,262-264,296-301,371-381; `ech.go:26-51,37-51`;
-///   `websocket/dialer.go:67`).
+///   other key here (third_party/v2ray-core/transport/internet/tls/config.go
+///   and `ech.go`; `websocket/dialer.go` passes the option).
 ///
 /// Every flag read here goes through [`ex_ray_flag_value`] rather than
 /// `OptionSegment::value` — see its doc. For `host` the divergence is
@@ -1087,7 +966,7 @@ fn ech_fetch_is_reachable(segments: &[garter::OptionSegment<'_>], ech_doh: Optio
 
 /// v2ray-core's `Config.parseServerName` strips this literal prefix from the
 /// TLS `ServerName` before `ApplyECH` (and `GetTLSConfig` generally) ever
-/// reads it (third_party/v2ray-core/transport/internet/tls/config.go:20).
+/// reads it (third_party/v2ray-core/transport/internet/tls/config.go).
 /// Pinned against the vendored source by
 /// `ech_and_mode_enums_match_vendored_config_go`.
 const V2RAY_CORE_EXP_8357_PREFIX: &str = "experiment:8357";
@@ -1103,7 +982,7 @@ fn ex_ray_flag_value<'a>(s: &'a garter::OptionSegment<'_>) -> &'a str {
 }
 
 /// Mirrors v2ray-core's `net.ParseAddress` normalization
-/// (third_party/v2ray-core/common/net/address.go:78-95): strips ONE matched
+/// (third_party/v2ray-core/common/net/address.go): strips ONE matched
 /// `[...]` bracket pair, then trims surrounding whitespace ONLY when the
 /// first or last byte isn't alphanumeric.
 fn v2ray_core_normalize(value: &str) -> &str {
@@ -1152,11 +1031,9 @@ fn ex_ray_local_addr_is_invalid(value: &str) -> bool {
 ///
 /// `IpAddr::to_canonical()` folds an IPv4-mapped IPv6 literal
 /// (`::ffff:0.0.0.0`) to plain IPv4 BEFORE the unspecified test, mirroring
-/// v2ray-core's own `IPAddress()` constructor (third_party/v2ray-core/
-/// common/net/address.go:99-101, `bytes[:10]==0 && [10]==[11]==0xff`) —
-/// without the fold, `Ipv6Addr::is_unspecified()` (`octets() == [0; 16]`)
-/// misses it: `::ffff:0.0.0.0`'s last four octets are `0.0.0.0`, but its
-/// 11th/12th are `0xff`, so the raw 16-byte check reads it as specified.
+/// v2ray-core's own `IPAddress()` constructor (third_party/v2ray-core/common/net/address.go,
+/// which folds when `bytes[:10]==0 && [10]==[11]==0xff`). Without the fold,
+/// `Ipv6Addr::is_unspecified()` (`octets() == [0; 16]`) misses it.
 fn ex_ray_remote_addr_is_invalid(value: &str) -> bool {
     let normalized = v2ray_core_normalize(value);
     match normalized.parse::<std::net::IpAddr>() {
@@ -1229,7 +1106,7 @@ fn classify_ech_doh(
     }
 
     // ex-ray only arms ECH_DOHserver when the value is non-empty
-    // (config.go:360-361: `if *echDoh != "" { tlsConfig.Ech_DOHserver =
+    // (config.go: `if *echDoh != "" { tlsConfig.Ech_DOHserver =
     // *echDoh }`) — an EMPTY operator value is inert, same as no `ech-doh`
     // at all. A BARE `ech-doh` (no `=`) is different: it reads as ex-ray's
     // own literal `"1"` (args.go), not an empty string, and `parseURLOption`
@@ -1263,6 +1140,7 @@ fn classify_ech_doh(
 /// `v2ray-plugin` resolves to the first-party `ex-ray` binary, a config may
 /// also name `ex-ray` directly, and `galoshes` ignores the keys itself but
 /// forwards the whole options string to its inner ex-ray.
+///
 /// Emits the ECH-posture `tracing::warn!` lines — called exactly once per
 /// actual plugin spawn (`start_plugin_chain`); the permit-derivation query
 /// [`effective_ech_doh`] deliberately does NOT call this, to avoid
@@ -1638,7 +1516,7 @@ mod inject_tests {
 
     // The cohort a pin-only rule would miss: a literal-IP server entry needs no
     // bootstrap query, so nothing is pinned — yet postern's hostname URL would
-    // still win under first-wins and cost the plaintext lookup #694 is about.
+    // still win under first-wins and cost the plaintext lookup the pin exists to close.
     #[skuld::test]
     fn an_unpinned_url_still_displaces_a_name_config_value() {
         let out = merged(
@@ -2964,7 +2842,7 @@ mod inject_tests {
         // nothing to do with the bound it protects (e.g. to stop a
         // mux=abc\;certRaw=SECRET-shaped escape from leaking a later
         // segment's value through it) — a message-text pin would go stale
-        // for that unrelated reason, and did.
+        // for that unrelated reason.
         assert!(
             source.contains("v >= 0 && v <= math.MaxUint32"),
             "ex_ray_fatal_config_error's mux/fwmark range (0..=u32::MAX) no longer matches \

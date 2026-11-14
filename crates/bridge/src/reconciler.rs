@@ -1,10 +1,8 @@
 //! Pure reconciliation decisions, and the order the two surfaces move in.
 //!
-//! Split out from any call site so cover fate and tunnel fate stop being
-//! expressible by imitation (`StopReason`'s two-variant trap, `check_health`
-//! hand-copying `stop_with`'s arm). Nothing here
-//! performs I/O: every function is a table lookup from measured/decided
-//! inputs to a step, and the actual driving of those steps lives elsewhere.
+//! Kept apart from any call site so cover fate and tunnel fate are decided in one place and
+//! not re-derived by imitation. Nothing here performs I/O: every function is a table lookup
+//! from measured/decided inputs to a step.
 
 use std::sync::Arc;
 
@@ -94,8 +92,7 @@ pub fn cover_step(intent: Intent, presence: CoverPresence, target: &Target) -> C
         Target::Unreadable => CoverStep::Hold,
 
         // The target no longer authorises the cover, regardless of what the
-        // preference says — this is the surface no longer being derived
-        // from the tunnel, applied to the opposite direction too.
+        // preference says.
         Target::Off => match presence {
             P::Live => CoverStep::Release,
             P::Recorded => CoverStep::Release,
@@ -113,7 +110,7 @@ pub fn cover_step(intent: Intent, presence: CoverPresence, target: &Target) -> C
             (I::On, P::Unreachable) => CoverStep::Hold,
 
             // `Unreadable` reads as armed (`Intent::reads_armed`), the same
-            // conservative lean the sibling file uses: an unreadable
+            // conservative lean `decide_cover_recovery` takes: an unreadable
             // preference is not consent to disarm.
             (I::Unreadable, P::Live) => CoverStep::Hold,
             (I::Unreadable, P::Recorded) => CoverStep::Engage,
@@ -186,10 +183,8 @@ pub enum CoverDisposition {
 
 /// Decide a torn-down session's cover fate from the CAUSE of the teardown.
 ///
-/// Exhaustive over [`SessionEvent`] with no wildcard, so a sixth variant
-/// cannot inherit an answer by falling into someone else's group — the defect
-/// this function exists to remove, and the one the transient-cover match
-/// reproduced by grouping on shared consequence to the target.
+/// Exhaustive over [`SessionEvent`] with no wildcard, so a new variant cannot
+/// inherit an answer by falling into someone else's group.
 ///
 /// `UserStopped` is an explicit user disarm: it releases regardless of intent,
 /// presence or target, because an escape must resolve an unknown toward
@@ -197,9 +192,7 @@ pub enum CoverDisposition {
 ///
 /// `GaveUp` is deliberately NOT grouped with it. Both move the target to
 /// `Off`, but giving up is the SYSTEM concluding the target is unreachable,
-/// not the user asking to open the host — so it defers to [`cover_step`],
-/// preserving today's behaviour rather than silently changing a policy nobody
-/// has been asked about.
+/// not the user asking to open the host — so it defers to [`cover_step`].
 pub fn teardown_cover_disposition(
     event: SessionEvent,
     intent: Intent,
@@ -231,19 +224,20 @@ pub fn teardown_cover_disposition(
 /// Separate from [`teardown_cover_disposition`] because the two covers answer
 /// different questions. The standing cover asks what the target authorises;
 /// this one asks only **"will a successor process adopt these filters"** —
-/// true for `CutoverRestart` alone, where a replacement bridge is already
-/// starting. Nothing adopts them on a clean shutdown, so keeping them there
+/// true for `CutoverRestart` (with the `Blipped` exception below), where a
+/// replacement bridge is already starting. Nothing adopts them on a clean shutdown, so keeping them there
 /// blocks the host from boot until the bridge next runs.
 ///
-/// Exhaustive with no wildcard: the arm this replaced grouped
-/// `CutoverRestart | Blipped | ProcessExiting` by their shared consequence to
-/// the target, which is what let `ProcessExiting` inherit an answer chosen for
-/// a cutover.
+/// Exhaustive with no wildcard, and never grouped by a shared consequence to
+/// the target: that is what would let `ProcessExiting` inherit an answer chosen
+/// for a cutover.
 ///
-/// `Blipped` deliberately keeps today's behaviour pending an open question:
-/// a blip's cover arguably *should* survive an in-process retry, but
-/// `stop_with` has already replaced the posture with `Idle` by this point, so
-/// nothing would own it. Changing it is a policy call, not a defect fix.
+/// `Blipped` is the one exception to "a successor adopts": it keeps the cover
+/// engaged with no successor process. `stop_with` has already replaced the
+/// posture with `Idle` by this point, so nothing owns the cover until the next
+/// start sweeps it, and the host stays blocked meanwhile. Whether a blip's cover
+/// should be released is an open policy call (bindreams/hole#1270, which also
+/// records that production never engages a transient cover today).
 pub fn transient_cover_disposition(event: SessionEvent) -> CoverDisposition {
     match event {
         SessionEvent::CutoverRestart => CoverDisposition::KeepEngaged,
@@ -256,12 +250,8 @@ pub fn transient_cover_disposition(event: SessionEvent) -> CoverDisposition {
 
 /// The order the two surfaces move in this reconcile pass.
 ///
-/// Engaging goes lockdown-then-tunnel; releasing goes tunnel-then-lockdown.
-/// This is the fix for the ordering inversion `check_health` had (releasing
-/// the cover at `proxy_manager.rs:2047`, before tearing the session down at
-/// `2058` — egress open while the tunnel was still half-standing):
-/// `step_order` makes the order a value derived from the decision, not a
-/// second statement sequence an author can get wrong at a new call site.
+/// Engaging goes lockdown-then-tunnel; releasing goes tunnel-then-lockdown, so
+/// egress is never open while the tunnel is still half-standing.
 pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
     match cover {
         CoverStep::Release => [Phase::Tunnel(tunnel), Phase::Cover(cover)],
@@ -274,13 +264,12 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 /// Reconcile the persisted target once, at startup, before any GUI or client
 /// has connected.
 ///
-/// This NARROWS #617's boot->first-connect gap without closing it. The gap is
-/// that macOS pf rules do not survive a reboot, so an armed user egresses in
-/// the clear until a connect re-engages the cover; reconciling at boot makes
-/// that connect happen sooner, but a boot connect that FAILS engages nothing
-/// at all (it is deliberately uncovered — see `start_cancellable`'s `Coverage`
-/// argument below). Closing #617 needs a cover that survives reboot on its
-/// own; see #1000.
+/// This narrows the boot-to-first-connect gap without closing it. macOS pf rules
+/// do not survive a reboot (docs/contributing/architecture/kill-switch-macos.md),
+/// so an armed user egresses in the clear until a connect re-engages the cover;
+/// reconciling at boot makes that connect happen sooner, but a boot connect that
+/// FAILS engages nothing at all (it is deliberately uncovered, see the `Coverage`
+/// argument below). Closing the gap needs a cover that survives reboot on its own.
 ///
 /// Called only from `boot::recover_then_reconcile`, which owns the order of the
 /// boot steps.
@@ -306,13 +295,11 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 /// blocked.
 ///
 /// Before deciding anything, the persisted target is folded through
-/// `target::resolve_startup_target` against the GUI-pushed startup
-/// preference (R8: "one decider, not two" — the startup behaviour is
-/// applied first, to produce the target, so reconciliation afterward has
-/// exactly one input) and the resolved value is persisted via `target::apply`
-/// before use, not merely held in memory: `DoNotConnect` must durably write
-/// `Off` so a later status read (or a session-event write, should one ever
-/// race this early) sees the same target this pass reconciles toward, not
+/// `target::resolve_startup_target` against the GUI-pushed startup preference,
+/// so reconciliation afterward has exactly one input. The resolved value is
+/// persisted via `target::apply` before use, not merely held in memory:
+/// `DoNotConnect` must durably write `Off` so a later status read (or a
+/// session-event write) sees the same target this pass reconciles toward, not
 /// the stale one it overrode.
 pub async fn reconcile_once<P, R, D>(proxy: &Arc<Mutex<ProxyManager<P, R, D>>>, cancel: &CancellationToken)
 where

@@ -70,7 +70,7 @@ async fn start_sizes_the_handoff_port_by_the_descriptors_protocols() {
     );
 }
 
-// Bind-race classification (#414) =====================================================================================
+// Bind-race classification ============================================================================================
 //
 // The load-bearing guarantee: a plugin-reported `StartError::BindConflict`
 // (mapped to `ProxyError::BindRace` in `spawn_plugin_runner_at`) must be
@@ -144,7 +144,7 @@ fn cancelled_is_not_a_bind_race() {
 /// before the test task resumes from one `yield_now`.
 ///
 /// This is the cause the `tests/plugin_chain.rs` Drop tests guard end to end;
-/// those go red only by taking ~a minute (a leaked chain ends on garter's own
+/// those go red only by taking long (a leaked chain ends on garter's own
 /// bounds), this one fails by assertion.
 #[skuld::test]
 async fn dropping_a_chain_task_cancels_its_token_and_aborts_its_task() {

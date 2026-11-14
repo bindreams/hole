@@ -378,8 +378,18 @@ remain in the tree; their detail is in the module docs of {src}`crates/bridge/sr
 - **The standing cover has no resolver permit at all**, which is the same gap as the ECH note above.
 - **The ECH-config reachability gate.** The resolver permit must not widen for a fetch that cannot happen.
   `ech_fetch_is_reachable` and `ex_ray_fatal_config_error` in {src}`crates/bridge/src/proxy/plugin.rs` model ex-ray's own
-  decision, reading the plugin options as ex-ray's parser does and mirroring every config error that makes it exit; their
-  doc comments hold the rule set, and a test pins each literal against the vendored source.
+  decision, reading the plugin options as ex-ray's parser does and mirroring every config error that makes it exit,
+  in ex-ray's own evaluation order; the code names the Go function each check mirrors, and a test pins each literal
+  against the vendored source. Three things are deliberately not modelled:
+  - `loglevel`. ex-ray rejects an empty or unknown one, but `inject_plugin_directives` always strips the operator's and
+    appends its own, so no operator value reaches ex-ray. Modelling it on the pre-injection options would report a
+    fatal config that starts fine, the opposite of the over-permit risk the gate closes.
+  - The content of `cert`/`certRaw`/`key`. Checking that the pair is a readable X509 pair needs file I/O, which this
+    pure gate does not do; only their presence without TLS is checked.
+  - Whether a `server`-mode listener fetches the ECH config at all. The empty-SNI fallback models `tls.WithDestination`,
+    a client-dial option with no evident server-listener equivalent in the vendored v2ray-core, and settling it needs
+    tracing the server listener's construction. Hole never spawns ex-ray as a server, so only an operator who writes
+    `server` into their own `plugin_opts` reaches it.
 ```
 
 ## Where the limits are today
