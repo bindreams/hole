@@ -1,8 +1,8 @@
 //! Hole-specific test infrastructure for bridge integration tests.
 //!
-//! The shared shadowsocks-server / cert / sentinel harness was lifted into the
-//! `plugin-e2e` crate (#435) so the plugin suites and Hole's bridge tests share
-//! one copy; the `ssserver_*` skuld fixtures here wrap those harness functions.
+//! The shared shadowsocks-server / cert / sentinel harness lives in the
+//! `plugin-e2e` crate, so the plugin suites and Hole's bridge tests share one
+//! copy; the `ssserver_*` skuld fixtures here wrap those harness functions.
 //! What remains in this module is Hole-specific: the `DistHarness` (spawns
 //! `hole bridge run`), the `HttpTarget` TUN sentinel, SOCKS5/HTTP-CONNECT
 //! clients, and net discovery. Consumed by `*_tests.rs` files across the crate.

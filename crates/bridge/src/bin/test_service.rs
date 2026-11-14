@@ -22,7 +22,7 @@
 //! - `--delay-attach <event>`: before attaching to the SCM at all, hold until
 //!   the named event is signalled. The SCM has created the process and is
 //!   waiting for it, so the service reads START_PENDING with nothing attached.
-//!   The SCM gives up on a process that never attaches (~30 s), so signal it
+//!   The SCM gives up on a process that never attaches, so signal it
 //!   promptly.
 //! - `--pid-log <path>`: append this process's id to `<path>` at start, one per
 //!   line, so a test can tell afterwards whether any process the service ran is

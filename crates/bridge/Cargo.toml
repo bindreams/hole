@@ -84,11 +84,10 @@ plist = "1"
 # Filter engine dependencies. All except `lru` and `tls-parser` are already
 # pulled in transitively via shadowsocks-service; promoted to direct deps so
 # the filter module can `use` them. Pinned to the same minor versions that
-# shadowsocks-service 1.24 uses to avoid duplication.
+# shadowsocks-service uses to avoid duplication.
 idna = "1"
 ipnet = "2"
 regex = "1"
-# New crates not previously in the tree.
 lru = "0.18"
 tls-parser = "0.12"
 # Filter engine runtime deps — smoltcp types leak into HoleRouter for
@@ -195,13 +194,12 @@ garter = { path = "../garter", features = ["test-utils"] }
 # Contained child spawn for the CTRL_BREAK shutdown-delivery test
 # (CREATE_NEW_PROCESS_GROUP + group signal). See foreground_tests.rs.
 cosca = { workspace = true, features = ["tokio"] }
-# `process` is enabled NOWHERE in the bridge's tokio features today (main
-# dep: rt-multi-thread/macros/sync/signal/io-util/net; dev-dep: test-util) —
-# the child-process test below needs it.
+# `process` is not among the main dependency's tokio features; the
+# child-process test needs it.
 tokio = { version = "1", features = ["test-util", "process"] }
 # In-process log capture in tests — verifies diagnostic spans /
-# `elapsed_ms` debug logs (#247) and the forwarder's typed-error log
-# lines (layer=..., caused_by=...) added for #248.
+# `elapsed_ms` debug logs and the forwarder's typed-error log lines
+# (layer=..., caused_by=...).
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # `test_support::skuld_fixtures::route_ss_server_logs` bridges the in-process ss server's `log` records
 # into the test subscriber; same version `hole-common` already resolves.
@@ -219,7 +217,7 @@ rand = "0.10"
 default-net = "0.22"
 # File-identity (volume serial + file index) for the privileged-lane cutover
 # proofs: the on-disk `Handle` must FLIP across a swap (the GUI self-heal
-# precondition). Same crate `crates/hole` uses for #514 self-heal.
+# precondition). Same crate `crates/hole` uses for the GUI self-heal.
 same-file = "1"
 # Library dep on the workspace task runner so the dist-directory e2e test
 # fixture can call `xtask::run_stage` directly instead of shelling out to

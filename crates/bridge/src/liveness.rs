@@ -1,10 +1,10 @@
-//! Structural "is a bridge running" check for `hole bridge unlock` (#840).
+//! Structural "is a bridge running" check for `hole bridge unlock` and
+//! `release-covers`.
 //!
-//! Replaces a point-in-time `launchctl print`/SCM `query_status` probe —
-//! which only answers "was a bridge running a moment ago", not "is one
-//! running for the whole duration of what I am about to do" — with a real
-//! OS-level exclusive lock the running bridge holds for its entire
-//! lifetime. `unlock`'s refusal check and its target-write → disengage →
+//! A point-in-time probe (`launchctl print`, SCM `query_status`) only answers
+//! "was a bridge running a moment ago", not "is one running for the whole
+//! duration of what I am about to do". So the running bridge holds a real
+//! OS-level exclusive lock for its entire lifetime. `unlock`'s refusal check and its target-write → disengage →
 //! intent-flip sequence both go through [`BridgeLiveness::try_acquire`] on
 //! the SAME lock file, so a bridge that starts mid-unlock contends on the
 //! lock instead of interleaving with it: either it observes the lock held
@@ -39,8 +39,7 @@ impl BridgeLiveness {
     }
 
     /// Attempt to acquire without blocking. `Ok(None)` means a running
-    /// bridge holds this lock right now — `unlock`'s replacement for the old
-    /// `is_running` probe. `Ok(Some(_))` returns a token that must be held
+    /// bridge holds this lock right now. `Ok(Some(_))` returns a token that must be held
     /// across every mutation the caller is about to perform, so a bridge
     /// that starts afterward contends on this same lock instead of
     /// interleaving with them.

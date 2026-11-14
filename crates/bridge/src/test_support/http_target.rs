@@ -10,8 +10,8 @@
 //! [`crate::test_support::net_discovery::UNOWNED_DSTS`].
 //!
 //! The single-shot [`plugin_e2e::sentinel::start_fake_sentinel`] is the
-//! plugin-side counterpart (used by `server_test_tests` and the relocated
-//! plugin suites); it lives in the shared `plugin-e2e` harness.
+//! plugin-side counterpart (used by `server_test_tests` and the plugin
+//! suites); it lives in the shared `plugin-e2e` harness.
 
 use crate::test_support::net_discovery::wait_for_primary_ipv4;
 use crate::test_support::socks5_client::http_response_body;
@@ -123,7 +123,7 @@ const SENTINEL_RESPONSE: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Length: 8\r\nConne
 /// Spawn an HTTP/1.0 sentinel server.
 ///
 /// The server uses raw `tokio::TcpListener` rather than hyper because the
-/// only response we ever send is a fixed 8-byte sentinel — pulling in a
+/// only response we ever send is a fixed sentinel — pulling in a
 /// router crate would be overkill. Each accepted connection reads the
 /// request line (and any extra bytes already in the kernel buffer), writes
 /// the canned response, and closes the socket.

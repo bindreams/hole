@@ -1,8 +1,8 @@
 //! Cutover effects seam, mirroring the GUI's self-heal OS seam: the OS-mutating
 //! steps go through a trait so the recording stub asserts the exact per-OS
 //! sequence. Real FFI (rename/SCM/launchctl/renamex_np) lives in the
-//! `os::{windows, macos}` impls behind the bindreams/hole#165 isolation
-//! contract.
+//! `os::{windows, macos}` impls, behind the bridge's OS-isolation contract
+//! (`docs/contributing/architecture/test-isolation.md`).
 
 #[cfg(target_os = "windows")]
 use crate::service_start::RepairStep;

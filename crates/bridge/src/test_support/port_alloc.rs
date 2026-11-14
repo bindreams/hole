@@ -14,7 +14,7 @@
 //! [`allocate_ephemeral_port`] is reserved for the case where the port
 //! is handed across a process boundary (e.g. to a `DistHarness`
 //! subprocess via JSON config) before the real bind happens; the
-//! closure shape can't fit there. See bindreams/hole#285 and #300.
+//! closure shape can't fit there.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -31,7 +31,7 @@ use util::port_alloc::{self, Protocols};
 ///
 /// Callers must declare the right `protocols` set: a TCP-only probe
 /// followed by a TCP+UDP bind invites the Windows independent
-/// excluded-port-range race that #285 exists to prevent. For SOCKS5
+/// excluded-port-range race that `bind_ephemeral` exists to prevent. For SOCKS5
 /// listener ports use `Protocols::TCP | Protocols::UDP` (the bridge
 /// SOCKS5 listener is structurally `Mode::TcpAndUdp`); for HTTP CONNECT
 /// listener ports use `Protocols::TCP`.
@@ -67,15 +67,14 @@ pub(crate) struct WaitForPortFailure {
 /// Each attempt goes through [`util::syn_budget::probe`] pinning
 /// [`util::syn_budget::SynBudget::NoRetransmit`] — this is a probe inside a
 /// loop that re-issues on any failure, exactly the shape the budget is for.
-/// A closed port is refused in ~0.1 ms instead of paying Windows' ~2.05 s
-/// stock SYN-retransmission budget, so the refusal's errno reaches the
-/// histogram instead of being cut off by the per-attempt cap.
+/// A closed port is refused at once instead of paying Windows' stock
+/// SYN-retransmission budget, so the refusal's errno reaches the histogram
+/// instead of being cut off by the per-attempt cap.
 ///
-/// The per-attempt cap **stays** — it is what bounds a genuine black hole
-/// (measured 1015 ms pinned, vs. 21037 ms unpinned for an unrouted
-/// address), a shape `NoRetransmit` does not affect. Without it, a
-/// black-holed port would spend the OS connect-timer (~21 s default) per
-/// attempt, leaving room for only 1–2 attempts in a 10 s budget.
+/// The per-attempt cap **stays**: it is what bounds a genuine black hole, a
+/// shape `NoRetransmit` does not affect. Without it, a black-holed port would
+/// spend the OS connect timer on every attempt, leaving room for only a couple
+/// of attempts within `timeout`.
 ///
 /// Diagnostics use `eprintln!` (not tracing) because this connect-failure
 /// histogram is intentionally always-on and must not be droppable by a

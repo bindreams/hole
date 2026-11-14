@@ -16,7 +16,7 @@ use tun_engine::{RoutingError, TunIdentity};
 
 #[skuld::test]
 fn sweep_wiring_reports_and_deletes_bridge_marker() {
-    // HONESTY NOTE (plan §Task 7 Step 2, review S6): this test asserts that
+    // This test asserts that
     // the bridge crate can reach `tombstone::sweep` and that the sweep
     // CONTRACT (breadcrumb + marker deletion) holds in the bridge's tracing
     // context. It does NOT assert that foreground.rs / macos.rs / windows.rs
@@ -57,7 +57,7 @@ fn sweep_wiring_reports_and_deletes_bridge_marker() {
 
 #[skuld::test]
 fn shutdown_reason_keys_on_marker() {
-    // f473b5d2: shared by all three entry points (this module,
+    // Shared by all three entry points (this module,
     // platform::macos, platform::windows) so the shutdown-tail bug this
     // guards against — treating a plain SIGTERM/Ctrl+C as a user disconnect
     // (`UserStopped`, which wrongly moves the target to `Off`) — can't
@@ -381,11 +381,11 @@ fn ctrl_break_resolves_shutdown_signal() {
 
 // dev-console's SIGTERM (relayed by sudo) must trigger graceful `pm.stop()`
 // instead of an ungraceful default-disposition kill that leaks routes/DNS
-// (bindreams/hole#452). `shutdown_signal()` installs the SIGTERM handler
-// SYNCHRONOUSLY when called (Step 3), so raising the signal immediately
-// after is non-fatal and is observed by the returned future — deterministic,
-// no spawn/poll race (a prior spawn+yield_now form raced and killed the test
-// process with SIGTERM's default disposition on iteration 0). macOS-gated to
+// `shutdown_signal()` installs the SIGTERM handler SYNCHRONOUSLY when called,
+// so raising the signal immediately after is non-fatal and is observed by the
+// returned future — deterministic, no spawn/poll race (installing it in a
+// spawned task would race, and SIGTERM's default disposition would kill the
+// test process). macOS-gated to
 // match libc's dependency gating; the Hole test lane's only POSIX hosts are macOS, and
 // nextest isolates each test in its own process so the raise can't disturb
 // siblings.

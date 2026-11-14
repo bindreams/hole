@@ -1,5 +1,5 @@
 //! Unit tests for [`super::server_endpoint_is_udp`] — the transport-aware
-//! preflight gate added in bindreams/hole#421.
+//! preflight gate.
 //!
 //! Kept separate from `server_test_tests.rs`: these are pure, I/O-free table
 //! assertions that must run on every platform, whereas `server_test_tests` does

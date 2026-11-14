@@ -1,6 +1,6 @@
 //! Enumerate the host's Windows user profiles, so the uninstall cover release
 //! can find the liveness lock of a bridge running under an account that is not
-//! its own (bindreams/hole#1003).
+//! its own.
 //!
 //! The MSI's custom actions run as SYSTEM (`Impersonate="no"`), and Windows
 //! elevation keeps a process in the *invoking* user's profile rather than
@@ -20,10 +20,9 @@
 //! Every outcome an entry can have is a [`ProfileEntry`] variant, and every
 //! way the pass over `ProfileList` can end is an [`EnumEnd`] variant; each is
 //! answered in a single exhaustive match ([`ProfileEntry::into_dir`],
-//! [`EnumEnd::disclose`]). That shape is the point: the defect this module
-//! exists to fix is an enumeration that yields no peer being read as "no other
-//! bridges", and the way it recurs is an entry leaving the peer set down a
-//! branch that says nothing. Nothing here shrinks the peer set quietly.
+//! [`EnumEnd::disclose`]). An enumeration that yields no peer reads as "no other
+//! bridges", so no entry may leave the peer set down a branch that says
+//! nothing: nothing here shrinks the peer set quietly.
 //!
 //! Which is why the subkey pass is written out rather than taken from
 //! `windows-registry`'s `Key::keys()`. That iterator ends on ANY non-zero

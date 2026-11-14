@@ -42,7 +42,7 @@ fn a_profile_dir_that_is_not_on_disk_is_reported_not_dropped() {
     // The exact value `S-1-5-18` stores, unexpanded. The caller's
     // `!peer.exists()` guard sends it down a skip branch that emits nothing,
     // so a bridge holding a SYSTEM-profile lock disappears from the peer set
-    // and the release proceeds over a live bridge (bindreams/hole#1003).
+    // and the release proceeds over a live bridge.
     let entry = resolve_entry(Ok(r"%systemroot%\system32\config\systemprofile".into()), verbatim);
 
     assert!(

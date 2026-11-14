@@ -2,8 +2,7 @@
 //!
 //! Calls `xtask::run_stage(Profile::Debug, &dist_bin)` exactly once per
 //! test binary invocation. Hardlinks are idempotent and cheap — the
-//! staging cost is dominated by `create_dir_all` + file metadata probes,
-//! ~10ms total.
+//! staging cost is dominated by `create_dir_all` + file metadata probes.
 //!
 //! The staged directory lives at `target/debug/dist/bin/` inside the
 //! workspace root. Paths:

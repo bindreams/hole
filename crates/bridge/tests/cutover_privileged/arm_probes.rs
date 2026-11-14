@@ -1,4 +1,4 @@
-//! Probes P2 and P3 of the service-retirement design: what the SCM does for a
+//! Probes P2 and P3 (the labels in the printed output): what the SCM does for a
 //! process that dies without reporting STOPPED, and what a notification armed
 //! on a fresh handle reports. Raw SCM calls only (`raw_scm`), so the lines
 //! describe the SCM and not the policy built on it.

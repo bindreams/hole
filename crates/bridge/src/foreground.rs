@@ -48,9 +48,8 @@ pub fn run(
 /// Resolve when a shutdown signal arrives: Ctrl+C (SIGINT) everywhere,
 /// SIGTERM on Unix, or CTRL_BREAK on Windows. dev-console terminates the
 /// bridge with SIGTERM (relayed through sudo); without a SIGTERM handler the
-/// bridge would die on the default disposition and leak routes/DNS
-/// (bindreams/hole#452). The dev supervisor's Windows graceful stop is
-/// CTRL_BREAK (bindreams/hole#454).
+/// bridge would die on the default disposition and leak routes/DNS. The dev
+/// supervisor's Windows graceful stop is CTRL_BREAK.
 ///
 /// Returns a future but installs the SIGTERM/CTRL_BREAK handlers EAGERLY
 /// when called (not lazily on first poll), so a caller that raises the
@@ -61,8 +60,8 @@ pub(crate) fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     #[cfg(unix)]
     let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
     // Windows: Ctrl+C (interactive) or CTRL_BREAK (the dev supervisor's
-    // graceful stop — taskkill /F gave the bridge no chance to tear down
-    // routes; CTRL_BREAK + this handler is the SIGTERM equivalent, #454).
+    // graceful stop: `taskkill /F` gives the bridge no chance to tear down
+    // routes, so CTRL_BREAK + this handler is the SIGTERM equivalent).
     // ctrl_break() registers eagerly here, matching the unix SIGTERM arm.
     #[cfg(not(unix))]
     let ctrl_break = tokio::signal::windows::ctrl_break();
@@ -194,12 +193,11 @@ async fn run_inner(
         tokio::task::spawn_blocking(move || crate::liveness::BridgeLiveness::acquire(&state_dir_liveness, owner))
             .await??;
 
-    // First-party readiness signal (#454): the dev supervisor pre-binds a
+    // First-party readiness signal: the dev supervisor pre-binds a
     // localhost listener and passes `--ready-notify ADDR/TOKEN`; we connect
     // and echo the token only now — after IpcServer::bind, which also ran
     // apply_socket_permissions — so a waiter can never observe the socket
-    // before its permissions are final (the DACL race dev.py's socket-file
-    // poll had).
+    // before its permissions are final.
     if let Some(spec) = ready_notify {
         notify_ready(spec).await;
     }
@@ -279,7 +277,7 @@ async fn run_inner(
         }
     };
 
-    // Native-crash observability (bindreams/hole#438): report + delete any
+    // Native-crash observability: report + delete any
     // crash marker a previously-crashed bridge left in log_dir. Offloaded to
     // a blocking thread to match the sibling recover_* calls (it is pure file
     // I/O — no netsh/route hazard — but spawn_blocking keeps the pattern
