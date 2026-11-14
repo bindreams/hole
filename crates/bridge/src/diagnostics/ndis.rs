@@ -32,9 +32,8 @@
 //! The probed data is spread across DISM (Get-WindowsDriver), NDIS
 //! (Get-NetAdapter*), Hyper-V WMI (Get-VMSwitchExtension), and PnP
 //! (pnputil). Direct Win32 bindings would require pulling in multiple
-//! COM / WMI / IOCTL surfaces. Shelling PowerShell is ~40 lines and
-//! gives us structured string output that's easy to grep for the
-//! watch-list strings. Performance is not a concern — snapshots fire
+//! COM / WMI / IOCTL surfaces. Shelling PowerShell gives structured
+//! string output that is easy to grep for the watch-list strings. Snapshots fire
 //! once per bridge lifecycle event, not in a hot path.
 //!
 //! [`Get-NetAdapter -IncludeHidden`]: https://learn.microsoft.com/en-us/powershell/module/netadapter/get-netadapter
@@ -128,7 +127,7 @@ pub fn log_snapshot(phase: &'static str) {
     // Emit each probe source's full output at debug level. Per-source
     // truncation — not one big concatenated blob — so callers reading
     // the log can tell which source contributed which lines even when
-    // the 16 KB cap hits.
+    // the cap hits.
     emit_debug_source(phase, "Get-NetAdapter -IncludeHidden", &adapters);
     emit_debug_source(phase, "Get-NetAdapterBinding -AllBindings", &bindings);
     emit_debug_source(phase, "Get-VMSwitchExtension", &vmswext);

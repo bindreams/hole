@@ -140,12 +140,8 @@ fn unlock_successful_disengage_flips_intent_off() {
 
 #[skuld::test]
 fn unlock_hands_back_what_the_disengage_could_not_prove() {
-    // #1010: `unlock_with` used to swallow the disengage's verdict and return
-    // `()`. It writes the kill-switch intent OFF in the statement after the
-    // disengage, so there is no next engage to re-arm or re-delete a
-    // boot-time key — the pre-delete runs only from `engage_lockdown`, which
-    // an off intent prevents. This is the last moment the qualification can
-    // reach anybody, which is why `hole bridge unlock` prints it.
+    // `unlock_with` must hand back the disengage's verdict, not `()`:
+    // `hole bridge unlock` prints it.
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::set_enabled(&CoverLock::acquire(dir.path()), true, None).unwrap();
 
@@ -172,7 +168,7 @@ fn unlock_hands_back_what_the_disengage_could_not_prove() {
     );
 }
 
-// `bridge unlock` vs. a live bridge (#840): the CLI escape and the in-app
+// `bridge unlock` vs. a live bridge: the CLI escape and the in-app
 // "Unblock Network" action must not race each other over the same cover. A
 // live bridge already owns reconciliation (and will reconcile the target
 // itself); `unlock` must refuse rather than race it, and name the in-app
@@ -238,9 +234,9 @@ fn unlock_over_a_target_it_cannot_read_leaves_off_and_keeps_a_backup() {
     }
 }
 
-// #986: the liveness exclusion is structural (a lock held across the whole
-// sequence), not a point-in-time probe — a bridge that would start mid-unlock
-// must observe the lock as held throughout, not just at the initial check.
+// The liveness exclusion is structural (a lock held across the whole sequence),
+// not a point-in-time probe: a bridge that would start mid-unlock must observe
+// the lock as held throughout, not just at the initial check.
 
 #[skuld::test]
 fn unlock_holds_the_liveness_lock_across_the_whole_sequence() {
@@ -405,7 +401,7 @@ fn plan_windows_images_covers_full_bindir_set() {
 // FIRST, so a release that never lands still converges: a later start
 // reconciles toward `Off` and sweeps. And it refuses against a live bridge for
 // the same reason `unlock` does — an out-of-process clear would leave the
-// bridge's posture claiming a cover that no longer exists (#1003).
+// bridge's posture claiming a cover that no longer exists.
 
 /// `release_covers_with` with no peer dirs, for the assertions about the
 /// sequencing around the release itself.
@@ -506,11 +502,11 @@ fn release_covers_leaves_every_peer_tree_it_provisioned() {
 /// that is not mounted at uninstall time, or a redirected Windows profile.
 ///
 /// A tripwire, by construction: there is no removal code for it to reach, and
-/// that is the property. It catches the shape that was there before — an
-/// existence probe that follows links (`try_exists`) reads a dangling one as
-/// absent, names it as a level this call is about to create, and hands it to a
-/// `remove_dir_all` that does NOT follow links and so removes the link itself,
-/// one level above anything Hole owns.
+/// that is the property. It would catch an existence probe that follows links
+/// (`try_exists`): it reads a dangling link as absent, names it as a level this
+/// call is about to create, and hands it to a `remove_dir_all` that does NOT
+/// follow links and so removes the link itself, one level above anything Hole
+/// owns.
 #[cfg(unix)]
 #[skuld::test]
 fn release_covers_never_removes_a_symlink_on_a_peer_path() {
@@ -755,8 +751,8 @@ fn clearance_with_sibling(sibling: KeyOutcome, keys: &[&'static str]) -> Clearan
 #[skuld::test]
 fn release_covers_reports_what_the_sweep_could_not_prove() {
     // The propagation itself: `release_covers_with` must hand the caller the
-    // sweep's verdict, not a bare `Ok`. Collapsing it here would put the
-    // silent `Ok` of #1003 back one layer up from where it was removed.
+    // sweep's verdict, not a bare `Ok`, which would tell the installer the host
+    // is clear.
     let dir = tempfile::tempdir().unwrap();
     let clearance = release_covers_with(dir.path(), &[], |_lock| {
         Ok(unproven_clearance(&["lockdown boot-time block-all V4"]))
@@ -893,7 +889,7 @@ fn an_unproven_release_does_not_send_the_operator_to_a_command_that_cannot_help(
     // `netsh wfp` is diagnostics-only — its verbs are capture, dump, help, set
     // and show; there is no delete. Telling a user in the one state where they
     // have no other tool that "`netsh wfp` can remove it" is a dead end
-    // dressed as a remedy, and the previous test pinned that exact string.
+    // dressed as a remedy.
     let report = release_clearance_report(&unproven_clearance(&["k"]), RUNNING_VERSION).expect("reported");
     let lowered = report.to_lowercase();
     for claim in ["netsh wfp` can remove", "netsh wfp can remove", "netsh wfp delete"] {

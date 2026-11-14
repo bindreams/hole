@@ -1,4 +1,4 @@
-//! Real Windows `CutoverOs`: rename-away-then-move-in swap (D1) + raw SCM
+//! Real Windows `CutoverOs`: rename-away-then-move-in swap + raw SCM
 //! stop/start driven by the `service_scm` state machine. The detached-child
 //! lifetime + breakaway probe live at the apply layer, which spawns THIS process
 //! as `hole bridge cutover`; this impl is the swap+restart body that child runs.
@@ -117,7 +117,7 @@ impl WindowsSwapStep for FsSwapStep {
 /// the swap all-or-nothing by deferring the destructive delete until the whole
 /// set commits, so any failure rolls back to the prior consistent set. The
 /// drivers differ in primitive (rename-away/move-in retaining `.old-<ver>` here
-/// vs `renamex_np` exchange there) and so are not yet unified.
+/// vs `renamex_np` exchange there).
 fn execute_image_swaps<O: WindowsSwapStep>(images: &[ImageMove], target_version: &str, ops: &O) -> std::io::Result<()> {
     let mut completed: Vec<Completed> = Vec::with_capacity(images.len());
     for (index, img) in images.iter().enumerate() {

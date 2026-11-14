@@ -1,162 +1,96 @@
 //! Always-on in-process ETW (Event Tracing for Windows) consumer.
 //!
-//! Subscribes to three Microsoft providers — TCPIP, WFP, Winsock-AFD —
-//! filters events to the bridge's own PID, and re-emits each matching
-//! event as a structured `tracing::event!()`. The bridge's own log file
-//! (`bridge.log`) becomes a narrative record of what the Windows network
-//! stack saw, accessible to users via `hole bridge log` on the same
-//! footing as the rest of the bridge's output.
+//! Subscribes to three Microsoft providers (TCPIP, WFP, Winsock-AFD), filters
+//! events to the bridge's own PID, and re-emits each matching event as a
+//! structured `tracing::event!()`, so `bridge.log` (read with `hole bridge log`)
+//! records what the Windows network stack saw.
 //!
-//! # Why this exists
-//!
-//! Logging volume is intentionally unbounded here — the goal is the most
-//! comprehensive record that can diagnose hard production network issues
-//! on customer machines:
-//!
-//! - connection-level events at `info` by default
-//! - per-packet NDIS firehose events: not even at `debug`; filtered out
-//!   at the kernel subscription level so they never reach our process
-//! - anomaly events (retransmit ≥ [`RETRANSMIT_WARN_THRESHOLD`],
-//!   connection-request timeout, abort) escalated to `warn`
+//! Volume is deliberately unbounded, to diagnose hard network issues on customer
+//! machines: connection-level events at `info`, anomalies (retransmit at or above
+//! [`RETRANSMIT_WARN_THRESHOLD`], connection-request timeout, abort) at `warn`.
+//! High-rate data-plane and bookkeeping TCPIP events are dropped
+//! ([`HIGH_VOLUME_TCPIP_EVENTS`]), and no NDIS packet-capture provider is
+//! subscribed.
 //!
 //! # Architecture
 //!
-//! 1. [`start_consumer`] is called once at bridge startup, after the
-//!    crash-recovery snapshots. It:
-//!    a. Sweeps any stale `hole-bridge-etw-*` sessions left by a crashed
-//!    prior bridge instance ([`sweep_stale_sessions`] via the Win32
-//!    `QueryAllTracesW` + `ControlTraceW` APIs).
-//!    b. Builds three `ferrisetw::Provider`s with all keywords
-//!    enabled. High-volume firehose events are filtered in userspace
-//!    via [`HIGH_VOLUME_TCPIP_EVENTS`] rather than at the kernel
-//!    level — events 1004, 1077, and the rest of the SendPath family
-//!    must stay visible — see [`TCPIP_KEYWORDS`].
-//!    c. Starts a [`ferrisetw::UserTrace`] session named
-//!    `hole-bridge-etw-<pid>` with `buffer_size = 256` KB to absorb
-//!    the wider event volume without kernel ring-buffer overrun.
-//!    d. Spawns a dedicated OS thread that calls `process_from_handle`
-//!    in a blocking loop. This thread runs the per-event callback.
-//!    e. Returns an [`EtwGuard`] that owns the session + the join handle.
+//! 1. [`start_consumer`] runs once at bridge startup, after the crash-recovery
+//!    snapshots, and returns an [`EtwGuard`] owning the `hole-bridge-etw-<pid>`
+//!    session and its processing thread. Every provider keyword is enabled and
+//!    high-volume events are dropped in userspace by [`HIGH_VOLUME_TCPIP_EVENTS`],
+//!    because a kernel keyword mask would also hide events 1004 and 1077 (see
+//!    [`TCPIP_KEYWORDS`]); the session buffer is widened to absorb the event
+//!    volume.
+//! 2. The callback ([`handle_event`]) filters by `process_id`, extracts a
+//!    shape-only [`ParsedFields`], calls the pure [`dispatch`], and translates
+//!    the returned [`Emission`] into a `tracing::event!`.
+//! 3. A timer thread ([`run_periodic_stats_inner`]) calls [`query_session_stats`]
+//!    once immediately and then every [`LIVE_STATS_INTERVAL`], so a `bridge.log`
+//!    collected from a still-running bridge always carries a completeness figure.
+//!    After the first `warn!`, repeated query failures (e.g. another bridge
+//!    swept the session) drop to `info!`: loud enough to survive log rotation as
+//!    evidence the session is gone, quiet enough not to re-flood.
+//! 4. [`EtwGuard::drop`] stops and joins the timer thread, reads the statistics
+//!    one last time, then stops the session ([`EtwGuard::stop_session`]). If the
+//!    kernel confirmed the session reclaimed, it joins the processing thread so
+//!    the callback drains its queue; otherwise it detaches the thread (see
+//!    [Drain on Drop](#drain-on-drop)).
 //!
-//! 2. The callback ([`handle_event`]) filters by `process_id`, extracts
-//!    a minimal shape-only [`ParsedFields`] struct from the live
-//!    `EventRecord`, calls the pure [`dispatch`] function, and
-//!    translates the returned [`Emission`] into a real `tracing::event!`
-//!    invocation.
-//!
-//! 3. A dedicated timer thread ([`run_periodic_stats_inner`]) ticks
-//!    [`query_session_stats`] once immediately and then every
-//!    [`LIVE_STATS_INTERVAL`] for as long as the session runs — not only at
-//!    shutdown — so a `bridge.log` collected from a still-running bridge
-//!    (the common case: users collect logs via Help → Collect Logs while
-//!    connected) always carries at least one completeness figure for the
-//!    session, from as early as the session start. Repeated query failures
-//!    (e.g. another bridge instance sweeping this session — see
-//!    [`sweep_stale_sessions`]) throttle to `info!` after the first `warn!`
-//!    — loud enough to survive log rotation as standing evidence the
-//!    session is gone, quiet enough not to re-flood at `warn!` forever.
-//!
-//! 4. [`EtwGuard::drop`] first stops the timer thread (closing its shutdown
-//!    channel wakes it immediately, not after the rest of the current
-//!    interval) and joins it, THEN reads session statistics one final time
-//!    via `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)` ([`query_session_stats`])
-//!    before stopping the session ([`EtwGuard::stop_session`], which signals
-//!    the kernel to stop delivering events). If the kernel confirmed the
-//!    session was reclaimed, `Drop` then joins the processing thread too,
-//!    guaranteeing the callback drains the pending event queue before
-//!    shutdown completes. If it did NOT — even the by-name STOP backstop
-//!    failed — `Drop` cannot tell a thread that is genuinely stuck apart
-//!    from one whose `CloseTrace` already succeeded and is about to return
-//!    on its own, so it abandons the thread rather than risk blocking
-//!    shutdown forever: it logs a `warn!` and drops the `JoinHandle`
-//!    without joining, detaching the OS thread instead.
-//!    Stopping the timer thread first is load-bearing, not incidental: it
-//!    guarantees no periodic tick can still be mid-query when the session is
-//!    stopped, so the two `query_session_stats` callers (periodic, drop-time)
-//!    never race the session teardown and no lock needs to serialize them.
-//!    Each stats query surfaces `EventsLost`, `BuffersWritten`,
-//!    `LogBuffersLost`, and `RealTimeBuffersLost` as a diagnostic
-//!    cross-check — nonzero loss in `EventsLost`, `LogBuffersLost`, or
-//!    `RealTimeBuffersLost` escalates to `warn!` (`BuffersWritten` is a
-//!    throughput count, not a loss counter, and never escalates);
-//!    delta-tracked on the periodic path via [`should_escalate`], so an
-//!    unchanging cumulative count doesn't re-warn every tick. See
-//!    [Drain on Drop](#drain-on-drop) below.
+//! Each stats query reports `EventsLost`, `BuffersWritten`, `LogBuffersLost` and
+//! `RealTimeBuffersLost`. Nonzero loss in any of the three loss counters
+//! escalates to `warn!`, delta-tracked on the periodic path by
+//! [`should_escalate`] so an unchanged count does not re-warn every tick;
+//! `BuffersWritten` is throughput and never escalates.
 //!
 //! # Drop's added wait
 //!
-//! Joining the timer thread in `Drop` adds a second, small, bounded
-//! blocking wait ahead of the pre-existing processing-thread join — bounded
-//! by however long one in-flight `ControlTraceW(QUERY)` call takes (a
-//! single synchronous Win32 call, not [`LIVE_STATS_INTERVAL`]), because
-//! closing the channel wakes a blocked `recv_timeout` immediately rather
-//! than waiting out the interval. This is the same shape of synchronous
-//! wait `Drop` already performs for the processing thread, not a new
-//! category of blocking risk; it is not solved with a timeout (this
-//! project does not paper over synchronization with timeouts).
+//! Joining the timer thread adds a bounded wait ahead of the processing-thread
+//! join: one in-flight `ControlTraceW(QUERY)`, a single synchronous Win32 call,
+//! not [`LIVE_STATS_INTERVAL`], because closing the shutdown channel wakes the
+//! timer's `recv_timeout` at once. It is the same kind of wait `Drop` already
+//! makes for the processing thread, and is not bounded by a timeout.
 //!
 //! # Drain on Drop
 //!
-//! `ferrisetw::UserTrace::Drop` does NOT join the processing thread — it
-//! only calls `close_trace` + `control_trace(STOP)`, and any events in
-//! the callback queue when the handle closes are lost. We work around
-//! this with the split-lifecycle API:
+//! `ferrisetw::UserTrace::Drop` does not join the processing thread, and events
+//! still queued for the callback when the handle closes are lost. So the guard
+//! uses the split-lifecycle API: `UserTrace::start` returns `(trace, handle)`
+//! without a thread, the guard spawns and joins its own, and
+//! [`ferrisetw::UserTrace::stop`] signals STOP, after which `process_from_handle`
+//! returns and the join completes.
 //!
-//! - `ferrisetw::UserTrace::start` returns `(trace, handle)` without
-//!   spawning a processing thread.
-//! - We spawn that thread ourselves and store its `JoinHandle` in
-//!   [`EtwGuard`].
-//! - [`ferrisetw::UserTrace::stop`] signals STOP; once STOP is processed
-//!   by the kernel, `process_from_handle` returns, our thread exits, and
-//!   `JoinHandle::join` returns.
+//! `UserTrace::stop` does not itself guarantee that: it chains `CloseTrace` and
+//! `ControlTraceW(STOP)` with `?`, so a `CloseTrace` error skips STOP.
+//! `ERROR_CTX_CLOSE_PENDING` is not such an error (ferrisetw returns `Ok` for it,
+//! and it is the ordinary answer for any busy session). On a genuine error the
+//! session stays live and `process_from_handle` has no exit condition left: MSDN
+//! gives a real-time consumer two, a `CloseTrace` that took effect and the
+//! controller stopping the session.
 //!
-//! `UserTrace::stop` does not by itself guarantee that last step: it chains
-//! `CloseTrace` and `ControlTraceW(STOP)` with `?`, so a `CloseTrace` error
-//! short-circuits before STOP is issued. The qualifier matters —
-//! `ERROR_CTX_CLOSE_PENDING` is not one of those errors but ferrisetw's `Ok`,
-//! and it is the ordinary answer whenever events are still queued, i.e. for
-//! any busy session. On a genuine error the session stays live and
-//! `process_from_handle` has nothing left to return for: MSDN gives a
-//! real-time consumer two exit conditions — a `CloseTrace` that took effect,
-//! and the controller stopping the session — and that path has neither.
-//!
-//! `UserTrace::stop` takes `self` by value, so ferrisetw's own `Drop` repeats
-//! close+STOP once more, discarding the error, before the caller ever sees the
-//! `Err`. A one-off `CloseTrace` failure is therefore already covered by that
-//! second attempt and [`EtwGuard::stop_session`]'s by-name STOP is a benign
-//! no-op; a failure that *repeats* is what reaches the third attempt — the
-//! only one addressed to the session rather than to a handle.
+//! `UserTrace::stop` takes `self`, so ferrisetw's own `Drop` repeats close+STOP,
+//! discarding the error. A one-off `CloseTrace` failure is therefore covered by
+//! that second attempt and [`EtwGuard::stop_session`]'s by-name STOP is a no-op;
+//! a failure that repeats reaches the third attempt, the only one addressed to
+//! the session rather than to a handle. If even that fails, `Drop` cannot tell a
+//! stuck thread from one whose `CloseTrace` succeeded and is about to return, so
+//! it abandons the thread instead of risking a shutdown that never ends.
 //!
 //! # Failure mode
 //!
-//! ETW diagnostics are best-effort but **not silent** on infrastructure
-//! failure. If `start_consumer` returns `Err` (missing privilege, wrong
-//! provider GUID, session-name collision), the caller logs the failure
-//! at `error!` level — not `warn` — so a customer-ship-me-logs workflow
-//! immediately surfaces "your machine's ETW is broken and we are
-//! diagnostic-blind." Bridge startup still proceeds; ETW failure is not
-//! fatal to the bridge's core job.
+//! ETW diagnostics are best-effort but not silent. If `start_consumer` returns
+//! `Err` (missing privilege, wrong provider GUID, session-name collision), the
+//! caller logs at `error!`, so a customer's logs show the machine is
+//! diagnostic-blind, and startup proceeds.
 //!
-//! # Provider GUIDs and keywords
+//! # Provider GUIDs, keywords and severity
 //!
-//! See [`TCPIP_PROVIDER`], [`WFP_PROVIDER`], [`AFD_PROVIDER`] for the
-//! GUIDs and the per-provider keyword masks. All three providers
-//! subscribe to every keyword bit (`!0`); high-volume events are
-//! dropped by event-ID in the userspace [`dispatch`] callback via
-//! [`HIGH_VOLUME_TCPIP_EVENTS`]. Kernel-level keyword filtering is
-//! avoided because it also masks events 1004 and 1077, which must stay
-//! visible — see the rationale comment on [`TCPIP_KEYWORDS`].
-//!
-//! # AFD/WFP severity
-//!
-//! Only TCPIP events get rich event-id-aware severity routing.
-//! AFD and WFP events are emitted at DEBUG via [`Emission::Unknown`]
-//! until either provider grows a rich handler. This matters because the
-//! providers recycle small event IDs (AFD `1002`/`1004` collide with
-//! TCPIP `TCB_CONNECT_REQUESTED` / `TCB_SYN_SEND`), so an event-id-only
-//! match would misclassify AFD background traffic as INFO-level TCPIP
-//! events — [`dispatch`] gates on the provider GUID before applying
-//! TCPIP severity.
+//! [`TCPIP_PROVIDER`], [`WFP_PROVIDER`] and [`AFD_PROVIDER`] hold the GUID
+//! strings; the keyword masks are [`TCPIP_KEYWORDS`], [`WFP_KEYWORDS`] and
+//! [`AFD_KEYWORDS`]. Only TCPIP events get event-id-aware severity;
+//! AFD and WFP events are emitted at DEBUG via [`Emission::Unknown`]. The
+//! providers recycle small event IDs (AFD `1002`/`1004` collide with TCPIP
+//! `TCB_CONNECT_REQUESTED`/`TCB_SYN_SEND`), so [`dispatch`] gates on the provider
+//! GUID before applying TCPIP severity.
 
 use dump::{dump, DeriveDump};
 use ferrisetw::native::EvntraceNativeError;
@@ -298,9 +232,8 @@ const HIGH_VOLUME_TCPIP_EVENTS: &[u16] = &[
     1300, 1324, 1370, 1371, 1391, 1396, 1397, 1443, 1454, 1551, 1589, 1590, 1626,
 ];
 
-/// Retransmit count (events 1002/1077 `RexmitCount`) at which we
-/// escalate from info to warn; three retransmits on a single flow is
-/// well into "something is wrong" territory.
+/// Retransmit count (events 1002/1077 `RexmitCount`) at which a flow's event
+/// escalates from info to warn.
 const RETRANSMIT_WARN_THRESHOLD: u32 = 3;
 
 // Public types ========================================================================================================
@@ -537,15 +470,15 @@ fn start_consumer_named(
     start_consumer_named_with_spawn(session_name, interval, on_tick, |builder, body| builder.spawn(body))
 }
 
-/// Same as [`start_consumer_named`], with the processing-thread spawn call
-/// itself substitutable. Production goes through `start_consumer_named`,
-/// which fills `spawn_processor` with `std::thread::Builder::spawn`; a test
-/// fills it with a closure that returns `Err`, so it can drive
-/// `start_consumer_named`'s own thread-spawn failure arm — the `drop(trace)`
-/// ordering plus [`abandon_session_on_thread_spawn_failure`] below — at the
-/// real call site, rather than calling `abandon_session_on_thread_spawn_failure`
-/// directly (see `thread_spawn_failure_stops_the_orphaned_session`'s doc
-/// comment for why that alone doesn't pin this call site).
+/// Same as [`start_consumer_named`], with the processing-thread spawn call itself
+/// substitutable. Production goes through `start_consumer_named`, which fills
+/// `spawn_processor` with `std::thread::Builder::spawn`; a test fills it with a
+/// closure that returns `Err`, so it can drive `start_consumer_named`'s own
+/// thread-spawn failure arm (the `drop(trace)` ordering plus
+/// [`abandon_session_on_thread_spawn_failure`]) at the real call site, rather than
+/// calling `abandon_session_on_thread_spawn_failure` directly (see
+/// `thread_spawn_failure_stops_the_orphaned_session`'s doc comment for why that
+/// alone doesn't pin this call site).
 fn start_consumer_named_with_spawn(
     session_name: String,
     interval: Duration,
@@ -590,10 +523,9 @@ fn start_consumer_named_with_spawn(
     // of the module doc.
     //
     // Buffer sizing: with all TCPIP keywords enabled, per-connect event
-    // volume is high (SendPath included). Default `buffer_size` (32 KB
-    // per-processor) risks ring-buffer overflow under IO load; widen to
-    // 256 KB. `max_buffer = 0` tells Windows to choose a reasonable
-    // ceiling. `query_session_stats` reads EventsLost periodically and once
+    // volume is high (SendPath included). The default `buffer_size` risks
+    // ring-buffer overflow under IO load, so it is widened. `max_buffer = 0`
+    // tells Windows to choose a reasonable ceiling. `query_session_stats` reads EventsLost periodically and once
     // more at drop, so an overrun surfaces as a nonzero count in bridge.log
     // well before shutdown.
     let trace_properties = TraceProperties {
@@ -649,7 +581,7 @@ fn start_consumer_named_with_spawn(
     // events, so a fallible `?` here would tear the whole consumer down
     // (dropping `trace` without joining `thread` — see the module's
     // "Drain on Drop" contract) over the failure of a purely supplementary
-    // 60-second diagnostics timer. Missing live stats is a degraded
+    // periodic diagnostics timer. Missing live stats is a degraded
     // diagnostic, not a reason to lose ETW event logging entirely.
     let (stats_tx, stats_rx) = mpsc::channel::<()>();
     let stats_session_name = session_name.clone();
@@ -736,9 +668,8 @@ fn warn_loss(phase: &'static str, session_name: &str, stats: SessionStats) {
     );
 }
 
-/// Cadence for the periodic live-session stats query — see
-/// [`run_periodic_stats_inner`]. Matches the existing
-/// `dns::forwarder::SUMMARY_INTERVAL` precedent elsewhere in this crate.
+/// Cadence for the periodic live-session stats query; see
+/// [`run_periodic_stats_inner`].
 const LIVE_STATS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Session statistics read by [`query_session_stats`]. All four fields are

@@ -126,7 +126,7 @@ mod windows {
     //! Suspended-child spawn (so the initiator can stamp the frozen child's
     //! identity into the marker before it can act), the conditional job-breakaway
     //! probe, and the ToolHelp thread-resume. Raw JobObject/ToolHelp FFI is
-    //! sanctioned here per the #165 isolation contract.
+    //! sanctioned here by the bridge's OS-isolation contract.
 
     use std::os::windows::process::CommandExt;
 

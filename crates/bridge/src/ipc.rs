@@ -38,7 +38,7 @@ use util::versioned_file::{CreateOutcome, StoreError};
 /// bridge only ever compares it for equality — never parses or orders it.
 /// Correctness rests on the client minting a fresh, never-reused id per connect
 /// attempt: that uniqueness is what makes a stale pre-arm un-matchable by any
-/// later attempt (#465).
+/// later attempt.
 type AttemptId = String;
 
 /// The `X-Hole-Attempt-Id` request header carrying the per-attempt idempotency
@@ -58,12 +58,12 @@ fn attempt_id_from(headers: &axum::http::HeaderMap) -> AttemptId {
 }
 
 /// The `X-Hole-On-Startup` request header carrying the GUI's current startup
-/// preference on `POST /v1/start` (#979, #617) — see `crate::target`.
+/// preference on `POST /v1/start` (bindreams/hole#979) — see `crate::target`.
 const ON_STARTUP_HEADER: &str = "x-hole-on-startup";
 
 /// Read the startup preference from a request's `X-Hole-On-Startup` header.
 /// A genuinely absent header — an older client that doesn't know about it,
-/// or the CLI, which has no preference to push (#979) — reads `None`: the
+/// or the CLI, which has no preference to push — reads `None`: the
 /// bridge keeps whatever preference (if any) it already has, rather than
 /// stomping it with the wire default. A present-but-garbled value still
 /// fails safe to the default.
@@ -79,7 +79,7 @@ fn on_startup_from(headers: &axum::http::HeaderMap) -> Option<StartupBehavior> {
 /// the GUI per connect attempt and sent on both Start and Cancel). A pre-arm is
 /// therefore a *named* slot: only the start carrying that exact id consumes it,
 /// so a stale arm left by a cancel whose start already finished — or never
-/// arrived — can never silently cancel a later, unrelated attempt (#465).
+/// arrived — can never silently cancel a later, unrelated attempt.
 #[derive(Default)]
 pub(crate) struct StartCancelState {
     /// Id + token of the currently in-flight start, if any. Single-occupancy:
@@ -128,7 +128,7 @@ pub(crate) struct IpcState<P: Proxy, R: Routing> {
     /// `start_entered`: if set, `persist_after_start` fires `persist_entered`
     /// on entry, then awaits `persist_gate`, before doing any write. Lets a
     /// test park a second request exactly inside the persist window
-    /// `handle_start`'s lock now spans, instead of racing scheduler timing.
+    /// `handle_start`'s lock spans, instead of racing scheduler timing.
     #[cfg(test)]
     pub(crate) persist_gate: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)]
@@ -364,7 +364,7 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
     // The manager's fields are copied out and the guard is DROPPED at the end
     // of this block — deliberately, not incidentally. Reading presence through
     // `pm` would run an OS probe (a `pfctl -s labels` fork on macOS) inside
-    // this critical section, on a path the GUI polls every 5s for the life of
+    // this critical section, on a path the GUI polls repeatedly for the life of
     // the app, contending with `handle_start`/`stop_with` for the same lock.
     // Returning the guard from the block instead of its values would keep the
     // lock held and silently undo this.
@@ -381,7 +381,7 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         StatusResponse {
             running: pm.state() == ProxyState::Running,
             uptime_secs: pm.uptime_secs(),
-            // Death reason only (path-free, #470) — NOT `last_error`, which can
+            // Death reason only (path-free) — NOT `last_error`, which can
             // carry a filesystem path/hostname from a failed start and must never
             // reach the GUI toast. The rich detail stays in `last_error` for
             // diagnostics (bridge="error") and the click-path start-error surface.
@@ -404,7 +404,7 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
     // longer exists.
     //
     // In `spawn_blocking`: the probe blocks (it forks `pfctl -s labels` on macOS; it opens the WFP engine on
-    // Windows), and status takes no `state.proxy`, so polls (every 5 s from the tray and the dashboard) can overlap.
+    // Windows), and status takes no `state.proxy`, so polls (from the tray and the dashboard) can overlap.
     // Inline, each would block a runtime worker.
     let routing = Arc::clone(&state.routing);
     let presence = tokio::task::spawn_blocking(move || routing.lockdown_cover_presence())
@@ -491,14 +491,13 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     hole_common::logging::redact_arm::arm_server(&config.server);
     let attempt_id = attempt_id_from(&headers);
     let on_startup = on_startup_from(&headers);
-    // No wire signal for "covered" reaches this handler anymore (#979 — see
-    // `hole_common::protocol::BridgeRequest::Start`'s doc for why the GUI
-    // stopped asserting it). Every start this HTTP handler ever sees is
-    // client-initiated (a manual connect, or the elevation re-exec of one) —
-    // the only source of a genuinely auto-connect-covered start is the
-    // bridge's own boot-time reconciliation (#617, `reconcile_once`), which
-    // calls `ProxyManager` directly and never goes through this handler at
-    // all.
+    // No wire signal for "covered" reaches this handler (see
+    // `hole_common::protocol::BridgeRequest::Start`'s doc for why the GUI stopped
+    // asserting it). Every start this HTTP handler sees is client-initiated (a
+    // manual connect, or the elevation re-exec of one). The bridge's boot-time
+    // reconciliation (`reconcile_once`) calls `ProxyManager`
+    // directly and starts `Uncovered` too, so no production path builds
+    // `Coverage::Covered`.
     let coverage = Coverage::Uncovered;
     #[allow(clippy::disallowed_methods)]
     // IPC root: every bridge cancel scope descends from this token. See clippy.toml CancellationToken::new rule.
@@ -536,7 +535,7 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     // (`persist_session_event`), so keeping the two critical sections under
     // one lock makes the writers mutually exclusive instead of racing — an
     // explicit Stop landing between this attempt's start and its own
-    // persist can no longer be silently reverted back to `Connected` by this
+    // persist cannot be silently reverted back to `Connected` by this
     // handler's unconditional overwrite. It also serializes this handler's
     // own startup-preference read-modify-write against a second start's,
     // since single-occupancy (the 409 above) will not admit the next start
@@ -585,9 +584,9 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
 /// - `on_startup` is a GUI-pushed preference, not a record of what happened —
 ///   when `Some`, it is written on every attempt regardless of `succeeded`,
 ///   same as the GUI would push a Settings change whether or not the tunnel
-///   is up. `None` means the caller (the CLI, which has no Settings to push,
-///   #979) pushed nothing: the persisted preference is left exactly as it
-///   was, never stomped down to the wire default.
+///   is up. `None` means the caller (the CLI, which has no Settings to push)
+///   pushed nothing: the persisted preference is left exactly as it was, never
+///   stomped down to the wire default.
 /// - The target and the preference's `candidate` (the config
 ///   `resolve_startup_target`'s `AlwaysConnect` arm falls back on) both
 ///   record what actually happened, so they are gated on `succeeded`
@@ -786,10 +785,9 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
 /// stays blocked while every record says it isn't and the user's only retry
 /// affordance (the tray still offering Unblock) is gone.
 ///
-/// The release is UNCONDITIONAL — no presence probe gates it. This once
-/// consulted `cover_step` and skipped the call on a confirmed `Absent`, which
-/// is check-then-act in front of an operation documented idempotent, and at
-/// the escape hatch a stale `Absent` is the one wrong answer that matters: it
+/// The release is UNCONDITIONAL: no presence probe gates it. A probe would be
+/// check-then-act in front of an operation documented idempotent, and at the
+/// escape hatch a stale `Absent` is the one wrong answer that matters: it
 /// reports success while the host stays blocked. `turn_lockdown_off` shares the rule.
 async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
@@ -1241,7 +1239,7 @@ async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
     }
 }
 
-// New handlers ========================================================================================================
+// Metrics and diagnostics =============================================================================================
 
 async fn handle_metrics<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
@@ -1608,11 +1606,8 @@ pub(crate) fn write_installer_user_sid(dir: &Path, sid: &str) -> std::io::Result
 /// Windows: detects error code 1379) and `group::add_user_to_group`
 /// is idempotent (macOS: `dseditgroup -o edit -a` is naturally
 /// idempotent; Windows: detects error code 1378). The SID file write
-/// unconditionally replaces the file. An end-to-end test
-/// would require elevation (to actually call `dseditgroup` /
-/// `net localgroup`), so we don't add one — elevation is a runtime
-/// dependency, not a test-harness dependency. Integration coverage is
-/// provided by the install-service Verification step.
+/// unconditionally replaces the file. No unit test asserts its effects; it runs
+/// only end to end in the installer lanes.
 pub fn prepare_ipc_access() -> std::io::Result<()> {
     crate::group::create_group()?;
     let user = crate::group::installing_username()?;

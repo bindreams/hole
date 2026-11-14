@@ -155,7 +155,7 @@ fn reap_keeps_a_record_it_cannot_read() {
 
 #[skuld::test]
 fn reap_clears_an_obsolete_record() {
-    // Version 1 holds `{pid, start_time_unix_ms}` objects, which can no longer name a process.
+    // Version 1 holds `{pid, start_time_unix_ms}` objects, which cannot name a process.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join(plugin_state::STATE_FILE_NAME),

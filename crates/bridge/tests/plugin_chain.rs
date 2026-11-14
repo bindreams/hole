@@ -334,8 +334,8 @@ async fn a_cancel_during_the_start_stops_the_plugin_it_spawned() {
 
 /// A start future dropped before it returns (the task around it aborted) must
 /// not orphan the plugin it spawned. Without the fix a leaked chain's plugin
-/// still ends, on garter's own readiness bound, so this goes red by taking about
-/// a minute; the by-assertion guard is `plugin_tests`' `ChainTask` drop test.
+/// still ends, on garter's own readiness bound, so this goes red only by taking
+/// that long; the by-assertion guard is `plugin_tests`' `ChainTask` drop test.
 #[skuld::test]
 async fn dropping_the_start_future_stops_the_plugin_it_spawned() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");

@@ -12,8 +12,7 @@
 //! `target/<profile>/deps/hole_bridge-<hash>.exe`, which does not have
 //! `ex-ray` as a sibling. The dist directory IS the production
 //! layout, so spawning from it exercises the real plugin resolution path
-//! without any test-only seams in production code. See PR #164 follow-up
-//! plan for the full rationale.
+//! without any test-only seams in production code.
 //!
 //! ## Lifetime
 //!
@@ -50,10 +49,11 @@ use tempfile::TempDir;
 
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
 
-/// Max spawn attempts when Windows Defender / macOS exec-busy holds
-/// the freshly-built `hole.exe`. Three with 500 ms exponential backoff
-/// gives a total of 500 + 1000 = 1500 ms of waiting — empirically
-/// enough to let a Defender scan release the handle.
+/// Max spawn attempts when Windows Defender / macOS exec-busy holds the
+/// freshly-built `hole.exe`. Retries back off exponentially from
+/// [`SPAWN_BACKOFF`]. The cap assumes the total backoff outlasts a Defender
+/// scan's hold on the handle; no measurement of that is recorded, and the cap
+/// itself is open: bindreams/hole#1298.
 const MAX_SPAWN_ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).expect("literal");
 const SPAWN_BACKOFF: Duration = Duration::from_millis(500);
 
@@ -186,7 +186,7 @@ impl DistHarness {
 
         // Use the diagnostic wrapper so any `ACCESS_DENIED` / `ETXTBSY`
         // spawn failure (typically Windows Defender scanning the freshly
-        // built `hole.exe`) lands a holder list in the log. See #208.
+        // built `hole.exe`) lands a holder list in the log.
         let mut child = util::retry::retry_if(
             || cmd.spawn(),
             util::retry::is_file_contention,
@@ -222,7 +222,7 @@ impl DistHarness {
 
         // Wait for the socket to become connectable before returning.
         // If the subprocess has already exited, surface that instead of
-        // waiting the full 10s timeout.
+        // waiting out the whole deadline.
         if let Err(e) = wait_for_socket_or_exit(&socket_path, &mut child, Duration::from_secs(10)).await {
             // Unregister BEFORE kill/wait — same ordering as the Drop
             // impl. If `child.kill()` or `child.wait()` themselves

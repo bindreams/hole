@@ -47,13 +47,12 @@ mod test_support;
 #[cfg(test)]
 mod dir_writers_tests;
 
-// The cross-implementation interop suite (ex-ray ↔ stock v2ray-plugin) was
-// relocated to the `plugin-e2e` crate (#435) so it runs on a plugin-owned,
-// Linux-inclusive matrix instead of Hole's Win+mac bridge CI.
+// The cross-implementation interop suite (ex-ray and stock v2ray-plugin) lives in
+// the `plugin-e2e` crate, not here.
 
 // Install the workspace test subscriber + panic hook. The dev-dep
 // is gated on cfg(test) because it isn't linked in non-test builds.
-// See `crates/test-observability/` and bindreams/hole#301.
+// See `crates/test-observability/`.
 #[cfg(test)]
 hole_test_observability::register!();
 

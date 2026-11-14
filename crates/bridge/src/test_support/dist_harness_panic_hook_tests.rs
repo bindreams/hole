@@ -17,8 +17,6 @@
 //! parent re-execs the current test binary with
 //! `HOLE_DIST_HARNESS_PANIC_TEST=1`; `lib.rs::main` short-circuits
 //! into [`run_child`] before `skuld::run_all`.
-//!
-//! See bindreams/hole#303 (regression gate (b)).
 
 #![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
@@ -57,7 +55,7 @@ pub(crate) fn run_child() {
 
     // Deliberate panic INSIDE `rt().block_on(...)` — the exact
     // tokio-worker-thread panic scenario the original DistHarness
-    // hook was designed to handle (see #200 H3). Panic propagates out
+    // hook was designed to handle. Panic propagates out
     // of `block_on`, then out of `run_child`, then out of `main`.
     // Default unwind → libtest panic printer → exit 101.
     runtime.block_on(async {

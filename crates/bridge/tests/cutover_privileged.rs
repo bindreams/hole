@@ -1,5 +1,4 @@
-//! Privileged-lane cutover proofs (the bindreams/hole#165 isolation contract,
-//! TUN lane). Real rename/SCM/renamex_np FFI driven through `hole_bridge`'s
+//! Privileged-lane cutover proofs (TUN lane). Real rename/SCM/renamex_np FFI driven through `hole_bridge`'s
 //! public API. NOT `#[ignore]`d and do NOT skip on missing privilege — a default
 //! `cargo nextest` run on an unelevated box runs them and FAILS LOUD; opting out
 //! is the explicit `SKULD_LABELS="!tun"` filter, and CI provisions the elevation.
@@ -7,8 +6,7 @@
 //! These key on SERVICE-STATE transitions (`NotifyServiceStatusChange`), the
 //! on-disk `same_file::Handle` identity FLIP, and the `/v1/version` flip — NEVER
 //! loopback. The GitHub Actions Windows runner drops inbound loopback to the test
-//! exe, so a loopback probe cannot tell a working cutover from a broken one (the
-//! PR1 lesson); the egress/identity/service-state signals are the only reliable
+//! exe, so a loopback probe cannot tell a working cutover from a broken one; the egress/identity/service-state signals are the only reliable
 //! ones on the runner.
 //!
 //! An INTEGRATION test (not a lib module) on purpose: Cargo guarantees the
@@ -80,7 +78,7 @@ use windows::Win32::Foundation::{ERROR_INVALID_SERVICE_CONTROL, ERROR_SERVICE_NO
 /// (the GUI self-heal precondition: `same_file::Handle` inequality is what makes
 /// `decide_self_heal` return Relaunch), and the swap must succeed WHILE the image
 /// is mapped by a running process (the running-exe rename held `FILE_SHARE_DELETE`
-/// — the load-bearing D1 premise). Non-privileged, but joins the TUN lane so it
+/// — the premise the swap rests on). Non-privileged, but joins the TUN lane so it
 /// serializes with the real-net tests.
 ///
 /// Spawns a COPY of the idle helper in a tempdir — never the cargo target bin,
@@ -840,7 +838,7 @@ impl OnStop {
     }
 
     /// The state the SCM answers the first Stop with (measured on
-    /// windows-latest, twice): the service's own STOP_PENDING, or, when the
+    /// windows-latest): the service's own STOP_PENDING, or, when the
     /// StopPending report fails, the RUNNING it last reported.
     fn first_stop_state(self) -> windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE {
         match self {
