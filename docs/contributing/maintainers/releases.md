@@ -2,7 +2,7 @@
 
 Hole is released as four independent products, each with its own version, tag and GitHub release. This page is for the
 person who cuts one: what a release ships, the two workflows that make it, and what each checks before it lets the
-release through. Taking a release back is [Rollback](rollback.md).
+release through. Withdrawing a defective one is [Withdrawing a release](withdrawal.md).
 
 ## The four tracks
 
@@ -43,6 +43,17 @@ Each track's versions live in its crates' `[package.metadata.hole-release].group
 The split is deliberate: the draft does everything that can be undone, and publishing does what cannot (the tag, `cargo publish`, the latest-release flip). Publishing re-checks that the release is still a draft and, for `hole`, that
 `SHA256SUMS` verifies against the signature. The tag exists only once the release is published, so deleting a draft
 removes everything it made.
+
+To abandon a draft, delete it. A draft may be deleted where a published release may not ([Withdrawing a
+release](withdrawal.md)) because it never served a file. This command deletes the release only if it is a draft:
+
+```sh
+[ "$(gh release view -R bindreams/hole <tag> --json isDraft --jq .isDraft)" = true ] && gh release delete -R bindreams/hole <tag>
+```
+
+Before running it, make sure no **Publish Release (`<product>`)** run for that version is queued or in progress (the
+Actions tab, or `gh run list -R bindreams/hole --workflow publish-release-<product>.yaml`): a run that publishes the
+release between the check and the delete makes the delete remove a published release.
 
 The notes are built from the commit subjects since the track's previous tag ([Commit
 messages](../commit-messages.md)): the highest-versioned release tag of that track that is an ancestor of the commit.
