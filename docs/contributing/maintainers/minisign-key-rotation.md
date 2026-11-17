@@ -26,7 +26,8 @@ A client checks a release against its *own* key, so a release signed with a new 
 not already contain the new public key. The new key therefore ships one release before it signs anything. Call the release
 that introduces the key **N**.
 
-1. **Generate the new pair** on a trusted machine, and keep the old private key until N is signed:
+1. **Generate the new pair** ([Signing keys](signing-keys.md)) on a trusted machine, and keep the old private key until N
+   is signed:
 
    ```sh
    minisign -G -p new-minisign.pub -s new-minisign.key
