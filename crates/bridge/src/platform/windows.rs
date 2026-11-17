@@ -37,6 +37,8 @@ use repair_session::{RepairSession, ENABLE_ACCESS, READ_ACCESS, REPAIR_ACCESS};
 #[path = "windows/status_session.rs"]
 mod status_session;
 use status_session::StatusSession;
+#[path = "windows/process_access.rs"]
+pub mod process_access;
 #[path = "windows/registration.rs"]
 pub mod registration;
 #[path = "windows/service_processes.rs"]
@@ -44,6 +46,8 @@ mod service_processes;
 pub use service_processes::scan_service_processes;
 #[path = "windows/service_sid.rs"]
 mod service_sid;
+#[path = "windows/token.rs"]
+pub mod token;
 pub use service_sid::{ServiceSid, SidRepair, SidRepairOutcome};
 
 // Constants ===========================================================================================================
@@ -82,8 +86,25 @@ pub fn explicit_plugin_source(dir: std::path::PathBuf) -> std::io::Result<crate:
     })
 }
 
+/// Opens this service process and its children to administrators for a
+/// retirement. A failure is logged and never stops the start: a bridge that will
+/// not start for it locks the user out.
+pub fn open_service_process_to_administrators() {
+    report_administrators_grant(process_access::grant_administrators_retirement_access());
+}
+
+fn report_administrators_grant(grant: std::io::Result<()>) {
+    if let Err(e) = grant {
+        error!(
+            error = &e as &dyn std::error::Error,
+            "could not open the service process to administrators; a caller without SeDebugPrivilege cannot retire it"
+        );
+    }
+}
+
 /// Run as a Windows Service (called by the service control manager).
 pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path, version: &str) -> std::io::Result<()> {
+    open_service_process_to_administrators();
     let default = hole_common::protocol::default_bridge_socket_path();
     if socket_path != default {
         SOCKET_PATH_OVERRIDE.set(socket_path.to_owned()).ok();

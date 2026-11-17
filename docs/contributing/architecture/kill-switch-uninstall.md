@@ -148,6 +148,16 @@ race. The contract, with the reference in the module docs it points at:
   process is held only if its token carries it. The bridge also ensures the SID type at startup, since an in-app update is
   run by the old release's code. The gap is the one window after an update from a release without it, closed at that host's
   next service start.
+- **The service opens its processes to administrators.** A process with a service SID is created with a descriptor that
+  grants full access to a logon SID unique to it and only query rights to Administrators, so a caller holding no
+  `SeDebugPrivilege` (an elevated prompt, or the MSI's custom action, whose service has none) could not open it to wait
+  for its exit or to end it. As the first act of its entry the bridge adds an allow entry for `BUILTIN\Administrators`
+  to its own process's DACL and to its token's default DACL, which every child process and that child's token are created
+  with; the rights and the masks they become are in {src}`crates/bridge/src/platform/windows/process_access.rs`. The grant
+  only adds: no entry is removed, and a second call adds nothing. A failed grant is logged as an error and never stops
+  the start. A process of the service that has not run the grant refuses the open; what the retirement does about it
+  depends on the state the SCM names the process in, which `Basis::verdict` in
+  {src}`crates/bridge/src/service_scm/hold.rs` decides.
 ```
 
 ## The Disabled service and its record

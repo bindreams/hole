@@ -151,6 +151,14 @@ impl EchoChild {
     }
 }
 
+/// The child's process handle, for reading or changing its security.
+#[cfg(windows)]
+impl std::os::windows::io::AsRawHandle for EchoChild {
+    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+        self.child.as_raw_handle()
+    }
+}
+
 impl Drop for EchoChild {
     fn drop(&mut self) {
         self.writer = None;

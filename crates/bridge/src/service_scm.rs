@@ -89,6 +89,20 @@ impl ReportedPid {
         }
     }
 
+    /// Whether a process found not to be the service's, on a claim of this kind,
+    /// is still not the service's once the SCM names the same id on the claim
+    /// `later`. A refusal under an id that may not be valid is a stranger's or a
+    /// service process that has not run its grant yet; a valid claim on the same
+    /// process says which, so the process is opened again under it.
+    pub fn rejection_stands_under(self, later: ReportedPid) -> bool {
+        match self {
+            // Already as strong as a verdict gets: a refusal here is fatal.
+            ReportedPid::Valid => true,
+            ReportedPid::MayBeInvalid => !later.is_a_claim_about_the_service(),
+            ReportedPid::Never => unreachable!("a state that names no process opens none"),
+        }
+    }
+
     /// Whether an id that no process has means the service's process has
     /// exited. Only where the id is valid is that a fact about the service;
     /// where it may be invalid it is a fact about the id.

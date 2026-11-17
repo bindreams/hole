@@ -50,6 +50,9 @@
 //! - `--running-event <event>`: signalled right after the service reports
 //!   RUNNING, once per start. A test that resets it before it kills the service
 //!   learns the SCM's restarted instance is up from the signal.
+//! - `--no-grant` (no value): do not run the grant that opens the service's
+//!   processes to administrators (`platform::os::open_service_process_to_administrators`),
+//!   which every start otherwise runs first.
 //!
 //! A first argument of `--park-forever` makes this the child `--spawn-orphan`
 //! starts: it does nothing, for ever.
@@ -102,6 +105,7 @@ struct Args {
     pid_log: Option<PathBuf>,
     sid_repair_log: Option<PathBuf>,
     spawn_orphan: Option<PathBuf>,
+    no_grant: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -111,6 +115,10 @@ static ARGS: std::sync::OnceLock<Args> = std::sync::OnceLock::new();
 fn parse_args(mut raw: impl Iterator<Item = OsString>) -> Args {
     let mut args = Args::default();
     while let Some(flag) = raw.next() {
+        if flag == "--no-grant" {
+            args.no_grant = true;
+            continue;
+        }
         let value = raw.next().expect("every flag takes a value");
         match flag.to_str() {
             Some("--control-log") => args.control_log = Some(PathBuf::from(value)),
@@ -156,6 +164,10 @@ fn main() -> Result<(), windows_service::Error> {
     }
     ARGS.set(parse_args(std::env::args_os().skip(1))).ok();
     let args = ARGS.get().expect("set above");
+    // First, as the bridge's own entry does: before the park, and so before any child it starts.
+    if !args.no_grant {
+        hole_bridge::platform::os::open_service_process_to_administrators();
+    }
     if let Some(path) = &args.pid_log {
         use std::io::Write;
         let mut log = std::fs::OpenOptions::new()
