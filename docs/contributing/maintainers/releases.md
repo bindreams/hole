@@ -34,9 +34,10 @@ Each track's versions live in its crates' `[package.metadata.hole-release].group
 1. Merge the change that sets the new version to `main`. A draft refuses a commit that is not an ancestor of `main`.
 1. Run **Draft Release (`<product>`)** from the Actions tab with the version, e.g. `0.8.0`. It runs all of CI on that
    commit, then creates a *draft* GitHub release with the files CI tested. Nothing is public yet.
-1. For `hole` only: sign the draft with `uv run scripts/sign-release.py <version>`. It downloads the draft's
-   `SHA256SUMS`, checks that it lists every asset exactly once, signs it with `minisign` and uploads
-   `SHA256SUMS.minisig`.
+1. For `hole` only: sign the draft with `uv run scripts/sign-release.py <version> --secret-key <the release key>`. It
+   downloads the draft's `SHA256SUMS`, checks that it lists every asset exactly once, signs it with `minisign` and
+   uploads `SHA256SUMS.minisig`. Without `--secret-key`, minisign signs with its own default key, whichever that is
+   ([Signing keys](signing-keys.md)).
 1. Read the draft's notes and files, then run **Publish Release (`<product>`)** with the same version.
 
 The split is deliberate: the draft does everything that can be undone, and publishing does what cannot (the tag, `cargo publish`, the latest-release flip). Publishing re-checks that the release is still a draft and, for `hole`, that
