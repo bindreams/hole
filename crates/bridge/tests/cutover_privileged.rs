@@ -64,6 +64,9 @@ mod sid_probes;
 #[cfg(target_os = "windows")]
 #[path = "cutover_privileged/start_type_lock_proofs.rs"]
 mod start_type_lock_proofs;
+#[cfg(target_os = "windows")]
+#[path = "cutover_privileged/without_debug_privilege.rs"]
+mod without_debug_privilege;
 
 #[cfg(target_os = "windows")]
 use hole_bridge::cutover::os::windows::WindowsCutoverOs;
@@ -1134,11 +1137,10 @@ mod left_behind {
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
     use std::path::Path;
 
-    use windows::core::PWSTR;
-    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::core::{HRESULT, PWSTR};
+    use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME, HANDLE};
     use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     /// The ids the helper logged.
@@ -1184,30 +1186,55 @@ mod left_behind {
         );
     }
 
+    /// Whether `pid` is a running helper process. The open asks only for
+    /// `PROCESS_QUERY_LIMITED_INFORMATION`, which an administrator is granted on a
+    /// service-SID service's process and a protected one, so an id the OS has since
+    /// given to such a process reads as not the helper. The exit state is the
+    /// handle's own: that right carries no `SYNCHRONIZE` to wait with.
     fn is_running_helper(pid: u32) -> bool {
         // SAFETY: plain FFI call; no pointer is passed.
-        let Ok(process) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
-        else {
+        let opened = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
+        let process = match opened {
+            Ok(process) => process,
             // No process has this id: it has exited and been released.
-            return false;
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) => return false,
+            // Not even the query right: nothing is known about this process.
+            Err(error) => panic!("cannot tell whether process {pid} is still running: its open failed: {error}"),
         };
         // SAFETY: `OpenProcess` returned a new handle this value now owns.
         let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
         let handle = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&process));
-        // SAFETY: `handle` is the live handle `process` owns.
-        if unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0 {
-            // Exited, kept in existence only by someone's handle.
-            return false;
-        }
-        // Running. An id the OS has since given to another program is not the helper.
+        // Read before the exit state: an exit is final, so a read that fails because the
+        // process exited meanwhile is told from one that fails for another reason.
         let mut buffer = [0u16; 1024];
         let mut length = buffer.len() as u32;
         // SAFETY: `buffer` and `length` outlive the call and describe the same storage.
-        unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut length) }
-            .expect("read the image of a running process");
+        let image =
+            unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut length) };
+        if has_exited(handle) {
+            // Exited, kept in existence only by someone's handle.
+            return false;
+        }
+        image.expect("read the image of a running process");
+        // Running. An id the OS has since given to another program is not the helper.
         String::from_utf16_lossy(&buffer[..length as usize])
             .to_ascii_lowercase()
             .ends_with("test_service.exe")
+    }
+
+    /// Whether the process `handle` names has an exit time, which it gets when it
+    /// exits (unlike its exit code, which a process may set to any value).
+    fn has_exited(handle: HANDLE) -> bool {
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        // SAFETY: `handle` is a live process handle with `PROCESS_QUERY_LIMITED_INFORMATION`; the four out-parameters outlive the call.
+        unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) }
+            .expect("read the times of a process");
+        exited.dwLowDateTime != 0 || exited.dwHighDateTime != 0
     }
 }
 
@@ -2033,18 +2060,18 @@ fn cutover_global_net_state_service_sid_probe_a_stranger() {
     assert_answers(&measure, false, "a stranger");
 }
 
-/// `OpenProcess(PROCESS_SYNCHRONIZE)` on the service process from the caller's
-/// token: the open every held process rests on. The caller here is an elevated
-/// administrator (the TUN lane runs elevated, which `create_service` needs). A
-/// SYSTEM caller (the MSI custom action) cannot be reproduced by a test without a
-/// second SYSTEM process; its first real answer is the CI installer test's
-/// uninstall, whose `gui-cli.log` dump names `OpenProcess` and its code if it was
-/// refused.
+/// `OpenProcess(RETIREMENT_ACCESS)` on the service process from an elevated
+/// administrator that holds no `SeDebugPrivilege` (an elevated prompt holds it
+/// disabled): the open every held process rests on, and one the process
+/// descriptor refuses unless the service has granted Administrators the access
+/// (`platform::os::open_service_process_to_administrators`, which the helper
+/// service runs). The open must succeed and the process must be running.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_stop_probe_open_process_synchronize_on_the_service_process() {
+fn cutover_global_net_state_stop_probe_opens_the_service_process_with_the_retirement_access_and_no_debug_privilege() {
+    use hole_bridge::platform::os::process_access::RETIREMENT_ACCESS;
     use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
     use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -2065,8 +2092,9 @@ fn cutover_global_net_state_stop_probe_open_process_synchronize_on_the_service_p
         .process_id
         .expect("a running service has a process");
 
+    without_debug_privilege::remove_debug_privilege();
     // SAFETY: plain FFI calls on a handle this test opens and closes.
-    let opened = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) };
+    let opened = unsafe { OpenProcess(RETIREMENT_ACCESS, false, pid) };
     let outcome = match &opened {
         Ok(handle) => {
             let waited = unsafe { WaitForSingleObject(*handle, 0) };
@@ -2082,19 +2110,11 @@ fn cutover_global_net_state_stop_probe_open_process_synchronize_on_the_service_p
         }
         Err(e) => format!("Err {e} (win32 code {})", e.code().0 & 0xFFFF),
     };
-    eprintln!(
-        "SCM stop probe, OpenProcess(PROCESS_SYNCHRONIZE) on the LocalSystem service process (pid {pid}) from an elevated administrator: {outcome}\n  \
-         MEANS: Ok => the process hold (service_scm/hold.rs, service_processes.rs) works for `hole bridge uninstall` run elevated, and \
-         the zero-timeout wait is the exit check `ProcessFate` reads. Err 5 (ACCESS_DENIED) => every uninstall by an elevated \
-         administrator fails with RetireError::Hold (\"the service's process could not be opened ...: OpenProcess failed\"), \
-         where it worked before the hold existed, and the exit has to be awaited another way (an owner question). \
-         SYSTEM (the MSI custom action) is not measured here."
-    );
-    // Measured in CI: the open succeeds and the process is running, which the
-    // process hold and the exit check rely on.
     assert!(
         outcome.starts_with("Ok; ") && outcome.contains("not signalled"),
-        "OpenProcess(PROCESS_SYNCHRONIZE) on the service process: {outcome}"
+        "OpenProcess(RETIREMENT_ACCESS) on the service process (pid {pid}) from an elevated administrator \
+         without SeDebugPrivilege: {outcome}. Err 5 (ACCESS_DENIED) means the service did not open its process \
+         to Administrators, so every retirement by such a caller fails with RetireError::Hold."
     );
 }
 
@@ -2134,9 +2154,9 @@ fn deregister_recorded(hook: recording::Hook<'_>) -> recording::Trace {
 /// Retires a service parked in START_PENDING by `flag`, and checks it ends up
 /// deregistered. The first look must be the parked START_PENDING, and the Stop
 /// must have come only after a later RUNNING, with the start type already
-/// disabled.
+/// disabled. `before_retire` runs once the service is parked.
 #[cfg(target_os = "windows")]
-fn retire_a_parked_service(flag: &str) {
+fn retire_a_parked_service(flag: &str, before_retire: impl FnOnce()) {
     use hole_bridge::platform::os::SERVICE_NAME;
     use hole_bridge::service_scm::Observed;
 
@@ -2157,6 +2177,7 @@ fn retire_a_parked_service(flag: &str) {
     let starter = start_in_background();
     parked.wait();
 
+    before_retire();
     let trace = deregister_recorded(releasing(&release));
 
     starter.join().unwrap().expect("the held service starts once released");
@@ -2178,13 +2199,13 @@ fn retire_a_parked_service(flag: &str) {
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_uninstall_waits_out_a_service_held_in_start_pending() {
-    retire_a_parked_service("--hold-start");
+    retire_a_parked_service("--hold-start", || {});
 }
 
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_uninstall_waits_out_a_service_not_yet_attached() {
-    retire_a_parked_service("--delay-attach");
+    retire_a_parked_service("--delay-attach", || {});
 }
 
 /// The SCM restarts a killed service (the restart delay is configuration; the
@@ -2610,19 +2631,25 @@ fn install_a_service_with_an_orphan(pid_log: &std::path::Path) -> (ProvisionedSe
 
 /// The uninstall ends a process that carries the service's token and that
 /// nothing will ever stop, instead of waiting on it for ever while it holds the
-/// machine-wide lock.
+/// machine-wide lock. `before_uninstall` runs once the service and its orphan are up.
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_uninstall_terminates_a_service_process_nothing_stops() {
+fn uninstall_terminates_an_orphan(before_uninstall: impl FnOnce()) {
     use hole_bridge::platform::os::SERVICE_NAME;
 
     let dir = tempfile::tempdir().unwrap();
     let pid_log = dir.path().join("pids.log");
     let (_service, _pids) = install_a_service_with_an_orphan(&pid_log);
 
+    before_uninstall();
     hole_bridge::platform::os::uninstall().expect("uninstall returns with the orphan terminated");
     left_behind::assert_none(&pid_log);
     scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_terminates_a_service_process_nothing_stops() {
+    uninstall_terminates_an_orphan(|| {});
 }
 
 /// The cutover's stop wait does the same over its own session.
@@ -2664,10 +2691,10 @@ fn cutover_global_net_state_uninstall_arms_before_the_stop_of_a_service_it_canno
     trace.assert_every_stop_follows_an_arm();
 }
 
-/// Unchanged behaviour: a RUNNING service is stopped and deregistered.
+/// A RUNNING service is stopped and deregistered. `before_uninstall` runs once
+/// the service is running.
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_uninstall_deregisters_a_running_service() {
+fn deregisters_a_running_service(before_uninstall: impl FnOnce()) {
     use hole_bridge::platform::os::SERVICE_NAME;
 
     let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
@@ -2680,11 +2707,18 @@ fn cutover_global_net_state_uninstall_deregisters_a_running_service() {
     };
     CutoverOs::start_service_wait_running(&mut os).expect("bring the service up");
 
+    before_uninstall();
     hole_bridge::platform::os::uninstall().expect("uninstall a running service");
     // Before the deletion is awaited: the uninstall itself returns with no
     // service process left.
     left_behind::assert_none(&pid_log);
     scm_deletion::wait_until_deleted(SERVICE_NAME).expect("the service is deleted");
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_uninstall_deregisters_a_running_service() {
+    deregisters_a_running_service(|| {});
 }
 
 /// `ensure_stopped` stops without deregistering, and puts the restart back.
@@ -3001,10 +3035,16 @@ fn cutover_global_net_state_uninstall_waits_out_a_process_whose_entry_is_already
     );
 
     let (messages, inbox) = std::sync::mpsc::channel();
+    let (checked, check_done) = std::sync::mpsc::channel::<()>();
     let retirement = std::thread::spawn(move || {
         let sink = messages.clone();
         let hook: recording::SurvivorHook<'_> = Box::new(move |event| {
             let _ = sink.send(Message::Survivor(*event));
+            if *event == SurvivorEvent::AwaitExits {
+                // The wait ends the process, so the test looks at it first. An
+                // error is the test's own panic, which is what gets reported.
+                let _ = check_done.recv();
+            }
         });
         let opening = RetireSession::open().expect("open the retire session");
         let result = retire_over(
@@ -3026,6 +3066,7 @@ fn cutover_global_net_state_uninstall_waits_out_a_process_whose_entry_is_already
                         "the process waited on is the helper's, and it is alive"
                     );
                     exit.signal();
+                    checked.send(()).expect("the retirement is waiting for the check");
                 }
             }
             Message::Returned(result) => break result,

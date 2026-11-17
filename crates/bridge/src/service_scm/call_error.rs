@@ -2,8 +2,9 @@
 
 use std::io;
 
-/// An SCM entry point (or the process wait that goes with a service) whose
-/// failure is reported by name.
+/// A Win32 call whose failure is reported by name: the SCM's entry points, the
+/// process and token calls that go with a service, and the calls that grant
+/// access to the service's own process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScmCall {
     OpenScManager,
@@ -26,6 +27,11 @@ pub enum ScmCall {
     TerminateProcess,
     CreateService,
     StartServiceCtrlDispatcher,
+    CreateWellKnownSid,
+    GetSecurityInfo,
+    SetEntriesInAcl,
+    SetSecurityInfo,
+    SetTokenInformation,
 }
 
 impl ScmCall {
@@ -51,6 +57,11 @@ impl ScmCall {
             ScmCall::TerminateProcess => "TerminateProcess",
             ScmCall::CreateService => "CreateService",
             ScmCall::StartServiceCtrlDispatcher => "StartServiceCtrlDispatcher",
+            ScmCall::CreateWellKnownSid => "CreateWellKnownSid",
+            ScmCall::GetSecurityInfo => "GetSecurityInfo",
+            ScmCall::SetEntriesInAcl => "SetEntriesInAcl",
+            ScmCall::SetSecurityInfo => "SetSecurityInfo",
+            ScmCall::SetTokenInformation => "SetTokenInformation",
         }
     }
 
@@ -80,6 +91,11 @@ impl ScmCall {
             ScmCall::TerminateProcess => false,
             ScmCall::CreateService => false,
             ScmCall::StartServiceCtrlDispatcher => false,
+            ScmCall::CreateWellKnownSid => false,
+            ScmCall::GetSecurityInfo => false,
+            ScmCall::SetEntriesInAcl => false,
+            ScmCall::SetSecurityInfo => false,
+            ScmCall::SetTokenInformation => false,
         }
     }
 
@@ -91,6 +107,17 @@ impl ScmCall {
             Some(code) => ScmCallError { call: self, code }.into_io(),
             // Nothing to carry but the text.
             None => io::Error::other(format!("{} failed: {failure}", self.name())),
+        }
+    }
+
+    /// `failure`, a failure of this call as the `windows` crate reports it, as
+    /// its typed failure with the Win32 code. The caller picks the conversion
+    /// to `io::Error`: [`ScmCallError::into_io`] logs, `into_io_unlogged` does not.
+    #[cfg(target_os = "windows")]
+    pub fn failed_with_windows(self, failure: &windows::core::Error) -> ScmCallError {
+        ScmCallError {
+            call: self,
+            code: win32_code_of_hresult(failure.code().0),
         }
     }
 }

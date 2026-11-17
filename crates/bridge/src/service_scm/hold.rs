@@ -168,6 +168,11 @@ impl Basis {
     ///   proves nothing either way and is reported.
     ///
     /// A missing process is [`Verdict::Gone`] on every basis.
+    ///
+    /// A denial is also what a process of the service gives before it has run
+    /// the grant that opens it to administrators (`platform::os::process_access`);
+    /// [`ProcessHolds::hold_current`] retries one met under a pending state. One
+    /// met in a scan is taken for another principal's and is not waited on.
     pub fn verdict(self, failure: ProbeFailure) -> Verdict {
         match self {
             Basis::Named(ReportedPid::Valid) => match failure {
@@ -391,7 +396,11 @@ impl<P> ProcessHolds<P> {
     /// is dropped and the second look is acted on as a first one, so a service
     /// that keeps changing is followed, one pass per real change, with no count.
     /// A process that fails the SID check is dropped the same way and reported
-    /// as [`Named::NotTheService`]; it is never held. Returns the last look.
+    /// as [`Named::NotTheService`]; it is never held, unless the first look's id
+    /// may not be valid and the second names it in a state whose id is: it is
+    /// then opened again under the second look's claim, the valid one, where a
+    /// refusal is fatal ([`ReportedPid::rejection_stands_under`], [`Basis::verdict`]).
+    /// Returns the last look.
     ///
     /// [qsse-remarks]: https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex#remarks
     pub fn hold_current<S: ProcessSource<Process = P>>(&mut self, source: &mut S) -> io::Result<Hold> {
@@ -429,6 +438,17 @@ impl<P> ProcessHolds<P> {
             };
             let again = source.read()?;
             if again.process_to_hold() != Some(pid) {
+                reading = again;
+                continue;
+            }
+            if candidate.is_none()
+                && !reading
+                    .observed
+                    .reported_pid()
+                    .rejection_stands_under(again.observed.reported_pid())
+            {
+                // The SCM now vouches for the process the open rejected, so the
+                // rejection may have been the service's own, not yet open to us.
                 reading = again;
                 continue;
             }

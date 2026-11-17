@@ -29,6 +29,10 @@ struct Script {
     reads: VecDeque<Reading>,
     gone: Vec<u32>,
     strangers: Vec<u32>,
+    /// Ids whose next `open` finds a stranger (a service process that has not run
+    /// its grant yet); each is taken off the list by it, so a later `open` of
+    /// the id finds the service's own process.
+    refused_once: Vec<u32>,
     /// Ids of processes that are open but already signalled.
     exited: Vec<u32>,
     /// The basis each `open` was asked on, in order.
@@ -42,6 +46,7 @@ impl Script {
             reads: reads.into(),
             gone: vec![],
             strangers: vec![],
+            refused_once: vec![],
             exited: vec![],
             bases: vec![],
         }
@@ -66,6 +71,10 @@ impl ProcessSource for Script {
             pid,
             log: self.log.clone(),
         };
+        if let Some(index) = self.refused_once.iter().position(|refused| *refused == pid) {
+            self.refused_once.remove(index);
+            return Ok(Opened::NotTheService);
+        }
         if self.strangers.contains(&pid) {
             // Dropped here, as the real source drops a process it rejects.
             return Ok(Opened::NotTheService);
@@ -288,6 +297,65 @@ fn a_process_without_the_service_sid_is_never_held() {
     assert!(held_pids(&holds).is_empty());
     // The source closes a rejected process as it returns it.
     assert_eq!(*log.borrow(), vec!["read", "open(100)", "close(100)", "read"]);
+}
+
+/// A refusal while the SCM says the id may not be valid is a stranger's only until
+/// the SCM names the same process in a state whose id is valid: then the process is
+/// the service's, so the refusal was the window before its grant.
+#[skuld::test]
+fn a_refusal_under_a_pending_state_is_retried_once_the_scm_names_the_process_running() {
+    let log = Log::default();
+    let mut source = Script::new(
+        &log,
+        vec![
+            reading(Observed::StartPending, 7),
+            reading(Observed::Running, 7),
+            reading(Observed::Running, 7),
+        ],
+    );
+    source.refused_once.push(7);
+    let mut holds = ProcessHolds::default();
+    let got = named_by(&mut holds, &mut source);
+    assert_eq!(got.reading, reading(Observed::Running, 7));
+    assert_eq!(got.named, Named::Held);
+    assert_eq!(held_pids(&holds), vec![7]);
+    assert_eq!(
+        source.bases,
+        vec![
+            Basis::Named(ReportedPid::MayBeInvalid),
+            Basis::Named(ReportedPid::Valid)
+        ]
+    );
+}
+
+/// The retry is only for the SCM's claim becoming valid: a stranger under a
+/// valid claim from the start is still not the service's.
+#[skuld::test]
+fn a_process_that_is_not_the_services_under_a_valid_claim_is_still_reported() {
+    let log = Log::default();
+    let mut source = Script::new(&log, vec![reading(Observed::Running, 7), reading(Observed::Running, 7)]);
+    source.strangers.push(7);
+    let mut holds = ProcessHolds::default();
+    let got = named_by(&mut holds, &mut source);
+    assert_eq!(got.named, Named::NotTheService);
+    assert!(held_pids(&holds).is_empty());
+    assert_eq!(source.bases, vec![Basis::Named(ReportedPid::Valid)]);
+}
+
+/// A refusal under a pending state stays a stranger's while the SCM's claim stays
+/// one that may not be valid.
+#[skuld::test]
+fn a_refusal_under_a_pending_state_stands_while_the_claim_stays_pending() {
+    let log = Log::default();
+    let mut source = Script::new(
+        &log,
+        vec![reading(Observed::StartPending, 7), reading(Observed::StartPending, 7)],
+    );
+    source.strangers.push(7);
+    let mut holds = ProcessHolds::default();
+    let got = named_by(&mut holds, &mut source);
+    assert_eq!(got.named, Named::NotTheService);
+    assert_eq!(source.bases, vec![Basis::Named(ReportedPid::MayBeInvalid)]);
 }
 
 #[skuld::test]
@@ -756,6 +824,7 @@ impl ProcessSource for DeniedToken {
         self.0.read()
     }
     fn open(&mut self, _: u32, basis: Basis) -> io::Result<Opened<Handle>> {
+        self.0.bases.push(basis);
         Opened::of_failure(basis, typed(ScmCall::OpenProcessToken, 5))
     }
     fn has_exited(&mut self, process: &Handle) -> io::Result<bool> {
@@ -786,6 +855,31 @@ fn a_denied_token_on_an_id_that_may_be_invalid_is_a_stranger() {
             .expect("a stranger is not an error");
         assert_eq!(got.fate, ProcessFate::Unheld, "{pending:?}");
     }
+}
+
+/// A refusal under a pending first look is a stranger's only until the SCM names
+/// the process running: refused again there, it is the service's own and fails the
+/// hold. It is opened once under each claim, not held and not looped on.
+#[skuld::test]
+fn a_stranger_refused_while_pending_and_again_once_running_fails_the_hold() {
+    let log = Log::default();
+    let mut source = DeniedToken(Script::new(
+        &log,
+        vec![reading(Observed::StartPending, 7), reading(Observed::Running, 7)],
+    ));
+    let mut holds = ProcessHolds::default();
+    let error = holds
+        .hold_current(&mut source)
+        .expect_err("a refusal under RUNNING is fatal");
+    assert!(io_error_is_a_refused_process_open(&error), "{error}");
+    assert!(held_pids(&holds).is_empty());
+    assert_eq!(
+        source.0.bases,
+        vec![
+            Basis::Named(ReportedPid::MayBeInvalid),
+            Basis::Named(ReportedPid::Valid)
+        ]
+    );
 }
 
 /// A scan-only outcome cannot come back for an id the SCM named.

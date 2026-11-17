@@ -289,3 +289,22 @@ fn every_step_of_a_change_opens_under_the_hold_of_its_own_thread_without_waiting
     drop(hold);
     assert!(!lock.is_held_for_another_thread(), "released with the hold");
 }
+
+/// A failed grant is an error in the log and nothing else.
+#[skuld::test]
+fn a_failed_grant_is_an_error_in_the_log() {
+    let log = garter::tracing_test::captured(|| {
+        report_administrators_grant(Err(std::io::Error::other("SetSecurityInfo failed: refused")));
+    });
+    assert!(log.contains("ERROR"), "{log}");
+    assert!(log.contains("SetSecurityInfo failed: refused"), "{log}");
+}
+
+/// A grant that worked says nothing.
+#[skuld::test]
+fn a_grant_that_worked_logs_nothing() {
+    assert_eq!(
+        garter::tracing_test::captured(|| report_administrators_grant(Ok(()))),
+        ""
+    );
+}

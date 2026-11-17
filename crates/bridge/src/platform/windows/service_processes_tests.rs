@@ -7,11 +7,11 @@ use windows::Win32::System::Threading::{
 };
 
 use super::{
-    has_exited, open_process, opened_from_token_read, scan_service_processes, ExitWait, HostProcesses,
-    ServiceProcesses, ServiceSid,
+    has_exited, open_process, opened_from_token_read, scan_service_processes, terminated_or_gone, ExitWait,
+    HostProcesses, ServiceProcesses, ServiceSid,
 };
 use crate::disable_record::Stamp;
-use crate::service_scm::call_error::{io_error_is_a_refused_process_open, ScmCall, ScmCallError};
+use crate::service_scm::call_error::{io_error_is_a_refused_process_open, scm_call_error, ScmCall, ScmCallError};
 use crate::service_scm::hold::{Basis, Opened, ProcessSource, Reading};
 use crate::service_scm::scan::{ListedProcess, ProcessEnumerator};
 use crate::service_scm::{Observed, ReportedPid};
@@ -360,4 +360,45 @@ fn the_paced_wait_with_nothing_held_takes_its_interval() {
     processes
         .wait_on_each(None)
         .expect("nothing held is nothing to wait for");
+}
+
+/// The call a failed attempt to end a process names is the call that failed.
+#[skuld::test]
+fn a_failed_attempt_to_end_a_process_names_the_call_that_failed() {
+    for call in [ScmCall::OpenProcess, ScmCall::TerminateProcess] {
+        let error = terminated_or_gone(&(), Err(ScmCallError { call, code: 5 }), never_exited)
+            .expect_err("the process is still running");
+        let typed = scm_call_error(&error).expect("the failure is typed");
+        assert_eq!((typed.call, typed.code), (call, 5));
+    }
+}
+
+/// A process that has exited is ended, whichever call failed; the failure is in
+/// the debug log.
+#[skuld::test]
+fn a_process_that_had_exited_is_ended_and_the_failure_is_debug_logged() {
+    use crate::test_support::log_capture::VecWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+
+    let writer = VecWriter::new();
+    let _guard = set_default_in_current_thread(
+        tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish(),
+    );
+
+    for call in [ScmCall::OpenProcess, ScmCall::TerminateProcess] {
+        terminated_or_gone(&(), Err(ScmCallError { call, code: 5 }), |_| Ok(true)).expect("it had exited");
+    }
+    terminated_or_gone(&(), Ok(()), |_| {
+        panic!("a process that was ended is not asked whether it exited")
+    })
+    .expect("it was ended");
+
+    let log = writer.snapshot_string();
+    assert_eq!(log.lines().filter(|line| line.contains("DEBUG")).count(), 2, "{log}");
+    assert!(log.contains("OpenProcess failed"), "{log}");
+    assert!(log.contains("TerminateProcess failed"), "{log}");
 }
