@@ -18,10 +18,24 @@ msiexec /i target\release\hole.msi /quiet           # install (drop /quiet for t
 `hole-msi` builds the front end first, because a release build embeds `ui/dist/` (see [Building in
 detail](build.md#the-front-end-toggle)).
 
+### Who stops the running service
+
+With Hole running, Windows Installer's uninstall dialog lists the app and the `HoleBridge` service, and its default
+closes both. If the person declines, the `BridgeUninstall` action (`hole bridge uninstall`, before `RemoveFiles`) stops
+the service anyway and the uninstall completes with the app left running.
+
 ### The install, E2E and uninstall run
 
 CI's installer lane installs the MSI, drives the installed app through WebDriver, uninstalls it and checks nothing is
-left. The same run works locally, against any MSI:
+left. It also upgrades over a second MSI linked from the same staged files. Both uninstall paths meet a running
+`HoleBridge` service, so the harness passes `MSIRESTARTMANAGERCONTROL=Disable` (under `/quiet`, Restart Manager would
+otherwise stop the service first); for the upgrade's nested removal it writes the property into the second MSI itself,
+because the removal ignores the outer command line. The proof is a `stop wait: sending Stop` record with a `Running`
+look in `C:\ProgramData\hole\logs\gui-cli.log`, gained during the `msiexec` call and, for the upgrade, written by
+the old product's uninstall, not the new product's install. The upgrade then uninstalls on the shipped default and
+expects Restart Manager to stop the service. The lifecycle runs against any MSI (`MSI_UNDER_TEST`); the upgrade case
+also needs the working tree's staged files (`target\release\installer-stage`, from `cargo xtask build hole-msi`) and an MSI
+under test whose version is not lower than the tree's.
 
 ```{warning}
 This installs Hole system-wide on the machine you run it on. Use a throwaway machine or virtual machine, not the one you
@@ -45,7 +59,8 @@ them. The run refuses to start, before it changes anything, when:
   the wrong process.
 
 Before installing, it records the MSI's ProductCode in `target\.hole-installed-by-the-msi-test-harness`. The cleanup
-uninstalls, by that ProductCode, only a Hole this harness installed, and reports any other it finds.
+uninstalls, by that ProductCode, only a Hole this harness installed, and reports any other it finds. The upgrade case
+records both of its ProductCodes, so the cleanup removes whichever of the two an interrupted run left.
 
 The tools the E2E needs (`tauri-driver`, `msedgedriver`, `gsudo`) download into `.cache/installer-e2e/`; nothing is added
 to `PATH` outside the test's child processes. Each phase that starts child processes has a failure bound
