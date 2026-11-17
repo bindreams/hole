@@ -15,18 +15,16 @@ from support import (
     VERIFY_GSUDO,
     installed_hole,
     machine_path_has_bin_dir,
+    missing_canonical_files,
     run_ps,
 )
 from support import e2e_environment, msi_path, service_registered  # noqa: F401 (fixtures)
-
-from conftest import canonical_windows_bindir
 
 pytestmark = pytest.mark.system_wide
 
 
 def test_installed_files_match_canonical_bindir(installed_hole: Path):
-    present = {p.name for p in (installed_hole / "bin").iterdir() if p.is_file()}
-    assert not canonical_windows_bindir() - present, "files the installer must install are missing"
+    assert not missing_canonical_files(), "files the installer must install are missing"
 
 
 def test_bridge_service_registered(installed_hole: Path):

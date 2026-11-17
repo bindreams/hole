@@ -440,6 +440,46 @@ def upgrade_wix() -> None:
         sys.exit(1)
 
 
+# Link =================================================================================================================
+
+
+def _stage_dir(root: Path) -> Path:
+    """Where `main` leaves the files the MSI packages."""
+    return root / "target" / "release" / "installer-stage"
+
+
+def _icon_dir(root: Path) -> Path:
+    """The folder holding `icon.ico`.
+
+    `generate_icons` in crates/hole/build.rs writes .cache/icons/icon.ico whenever build.rs runs, and the file
+    persists across cargo invocations. Fail loud here if it's absent: a missing ICO would otherwise surface as a less
+    obvious WiX bindpath-resolution error.
+    """
+    icon_dir = root / ".cache" / "icons"
+    if not (icon_dir / "icon.ico").exists():
+        raise BuildError(
+            f"missing {icon_dir / 'icon.ico'}; expected `cargo build` to have generated it. "
+            "Re-run `cargo build --release --workspace`."
+        )
+    return icon_dir
+
+
+def link_msi(output: Path) -> Path:
+    """Link an MSI from the files `main` staged, into `output`. A new ProductCode every time.
+
+    Runs no `cargo build` and no staging. The package has no fixed ProductCode, so two links of the same files are
+    two products of one version, and installing one over the other is a major upgrade.
+    """
+    console = Console(stderr=True)
+    root = _find_repo_root()
+    stage_dir = _stage_dir(root)
+    if not stage_dir.is_dir() or not any(stage_dir.iterdir()):
+        raise BuildError(f"no staged files in {stage_dir}: run `cargo xtask build hole-msi` first")
+    wix_exe = ensure_wix(root, console)
+    wix_build(wix_exe, WXS_PATH, stage_dir, _icon_dir(root), _PKG_DIR, get_version(root), output, console)
+    return output
+
+
 # Main =================================================================================================================
 
 
@@ -455,26 +495,9 @@ def main() -> None:
 
         cargo_build(console)
 
-        stage_dir = root / "target" / "release" / "installer-stage"
-        stage_files(root, stage_dir, console)
+        stage_files(root, _stage_dir(root), console)
 
-        # `generate_icons` in crates/hole/build.rs writes
-        # .cache/icons/icon.ico whenever build.rs runs, and the file
-        # persists across cargo invocations. Fail loud here if it's
-        # absent — a missing ICO would otherwise surface as a less
-        # obvious WiX bindpath-resolution error.
-        icon_dir = root / ".cache" / "icons"
-        if not (icon_dir / "icon.ico").exists():
-            raise BuildError(
-                f"missing {icon_dir / 'icon.ico'}; expected `cargo build` to have generated it. "
-                "Re-run `cargo build --release --workspace`."
-            )
-
-        version = get_version(root)
-        wix_exe = ensure_wix(root, console)
-
-        output = root / "target" / "release" / "hole.msi"
-        wix_build(wix_exe, WXS_PATH, stage_dir, icon_dir, _PKG_DIR, version, output, console)
+        output = link_msi(root / "target" / "release" / "hole.msi")
 
         console.print(f"[bold green]Installer built:[/] {output}")
     except BuildError as e:
