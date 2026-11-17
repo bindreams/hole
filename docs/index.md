@@ -114,6 +114,7 @@ Releasing <contributing/maintainers/releases.md>
 Publishing garter <contributing/maintainers/garter-crates-io.md>
 Ship blockers and stated limits <contributing/maintainers/ship-blockers.md>
 Rollback <contributing/maintainers/rollback.md>
+The withdrawal list <contributing/maintainers/withdrawal-list.md>
 Signing keys <contributing/maintainers/signing-keys.md>
 Rotating the signing key <contributing/maintainers/minisign-key-rotation.md>
 When an uninstall refuses to complete <contributing/maintainers/uninstall-gate.md>

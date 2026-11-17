@@ -9,6 +9,7 @@
 use hole_common::verify::VerifyError;
 
 use super::error::UpdateError;
+use super::http::{self, Bounds};
 
 /// Maximum size for sidecar file downloads.
 const SIDECAR_SIZE_LIMIT: u64 = 1024 * 1024;
@@ -27,8 +28,8 @@ pub fn fetch_manifest(sha256sums_url: &str, sha256sums_minisig_url: &str) -> Res
 // Helpers =============================================================================================================
 
 /// Download a small text file from a URL, with a size limit.
-fn download_text(url: &str) -> Result<String, UpdateError> {
-    let response = ureq::get(url).call()?;
+pub(super) fn download_text(url: &str) -> Result<String, UpdateError> {
+    let response = http::get(url, Bounds::SMALL).call()?;
     let text = response
         .into_body()
         .with_config()

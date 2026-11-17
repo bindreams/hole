@@ -9,6 +9,7 @@ mod secret_newtype;
 pub mod update_marker;
 pub mod verify;
 pub mod version;
+pub mod withdrawals;
 
 // Install the workspace test subscriber + panic hook. The dev-dep
 // is gated on cfg(test) because it isn't linked in non-test builds

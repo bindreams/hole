@@ -146,6 +146,7 @@ fn launch_gui(show_dashboard: bool) {
             Some(vec![hole::launch::NO_SHOW_DASHBOARD]),
         ))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         // `.skip_logger()` is critical: `tracing-subscriber 0.3`'s default
         // features include `tracing-log`, which installs `LogTracer` as the
         // global `log` dispatcher during `logging::init()` earlier in
@@ -227,10 +228,9 @@ fn launch_gui(show_dashboard: bool) {
             // support; this cleans those up after a few days). Non-
             // blocking; failures are logged at `warn` only.
             orphan_sweep::spawn_default();
-            hole::update::start_update_checker(app.handle().clone(), |app, _info| {
-                // Rebuild the tray menu to include the "Install Update" item.
-                // `UpdateState` is already populated when this fires; the
-                // rebuild reads the info from it on the main thread.
+            hole::update::start_update_checker(app.handle().clone(), |app| {
+                // `UpdateState` is already updated when this fires; the rebuild
+                // reads it on the main thread.
                 tray::rebuild_tray_menu(app);
             });
             Ok(())

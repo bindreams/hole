@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use super::error::UpdateError;
+use super::http::{self, Bounds};
 
 /// Download an asset from a URL to `dest`, using an intermediate `.part` file.
 ///
@@ -12,7 +13,7 @@ pub fn download_asset(url: &str, dest: &Path) -> Result<(), UpdateError> {
     let part = part_file_path(dest);
 
     // Stream to .part file.
-    let response = ureq::get(url).call()?;
+    let response = http::get(url, Bounds::PAYLOAD).call()?;
     let mut body = response.into_body().into_reader();
     let mut file = std::fs::File::create(&part)?;
     std::io::copy(&mut body, &mut file)?;
