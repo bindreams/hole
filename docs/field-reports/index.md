@@ -19,8 +19,8 @@ Nothing here names a person, a machine or a server. "A client in Russia" and "a 
 ## The cases
 
 - [A CDN-fronted server that does not answer](russia-ech-investigation.md): a client in Russia whose tunnel to a
-  CDN-fronted server never carried traffic, with an error that reads as a timeout on an established connection. The case
-  is open: the reading that a censor was at work was never tested.
+  CDN-fronted server never carried traffic, with an error that most likely means a timeout after the connection was
+  made. The case is open: the reading that a censor was at work was never tested.
 - [When the server is fine but the handshake dies](range-blocked-hosts.md): a network that lets TCP through and resets
   the TLS handshake for whole ranges of hosting providers, and how to tell it from a bad password.
 - [ECH in practice](ech-in-practice.md): hiding the server's name with {term}`ECH`, the lookup that can give it away,
