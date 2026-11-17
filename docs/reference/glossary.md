@@ -75,6 +75,11 @@ SIP003 plugin
   SIP003 is the specification of how it is started and configured. See
   [Shadowsocks and its plugins](../how-it-works/plugins.md) and [the specification](https://shadowsocks.org/doc/sip003.html).
 
+TSPU
+  The traffic-inspection equipment that Russian internet providers install, which can block or slow connections by
+  address, protocol or content. Reports of it in this documentation are inferences from what a client could observe. See
+  [Field reports](../field-reports/index.md).
+
 TUN
   A virtual network adapter that a program creates through the operating system. Hole routes the machine's traffic into
   one, so it sees the packets of every app. See [the TUN device and the routes](../how-it-works/tun.md) and

@@ -19,6 +19,8 @@ either without you installing anything. Without a plugin, Hole speaks plain Shad
   [glossary](reference/glossary.md) explains the terms, and the [command line](reference/cli.md) lists the commands.
 - **How it works:** the picture below, then [how Hole is put together](how-it-works/overview.md) and the pages that
   follow it.
+- **Hostile networks:** the [field reports](field-reports/index.md) are case studies from networks that interfere with
+  traffic, and [the recommendations](field-reports/hostile-networks.md) drawn from them.
 - **Contributing:** [Contributing](contributing/index.md) covers building Hole, running its tests and developing it. How
   it is put together starts at the [architecture overview](contributing/architecture/overview.md).
 
@@ -63,6 +65,18 @@ ECH and DoH <how-it-works/ech-and-doh.md>
 DNS through the tunnel <how-it-works/dns.md>
 UDP: dropped, never bypassed <how-it-works/udp.md>
 The kill switch <how-it-works/kill-switch.md>
+```
+
+```{toctree}
+---
+caption: Field reports
+hidden:
+---
+Field reports <field-reports/index.md>
+A CDN address that never answers <field-reports/russia-ech-investigation.md>
+When the server is fine but the handshake dies <field-reports/range-blocked-hosts.md>
+ECH in practice <field-reports/ech-in-practice.md>
+Recommendations for hostile networks <field-reports/hostile-networks.md>
 ```
 
 ```{toctree}
