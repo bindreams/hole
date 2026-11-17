@@ -17,6 +17,10 @@ On Windows the installer runs `hole path add` for you. On macOS `hole` is not on
 sudo /Applications/Hole.app/Contents/MacOS/hole path add
 ```
 
+On macOS, `path add` links `/usr/local/bin/hole` to the binary. It replaces only an earlier Hole link there. If the
+path holds anything else (a file, a directory, or a link to another program), it names what it found, exits with an
+error and deletes nothing. `path remove` likewise removes only a link to a Hole binary.
+
 `hole bridge unlock` is the recovery route when no bridge is running. While one is, it refuses: use the app's **Unblock
 Network** action instead.
 

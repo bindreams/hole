@@ -1,10 +1,9 @@
 // PATH management: add/remove hole to/from system PATH.
 
-/// Get the directory containing the current executable.
-#[cfg(target_os = "windows")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "windows")]
+/// Get the directory containing the current executable.
 fn exe_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
     let dir = exe
@@ -12,6 +11,87 @@ fn exe_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
         .ok_or("cannot determine executable directory")?
         .to_path_buf();
     Ok(dir)
+}
+
+// Link ownership ======================================================================================================
+
+/// What is at the `hole` link path, as observed.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum Entry {
+    Absent,
+    Directory,
+    /// Anything that is neither a directory nor a symlink.
+    File,
+    Link(PathBuf),
+}
+
+/// What `add` does about the entry at the link path.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum AddPlan {
+    Create,
+    AlreadyDone,
+    /// An earlier install's link: delete it, then create ours.
+    Replace,
+    /// Not Hole's. Holds the message to return; nothing is deleted.
+    Refuse(String),
+}
+
+/// What `remove` does about the entry at the link path.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum RemovePlan {
+    NothingToRemove,
+    Remove,
+    /// Not Hole's. Holds the message to return; nothing is deleted.
+    Refuse(String),
+}
+
+/// Whether the entry is a symlink to a Hole binary, which is the only thing Hole may delete there.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+fn is_hole_link(entry: &Entry) -> bool {
+    let Entry::Link(target) = entry else {
+        return false;
+    };
+    matches!(target.file_name().and_then(|f| f.to_str()), Some("hole" | "hole.exe"))
+}
+
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+fn describe(entry: &Entry) -> String {
+    match entry {
+        Entry::Absent => "nothing".to_owned(),
+        Entry::Directory => "a directory".to_owned(),
+        Entry::File => "a file that is not a symlink".to_owned(),
+        Entry::Link(target) => format!("a link to {}", target.display()),
+    }
+}
+
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+fn decide_add(link_path: &Path, entry: &Entry, exe: &Path) -> AddPlan {
+    match entry {
+        Entry::Absent => AddPlan::Create,
+        Entry::Link(target) if target == exe => AddPlan::AlreadyDone,
+        _ if is_hole_link(entry) => AddPlan::Replace,
+        _ => AddPlan::Refuse(format!(
+            "{} is {}, not a link to a hole binary: refusing to replace it",
+            link_path.display(),
+            describe(entry)
+        )),
+    }
+}
+
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+fn decide_remove(link_path: &Path, entry: &Entry) -> RemovePlan {
+    match entry {
+        Entry::Link(_) if is_hole_link(entry) => RemovePlan::Remove,
+        Entry::Link(_) => RemovePlan::Refuse(format!(
+            "{} is {}, not a link to a hole binary: refusing to remove it",
+            link_path.display(),
+            describe(entry)
+        )),
+        Entry::Absent | Entry::Directory | Entry::File => RemovePlan::NothingToRemove,
+    }
 }
 
 // Platform implementations ============================================================================================
@@ -130,13 +210,35 @@ fn broadcast_env_change() {
     }
 }
 
+/// Observe what is at `path` without following a link.
+#[cfg(target_os = "macos")]
+fn observe(path: &Path) -> std::io::Result<Entry> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Entry::Absent),
+        Err(e) => return Err(e),
+    };
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        return Ok(Entry::Link(std::fs::read_link(path)?));
+    }
+    Ok(if file_type.is_dir() {
+        Entry::Directory
+    } else {
+        Entry::File
+    })
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_LINK_PATH: &str = "/usr/local/bin/hole";
+
 #[cfg(target_os = "macos")]
 pub fn add() -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::fs::symlink;
 
     let exe = std::env::current_exe()?;
     let exe = std::fs::canonicalize(&exe)?;
-    let link_path = std::path::Path::new("/usr/local/bin/hole");
+    let link_path = Path::new(MACOS_LINK_PATH);
 
     // Warn about App Translocation
     let exe_str = exe.to_string_lossy();
@@ -146,50 +248,37 @@ pub fn add() -> Result<(), Box<dyn std::error::Error>> {
         return Err("App Translocation detected".into());
     }
 
-    if link_path.exists() || link_path.is_symlink() {
-        // Check if it already points to us
-        if let Ok(target) = std::fs::read_link(link_path) {
-            if target == exe {
-                cli_log!(info, "symlink already exists and points to {exe_str}");
-                return Ok(());
-            }
+    match decide_add(link_path, &observe(link_path)?, &exe) {
+        AddPlan::AlreadyDone => {
+            cli_log!(info, "symlink already exists and points to {exe_str}");
+            return Ok(());
         }
-        // Remove stale symlink
-        std::fs::remove_file(link_path)?;
+        AddPlan::Refuse(message) => return Err(message.into()),
+        AddPlan::Replace => std::fs::remove_file(link_path)?,
+        AddPlan::Create => {}
     }
 
     symlink(&exe, link_path)?;
-    cli_log!(info, "created symlink /usr/local/bin/hole -> {exe_str}");
+    cli_log!(info, "created symlink {MACOS_LINK_PATH} -> {exe_str}");
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 pub fn remove() -> Result<(), Box<dyn std::error::Error>> {
-    let link_path = std::path::Path::new("/usr/local/bin/hole");
+    let link_path = Path::new(MACOS_LINK_PATH);
 
-    if !link_path.is_symlink() {
-        cli_log!(warn, "/usr/local/bin/hole does not exist or is not a symlink");
-        return Ok(());
-    }
-
-    // Verify it's our symlink before removing (check the filename, not entire path)
-    if let Ok(target) = std::fs::read_link(link_path) {
-        let filename = target
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if filename != "hole" && filename != "hole.exe" {
-            return Err(format!(
-                "/usr/local/bin/hole points to {}, not a hole binary — refusing to remove",
-                target.display()
-            )
-            .into());
+    match decide_remove(link_path, &observe(link_path)?) {
+        RemovePlan::NothingToRemove => {
+            cli_log!(warn, "{MACOS_LINK_PATH} does not exist or is not a symlink");
+            Ok(())
+        }
+        RemovePlan::Refuse(message) => Err(message.into()),
+        RemovePlan::Remove => {
+            std::fs::remove_file(link_path)?;
+            cli_log!(info, "removed {MACOS_LINK_PATH}");
+            Ok(())
         }
     }
-
-    std::fs::remove_file(link_path)?;
-    cli_log!(info, "removed /usr/local/bin/hole");
-    Ok(())
 }
 
 #[cfg(test)]
