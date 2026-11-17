@@ -46,6 +46,7 @@ tauri = { version = "2", features = ["tray-icon", "devtools"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
+tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -123,9 +124,8 @@ walkdir = "2"
 # wiring guard (`setup_tests.rs`), the same instrument
 # `crates/bridge/src/reconciler_tests.rs` uses for the cover-release callers.
 regex = "1"
-# Test-only: the ASSET_SUFFIX drift-guard asserts against the shared
-# release-asset source (`asset::host_update_asset_suffix`). No features — the
-# `asset` module is feature-independent.
+# Test-only: the asset-suffix test checks the update archive suffix against the shared release-asset source
+# (`asset::host_update_asset_suffix`). No features — the `asset` module is feature-independent.
 xtask-lib = { path = "../../xtask-lib" }
 
 [[test]]

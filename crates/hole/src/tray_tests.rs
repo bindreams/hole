@@ -191,6 +191,162 @@ fn lockdown_off_renders_plain_label() {
     assert!(!label.to_lowercase().contains("warning"));
 }
 
+// update_items ========================================================================================================
+
+fn offer(version: &str) -> hole::update::UpdateInfo {
+    offer_with_page(version, Some("https://example.com/releases/page"))
+}
+
+fn offer_with_page(version: &str, html_url: Option<&str>) -> hole::update::UpdateInfo {
+    hole::update::UpdateInfo {
+        version: hole_common::version::ReleaseVersion::parse(version).unwrap(),
+        asset_url: String::new(),
+        asset_name: String::new(),
+        sha256sums_url: String::new(),
+        sha256sums_minisig_url: String::new(),
+        html_url: html_url.map(str::to_string),
+    }
+}
+
+fn withdrawal(version: &str, reason: &str) -> hole::update::Withdrawal {
+    hole::update::Withdrawal {
+        version: hole_common::version::ReleaseVersion::parse(version).unwrap(),
+        platforms: None,
+        reason: reason.to_string(),
+        url: "https://example.com/why".to_string(),
+    }
+}
+
+#[skuld::test]
+fn the_update_items_follow_the_offer_and_the_withdrawal_independently() {
+    // The offer is absent, present with a release page, or present without one.
+    for (offered, linked) in [(false, false), (true, true), (true, false)] {
+        for withdrawn in [false, true] {
+            let update = hole::update::UpdateCheck {
+                offer: offered.then(|| offer_with_page("0.8.0", linked.then_some("https://example.com/page"))),
+                running_withdrawn: withdrawn.then(|| withdrawal("0.7.0", "r")),
+            };
+
+            let items = update_items(&update);
+
+            assert_eq!(items.install.is_some(), offered, "install, offered={offered}");
+            assert_eq!(
+                items.whats_new.is_some(),
+                linked,
+                "what's new follows the link, offered={offered} linked={linked}"
+            );
+            assert_eq!(items.withdrawn.is_some(), withdrawn, "withdrawn, withdrawn={withdrawn}");
+        }
+    }
+}
+
+#[skuld::test]
+fn the_update_item_labels_carry_only_version_numbers() {
+    let update = hole::update::UpdateCheck {
+        offer: Some(offer("0.8.0")),
+        running_withdrawn: Some(withdrawal("0.7.0", "a reason that must never reach a menu")),
+    };
+
+    let items = update_items(&update);
+
+    assert_eq!(
+        items.install.as_ref().map(|i| i.label.as_str()),
+        Some("Install Update (v0.8.0)")
+    );
+    assert_eq!(
+        items.whats_new.as_ref().map(|i| i.label.as_str()),
+        Some("What's New in v0.8.0...")
+    );
+    assert_eq!(
+        items.withdrawn.as_ref().map(|i| i.label.as_str()),
+        Some("Version 0.7.0 Was Withdrawn...")
+    );
+}
+
+fn version(s: &str) -> hole_common::version::ReleaseVersion {
+    hole_common::version::ReleaseVersion::parse(s).unwrap()
+}
+
+#[skuld::test]
+fn an_update_item_carries_the_version_its_label_shows() {
+    let update = hole::update::UpdateCheck {
+        offer: Some(offer("0.8.0")),
+        running_withdrawn: None,
+    };
+
+    let items = update_items(&update);
+
+    let install = items.install.unwrap();
+    let whats_new = items.whats_new.unwrap();
+    assert_eq!(
+        UpdateItemId::parse(&install.id),
+        Some(UpdateItemId::Install(version("0.8.0")))
+    );
+    assert_eq!(
+        UpdateItemId::parse(&whats_new.id),
+        Some(UpdateItemId::WhatsNew(version("0.8.0")))
+    );
+}
+
+#[skuld::test]
+fn an_update_item_id_round_trips_and_names_its_kind() {
+    for shown in ["0.8.0", "10.20.30"] {
+        for item in [
+            UpdateItemId::Install(version(shown)),
+            UpdateItemId::WhatsNew(version(shown)),
+        ] {
+            assert_eq!(UpdateItemId::parse(&item.id()), Some(item.clone()));
+        }
+    }
+    assert_ne!(
+        UpdateItemId::Install(version("0.8.0")).id(),
+        UpdateItemId::WhatsNew(version("0.8.0")).id()
+    );
+}
+
+#[skuld::test]
+fn an_id_that_is_not_an_update_item_is_not_parsed() {
+    for id in [
+        "install_update",
+        "install_update:",
+        "install_update:not-a-version",
+        "install_update:0.8.0-rc.1",
+        "whats_new",
+        "whats_new:0.8",
+        "connect",
+        "version_withdrawn",
+        "",
+    ] {
+        assert_eq!(UpdateItemId::parse(id), None, "{id:?}");
+    }
+}
+
+#[skuld::test]
+fn whats_new_opens_the_page_only_of_the_version_it_showed() {
+    let stored = |offer: Option<hole::update::UpdateInfo>| hole::update::UpdateCheck {
+        offer,
+        running_withdrawn: None,
+    };
+
+    assert_eq!(
+        whats_new_target(&version("0.8.0"), &stored(Some(offer("0.8.0")))),
+        WhatsNewTarget::Page("https://example.com/releases/page".to_string())
+    );
+    assert_eq!(
+        whats_new_target(&version("0.8.0"), &stored(Some(offer("0.9.0")))),
+        WhatsNewTarget::NotOffered,
+        "another version's page is never opened"
+    );
+    assert_eq!(
+        whats_new_target(&version("0.8.0"), &stored(None)),
+        WhatsNewTarget::NotOffered
+    );
+    assert_eq!(
+        whats_new_target(&version("0.8.0"), &stored(Some(offer_with_page("0.8.0", None)))),
+        WhatsNewTarget::NoPage
+    );
+}
+
 // escape_items ========================================================================================================
 
 #[skuld::test]

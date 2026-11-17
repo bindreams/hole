@@ -1,0 +1,12 @@
+payload: |
+  withdrawn:
+    - version: 0.7.0
+      platforms: [windows-amd64]
+      reason: Uninstalling from Settings fails and rolls back.
+      url: https://github.com/bindreams/hole/issues/1342
+signatures:
+- |
+  untrusted comment: signature from minisign secret key
+  RUR/A9sHYSwUIbU0oeZBFafcxYW9d3DQJLqIIw+9tABaOHDUERea2HYhOJ2Z1KxpVm3H5QEwuXebTJmrWUukLJLavGyq43eOBgU=
+  trusted comment: hole withdrawal list static/hole.yaml
+  L4vZLwxf6+tkHEMqKADjkN6qkxo9RyHgQd7osW7l1WzCyX16cTaX6wrSxiuaDeBy3K0uvb30L7agruIyo4y6BA==

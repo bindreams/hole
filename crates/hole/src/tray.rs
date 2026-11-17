@@ -5,6 +5,7 @@ use crate::setup::{InstallGate, CHANGE_IN_PROGRESS_ERROR};
 use crate::state::AppState;
 use hole::tray_icons;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, CoverPresence};
+use hole_common::version::ReleaseVersion;
 use serde::Serialize;
 use tauri::menu::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -247,7 +248,7 @@ const ID_DISCONNECT: &str = "disconnect";
 const ID_AUTOSTART: &str = "autostart";
 const ID_SETTINGS: &str = "settings";
 const ID_EXIT: &str = "exit";
-const ID_INSTALL_UPDATE: &str = "install_update";
+const ID_VERSION_WITHDRAWN: &str = "version_withdrawn";
 const ID_LOCKDOWN: &str = "lockdown";
 const ID_BLOCKED_RETRY: &str = "blocked_retry";
 const ID_UNBLOCK: &str = "unblock";
@@ -378,7 +379,96 @@ fn escape_items(cover_presence: CoverPresence, blocked_offers_go_offline: bool) 
     }
 }
 
-/// Build the tray menu, optionally including an "Install Update" item.
+/// An update menu item's id. The two kinds carry the version their label shows, so a click acts on
+/// what the person was shown, not on the update state at click time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateItemId {
+    Install(ReleaseVersion),
+    WhatsNew(ReleaseVersion),
+}
+
+impl UpdateItemId {
+    const INSTALL_PREFIX: &'static str = "install_update:";
+    const WHATS_NEW_PREFIX: &'static str = "whats_new:";
+
+    fn id(&self) -> String {
+        match self {
+            Self::Install(version) => format!("{}{version}", Self::INSTALL_PREFIX),
+            Self::WhatsNew(version) => format!("{}{version}", Self::WHATS_NEW_PREFIX),
+        }
+    }
+
+    /// `None` for an id that is not an update item's.
+    fn parse(id: &str) -> Option<Self> {
+        if let Some(version) = id.strip_prefix(Self::INSTALL_PREFIX) {
+            return ReleaseVersion::parse(version).ok().map(Self::Install);
+        }
+        let version = id.strip_prefix(Self::WHATS_NEW_PREFIX)?;
+        ReleaseVersion::parse(version).ok().map(Self::WhatsNew)
+    }
+}
+
+/// An update-related menu item: the id its click arrives under, and its label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpdateItem {
+    id: String,
+    label: String,
+}
+
+/// The update-related menu items, `None` where an item is absent. Only a version number is taken from
+/// the update state: text from the withdrawal list never sizes a menu item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpdateItems {
+    /// Present while the running version is withdrawn.
+    withdrawn: Option<UpdateItem>,
+    install: Option<UpdateItem>,
+    /// Present with `install`, directly under it, when the offer has a release page to open.
+    whats_new: Option<UpdateItem>,
+}
+
+fn update_items(update: &hole::update::UpdateCheck) -> UpdateItems {
+    UpdateItems {
+        withdrawn: update.running_withdrawn.as_ref().map(|w| UpdateItem {
+            id: ID_VERSION_WITHDRAWN.to_string(),
+            label: format!("Version {} Was Withdrawn...", w.version),
+        }),
+        install: update.offer.as_ref().map(|o| UpdateItem {
+            id: UpdateItemId::Install(o.version.clone()).id(),
+            label: format!("Install Update (v{})", o.version),
+        }),
+        whats_new: update
+            .offer
+            .as_ref()
+            .filter(|o| o.html_url.is_some())
+            .map(|o| UpdateItem {
+                id: UpdateItemId::WhatsNew(o.version.clone()).id(),
+                label: format!("What's New in v{}...", o.version),
+            }),
+    }
+}
+
+/// What a "What's New" click opens: the page of the version its label showed, if that version is
+/// still the stored offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WhatsNewTarget {
+    Page(String),
+    /// The shown version is no longer the stored offer.
+    NotOffered,
+    /// The shown version is the stored offer, and it has no release page.
+    NoPage,
+}
+
+fn whats_new_target(shown: &ReleaseVersion, stored: &hole::update::UpdateCheck) -> WhatsNewTarget {
+    match &stored.offer {
+        Some(offer) if offer.version == *shown => match &offer.html_url {
+            Some(page) => WhatsNewTarget::Page(page.clone()),
+            None => WhatsNewTarget::NoPage,
+        },
+        _ => WhatsNewTarget::NotOffered,
+    }
+}
+
+/// Build the tray menu, including an "Install Update" item when `update` carries an offer.
 ///
 /// `running` is the bridge's actual state (from the `ProxyStateCell`,
 /// never persisted config); `transition` is an in-flight
@@ -387,7 +477,7 @@ fn escape_items(cover_presence: CoverPresence, blocked_offers_go_offline: bool) 
 /// the standing kill-switch toggle.
 fn build_tray_menu(
     app: &AppHandle,
-    update: Option<&hole::update::UpdateInfo>,
+    update: &hole::update::UpdateCheck,
     running: bool,
     transition: Option<bool>,
     lockdown_enabled: bool,
@@ -435,16 +525,14 @@ fn build_tray_menu(
     let sep2 = PredefinedMenuItem::separator(app)?;
     let sep3 = PredefinedMenuItem::separator(app)?;
     let exit = MenuItem::with_id(app, ID_EXIT, "Exit", true, None::<&str>)?;
-    let update_item = match update {
-        Some(info) => Some(MenuItem::with_id(
-            app,
-            ID_INSTALL_UPDATE,
-            format!("Install Update (v{})", info.version),
-            true,
-            None::<&str>,
-        )?),
-        None => None,
+    let labels = update_items(update);
+    let update_menu_item = |item: Option<UpdateItem>| -> Result<Option<MenuItem<tauri::Wry>>, tauri::Error> {
+        item.map(|item| MenuItem::with_id(app, item.id, item.label, true, None::<&str>))
+            .transpose()
     };
+    let withdrawn_item = update_menu_item(labels.withdrawn)?;
+    let install_item = update_menu_item(labels.install)?;
+    let whats_new_item = update_menu_item(labels.whats_new)?;
 
     let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&status, &connect];
     let escapes = escape_items(cover_presence, acts.show_go_offline);
@@ -461,8 +549,16 @@ fn build_tray_menu(
         &settings,
         &sep2,
     ]);
-    if let Some(ref u) = update_item {
-        items.push(u);
+    let update_group: Vec<&MenuItem<tauri::Wry>> = [&withdrawn_item, &install_item, &whats_new_item]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !update_group.is_empty() {
+        items.extend(
+            update_group
+                .into_iter()
+                .map(|i| i as &dyn tauri::menu::IsMenuItem<tauri::Wry>),
+        );
         items.push(&sep3);
     }
     items.push(&exit);
@@ -510,7 +606,7 @@ pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
     let snap = app.state::<AppState>().proxy_snapshot();
     let menu = build_tray_menu(
         app.handle(),
-        None,
+        &hole::update::UpdateCheck::default(),
         snap.running,
         None,
         snap.lockdown_enabled,
@@ -561,12 +657,12 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
             return;
         };
         let update_state = handle.state::<hole::update::UpdateState>();
-        let update_info = update_state.rx.borrow().clone();
+        let update = update_state.rx.borrow().clone();
         let snap = handle.state::<AppState>().proxy_snapshot();
         let transition = handle.state::<TransitionSlot>().target();
         match build_tray_menu(
             &handle,
-            update_info.as_ref(),
+            &update,
             snap.running,
             transition,
             snap.lockdown_enabled,
@@ -861,7 +957,12 @@ fn handle_tray_icon_event(tray: &TrayIcon, event: TrayIconEvent) {
 /// to all registered `on_menu_event` handlers. Without the split, clicking a tray item would
 /// also invoke the window's handler (and vice versa), causing actions to fire twice.
 fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
-    match event.id().as_ref() {
+    let id = event.id().as_ref();
+    if let Some(item) = UpdateItemId::parse(id) {
+        handle_update_item_click(app, item);
+        return;
+    }
+    match id {
         // The clicked item's ID carries the user's intent — the intent the
         // displayed label offered, not a flip of any state read now.
         id @ (ID_CONNECT | ID_DISCONNECT) => {
@@ -937,12 +1038,20 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move { exit_app(app_handle).await });
         }
-        ID_INSTALL_UPDATE => {
-            info!("tray: install update requested");
-            let app_handle = app.clone();
-            tauri::async_runtime::spawn(async move {
-                handle_install_update_from_tray(app_handle, None).await;
-            });
+        ID_VERSION_WITHDRAWN => {
+            let withdrawal = app
+                .state::<hole::update::UpdateState>()
+                .rx
+                .borrow()
+                .running_withdrawn
+                .clone();
+            match withdrawal {
+                Some(withdrawal) => {
+                    let app_handle = app.clone();
+                    tauri::async_runtime::spawn_blocking(move || show_withdrawn_dialog(&app_handle, &withdrawal));
+                }
+                None => warn!("version withdrawn clicked but no withdrawal available"),
+            }
         }
         ID_UNBLOCK => {
             info!("tray: unblock clicked");
@@ -1082,17 +1191,119 @@ async fn read_lockdown_fresh(app: &AppHandle) -> bool {
     }
 }
 
-async fn handle_install_update_from_tray(app: AppHandle, precomputed_consent: Option<bool>) {
+/// Open `url` in the default browser. Callers pass only validated `https` URLs; anything else is a bug.
+fn open_url(app: &AppHandle, url: &str) {
+    use tauri_plugin_opener::OpenerExt;
+
+    if !hole_common::withdrawals::is_https_url(url) {
+        debug_assert!(false, "a URL that is not https reached the opener");
+        warn!("refusing to open a URL that is not https");
+        return;
+    }
+
+    if let Err(e) = app.opener().open_url(url, None::<&str>) {
+        warn!(error = &e as &dyn std::error::Error, "failed to open a link");
+    }
+}
+
+/// Show the withdrawal's reason, with a button that opens its link. Blocking: not for the main thread.
+fn show_withdrawn_dialog(app: &AppHandle, withdrawal: &hole::update::Withdrawal) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
-    // Get update info from update state.
-    let update_state = app.state::<hole::update::UpdateState>();
-    let update_info = update_state.rx.borrow().clone();
+    let details = app
+        .dialog()
+        .message(hole::update::withdrawn_dialog_body(withdrawal))
+        .title(hole::update::WITHDRAWN_DIALOG_TITLE)
+        .buttons(MessageDialogButtons::OkCancelCustom("Details".into(), "Close".into()))
+        .blocking_show();
+    if details {
+        open_url(app, &withdrawal.url);
+    }
+}
 
-    let Some(info) = update_info else {
-        warn!("install update clicked but no update info available");
-        return;
+/// A click on an update menu item, acting on the version its label showed.
+fn handle_update_item_click(app: &AppHandle, item: UpdateItemId) {
+    match item {
+        UpdateItemId::Install(shown) => {
+            info!(version = %shown, "tray: install update requested");
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(info) = still_offered(&app_handle, &shown).await {
+                    install_update(app_handle, info, None).await;
+                }
+            });
+        }
+        UpdateItemId::WhatsNew(shown) => {
+            let stored = app.state::<hole::update::UpdateState>().rx.borrow().clone();
+            let (title, body) = match whats_new_target(&shown, &stored) {
+                WhatsNewTarget::Page(page) => return open_url(app, &page),
+                WhatsNewTarget::NotOffered => (
+                    hole::update::STALE_OFFER_DIALOG_TITLE,
+                    hole::update::stale_offer_dialog_body(&shown, &stored),
+                ),
+                WhatsNewTarget::NoPage => {
+                    warn!(version = %shown, "what's new clicked but the offer has no release page");
+                    ("What's New", format!("There is no release page for version {shown}."))
+                }
+            };
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                use tauri_plugin_dialog::DialogExt;
+                app_handle.dialog().message(body).title(title).blocking_show();
+            });
+        }
+    }
+}
+
+/// Check again, after the last wait on the person, and return the offer when it is still `shown`, the
+/// version they were shown. Otherwise nothing is installed and they are told why.
+async fn still_offered(app: &AppHandle, shown: &ReleaseVersion) -> Option<hole::update::UpdateInfo> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let result = app
+        .state::<hole::update::UpdateState>()
+        .check_and_store(hole::update::check_for_update)
+        .await;
+    let stored = match result {
+        Ok(stored) => stored,
+        Err(e) => {
+            error!(error = &e as &dyn std::error::Error, "update re-check task panicked");
+            return None;
+        }
     };
+    if stored.changed {
+        rebuild_tray_menu(app);
+    }
+    let checked = match stored.checked {
+        Ok(checked) => checked,
+        Err(e) => {
+            error!(error = &e as &dyn std::error::Error, "update re-check failed");
+            app.dialog()
+                .message(format!("Failed to check for updates: {e}"))
+                .title("Update Error")
+                .blocking_show();
+            return None;
+        }
+    };
+
+    match hole::update::recheck_offer(shown, checked) {
+        hole::update::StaleOffer::Install(info) => Some(info),
+        hole::update::StaleOffer::Replaced { offered, now } => {
+            info!(version = %offered, "the offered update is no longer offered; not installing");
+            app.dialog()
+                .message(hole::update::stale_offer_dialog_body(&offered, &now))
+                .title(hole::update::STALE_OFFER_DIALOG_TITLE)
+                .blocking_show();
+            None
+        }
+    }
+}
+
+/// Download, verify and hand `info` to the bridge. `precomputed_consent` is the consent a dialog
+/// already obtained; `None` asks here when Lockdown is off, and checks again that `info` is still
+/// offered once the person has answered.
+async fn install_update(app: AppHandle, info: hole::update::UpdateInfo, precomputed_consent: Option<bool>) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
     let download_dir = match tempfile::TempDir::with_prefix("hole-update-") {
         Ok(d) => d,
@@ -1194,6 +1405,9 @@ async fn handle_install_update_from_tray(app: AppHandle, precomputed_consent: Op
                     info!("user declined lockdown-off update consent");
                     return;
                 }
+                if still_offered(&app, &info.version).await.is_none() {
+                    return;
+                }
                 true
             }
         },
@@ -1284,47 +1498,60 @@ pub(crate) async fn handle_collect_logs(app: AppHandle) {
 pub(crate) async fn handle_check_for_updates(app: AppHandle) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
-    let result = tokio::task::spawn_blocking(hole::update::check_for_update).await;
+    let result = app
+        .state::<hole::update::UpdateState>()
+        .check_and_store(hole::update::check_for_update)
+        .await;
+    let stored = match result {
+        Ok(stored) => stored,
+        Err(e) => {
+            error!(error = &e as &dyn std::error::Error, "update check task panicked");
+            return;
+        }
+    };
+    // The tray shows what the latest check found, whoever ran it.
+    if stored.changed {
+        rebuild_tray_menu(&app);
+    }
 
-    match result {
-        Ok(Ok(Some(info))) => {
+    match stored.checked {
+        Ok(hole::update::UpdateCheck {
+            offer: Some(info),
+            running_withdrawn,
+        }) => {
             let lockdown_enabled = read_lockdown_fresh(&app).await;
             let confirmed = app
                 .dialog()
                 .message(hole::update::check_update_dialog_body(
                     &info.version.to_string(),
                     lockdown_enabled,
+                    running_withdrawn.as_ref(),
                 ))
                 .title("Update Available")
                 .buttons(MessageDialogButtons::OkCancelCustom("Install".into(), "Later".into()))
                 .blocking_show();
 
             if confirmed {
-                // Consent already decided by the merged dialog above.
-                let update_state = app.state::<hole::update::UpdateState>();
-                update_state.tx.send_replace(Some(info));
-                handle_install_update_from_tray(app, Some(hole::update::check_update_consent(lockdown_enabled))).await;
+                // Consent is already decided by the dialog above, which the offer may have outlived.
+                if let Some(info) = still_offered(&app, &info.version).await {
+                    install_update(app, info, Some(hole::update::check_update_consent(lockdown_enabled))).await;
+                }
             } else {
                 info!("user declined the available update at the check dialog");
             }
         }
-        Ok(Ok(None)) => {
-            app.dialog()
-                .message(format!(
-                    "You're running the latest version ({}).",
-                    hole::version::VERSION
-                ))
-                .title("No Updates Available")
-                .blocking_show();
+        Ok(hole::update::UpdateCheck {
+            offer: None,
+            running_withdrawn,
+        }) => {
+            let dialog = hole::update::no_update_dialog(hole::version::VERSION, running_withdrawn.as_ref());
+            app.dialog().message(dialog.body).title(dialog.title).blocking_show();
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             app.dialog()
                 .message(format!("Failed to check for updates: {e}"))
                 .title("Update Error")
                 .blocking_show();
-        }
-        Err(e) => {
-            error!(error = &e as &dyn std::error::Error, "update check task panicked");
         }
     }
 }

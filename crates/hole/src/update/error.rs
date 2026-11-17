@@ -2,9 +2,11 @@
 
 use thiserror::Error;
 
+use super::withdrawals::WithdrawalListError;
+
 #[derive(Debug, Error)]
 pub enum UpdateError {
-    #[error("HTTP request failed: {0}")]
+    #[error("{}", http_failure(.0))]
     Http(Box<ureq::Error>),
     #[error("failed to parse response: {0}")]
     Json(#[from] serde_json::Error),
@@ -16,10 +18,20 @@ pub enum UpdateError {
     SignatureInvalid(String),
     #[error("asset {0} not found in SHA256SUMS")]
     AssetNotInManifest(String),
+    #[error(transparent)]
+    WithdrawalList(#[from] WithdrawalListError),
 }
 
 impl From<ureq::Error> for UpdateError {
     fn from(e: ureq::Error) -> Self {
         Self::Http(Box::new(e))
+    }
+}
+
+/// What a person reads for a failed request: a timeout says the server did not respond.
+fn http_failure(e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::Timeout(_) => format!("the server did not respond in time ({e})"),
+        _ => format!("HTTP request failed: {e}"),
     }
 }

@@ -648,3 +648,36 @@ fn the_release_assets_json_has_the_keys_its_consumers_read() {
         assert_eq!(keys, ["arch", "asset", "assets", "os"]);
     }
 }
+
+/// The ids the withdrawal list and the updater use are the ones the release stages its update archives
+/// under, on all three release platforms, not only the host's.
+#[skuld::test]
+fn the_release_platform_ids_are_the_ones_the_update_archives_are_named_with() {
+    let mac_amd64 = Platform {
+        os: Os::Darwin,
+        arch: Arch::Amd64,
+    };
+    let mut staged: Vec<String> = [
+        (Lane::Msi, WIN, "zip"),
+        (Lane::Dmg, MAC, "tar.gz"),
+        (Lane::Dmg, mac_amd64, "tar.gz"),
+    ]
+    .into_iter()
+    .map(|(lane, platform, extension)| {
+        let name = payload(Group::Hole, lane, platform).name;
+        let id = name
+            .strip_prefix("hole-1.2.3-")
+            .and_then(|rest| rest.strip_suffix(&format!(".{extension}")));
+        id.unwrap_or_else(|| panic!("an update archive name this test does not expect: {name}"))
+            .to_string()
+    })
+    .collect();
+    let mut known: Vec<String> = hole_common::withdrawals::PLATFORM_IDS
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    staged.sort();
+    known.sort();
+
+    assert_eq!(staged, known);
+}

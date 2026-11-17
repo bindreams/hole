@@ -38,6 +38,18 @@ that introduces the key **N**.
    `uv run scripts/sign-release.py <version> --secret-key <old key>`. The clients that update to N verify it with the old
    key they already have; N carries the new one. The publish workflow still holds the old key, so it verifies N.
 
+1. **From the commit that embeds the new public key, sign `static/hole.yaml` with both keys**:
+   `cargo xtask sign-static --secret-key <old key> --secret-key <new key> --public-key <old public key>`, where the
+   public key is the base64 line of the old `.pub` file (the value `MINISIGN_PUBLIC_KEY` held before this change).
+   Clients built before N verify the
+   [withdrawal list](withdrawal-list.md) with the old key and clients built from N on with the new one, and each needs
+   one signature it can verify: a client that verifies none reads the list as unreadable, and its update checks fail
+   until it has one. Keep signing with both for as long as a client built before N matters, then pass the new key alone.
+   Every edit of the list is signed again with the same keys. The tool proves each signature it writes: the tree
+   embeds the new key, `--public-key` names the old one, and it writes nothing unless every signature verifies under one
+   of the two and each key verifies one. A wrong old secret key is refused, naming the signature. With several
+   `--secret-key` and no `--public-key` the tool refuses to run.
+
 1. **After N is published, replace the public key in the workflow files** ({src}`.github/workflows/publish-release-hole.yaml`
    and the reusable one) with the new key.
 
