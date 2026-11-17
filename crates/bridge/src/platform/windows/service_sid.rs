@@ -17,7 +17,7 @@ use sha1::{Digest, Sha1};
 use windows::core::{HSTRING, PWSTR};
 use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE};
 use windows::Win32::Security::{
-    EqualSid, GetTokenInformation, LookupAccountNameW, TokenGroups, PSID, SID_NAME_USE, TOKEN_GROUPS, TOKEN_QUERY,
+    EqualSid, LookupAccountNameW, TokenGroups, PSID, SID_NAME_USE, TOKEN_GROUPS, TOKEN_QUERY,
 };
 use windows::Win32::System::Services::{
     ChangeServiceConfig2W, QueryServiceConfig2W, SC_HANDLE, SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_SID_INFO,
@@ -28,15 +28,7 @@ use windows_service::service::{Service, ServiceAccess};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::{scm_failure, SERVICE_NAME};
-use crate::service_scm::call_error::{win32_code_of_hresult, ScmCall, ScmCallError};
-
-fn failed(call: ScmCall, e: &windows::core::Error) -> io::Error {
-    ScmCallError {
-        call,
-        code: win32_code_of_hresult(e.code().0),
-    }
-    .into_io()
-}
+use crate::service_scm::call_error::{ScmCall, ScmCallError};
 
 /// Give `service` a service SID (`SERVICE_SID_TYPE_UNRESTRICTED`), which every
 /// process the SCM starts as the service carries in its token from then on.
@@ -57,7 +49,7 @@ pub fn apply_service_sid(service: &Service) -> io::Result<()> {
             Some(std::ptr::from_ref(&info).cast()),
         )
     }
-    .map_err(|e| failed(ScmCall::ChangeServiceConfig2, &e))
+    .map_err(|e| ScmCall::ChangeServiceConfig2.failed_with_windows(&e).into_io())
 }
 
 /// What a service's current SID type calls for.
@@ -108,7 +100,7 @@ fn service_sid_type(service: &Service) -> io::Result<u32> {
             &mut needed,
         )
     }
-    .map_err(|e| failed(ScmCall::QueryServiceConfig2, &e))?;
+    .map_err(|e| ScmCall::QueryServiceConfig2.failed_with_windows(&e).into_io())?;
     Ok(info.dwServiceSidType)
 }
 
@@ -181,7 +173,7 @@ impl ServiceSid {
         let sized = unsafe { LookupAccountNameW(None, &account, None, &mut sid_len, None, &mut domain_len, &mut kind) };
         match sized {
             Err(e) if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() => {}
-            Err(e) => return Err(failed(ScmCall::LookupAccountName, &e)),
+            Err(e) => return Err(ScmCall::LookupAccountName.failed_with_windows(&e).into_io()),
             // A lookup that fits no bytes at all is not a SID.
             Ok(()) => return Err(io::Error::other("LookupAccountName returned an empty SID")),
         }
@@ -200,7 +192,7 @@ impl ServiceSid {
                 &mut kind,
             )
         }
-        .map_err(|e| failed(ScmCall::LookupAccountName, &e))?;
+        .map_err(|e| ScmCall::LookupAccountName.failed_with_windows(&e).into_io())?;
         Ok(Self { sid })
     }
 
@@ -234,20 +226,12 @@ impl ServiceSid {
         let mut token = HANDLE::default();
         // SAFETY: `process` is a live handle, and `token` is an out-parameter.
         unsafe { OpenProcessToken(HANDLE(process.as_raw_handle()), TOKEN_QUERY, &mut token) }
-            .map_err(|e| failed(ScmCall::OpenProcessToken, &e))?;
+            .map_err(|e| ScmCall::OpenProcessToken.failed_with_windows(&e).into_io())?;
         // SAFETY: `OpenProcessToken` returned a new handle this value now owns.
         let token = unsafe { OwnedHandle::from_raw_handle(token.0) };
         let token = HANDLE(token.as_raw_handle());
 
-        // The sizing call is expected to fail with ERROR_INSUFFICIENT_BUFFER.
-        let mut len = 0u32;
-        // SAFETY: a null buffer of length 0 is the documented way to ask for the size.
-        let _ = unsafe { GetTokenInformation(token, TokenGroups, None, 0, &mut len) };
-        // `u64`s: `TOKEN_GROUPS` has pointer alignment.
-        let mut buf = vec![0u64; (len as usize).div_ceil(std::mem::size_of::<u64>()).max(1)];
-        // SAFETY: `buf` holds at least `len` bytes, the size reported above.
-        unsafe { GetTokenInformation(token, TokenGroups, Some(buf.as_mut_ptr().cast()), len, &mut len) }
-            .map_err(|e| failed(ScmCall::GetTokenInformation, &e))?;
+        let buf = super::token::information(token, TokenGroups).map_err(ScmCallError::into_io)?;
         // SAFETY: on success `buf` holds a `TOKEN_GROUPS` whose `GroupCount`
         // entries follow it in the same allocation, which outlives the borrow.
         let groups = unsafe {

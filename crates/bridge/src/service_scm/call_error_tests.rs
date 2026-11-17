@@ -64,6 +64,11 @@ fn each_call_has_its_win32_name() {
         (ScmCall::TerminateProcess, "TerminateProcess"),
         (ScmCall::CreateService, "CreateService"),
         (ScmCall::StartServiceCtrlDispatcher, "StartServiceCtrlDispatcher"),
+        (ScmCall::CreateWellKnownSid, "CreateWellKnownSid"),
+        (ScmCall::GetSecurityInfo, "GetSecurityInfo"),
+        (ScmCall::SetEntriesInAcl, "SetEntriesInAcl"),
+        (ScmCall::SetSecurityInfo, "SetSecurityInfo"),
+        (ScmCall::SetTokenInformation, "SetTokenInformation"),
     ];
     for (call, name) in table {
         assert_eq!(call.name(), name);

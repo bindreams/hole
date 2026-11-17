@@ -7,19 +7,19 @@
 //! service's by its token's service SID, and confirmed by
 //! [`ProcessHolds::look`]. A process the SCM no longer names is found by its
 //! token alone, by [`scan_service_processes`].
+//!
+//! The opens ask only for rights in
+//! [`RETIREMENT_ACCESS`](super::process_access::RETIREMENT_ACCESS), which the
+//! service grants Administrators on its own process and its children
+//! ([`super::process_access`]): the caller needs no `SeDebugPrivilege`.
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-use tracing::{info, warn};
-use windows::Win32::Foundation::{GetLastError, ERROR_NOT_ALL_ASSIGNED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows::Win32::Security::{
-    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
-};
+use tracing::info;
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken, TerminateProcess, WaitForSingleObject,
-    INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    GetCurrentProcessId, OpenProcess, TerminateProcess, WaitForSingleObject, INFINITE,
 };
 
 use crate::disable_record::{creation_time_of, has_exited, Stamp};
@@ -28,6 +28,7 @@ use crate::service_scm::hold::{Basis, Look, Opened, ProcessHolds, ProcessSource}
 use crate::service_scm::scan::{scan, ListedProcess, ProcessEnumerator, ScanFinding, ScanResult};
 use crate::service_scm::settle::{ExitWait, SCM_REQUERY_MILLIS};
 
+use super::process_access::{RETIREMENT_HOLD_ACCESS, RETIREMENT_TERMINATE_ACCESS};
 use super::service_sid::ServiceSid;
 
 /// Open process `pid` for waiting and for reading its token, and keep it only
@@ -61,7 +62,7 @@ fn open_process_where(
     is_the_one: impl FnOnce(&OwnedHandle) -> io::Result<bool>,
 ) -> io::Result<Opened<OwnedHandle>> {
     // SAFETY: plain FFI call; no pointer is passed.
-    match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+    match unsafe { OpenProcess(RETIREMENT_HOLD_ACCESS, false, pid) } {
         Ok(handle) => {
             // SAFETY: `OpenProcess` returned a new handle this value now owns.
             let process = unsafe { OwnedHandle::from_raw_handle(handle.0) };
@@ -165,62 +166,39 @@ pub fn scan_service_processes(service: &ServiceSid) -> io::Result<ScanResult<Own
 /// is an error unless the process had exited by then: `TerminateProcess`
 /// answers an exited process with `ERROR_ACCESS_DENIED`.
 fn terminate(pid: u32, held: &OwnedHandle) -> io::Result<()> {
-    // The held handle has no `PROCESS_TERMINATE` right: asking for it there
-    // would turn a denial for a SYSTEM process into "not the service's".
-    // SAFETY: plain FFI call; no pointer is passed.
-    let opened = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) };
-    let terminated = opened.and_then(|handle| {
-        // SAFETY: `OpenProcess` returned a new handle this value now owns.
-        let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
-        // SAFETY: `handle` is the live handle just opened with the terminate right.
-        unsafe { TerminateProcess(HANDLE(handle.as_raw_handle()), 1) }
-    });
-    match terminated {
-        Ok(()) => Ok(()),
-        Err(_) if has_exited(held)? => Ok(()),
-        Err(e) => Err(ScmCallError {
-            call: ScmCall::TerminateProcess,
-            code: win32_code_of_hresult(e.code().0),
-        }
-        .into_io()),
-    }
+    terminated_or_gone(held, end_process(pid), has_exited)
 }
 
-/// Enables `SeDebugPrivilege` on this process's token, which an elevated
-/// administrator holds disabled. With it enabled `OpenProcess` grants the
-/// requested access whatever the process's security descriptor says
-/// ([`OpenProcess`, Remarks](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess#remarks)),
-/// which a SYSTEM process's descriptor otherwise refuses an administrator for
-/// `PROCESS_TERMINATE`. A token that does not hold it is warned about; the
-/// terminate that needed it then fails with its own error.
-fn enable_debug_privilege() {
-    let mut token = HANDLE::default();
-    // SAFETY: plain FFI calls on this process's own token, closed by `OwnedHandle`.
-    let enabled = unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token).and_then(|()| {
-            let token = OwnedHandle::from_raw_handle(token.0);
-            let mut luid = Default::default();
-            LookupPrivilegeValueW(None, SE_DEBUG_NAME, &mut luid)?;
-            let privileges = TOKEN_PRIVILEGES {
-                PrivilegeCount: 1,
-                Privileges: [LUID_AND_ATTRIBUTES {
-                    Luid: luid,
-                    Attributes: SE_PRIVILEGE_ENABLED,
-                }],
-            };
-            AdjustTokenPrivileges(HANDLE(token.as_raw_handle()), false, Some(&privileges), 0, None, None)?;
-            // Succeeds even when nothing was assigned; the last error says which.
-            if GetLastError() == ERROR_NOT_ALL_ASSIGNED {
-                return Err(windows::core::Error::from(ERROR_NOT_ALL_ASSIGNED));
-            }
+/// Opens process `pid` to end it and ends it, each failure named for its call.
+fn end_process(pid: u32) -> Result<(), ScmCallError> {
+    // The held handle has no terminate right; asking for it there would turn a refusal into "not the service's".
+    // SAFETY: plain FFI call; no pointer is passed.
+    let handle = unsafe { OpenProcess(RETIREMENT_TERMINATE_ACCESS, false, pid) }
+        .map_err(|e| ScmCall::OpenProcess.failed_with_windows(&e))?;
+    // SAFETY: `OpenProcess` returned a new handle this value now owns.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    // SAFETY: `handle` is the live handle just opened with the terminate right.
+    unsafe { TerminateProcess(HANDLE(handle.as_raw_handle()), 1) }
+        .map_err(|e| ScmCall::TerminateProcess.failed_with_windows(&e))
+}
+
+/// `ended`, the outcome of ending `process`, as an error unless it failed
+/// because the process had already exited.
+fn terminated_or_gone<P>(
+    process: &P,
+    ended: Result<(), ScmCallError>,
+    has_exited: impl FnOnce(&P) -> io::Result<bool>,
+) -> io::Result<()> {
+    match ended {
+        Ok(()) => Ok(()),
+        Err(error) if has_exited(process)? => {
+            tracing::debug!(
+                error = &error as &dyn std::error::Error,
+                "a process that has exited could not be ended"
+            );
             Ok(())
-        })
-    };
-    if let Err(error) = enabled {
-        warn!(
-            error = &error as &dyn std::error::Error,
-            "SeDebugPrivilege could not be enabled; terminating a process of another principal may be refused"
-        );
+        }
+        Err(error) => Err(error.into_io()),
     }
 }
 
@@ -258,14 +236,9 @@ impl ServiceProcesses {
     /// the service's by its token, and the held handle keeps its id from being
     /// reused, so the id names the same process at the second open.
     fn terminate_live(&self) -> io::Result<()> {
-        let mut debug_enabled = false;
         for (pid, process) in self.holds.orphans() {
             if has_exited(process)? {
                 continue;
-            }
-            if !debug_enabled {
-                enable_debug_privilege();
-                debug_enabled = true;
             }
             info!(
                 pid,
