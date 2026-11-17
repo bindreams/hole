@@ -66,7 +66,7 @@ holds it. Product and install: [README.md](README.md). Everything else: [docs/in
   [file lock](docs/contributing/architecture/file-lock.md)
 - **Logging and plugin diagnostics.** Log destinations, `HOLE_BRIDGE_LOG` directives and the plugin tap. →
   [logging](docs/contributing/architecture/logging.md)
-- **Releases, rollback, signing key, icons, uninstall refusal.** →
+- **Releases, withdrawal, signing key, icons, uninstall refusal.** →
   [maintainers](docs/contributing/maintainers/index.md)
 
 ## Invariants you must not break

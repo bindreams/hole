@@ -1,8 +1,8 @@
 # The withdrawal list
 
-A published `hole` release cannot be deleted and its pre-release flag is not used to hide it ([Rollback](rollback.md)).
-`static/hole.yaml` on `main` is where a release is withdrawn instead: the updater skips a listed version, and warns
-someone already running one. The bridge does not read the list.
+A published `hole` release is not deleted or hidden ([Withdrawing a release](withdrawal.md)). `static/hole.yaml` on
+`main` is the list that steers clients around it: the updater skips a listed version, and warns someone already running
+one. The bridge does not read the list.
 
 ## The file
 
@@ -64,7 +64,7 @@ The file always exists: with nothing withdrawn, the payload is `withdrawn: []`.
   entry's `reason` and a button for its `url`; `hole upgrade` prints a warning with both. A development build
   (version `X.Y.Z-snapshot+...`) is not the release and gets no warning.
 
-## Withdrawing a release
+## Adding an entry
 
 1. Add an entry to the payload in `static/hole.yaml`.
 1. Sign it: `cargo xtask sign-static`. It takes `--secret-key <path>` and `--public-key <base64>`, each zero or more
@@ -80,8 +80,6 @@ The file always exists: with nothing withdrawn, the payload is `withdrawn: []`.
 1. Confirm with `hole upgrade` on a client older than the withdrawn version: it prints a log record containing
    `skipping a withdrawn release` for that version, with its `url`, on stderr and in `gui-cli.log` (the command-line
    log; [where logs go](../architecture/logging.md#where-the-logs-go)).
-
-Also follow [Rollback](rollback.md): the list steers clients, and the release notes still need their caution banner.
 
 ### What the tool refuses
 
@@ -114,7 +112,6 @@ So a wrong old secret key in a rotation is caught before it writes a file older 
 
 ## Limits
 
-- Only clients that ship this read the list. `0.7.0` and older still take a withdrawn release until a higher version is
-  published.
+- Only clients that ship this read the list ([what the updater does](withdrawal.md#what-the-updater-does)).
 - A replayed older list can hide a withdrawal and cannot invent one.
 - The bridge does not read the list: a withdrawn release is still installable by hand.
