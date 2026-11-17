@@ -31,10 +31,10 @@ change, or `Cargo.lock` can drift.
    - *Transient* (a registry hiccup): re-run the publish workflow. If the version already reached crates.io, the re-run
      skips `cargo publish` and only flips the release.
    - *Persistent* (a yanked dependency, a breaking registry change): the draft cannot be saved as it stands. Patch
-     `Cargo.toml` to pin around the problem, merge it, delete the draft ([Rollback](rollback.md)) and run the draft
-     workflow again on the patched commit.
+     `Cargo.toml` to pin around the problem, merge it, delete the draft
+     ([Cutting a release](releases.md#cutting-a-release)) and run the draft workflow again on the patched commit.
 
 The idempotency check protects against publishing a version twice. It does not protect against a failure that repeats: a
 yanked dependency fails every re-run until the upstream problem is fixed.
 
-Once a version is on crates.io it cannot be taken back: see [Yanking garter](rollback.md#yanking-garter).
+Once a version is on crates.io it cannot be taken back: see [Withdrawing garter](withdrawal.md#withdrawing-garter).
