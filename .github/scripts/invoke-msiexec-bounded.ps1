@@ -25,6 +25,10 @@ param(
     [Parameter(Mandatory)]
     [string]$LogPath,
 
+    # Public properties (`NAME=value`) appended to the default msiexec command
+    # line. Ignored when -ExeArgs replaces it.
+    [string[]]$Properties = @(),
+
     # A failure bound, not an expected duration: install and uninstall
     # normally complete in 2-4 seconds.
     [ValidateRange(0.0, 60.0)]
@@ -64,7 +68,7 @@ param(
 )
 
 if (-not $ExeArgs) {
-    $ExeArgs = @($Verb, $Package, "/quiet", "/norestart", "/l*vx", $LogPath)
+    $ExeArgs = @($Verb, $Package, "/quiet", "/norestart", "/l*vx", $LogPath) + $Properties
 }
 
 # The wedge branch's helpers: the process-tree walk and the native thread-stack
