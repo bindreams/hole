@@ -34,9 +34,10 @@ without TLS, or without a DoH address to fetch the config from.
 class: note
 ---
 When `always` refuses, the plugin's own error names ECH. It can reach only `bridge.log`, the {term}`bridge`'s log (its
-location is on [the logging page](../contributing/architecture/logging.md)), and is not guaranteed to appear there: it is
-quoted only when the start-time {term}`self-test`'s reading implicates the transport. The message on screen is one of the general tunnel
-failures.
+location is on [the logging page](../contributing/architecture/logging.md)). The bridge's relay writes every line the
+plugin prints into that log as it arrives. The start-time {term}`self-test` decides only whether the plugin's last lines
+are quoted again beside the failure: they are when its reading implicates the transport and the reachability probe has not
+already named the cause. The message on screen is one of the general tunnel failures.
 ```
 
 ## A lookup that can give the name away
@@ -47,18 +48,19 @@ it does so through the operating system's resolver: a plaintext query, visible o
 was meant to protect. The lookup that was meant to hide one name would leak another.
 
 **Observed.** A tester in Russia, on a Windows machine tethered through a phone, could not connect. Every ECH lookup failed
-with "no ech record found", though the record itself was healthy: the same config bytes came back when the tester queried
-the resolver directly. The config asked for `ech=always`, so ex-ray refused to handshake rather than send the name in the
-clear, and no tunnel came up. The screen said only that the DNS {term}`self-test` failed.
+with "no ech record found", though the record itself was healthy: a JSON query the tester ran by hand returned a
+healthy record, with the same config bytes as the server side. The config asked for `ech=always`, so ex-ray refused to handshake
+rather than send the name in the clear, and no tunnel came up. The screen said only that the DNS {term}`self-test` failed.
 
 That error is reached only after an HTTP 200 whose body is a valid DNS message with no matching HTTPS answer. A network
 failure, a non-200 reply or a malformed message each give a different error. So the query reached something that answered,
 and what answered did not carry the record.
 
-**Not confirmed.** Whether this was the tester's actual trigger was never settled. The datapoint that would settle it,
-what the tester's own system resolver returns for the DoH resolver's hostname, was not collected. A query the tester ran by
-hand returned the healthy record, and the notes took that as ruling out the first guess, a middlebox stripping the
-answer. They do not say which client or path the hand-run query used.
+**Not confirmed.** Whether this was the tester's actual trigger was never settled. The notes took the hand-run query as
+ruling out the first guess, a middlebox stripping the answer. But it was a JSON GET, and ex-ray sends a wireformat POST,
+so it did not reproduce ex-ray's query. Two datapoints would settle it, and neither was collected: what the tester's own
+system resolver returns for the DoH resolver's hostname, and whether a wireformat POST to that resolver returns the HTTPS
+record from the tester's machine.
 
 **Unexplained.** On the same machine Hole's secure lookup of the server's address failed four times with a certificate
 that could not be verified, then worked about 45 seconds later. That fits something on that network

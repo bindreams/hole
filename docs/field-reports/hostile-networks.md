@@ -44,24 +44,35 @@ flowchart TD
 ```
 
 The two questions are asked of the machine on that network, from outside Hole. Any TCP connect tool answers the first (for
-example `nc -vz <address> 443`, or `Test-NetConnection <address> -Port 443` in Windows PowerShell), and `openssl s_client -connect <address>:443` the second. The second applies only to a server that uses TLS (`tls` in the plugin options): a
-server without TLS has no TLS hello to answer, so ask the third question instead.
+example `nc -vz <ip> 443`, or `Test-NetConnection <ip> -Port 443` in Windows PowerShell), and
+`openssl s_client -connect <ip>:443 -noservername` the second. The second applies only to a server that uses TLS (`tls` in
+the plugin options): a server without TLS has no TLS hello to answer, so ask the third question instead.
 
-| Failure                         | What the network does                                                                 | What Hole says                                                                                                                                                        | Seen in                                                                                                                                                     |
-| ------------------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **1. The SYN gets no reply**    | Drops connection attempts to the address, or to its port.                             | Connect: "…The server did not respond (connection timed out)." Test: "No response from the server." Hole shows the same for failures other than a refusal; see below. | No case here establishes it. [The Russian case](russia-ech-investigation.md) was first read this way, but its error text reads as failure 3, so it is open. |
-| **2. The ClientHello dies**     | Lets TCP complete, then resets or ignores the TLS handshake, whatever the name in it. | Connect and Test: "The network is blocking the connection to this server…".                                                                                           | [Range-blocked hosts](range-blocked-hosts.md).                                                                                                              |
-| **3. Established, then silent** | The connection comes up and carries something, then stops, with or without a reset.   | Nothing on screen: "Connected" is decided once, at start. The log shows the reconnects.                                                                               | Observed on a test box in Russia; see below.                                                                                                                |
+Run them against the server's IP address, not its domain, and with `-noservername`. On a network that watches, a domain
+in the command is a plaintext DNS query for it, and without `-noservername` the hello can carry the name in the clear.
+Both would hand the network the name the setup is trying to hide. Do not take the IP from Hole: the resolved address in
+Hole's log is redacted. Use the address you already know for the server, or look the domain up over DoH from a different
+network. The probe in [How Hole reports it](range-blocked-hosts.md#how-hole-reports-it) is also sent without a name; a
+server that drops a hello with no name can look blocked, so compare against the control below.
 
-Hole's message alone does not pick a row: failures 1 and 2 can both end as "did not respond", so use the two questions.
+| Failure                         | What the network does                                                                 | What Hole says                                                                                                                                                        | Seen in                                                                                                                                                                                                                |
+| ------------------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1. The SYN gets no reply**    | Drops connection attempts to the address, or to its port.                             | Connect: "…The server did not respond (connection timed out)." Test: "No response from the server." Hole shows the same for failures other than a refusal; see below. | No case here establishes it. [The Russian case](russia-ech-investigation.md) was first read this way, but its error text fits failure 2 or 3 at least as well, and the evidence does not separate them, so it is open. |
+| **2. The ClientHello dies**     | Lets TCP complete, then resets or ignores the TLS handshake, whatever the name in it. | "The network is blocking the connection to this server…", on Test, and on connect when the probe ran.                                                                 | [Range-blocked hosts](range-blocked-hosts.md).                                                                                                                                                                         |
+| **3. Established, then silent** | The connection comes up and carries something, then stops, with or without a reset.   | Nothing on screen: "Connected" is decided once, at start. The log shows the reconnects.                                                                               | Observed on a test box in Russia; see below.                                                                                                                                                                           |
+
+What Hole shows depends on whether its reachability probe ran. When it ran, failure 1 shows as "did not respond" on connect
+and as "No response from the server." on Test, and failure 2 as the network-blocked message on both. For a server using TLS or WebSocket, a completed
+connect with no byte back is what the probe reads as blocked. On connect the probe is skipped while a firewall cover is in force
+or about to be, and with the {term}`DNS forwarder` off; then both failures show the start-time {term}`self-test`'s own
+message, and only the two questions tell them apart. "Did not respond" also covers connect errors that are not a silent
+SYN (see below), so it does not by itself mean failure 1.
 
 **Failure 1: what to do.** No remedy is established. Run the control, the first recommendation below.
 
 **Failure 3, in the field.** Observed on a test box in Russia, in a later triage of two logs: the connection to the server
 was reset by the remote about 20 seconds after connecting, with only the first exchange getting through, and silence
-before the reset. Observed on the same box on a development build from before the keepalive existed: the tunnel went dead
-roughly every two minutes with no reset at all, and recovered only through ex-ray's idle timeout, about five minutes. Both
-are consistent with a middlebox, and neither is proven to be one.
+before the reset. This is consistent with a middlebox, and not proven to be one.
 
 **Failure 3: what to do.** There is nothing to set. A transport that dies visibly is replaced by the galoshes client; a
 silent one is caught by galoshes' {term}`keepalive`, which fires when no byte has come in for a whole interval. Both need
@@ -91,9 +102,14 @@ above.
 **Because.** Two machines failing against one address cannot tell a network block from a fault in that address or path.
 An earlier case that looked the same had a different cause. **From** [the Russian case](russia-ech-investigation.md#the-control-that-was-never-run).
 
-**Do.** From the same machine, in the same window, connect to something else: a different host behind the same CDN, and a
-bare TCP connection to the server's port with no TLS (the tools above). If those work, the problem is the address or the
-hello. If they do not, it is broader.
+**Do.** From the same machine, in the same window, run three probes and keep their answers apart:
+
+- A bare TCP connect to the server's port, with no TLS. No reply is failure 1: the address or port is not reachable at all.
+- A TLS hello to the server. A reset or silence after that connect succeeded is failure 2.
+- A TLS connection to another host behind the same CDN. If it works while the server's does not, the block is on this
+  address and not on the CDN's whole range; if it fails too, the network is dropping that CDN broadly.
+
+The tools are the ones above, run against IP addresses.
 
 ### Keep the server out of ranges that get blocked
 

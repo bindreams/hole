@@ -23,6 +23,8 @@ was never run](#the-control-that-was-never-run) says what would settle it.
   name (`host`). The domain is served from a CDN, so it resolves to an address in the CDN's space.
 - No `ech` option in the plugin options, so the default, `auto` (see [the three ways ECH can
   fail](ech-in-practice.md#three-ways-it-can-fail-and-which-way-each-one-fails)).
+- A `fast-open` option, which the notes record for this config. {term}`ex-ray` reads the option as `fastOpen`, so whether TCP
+  Fast Open was on is unknown.
 
 ## Observed
 
@@ -75,6 +77,10 @@ Windows reports a failed connect as `connectex`. Read as written, the error is a
 the TCP handshake completed and then nothing came back. The notes' working hypothesis read the failure as SYNs sent and
 never answered. The error text does not show that, and the only SYN-level evidence is the connection trace above.
 
+That reading holds only if TCP Fast Open was off. With it, the client's first data can ride the SYN, so a handshake that
+fails can show up first on a read, and the same error would then not say that the connection was established. Whether the
+option took effect is not known ([the setting](#the-setting)).
+
 That leaves several readings. The error text fits each, none is established, and all are hypotheses:
 
 - **A censor acting on the hello.** The hypothesis recorded at the time: deep packet inspection (DPI), or the
@@ -125,7 +131,8 @@ it re-checks that traffic flows. That is a known gap, tracked in
 - Before blaming the network, run a control dial from the same box. The [recommendations](hostile-networks.md) put it
   first.
 - Tell the layer apart: no reply to the SYN, a reset ClientHello and a tunnel that dies after it are three different
-  failures ([telling them apart](hostile-networks.md#telling-the-failures-apart)). This case's own error reads as the
-  third, not the first.
+  failures ([telling them apart](hostile-networks.md#telling-the-failures-apart)). This case's own error fits the second
+  or the third, not the first. The evidence does not separate those two; the leading hypothesis, a censor acting on the
+  hello, is the second.
 - ECH conceals the server's name, not its address. If the address is what is blocked, ECH cannot help; see [ECH in
   practice](ech-in-practice.md#what-ech-does-not-do).

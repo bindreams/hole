@@ -69,12 +69,12 @@ connection can fail.
 fails, the bridge waits for the probe's verdict, at most the probe's remaining budget, and the verdict decides what you are
 told:
 
-| The probe found                                                     | The message                                                                                         |
-| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| A connect, then no first byte back: reset, silence or end of stream | "The network is blocking the connection to this server…", with the advice to try a different server |
-| The server refused the TCP connection                               | "The server refused the connection."                                                                |
-| Nothing answered the TCP connect, or it failed some other way       | "The server did not respond (connection timed out)."                                                |
-| It could not tell                                                   | The self-test's own message                                                                         |
+| The probe found                                                                                                     | The message                                                                                         |
+| ------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| A connect, then no first byte back: reset, silence or end of stream                                                 | "The network is blocking the connection to this server…", with the advice to try a different server |
+| The server refused the TCP connection                                                                               | "The server refused the connection."                                                                |
+| Nothing answered the TCP connect, or it failed some other way                                                       | "The server did not respond (connection timed out)."                                                |
+| Anything else: the server was reachable, the lookup failed, the probe could not tell, or it was skipped (see below) | The self-test's own message                                                                         |
 
 **When you press Test.** If the tunnel test ends as "Server rejected the connection" or "Server cannot reach the public
 internet", the bridge runs the same probe. When it says the handshake was blocked, Test shows the network-blocked message
