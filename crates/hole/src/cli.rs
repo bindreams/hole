@@ -559,9 +559,22 @@ pub(crate) fn dispatch(command: Command) -> ! {
 
 fn handle_upgrade(yes: bool) -> i32 {
     cli_log!(info, "checking for updates...");
-    match hole::update::check_for_update() {
-        Ok(Some(info)) => {
+    let check = match hole::update::check_for_update() {
+        Ok(check) => check,
+        Err(e) => {
+            cli_log!(error, "update check failed: {e}");
+            return 1;
+        }
+    };
+    if let Some(withdrawal) = &check.running_withdrawn {
+        cli_log!(warn, "{}", hole::update::cli_withdrawn_warning(withdrawal));
+    }
+    match check.offer {
+        Some(info) => {
             cli_log!(info, "update available: v{}", info.version);
+            if let Some(page) = &info.html_url {
+                cli_log!(info, "release notes: {page}");
+            }
 
             let download_dir = match tempfile::TempDir::with_prefix("hole-update-") {
                 Ok(d) => d,
@@ -691,13 +704,13 @@ fn handle_upgrade(yes: bool) -> i32 {
             cli_log!(info, "cutover started for v{}", info.version);
             0
         }
-        Ok(None) => {
-            cli_log!(info, "already up to date ({})", hole::version::VERSION);
+        None if check.running_withdrawn.is_some() => {
+            cli_log!(info, "no newer version is available yet");
             0
         }
-        Err(e) => {
-            cli_log!(error, "update check failed: {e}");
-            1
+        None => {
+            cli_log!(info, "already up to date ({})", hole::version::VERSION);
+            0
         }
     }
 }

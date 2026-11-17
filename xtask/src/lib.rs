@@ -42,6 +42,7 @@ pub mod pull_subrepo;
 pub mod retry;
 pub mod run_injected_env;
 pub mod schemars_pin;
+pub mod sign_static;
 pub mod skuld_label_coverage;
 pub mod stage;
 pub mod stage_release;
@@ -121,6 +122,9 @@ mod pull_subrepo_tests;
 #[cfg(test)]
 #[path = "renovate_prek_tests.rs"]
 mod renovate_prek_tests;
+#[cfg(test)]
+#[path = "sign_static_tests.rs"]
+mod sign_static_tests;
 #[cfg(test)]
 #[path = "skuld_label_coverage_tests.rs"]
 mod skuld_label_coverage_tests;
@@ -268,6 +272,23 @@ pub enum Command {
     /// archive with no registry. Wired into `prek.toml` as the
     /// `check-schemars-pin` hook. See `xtask/src/schemars_pin.rs`.
     CheckSchemarsPin,
+    /// Sign `static/hole.yaml` in place: check the payload reads as a withdrawal list, sign its exact text with
+    /// the `minisign` program, check the signatures verify under the keys given, and write the file
+    /// back as the envelope with the new signatures.
+    ///
+    /// The maintainer's secret key signs it, as for a release (`scripts/sign-release.py`). A key rotation
+    /// passes the old and the new key, and the public half of every key the tree does not ship.
+    SignStatic {
+        /// Path to a minisign secret key file; repeat it to sign with several keys, one signature per key in
+        /// the order given. `minisign`'s default key when absent.
+        #[arg(long, short = 's')]
+        secret_key: Vec<PathBuf>,
+        /// The base64 public key of a key a client may hold besides the one this tree ships (as
+        /// `MINISIGN_PUBLIC_KEY` holds it); repeat it per key. Every signature is proved against these keys
+        /// and the tree's, and each key must verify one. Required when more than one `--secret-key` is given.
+        #[arg(long)]
+        public_key: Vec<String>,
+    },
     /// Run the prek hooks CI runs once (`portable`: every hook not listed in
     /// `.github/lint.toml`) or on every platform (`platform-dependent`: the
     /// hooks it lists). Both are derived from that one list.
@@ -520,6 +541,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Galoshes => run_galoshes(),
         Command::Wintun => run_wintun(),
         Command::GolangciLint { args } => run_golangci_lint(&args),
+        Command::SignStatic { secret_key, public_key } => sign_static::run(&repo_root()?, &secret_key, &public_key),
         Command::Prek { which } => prek_split::run(which, &repo_root()?),
         Command::ProvisionUpstreamV2ray => run_provision_upstream_v2ray(),
         Command::PullSubrepo { path, tag } => run_pull_subrepo(path, tag),

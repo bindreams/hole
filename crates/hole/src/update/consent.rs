@@ -2,7 +2,11 @@
 //! the bridge restart briefly egresses cleartext and obtains the user's answer.
 
 use hole_common::protocol::BridgeRequest;
+use hole_common::version::ReleaseVersion;
 use std::path::PathBuf;
+
+use super::check::UpdateCheck;
+use super::withdrawals::Withdrawal;
 
 pub const CONSENT_DIALOG_TITLE: &str = "Install Update";
 pub const CONSENT_DIALOG_BODY: &str = "Installing this update restarts the VPN.\n\nWith Lockdown off, your internet traffic briefly goes out unencrypted while the VPN restarts.\n\nInstall this update?";
@@ -33,12 +37,86 @@ const CHECK_LEAK_DISCLOSURE: &str =
     "Installing it restarts the VPN. With Lockdown off, your traffic briefly goes out unencrypted while the VPN restarts.";
 
 /// Body for the tray "Check for Updates" dialog; the lockdown-off branch folds
-/// in the leak disclosure so that path needs only one dialog.
-pub fn check_update_dialog_body(version: &str, lockdown_enabled: bool) -> String {
-    if lockdown_enabled {
+/// in the leak disclosure so that path needs only one dialog. When the running version is withdrawn, the
+/// body starts with the sentence the withdrawn-version dialog uses.
+pub fn check_update_dialog_body(
+    version: &str,
+    lockdown_enabled: bool,
+    running_withdrawn: Option<&Withdrawal>,
+) -> String {
+    let offer = if lockdown_enabled {
         format!("Version {version} is available.\n\nWould you like to install it now?")
     } else {
         format!("Version {version} is available.\n\n{CHECK_LEAK_DISCLOSURE}\n\nInstall it now?")
+    };
+    match running_withdrawn {
+        Some(withdrawal) => format!("{}\n\n{offer}", withdrawn_dialog_body(withdrawal)),
+        None => offer,
+    }
+}
+
+pub const WITHDRAWN_DIALOG_TITLE: &str = "Version Withdrawn";
+
+/// A dialog's title and body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogText {
+    pub title: &'static str,
+    pub body: String,
+}
+
+/// Body of the dialog the tray's withdrawn-version item opens.
+pub fn withdrawn_dialog_body(withdrawal: &Withdrawal) -> String {
+    format!(
+        "Hole {} was withdrawn.
+
+{}",
+        withdrawal.version, withdrawal.reason
+    )
+}
+
+/// The dialog "Check for Updates" shows when no update is offered: the latest-version notice, or, when
+/// the running version is withdrawn, that it was and that nothing newer exists yet.
+pub fn no_update_dialog(running_version: &str, running_withdrawn: Option<&Withdrawal>) -> DialogText {
+    match running_withdrawn {
+        Some(withdrawal) => DialogText {
+            title: WITHDRAWN_DIALOG_TITLE,
+            body: format!(
+                "Hole {} was withdrawn and no newer version is available yet.
+
+{}",
+                withdrawal.version, withdrawal.reason
+            ),
+        },
+        None => DialogText {
+            title: "No Updates Available",
+            body: format!("You're running the latest version ({running_version})."),
+        },
+    }
+}
+
+/// The `hole upgrade` warning for a withdrawn running version.
+pub fn cli_withdrawn_warning(withdrawal: &Withdrawal) -> String {
+    format!(
+        "this version ({}) was withdrawn: {} ({})",
+        withdrawal.version, withdrawal.reason, withdrawal.url
+    )
+}
+
+pub const STALE_OFFER_DIALOG_TITLE: &str = "Update No Longer Available";
+
+/// Body shown when "Install Update" checked again and the offered version is no longer offered:
+/// nothing was installed, and `now` says what is offered instead.
+pub fn stale_offer_dialog_body(offered: &ReleaseVersion, now: &UpdateCheck) -> String {
+    match &now.offer {
+        Some(offer) => format!(
+            "Version {offered} is no longer offered. Nothing was installed.
+
+Version {} is available instead; choose Install Update to install it.",
+            offer.version
+        ),
+        None => {
+            format!("Version {offered} is no longer offered, and no update is available now. Nothing was installed.")
+        }
     }
 }
 

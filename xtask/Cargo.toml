@@ -28,6 +28,7 @@ ctrlc = "3" # transparent-launcher interrupt handling: a handler (not SIG_IGN) r
 # which is the only other consumer that turns the feature on.
 xtask-lib = { path = "../xtask-lib", features = ["serde", "clap", "version", "tauri-config"] }
 hole-common = { path = "../crates/common" } # `gen-ui-constants` reads NETWORK_BLOCKED_MESSAGE
+yaml_serde = "0.10" # `sign-static` reads the withdrawal list's payload as a client does
 payload-archive = { path = "../crates/payload-archive" } # `update-archive` packs the per-platform payload via the shared pack_* the bridge unpacks with
 
 # `cargo xtask wintun` / `cargo xtask golangci-lint` (download + extract +
@@ -111,6 +112,8 @@ proc-macro2 = "1"
 # to find the attributes that enclose an invocation. Also already in the graph.
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
+# `sign_static` tests sign list fixtures with a key pair generated per test, as `hole-common`'s do.
+minisign = "0.10"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = { workspace = true } # raise()/kill() + SIGINT in signal tests
