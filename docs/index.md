@@ -73,7 +73,7 @@ caption: Field reports
 hidden:
 ---
 Field reports <field-reports/index.md>
-A CDN address that never answers <field-reports/russia-ech-investigation.md>
+A CDN-fronted server that does not answer <field-reports/russia-ech-investigation.md>
 When the server is fine but the handshake dies <field-reports/range-blocked-hosts.md>
 ECH in practice <field-reports/ech-in-practice.md>
 Recommendations for hostile networks <field-reports/hostile-networks.md>

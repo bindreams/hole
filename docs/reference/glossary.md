@@ -41,6 +41,13 @@ galoshes
   A {term}`SIP003 plugin` that embeds {term}`ex-ray` and adds UDP support by carrying many streams over one multiplexed
   connection. See [Distributions](distributions.md).
 
+keepalive
+  A probe a connection sends when it has been quiet, so the sender can tell a dead connection from an idle one. Hole has
+  two. {term}`galoshes` probes its transport once nothing has arrived for an interval, and treats the transport as dead if
+  still nothing arrives; see [the galoshes transport](../contributing/architecture/galoshes-transport.md#telling-that-the-transport-is-dead).
+  ex-ray's `tcp-keepalive` option is the operating system's TCP keepalive on the socket to the server; see
+  {src}`ex-ray's README <crates/ex-ray/README.md>`.
+
 kill switch
   An optional setting, off by default, that the tray calls **Lockdown**. While it is on and Hole is connecting or
   connected, traffic that would leave outside the tunnel is blocked, including to devices on your local network such as
@@ -53,6 +60,11 @@ lockdown
 Postern
   A self-hosted portal that runs Shadowsocks servers and gives each person you invite a ready-made client config. It is
   Hole's companion project. See [its documentation](https://postern.readthedocs.io).
+
+self-test
+  The check the {term}`bridge` runs before it opens the {term}`TUN` device: one test DNS lookup, sent through the
+  {term}`DNS forwarder` and the proxy. Hole reports "Connected" only once it is answered. It runs only with the forwarder
+  on. See [DNS through the tunnel](../how-it-works/dns.md#what-hole-checks-first).
 
 SNI
   Server Name Indication: the name of the server a client wants to reach, which a TLS handshake normally sends unencrypted.
