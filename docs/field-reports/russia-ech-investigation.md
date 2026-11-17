@@ -4,15 +4,13 @@ A client in Russia could not get a working tunnel, and a second test box in Russ
 server behind a CDN, and the {term}`ECH` lookup for it succeeded every time, so the first suspicion was that a censor was
 reacting to ECH. That suspicion was written down as a hypothesis, and the test that would check it was never run.
 
-The sources are the investigator's working notes, which are not published, and the logs they quote, which are not part of
-this documentation. Every observation below is therefore second-hand.
-
 ```{admonition} This case is open
 ---
 class: warning
 ---
-The observations below are what the notes report. The reading that a censor targeted ECH is a hypothesis, and the
-evidence neither confirms nor excludes it. [Reading the evidence](#reading-the-evidence) says why, and [the control that
+The sources are the investigator's working notes, which are not published, and the logs they quote, which are not part of
+this documentation, so every observation below is second-hand. The reading that a censor targeted ECH is a hypothesis,
+and the evidence neither confirms nor excludes it. [Reading the evidence](#reading-the-evidence) says why, and [the control that
 was never run](#the-control-that-was-never-run) says what would settle it.
 ```
 
@@ -59,8 +57,8 @@ notes do not say why there are more lookups than connect attempts.
 With no `ech` option the mode is `auto`. When the lookup succeeds, `auto` and `always` act alike: the ECH extension is
 applied. `auto` differs only when the lookup itself fails, and then it sends the name in the clear.
 
-The release in question already dialed the WebSocket transport as Chrome would: ex-ray's default fingerprint for a
-client WebSocket dial is `chrome_auto`, and that fingerprint carries ECH. So the lookups that succeeded produced
+ex-ray's default fingerprint for a client WebSocket dial is `chrome_auto`, which carries ECH (the release in this case had
+it too). So the lookups that succeeded produced
 ClientHellos with ECH, and the real server name was not sent in the clear on any attempt that got as far as a
 ClientHello. Whether any attempt got that far is what the next section is about.
 
@@ -104,7 +102,7 @@ same unknown reason.
 An earlier case is a caution; it has no page here, and this is the notes' summary of it. An earlier "unusable from Russia"
 report, from a test box, looked the same: the start-time check failed, and no traffic came back after the tunnel came up.
 A packet capture showed the handshake with the CDN completing cleanly, so the censorship reading was ruled out. The cause
-was a fault in Hole's own tunnel transport that a lossy path exposed. The symptom a user sees does not say which of the
+turned out to be on Hole's side, not the network's. The symptom a user sees does not say which of the
 two they have.
 
 ## The control that was never run
@@ -123,8 +121,7 @@ network reacted to. Neither test has been run.
 ## What Hole showed
 
 The dashboard stayed green while no data came in. "Connected" is decided once, by the start-time self-test; nothing after
-it re-checks that traffic flows. That is a known gap, tracked in
-[bindreams/hole#772](https://github.com/bindreams/hole/issues/772).
+it re-checks that traffic flows.
 
 ## What to take from it
 

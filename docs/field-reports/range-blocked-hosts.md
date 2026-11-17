@@ -6,8 +6,8 @@ about what that looks like, how to read it, what might fix it, and how Hole tell
 
 ## What it looked like
 
-These are observations, taken from the issue that tracked this case and the investigator's notes, of a test box in Russia
-probing the tester's server and other hosts. They do not say which tool sent the probes.
+These are second-hand observations of a test box in Russia probing the tester's server and other hosts. They do not say
+which tool sent the probes.
 
 | Probe from the test box                                                                         | Result                                          |
 | ----------------------------------------------------------------------------------------------- | ----------------------------------------------- |
@@ -37,7 +37,7 @@ Three facts decide the reading:
   blocked hosts were also VPN servers is not stated.
 
 The reading recorded at the time was that this is a {term}`TSPU` block of VPN-hosting ranges (the traffic-inspection
-equipment of Russian internet providers). What the probes show is the three facts above, the range scope above all. That a
+equipment of Russian internet providers). That a
 particular operator's equipment is doing it, and that the ranges are blocked for hosting VPNs, are inferences.
 
 ## What might fix it
@@ -55,19 +55,15 @@ server's own documentation; for a [Postern](https://postern.readthedocs.io/en/la
 
 ## Why a longer wait is the wrong fix
 
-A reset is not slowness, so waiting longer cannot turn it into an answer. Hole does not stretch its start-time
-{term}`self-test` to cover this case. It asks a different question instead, described next.
+A reset is not slowness, so waiting longer cannot turn it into an answer.
 
 ## How Hole reports it
 
 Hole tells a network that drops the handshake apart from a server that rejects the credentials, in both places a
 connection can fail.
 
-**When you connect.** The {term}`bridge` (Hole's privileged background service) starts an out-of-band probe of the server's address beside the start-time DNS
-{term}`self-test`: before it opens the tunnel, the bridge sends one test lookup through the proxy, and Hole shows
-"Connected" only if it is answered. A passing self-test is not delayed by the probe, which is cancelled. If the self-test
-fails, the bridge waits for the probe's verdict, at most the probe's remaining budget, and the verdict decides what you are
-told:
+**When you connect.** The {term}`bridge` probes the server's address beside the start-time DNS {term}`self-test`. If the
+self-test fails, the probe's verdict decides what you are told:
 
 | The probe found                                                                                                     | The message                                                                                         |
 | ------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -90,9 +86,12 @@ whether the network lets the handshake through, not whose certificate comes back
 ---
 class: note
 ---
-- **On connect, it is skipped while a cover is in force or about to be.** A {term}`cover` is a firewall block; the
-  standing one is {term}`Lockdown <lockdown>`'s. The bridge's own block would make the probe's traffic fail, so the connect failure
-  keeps the self-test's own message and the network-blocked one does not appear. Test has no such condition.
+- **On connect, it is skipped while {term}`Lockdown <lockdown>`'s standing {term}`cover` is in force.** A cover is a
+  firewall block. The bridge's own block would make the probe's traffic fail, so the connect failure keeps the
+  self-test's own message and the network-blocked one does not appear. Test is not skipped, but its traffic passes through
+  the same block: a Test run while Lockdown's block is in force can report Hole's own block as "No response from the
+  server." or as a blocked network. Choose **Unblock Network** in the tray before you trust it
+  ([details](hostile-networks.md#telling-the-failures-apart)).
 - **On connect, it runs only with the {term}`DNS forwarder` on.** The self-test it accompanies is the forwarder's.
 - **Its hello is not ex-ray's.** The probe sends no ECH and no domain name. So "reachable" means a plain ClientHello got
   an answer, not that the one ex-ray sends would, and a server that itself drops a hello with no domain name would read

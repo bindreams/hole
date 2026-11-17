@@ -1,9 +1,7 @@
 # ECH in practice
 
 {term}`ECH` keeps the real server name out of the TLS handshake. The [concept page](../how-it-works/ech-and-doh.md)
-explains how it works and what Hole's options are. This page is about what happens when it meets real networks: three ways
-it can fail, a lookup that gave the name away anyway, a key that rotates under a running client, and the shape of the
-hello it rides in.
+explains how it works and what Hole's options are. This page is about what happens when it meets real networks.
 
 ## Why the name is worth hiding
 
@@ -33,11 +31,9 @@ without TLS, or without a DoH address to fetch the config from.
 ---
 class: note
 ---
-When `always` refuses, the plugin's own error names ECH. It can reach only `bridge.log`, the {term}`bridge`'s log (its
-location is on [the logging page](../contributing/architecture/logging.md)). The bridge's relay writes every line the
-plugin prints into that log as it arrives. The start-time {term}`self-test` decides only whether the plugin's last lines
-are quoted again beside the failure: they are when its reading implicates the transport and the reachability probe has not
-already named the cause. The message on screen is one of the general tunnel failures.
+When `always` refuses, the plugin's own error names ECH but reaches only `bridge.log`, the {term}`bridge`'s log (its
+location is on [the logging page](../contributing/architecture/logging.md)). The message on screen is one of the general
+tunnel failures.
 ```
 
 ## A lookup that can give the name away
@@ -52,15 +48,21 @@ with "no ech record found", though the record itself was healthy: a JSON query t
 healthy record, with the same config bytes as the server side. The config asked for `ech=always`, so ex-ray refused to handshake
 rather than send the name in the clear, and no tunnel came up. The screen said only that the DNS {term}`self-test` failed.
 
-That error is reached only after an HTTP 200 whose body is a valid DNS message with no matching HTTPS answer. A network
-failure, a non-200 reply or a malformed message each give a different error. So the query reached something that answered,
-and what answered did not carry the record.
+That error is reached only after an HTTP 200 whose body is a valid DNS message holding no HTTPS answer whose owner name
+is the queried domain and that carries an `ech` parameter. A network failure, a non-200 reply or a malformed message each
+give a different error. So the query reached something that answered, and what answered held no such answer.
 
 **Not confirmed.** Whether this was the tester's actual trigger was never settled. The notes took the hand-run query as
 ruling out the first guess, a middlebox stripping the answer. But it was a JSON GET, and ex-ray sends a wireformat POST,
-so it did not reproduce ex-ray's query. Two datapoints would settle it, and neither was collected: what the tester's own
-system resolver returns for the DoH resolver's hostname, and whether a wireformat POST to that resolver returns the HTTPS
-record from the tester's machine.
+so it did not reproduce ex-ray's query.
+
+**Hypothesis.** The server's domain may be a CNAME to another name, as a CDN-fronted domain often is. A resolver that
+follows it answers with the CNAME and the HTTPS record under the target's name, and ex-ray's match on the owner name does
+not accept that record. A healthy record would then fit both the hand-run query and "no ech record found".
+
+Three datapoints would settle it, and none was collected: what the tester's own system resolver returns for the DoH
+resolver's hostname, whether a wireformat POST to that resolver returns the HTTPS record from the tester's machine, and
+whether the server's domain is a CNAME to another name.
 
 **Unexplained.** On the same machine Hole's secure lookup of the server's address failed four times with a certificate
 that could not be verified, then worked about 45 seconds later. That fits something on that network
@@ -68,9 +70,9 @@ interfering with some TLS connections and not others, and the observation does n
 "something on this network may be intercepting encrypted connections".
 
 **What Hole does.** The `ech-doh` it gives ex-ray is an IP-literal URL of the form `https://<ip>/dns-query`, so there
-is nothing to resolve. The address is the resolver that answered Hole's own lookup of the server, where one did. When
-this was measured, every endpoint in Hole's resolver table accepted an IP-literal DoH request over HTTP/2 with a verified
-certificate, so the change needed no per-provider exception. A resolver you add yourself must list its IP address in its
+is nothing to resolve. The address is the resolver that answered Hole's own lookup of the server, where one did. Every
+endpoint in Hole's resolver table was measured to accept an IP-literal DoH request over HTTP/2 with a verified
+certificate, so no per-provider exception is needed. A resolver you add yourself must list its IP address in its
 certificate; [the concept page](../how-it-works/ech-and-doh.md#doh-carries-the-lookups-hole-must-make-privately) covers
 that.
 
@@ -90,8 +92,8 @@ more often than that leaves the client holding a stale config for part of every 
 rejected handshake and the retry, not a failed connection.
 
 **Reported, not re-checked.** The investigators' notes say Cloudflare rotates its ECH keys hourly and accepts no old key after
-rotation, relying on clients that retry with `retry_configs`. The announcement post for its ECH support was fetched for
-this page and does not state the interval, so treat the figure as a hypothesis. The retry itself does not depend on it.
+rotation, relying on clients that retry with `retry_configs`. The interval is unconfirmed; treat the figure as a
+hypothesis. The retry itself does not depend on it.
 
 ## The shape of the hello
 

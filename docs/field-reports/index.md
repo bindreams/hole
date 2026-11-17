@@ -1,8 +1,7 @@
 # Field reports
 
-Hole is built for networks that interfere with traffic, and it has been tried on some of them: from Russia, on a phone
-hotspot, on test boxes. These pages are case studies of what those networks did and what the technique did about it. They
-are about the environment and the technique, not about bugs in a release.
+These pages are case studies of networks that interfere with traffic, and of what Hole's technique does in them. They
+cover the environment and the technique, not bugs in a release.
 
 Each page keeps its kinds of statement apart, and labels them:
 
@@ -14,7 +13,7 @@ Each page keeps its kinds of statement apart, and labels them:
   which.
 - **Advice**: something to try, with its reason. A remedy is called advice unless a report observed it work.
 
-Nothing here names a person, a machine or a server. "A client in Russia" and "a test box" stand for real ones.
+Nothing here names a person, a machine or a server.
 
 ## The cases
 

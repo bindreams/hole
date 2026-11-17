@@ -2,8 +2,7 @@
 
 This page is for someone who runs a server for people on a network that interferes with traffic, or who sets up their
 client. It opens with how to tell three failures apart, because they stop at different places, then lists what to set and
-what to leave alone. Each recommendation names the [field report](index.md) it comes from and says whether it is advice
-or was observed to work. None of it was observed to work, so all of it is advice.
+what to leave alone. Each recommendation names the [field report](index.md) it comes from.
 
 ```{admonition} What these rest on
 ---
@@ -23,9 +22,7 @@ entry (`tls;host=example.com`, and the like), which Hole passes to the plugin: `
 needs in its own plugin options, and how to put a server behind a CDN, is the server's own documentation: for a
 [Postern](https://postern.readthedocs.io/en/latest/) server, Postern's. This page does not repeat it.
 
-The messages and options below are from the current source. The reachability probe and its "network blocked" message
-shipped in Hole 0.4.0; the {term}`keepalive` and the IP-literal `ech-doh` first shipped in 0.6.0. A client on an older
-release does not have them.
+The messages and options below are from the current source. A client on an older release may lack these.
 
 ## Telling the failures apart
 
@@ -61,12 +58,7 @@ server that drops a hello with no name can look blocked, so compare against the 
 | **2. The ClientHello dies**     | Lets TCP complete, then resets or ignores the TLS handshake, whatever the name in it. | "The network is blocking the connection to this server…", on Test, and on connect when the probe ran.                                                                 | [Range-blocked hosts](range-blocked-hosts.md).                                                                                                                                                                         |
 | **3. Established, then silent** | The connection comes up and carries something, then stops, with or without a reset.   | Nothing on screen: "Connected" is decided once, at start. The log shows the reconnects.                                                                               | Observed on a test box in Russia; see below.                                                                                                                                                                           |
 
-What Hole shows depends on whether its reachability probe ran. When it ran, failure 1 shows as "did not respond" on connect
-and as "No response from the server." on Test, and failure 2 as the network-blocked message on both. For a server using TLS or WebSocket, a completed
-connect with no byte back is what the probe reads as blocked. On connect the probe is skipped while a firewall cover is in force
-or about to be, and with the {term}`DNS forwarder` off; then both failures show the start-time {term}`self-test`'s own
-message, and only the two questions tell them apart. "Did not respond" also covers connect errors that are not a silent
-SYN (see below), so it does not by itself mean failure 1.
+What Hole shows depends on whether its reachability probe ran; see [the probe's limits](range-blocked-hosts.md#how-hole-reports-it).
 
 **Failure 1: what to do.** No remedy is established. Run the control, the first recommendation below.
 
@@ -86,11 +78,17 @@ class: note
 ---
 "The server did not respond" is also what Hole says when the connect failed for any reason other than a refusal: an
 unreachable network, a firewall on the machine, a reset. When you *connect*, the network-blocked message is not shown while
-any firewall {term}`cover` is in force or about to be, which includes {term}`Lockdown <lockdown>`, or with the
-{term}`DNS forwarder` off. So turning on Lockdown for someone costs this diagnostic on connect; Test is unaffected. A wrong
-password is reported only when the probe has not found the network blocking: "Server rejected the connection (wrong
-password, cipher, or plugin config)." The [probe's limits](range-blocked-hosts.md#how-hole-reports-it) apply to every row
-above.
+{term}`Lockdown <lockdown>`'s block (the standing {term}`cover`) is in force, or with the {term}`DNS forwarder` off. So
+turning on Lockdown for someone costs this diagnostic on connect. A wrong password is reported only when the probe has not
+found the network blocking: "Server rejected the connection (wrong password, cipher, or plugin config)." The [probe's
+limits](range-blocked-hosts.md#how-hole-reports-it) apply to every row above.
+
+Test skips nothing while the block is in force, but its traffic passes through the block like any other. On macOS the block
+lets through only TCP to the server it was set up for; on Windows it lets through that server's address and the programs
+of the bridge and of the session's plugin. A Test of any other server, or on macOS of a QUIC one, can then fail on Hole's own
+block and read as "No response from the server." or as the network-blocked message. While the block is in force, choose
+**Unblock Network** in the tray before you trust a Test verdict; that also switches Lockdown off ([the
+kill switch](../how-it-works/kill-switch.md)).
 ```
 
 ## Recommendations
@@ -122,9 +120,9 @@ hoster's space is untested. **From** [range-blocked hosts](range-blocked-hosts.m
 **Do.** Put the endpoint behind a CDN, as WebSocket over TLS, or move to a provider that is not blocked. The plugin options
 are `tls` and `host=<domain>`, on the server as well as the client; TLS is off unless `tls` is set
 ({src}`crates/ex-ray/config.go`). Setting the server side up is in the server's own documentation (Postern's, above).
-Two cautions. The one case here that used a CDN, [the Russian case](russia-ech-investigation.md), is open and its cause
-unknown, so fronting is not shown to fix a block. And moving is whack-a-mole. This page has no way to check a candidate
-provider before you use it; the last recommendation, **Test**, from that network, is the check.
+Two cautions, both in [what might fix it](range-blocked-hosts.md#what-might-fix-it): fronting is not shown to fix a
+block, and moving may be whack-a-mole. This page has no way to check a candidate provider before you use it; the last
+recommendation, **Test**, from that network, is the check.
 
 ### Give the TLS server name as a domain whose DNS publishes an ECH config
 
@@ -157,8 +155,7 @@ needs TLS and a DoH address; Hole supplies the DoH address itself (next recommen
 own. **From** [ECH in practice](ech-in-practice.md#a-lookup-that-can-give-the-name-away).
 
 **Do.** Do not set `ech-doh` in the plugin options. A config from Postern arrives with `ech` and `ech-doh` already
-appended; leave it. Hole replaces a hostname value, and an IP-literal value too once its own resolver answered; ex-ray
-itself keeps the first value it reads. The logic is `hole_ech_doh_outranks` in {src}`crates/bridge/src/proxy/plugin.rs`.
+appended; leave it. [ECH in practice](ech-in-practice.md#a-lookup-that-can-give-the-name-away) says when Hole replaces it.
 
 ### Keep the secure lookup on
 
@@ -195,5 +192,7 @@ transport, which is the one that uses the Chrome-like hello; `mode=quic` chooses
 apart from a bad password. **From** [range-blocked hosts](range-blocked-hosts.md#how-hole-reports-it).
 
 **Do.** Have someone on that network press **Test** on the server's entry in Hole's dashboard before you rely on the
-config. A pass is the first check, not the last: Test opens one tunnel and fetches a header from a public address, trying
-a second address if the first returns nothing, and a connect does more, including the start-time {term}`self-test`.
+config. If Lockdown's block is in force, choose **Unblock Network** first
+([why](#telling-the-failures-apart)). A pass is the first check, not the last: Test opens one tunnel and fetches a header
+from a public address, trying a second address if the first returns nothing, and a connect does more, including the
+start-time {term}`self-test`.
