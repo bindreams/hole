@@ -823,6 +823,30 @@ def test_main_feature_wraps_all_component_groups(package: ET.Element) -> None:
     assert refs == expected, f"Feature 'Main' must reference exactly {expected}; got {refs}"
 
 
+# Notices file tests ===================================================================================================
+
+# NOTICES.md's component code; fixed so an upgrade replaces the installed file.
+NOTICES_COMPONENT_GUID = "F6A7B8C9-D0E1-2345-F012-456789012345"
+
+
+def test_notices_md_component_exists(package: ET.Element) -> None:
+    """NOTICES.md ships in the install folder, under the component code earlier releases gave it."""
+    comp = _find_component(package, "NoticesMd")
+    assert comp is not None, "Component 'NoticesMd' is required: every updater from 0.3.0 requires NOTICES.md"
+    assert comp.get("Guid", "").upper() == NOTICES_COMPONENT_GUID, (
+        f"NoticesMd keeps the component code of releases 0.2.0 to 0.7.0; got '{comp.get('Guid')}'"
+    )
+    file_elem = next(
+        (f for f in comp.iter(f"{{{NS['wix']}}}File") if f.get("Id") == "NOTICES.md"),
+        None,
+    )
+    assert file_elem is not None, "NoticesMd component must contain <File Id='NOTICES.md'>"
+    source = file_elem.get("Source", "")
+    assert source == "!(bindpath.BinDir)\\NOTICES.md", (
+        f"NOTICES.md File Source must be BinDir\\NOTICES.md; got '{source}'"
+    )
+
+
 # BINDIR conformance tests =============================================================================================
 #
 # Guards the staging->packaging boundary: every file `cargo xtask stage` puts

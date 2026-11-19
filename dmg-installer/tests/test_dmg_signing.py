@@ -58,3 +58,10 @@ def test_main_binary_is_not_linker_signed(installed_app: Path) -> None:
         f"main binary still carries the linker-applied ad-hoc signature "
         f"(0x20000 flag bit) — Tauri's codesign step did not re-sign it:\n{output}"
     )
+
+
+def test_notices_present_in_bundle(installed_app: Path) -> None:
+    """The generated third-party notices ship in the bundle, as the licences of the components ask."""
+    notices = installed_app / "Contents" / "Resources" / "NOTICES.md"
+    assert notices.is_file(), "NOTICES.md missing from the .app bundle"
+    assert notices.stat().st_size > 0, "NOTICES.md in the .app bundle is empty"

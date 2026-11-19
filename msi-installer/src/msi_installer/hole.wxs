@@ -183,6 +183,13 @@
       <Component Id="WintunDll" Guid="C3D4E5F6-A7B8-9012-CDEF-123456789012">
         <File Id="wintun.dll" Source="!(bindpath.BinDir)\wintun.dll" KeyPath="yes" />
       </Component>
+      <!-- NOTICES.md: the third-party notices `cargo xtask notices` generates. Same file name and
+           folder as in releases 0.2.0 to 0.7.0, so the component keeps their GUID: a new GUID for a
+           file at the same path would make two components share it, which Windows Installer's
+           component rules forbid, and a regenerated file's new content does not change the code. -->
+      <Component Id="NoticesMd" Guid="F6A7B8C9-D0E1-2345-F012-456789012345">
+        <File Id="NOTICES.md" Source="!(bindpath.BinDir)\NOTICES.md" KeyPath="yes" />
+      </Component>
     </ComponentGroup>
 
     <!-- Start Menu shortcut. Conditioned on INSTALL_START_MENU; component GUID

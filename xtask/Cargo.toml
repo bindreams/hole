@@ -52,6 +52,13 @@ serde_yml = "0.0.13"
 indexmap = { version = "2", features = ["serde"] }
 petgraph = "0.8"
 
+# `cargo xtask notices`: licence expressions and the standard licence texts (`text` feature).
+spdx = { version = "0.13", features = ["text"] }
+thiserror = "2" # `NoticesError`
+# The Rust standard library's copyright file is HTML: `dom_query` converts it to text and reads which licences it names.
+# Already in the graph (`tauri-utils`).
+dom_query = "0.28"
+
 # `cargo xtask pull-subrepo` shells out to `go mod edit -json` on a scratch
 # copy of a conflicted go.mod (pull_subrepo::go_mod_replace_directives) — a
 # real (non-test) code path, so this must be a normal dependency, not

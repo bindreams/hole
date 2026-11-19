@@ -58,6 +58,14 @@ fn fake_repo() -> tempfile::TempDir {
         fs::write(wintun.join("wintun.dll"), b"fake wintun").unwrap();
     }
 
+    // The generated notices of the host platform, where `cargo xtask notices` leaves them.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        let notices = root.join(crate::notices::HOST_OUTPUT);
+        fs::create_dir_all(notices.parent().unwrap()).unwrap();
+        fs::write(notices, b"fake notices").unwrap();
+    }
+
     dir
 }
 
@@ -73,11 +81,18 @@ fn bindir_contains_expected_files() {
     #[cfg(target_os = "windows")]
     assert_eq!(
         names,
-        vec!["hole.exe", "hole.pdb", "ex-ray.exe", "galoshes.exe", "wintun.dll"]
+        vec![
+            "hole.exe",
+            "hole.pdb",
+            "ex-ray.exe",
+            "galoshes.exe",
+            "wintun.dll",
+            "NOTICES.md"
+        ]
     );
 
     #[cfg(target_os = "macos")]
-    assert_eq!(names, vec!["hole", "hole.dSYM", "ex-ray", "galoshes"]);
+    assert_eq!(names, vec!["hole", "hole.dSYM", "ex-ray", "galoshes", "NOTICES.md"]);
 
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     assert_eq!(names, vec!["hole", "ex-ray", "galoshes"]);
@@ -176,4 +191,46 @@ fn bindir_names_bundle_flag_prints_the_bundle_set() {
     assert_eq!(bundle, bundle_payload_names(Os::Darwin));
     assert!(full.contains(&"ex-ray".to_string()) && !bundle.contains(&"ex-ray".to_string()));
     assert!(full.contains(&"galoshes".to_string()) && !bundle.contains(&"galoshes".to_string()));
+}
+
+/// `NOTICES.md` ships from the file a bare `cargo xtask notices` generated for the host platform, at its one fixed path,
+/// not from a file kept in the repository.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[skuld::test]
+fn notices_md_is_the_generated_file_of_the_host_platform() {
+    let repo = fake_repo();
+    let files = bindir_files(Profile::Release, repo.path()).unwrap();
+    let notices = files.iter().find(|f| f.dest_name == "NOTICES.md").unwrap();
+    assert_eq!(notices.source.path(), repo.path().join(".cache/notices/NOTICES.md"));
+}
+
+/// A repository where `cargo xtask notices` has not run has no notices to stage; the error names the command.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[skuld::test]
+fn bindir_errors_when_the_notices_were_not_generated() {
+    let repo = fake_repo();
+    fs::remove_file(repo.path().join(crate::notices::HOST_OUTPUT)).unwrap();
+
+    let err = bindir_files(Profile::Debug, repo.path()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("NOTICES.md") && msg.contains("cargo xtask notices"),
+        "expected an error naming the notices command, got: {msg}"
+    );
+}
+
+#[skuld::test]
+fn every_upstream_library_of_the_bindir_has_the_path_it_is_provisioned_at() {
+    let mut checked = 0;
+    for os in [Os::Windows, Os::Darwin, Os::Linux] {
+        for entry in bindir_entries(os) {
+            if entry.kind.needs_a_declared_entry() {
+                checked += 1;
+                let path = upstream_library_path(&entry.name)
+                    .unwrap_or_else(|| panic!("{os}: `{}` has no provisioned path", entry.name));
+                assert!(path.ends_with(&format!("/{}", entry.name)), "{path}");
+            }
+        }
+    }
+    assert!(checked > 0, "the Windows BINDIR ships wintun.dll as it came");
 }

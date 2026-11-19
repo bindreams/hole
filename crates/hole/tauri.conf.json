@@ -27,7 +27,8 @@
     "macOS": {
       "signingIdentity": "-",
       "files": {
-        "MacOS/hole.dSYM": ".cache/hole.dSYM"
+        "MacOS/hole.dSYM": ".cache/hole.dSYM",
+        "Resources/NOTICES.md": ".cache/notices/NOTICES.md"
       }
     },
     "externalBin": [

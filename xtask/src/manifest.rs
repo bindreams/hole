@@ -83,7 +83,12 @@ impl Platform {
 
     /// The host platform, or `None` if either component is unknown.
     pub fn host() -> Option<Self> {
-        Some(Self::new(Os::host()?, Arch::host()?))
+        Self::or_host(None, None)
+    }
+
+    /// `os` and `arch` where given and the host's where not, or `None` if one the host would supply is unknown.
+    pub fn or_host(os: Option<Os>, arch: Option<Arch>) -> Option<Self> {
+        Some(Self::new(os.or_else(Os::host)?, arch.or_else(Arch::host)?))
     }
 }
 

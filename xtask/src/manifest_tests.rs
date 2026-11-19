@@ -579,6 +579,7 @@ fn production_build_yaml_parses() {
         "hole-dmg",
         "hole-tests",
         "frontend-build",
+        "npm-install",
         // Lint and check targets — proof that the manifest expresses non-test
         // runnables. Removing any of these would silently strip a CI gate.
         "clippy-hole",
@@ -668,14 +669,6 @@ fn frontend_check_target_shape() {
         t.run,
         vec![
             Step::Bash {
-                command: "npm ci --dry-run --offline --ignore-scripts --no-audit --no-fund".to_string(),
-                environment: HashMap::new(),
-            },
-            Step::Bash {
-                command: ".github/scripts/retry.sh npm ci --no-audit --no-fund".to_string(),
-                environment: HashMap::new(),
-            },
-            Step::Bash {
                 command: "npm run check".to_string(),
                 environment: HashMap::new(),
             },
@@ -685,16 +678,48 @@ fn frontend_check_target_shape() {
             },
         ]
     );
-    // No `depends: frontend-build`. tsc reads source files directly; the
-    // Vite bundle is an artifact, not an input to the type-check.
+    // The packages, not the bundle: tsc reads source files directly, so the Vite bundle is not an input to the
+    // type-check. `npm-install` covers every platform the check runs on, or the dependency would be skipped there.
+    assert_eq!(t.depends, vec!["npm-install".to_string()]);
+    let npm_install = m.get("npm-install").expect("npm-install target missing");
+    assert_eq!(npm_install.platforms, t.platforms);
+}
+
+#[skuld::test]
+fn npm_install_target_shape() {
+    // Pins that `npm-install` has no building step, so the `hole` debug path gets no Vite bundle.
+    let yaml = include_str!("../../build.yaml");
+    let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
+    let t = m.get("npm-install").expect("npm-install target missing");
+
+    // Every platform `frontend-check` runs on, which depends on it.
+    assert_eq!(t.platforms.len(), 6);
+    // The dry run checks the lockfile against `package.json` strictly. The install is `npm install --no-save`, which
+    // npm itself does nothing for when `node_modules/` already matches the lockfile, and never writes the lockfile;
+    // `npm ci` deletes and reinstalls `node_modules/` every time, under a running `npm run dev`.
+    assert_eq!(
+        t.build,
+        vec![
+            Step::Bash {
+                command: "npm ci --dry-run --offline --ignore-scripts --no-audit --no-fund".to_string(),
+                environment: HashMap::new(),
+            },
+            Step::Bash {
+                command: ".github/scripts/retry.sh npm install --no-save --no-audit --no-fund".to_string(),
+                environment: HashMap::new(),
+            },
+        ],
+    );
     assert_eq!(t.depends, Vec::<String>::new());
+    assert!(!t.has_run());
 }
 
 #[skuld::test]
 fn frontend_build_target_shape() {
     // The Renovate npm safety gate (see Frontend check CI job) depends on
     // `frontend-build` producing ui/dist/ on linux/amd64 with strict-lockfile
-    // semantics. Pin the shape so a future edit can't silently weaken the gate.
+    // semantics, which its `npm-install` dependency provides. Pin the shape so
+    // a future edit can't silently weaken the gate.
     let yaml = include_str!("../../build.yaml");
     let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
     let t = m.get("frontend-build").expect("frontend-build target missing");
@@ -710,28 +735,78 @@ fn frontend_build_target_shape() {
     );
     assert_eq!(
         t.build,
-        vec![
-            Step::Bash {
-                command: "npm ci --dry-run --offline --ignore-scripts --no-audit --no-fund".to_string(),
-                environment: HashMap::new(),
-            },
-            Step::Bash {
-                command: ".github/scripts/retry.sh npm ci --no-audit --no-fund".to_string(),
-                environment: HashMap::new(),
-            },
-            Step::Bash {
-                command: "npm run build".to_string(),
-                environment: HashMap::new(),
-            },
-        ],
+        vec![Step::Bash {
+            command: "npm run build".to_string(),
+            environment: HashMap::new(),
+        }],
     );
-    // Adding a `depends:` would silently start compiling Rust on every PR
-    // (the gate is supposed to be JS-only). Adding a `run:` step would make
-    // `cargo xtask run frontend-build` succeed with whatever side effect the
-    // step has — `frontend-build` is an artifact target, not a runnable, so
-    // pin both as load-bearing.
-    assert_eq!(t.depends, Vec::<String>::new());
+    // The only dependency is the JS package install: anything else would
+    // silently start compiling Rust on every PR (the gate is supposed to be
+    // JS-only). Adding a `run:` step would make `cargo xtask run
+    // frontend-build` succeed with whatever side effect the step has —
+    // `frontend-build` is an artifact target, not a runnable, so pin both as
+    // load-bearing.
+    assert_eq!(t.depends, vec!["npm-install".to_string()]);
     assert!(!t.has_run());
+}
+
+#[skuld::test]
+fn notices_needs_the_packages_and_not_a_frontend_build() {
+    // A `frontend-build` under `notices` would put a Vite bundle on the `hole` (debug) path.
+    let yaml = include_str!("../../build.yaml");
+    let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
+    let t = m.get("notices").expect("notices target missing");
+    assert!(t.depends.contains(&"npm-install".to_string()), "{:?}", t.depends);
+    assert!(!t.depends.contains(&"frontend-build".to_string()), "{:?}", t.depends);
+
+    let plan = Plan::new(&m).expect("plan builds from production manifest");
+    let order = plan
+        .order_for(&["hole"], Platform::new(Os::Windows, Arch::Amd64))
+        .expect("hole applies to windows/amd64");
+    assert!(
+        !order.contains(&"frontend-build"),
+        "hole (debug) must not build the frontend: {order:?}"
+    );
+    assert!(order.contains(&"npm-install"), "{order:?}");
+}
+
+#[skuld::test]
+fn hole_dmg_depends_on_the_notices_which_a_bare_command_writes_where_the_bundler_reads() {
+    let yaml = include_str!("../../build.yaml");
+    let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
+    let dmg = m.get("hole-dmg").expect("hole-dmg target missing");
+    let commands: Vec<&str> = dmg
+        .build
+        .iter()
+        .filter_map(|step| match step {
+            Step::Bash { command, .. } => Some(command.as_str()),
+            Step::Process { .. } => None,
+        })
+        .collect();
+    // A bare run writes the host's file where `bundle.macOS.files` points, and the `notices` target is that run: the
+    // image generates nothing of its own.
+    assert!(commands.iter().all(|c| !c.contains("xtask notices")), "{commands:?}");
+    let generator = m.get("notices").expect("notices target missing");
+    let generator: Vec<&str> = generator
+        .build
+        .iter()
+        .filter_map(|step| match step {
+            Step::Bash { command, .. } => Some(command.as_str()),
+            Step::Process { .. } => None,
+        })
+        .collect();
+    assert_eq!(generator, ["cargo xtask notices"]);
+
+    // The generator's inputs are stated once, on the `notices` target, which the image depends on like the others.
+    assert!(dmg.depends.contains(&"notices".to_string()), "{:?}", dmg.depends);
+    let plan = Plan::new(&m).expect("plan builds from production manifest");
+    for arch in [Arch::Amd64, Arch::Arm64] {
+        let order = plan
+            .order_for(&["hole-dmg"], Platform::new(Os::Darwin, arch))
+            .expect("hole-dmg applies to darwin");
+        assert!(order.contains(&"notices"), "{order:?}");
+        assert!(order.contains(&"ex-ray") && order.contains(&"npm-install"), "{order:?}");
+    }
 }
 
 #[skuld::test]
@@ -935,4 +1010,47 @@ fn hole_run_is_dev_mode_build_and_launch() {
             );
         }
     }
+}
+
+#[skuld::test]
+fn or_host_takes_the_host_for_what_is_not_given() {
+    let host = Platform::host().expect("test host must be in the known platform set");
+    assert_eq!(Platform::or_host(None, None), Some(host));
+    let other_os = if host.os == Os::Windows {
+        Os::Darwin
+    } else {
+        Os::Windows
+    };
+    let other_arch = if host.arch == Arch::Amd64 {
+        Arch::Arm64
+    } else {
+        Arch::Amd64
+    };
+    assert_eq!(
+        Platform::or_host(Some(other_os), None),
+        Some(Platform::new(other_os, host.arch))
+    );
+    assert_eq!(
+        Platform::or_host(None, Some(other_arch)),
+        Some(Platform::new(host.os, other_arch))
+    );
+    assert_eq!(
+        Platform::or_host(Some(other_os), Some(other_arch)),
+        Some(Platform::new(other_os, other_arch))
+    );
+}
+
+#[skuld::test]
+fn notices_does_not_run_the_retrying_fetch() {
+    // Why the target has no retrying fetch step: the comment on `notices` in build.yaml.
+    let yaml = include_str!("../../build.yaml");
+    let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
+    let t = m.get("notices").expect("notices target missing");
+    assert_eq!(
+        t.build,
+        vec![Step::Bash {
+            command: "cargo xtask notices".to_string(),
+            environment: HashMap::new(),
+        }]
+    );
 }
