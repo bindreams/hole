@@ -36,6 +36,7 @@ pub mod global_net_state_conformance;
 pub mod golangci_lint;
 pub mod interrupt;
 pub mod manifest;
+pub mod notices;
 pub mod orchestrate;
 pub mod prek_split;
 pub mod pull_subrepo;
@@ -137,6 +138,10 @@ mod tauri_bundle_tests;
 #[cfg(test)]
 #[path = "test_binaries_tests.rs"]
 mod test_binaries_tests;
+// `wintun::extract` exists on Windows only: the DLL is a Windows file.
+#[cfg(all(test, target_os = "windows"))]
+#[path = "wintun_tests.rs"]
+mod wintun_tests;
 
 #[derive(Parser)]
 #[command(
@@ -363,6 +368,26 @@ pub enum Command {
         #[arg(long)]
         bundle: bool,
     },
+    /// Generate the third-party notices file (`NOTICES.md`) of one platform's `hole` artifact.
+    ///
+    /// Needs the Go module cache (`cargo xtask ex-ray`), `node_modules` (`npm-install`) and, on Windows,
+    /// `cargo xtask wintun`. The host's own file goes to `.cache/notices/NOTICES.md`, however the host was named (bare, or
+    /// with `--os` and `--arch` that resolve to it); any other platform's to `.cache/notices/<os>-<arch>/NOTICES.md`.
+    ///
+    /// The npm packages are the ones installed on this host. For another platform, generation fails when the lock has
+    /// a production package that npm installs only on some platforms: that set can only be read on the platform it
+    /// is for. Without one the host's set is the target's.
+    Notices {
+        /// Target OS (defaults to the host).
+        #[arg(long)]
+        os: Option<manifest::Os>,
+        /// Target architecture (defaults to the host).
+        #[arg(long)]
+        arch: Option<manifest::Arch>,
+        /// Output file, relative to the repo root unless absolute.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Generate `ui/generated.ts` from Rust constants (single source of truth).
     GenUiConstants {
         /// Verify the committed file is up to date instead of writing it.
@@ -561,6 +586,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 .or_else(manifest::Os::host)
                 .ok_or_else(|| anyhow!("unknown host OS"))?;
             println!("{}", render_bindir_names(os, bundle));
+            Ok(())
+        }
+        Command::Notices { os, arch, out } => {
+            let platform = Platform::or_host(os, arch)
+                .ok_or_else(|| anyhow!("unknown host platform: pass the --os and --arch to generate for"))?;
+            let out = out.unwrap_or_else(|| notices::default_output(&platform, Platform::host()));
+            notices::generate(&platform, &repo_root()?, &out)?;
             Ok(())
         }
         Command::GenUiConstants { check } => gen_ui_constants::write_or_check(&repo_root()?, check),

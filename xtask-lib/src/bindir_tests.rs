@@ -6,12 +6,20 @@ fn dest_names_per_os_are_exact() {
     // here AND in every installer manifest (caught by the conformance tests).
     assert_eq!(
         bindir_dest_names(Os::Windows),
-        vec!["hole.exe", "hole.pdb", "ex-ray.exe", "galoshes.exe", "wintun.dll"]
+        vec![
+            "hole.exe",
+            "hole.pdb",
+            "ex-ray.exe",
+            "galoshes.exe",
+            "wintun.dll",
+            "NOTICES.md"
+        ]
     );
     assert_eq!(
         bindir_dest_names(Os::Darwin),
-        vec!["hole", "hole.dSYM", "ex-ray", "galoshes"]
+        vec!["hole", "hole.dSYM", "ex-ray", "galoshes", "NOTICES.md"]
     );
+    // Linux ships no `hole` artifact, so no notices are generated for it.
     assert_eq!(bindir_dest_names(Os::Linux), vec!["hole", "ex-ray", "galoshes"]);
 }
 
@@ -38,7 +46,10 @@ fn embedded_plugin_names_per_os() {
 
 #[skuld::test]
 fn bundle_payload_names_drop_only_the_embedded_names() {
-    assert_eq!(bundle_payload_names(Os::Darwin), vec!["hole", "hole.dSYM"]);
+    assert_eq!(
+        bundle_payload_names(Os::Darwin),
+        vec!["hole", "hole.dSYM", "NOTICES.md"]
+    );
     for os in [Os::Windows, Os::Linux] {
         assert_eq!(bundle_payload_names(os), bindir_dest_names(os), "{os}");
     }
@@ -92,4 +103,29 @@ fn cache_sidecar_path_is_what_tauri_appends_to_the_external_bin_entry() {
         cache_sidecar_file_name("ex-ray", "x86_64-apple-darwin", false),
         "ex-ray-x86_64-apple-darwin"
     );
+}
+
+#[skuld::test]
+fn only_wintun_ships_as_it_came_from_upstream() {
+    let upstream = |os| -> Vec<String> {
+        bindir_entries(os)
+            .into_iter()
+            .filter(|e| e.kind == FileKind::UpstreamLibrary)
+            .map(|e| e.name)
+            .collect()
+    };
+    assert_eq!(upstream(Os::Windows), ["wintun.dll"]);
+    assert!(upstream(Os::Darwin).is_empty());
+    assert!(upstream(Os::Linux).is_empty());
+    // Not run, so never hardened.
+    assert!(!FileKind::UpstreamLibrary.is_executable());
+    assert!(!FileKind::UpstreamLibrary.is_verified_on(Os::Windows));
+}
+
+#[skuld::test]
+fn a_file_needs_a_declared_entry_only_when_it_ships_as_it_came_from_upstream() {
+    assert!(FileKind::UpstreamLibrary.needs_a_declared_entry());
+    assert!(!FileKind::RustExecutable.needs_a_declared_entry());
+    assert!(!FileKind::ForeignExecutable.needs_a_declared_entry());
+    assert!(!FileKind::NotExecutable.needs_a_declared_entry());
 }

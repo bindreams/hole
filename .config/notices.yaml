@@ -1,0 +1,343 @@
+# Input to `cargo xtask notices`, which writes the third-party notices file of a `hole` artifact.
+#
+# `licenses`: a licence is on this list when it is compatible with GPL-3.0-or-later and its duty for a binary copy is
+# met by the notices file. Membership allows, position prefers: where a component's licence expression offers a choice,
+# the first listed licence it allows is the one followed and printed.
+#   text: shared            the standard text names no holder; printed once, with the components under it
+#   text: shared-with-notice  as shared, and the component's NOTICE files are printed too
+#   text: own               the text names a holder; the component's own licence files are printed whole
+# A licence that prints its standard text (`shared`, `shared-with-notice`) must have one in the spdx crate: a
+# `LicenseRef-` licence is `text: own`.
+licenses:
+  - {id: Apache-2.0, text: shared-with-notice}
+  - {id: MIT, text: own}
+  - {id: BSD-3-Clause, text: own}
+  - {id: BSD-2-Clause, text: own}
+  - {id: ISC, text: own}
+  - {id: Unicode-3.0, text: own}
+  - {id: Zlib, text: own}
+  - {id: 0BSD, text: own}
+  - {id: MIT-0, text: own}
+  - {id: Unlicense, text: shared}
+  - {id: CC0-1.0, text: shared}
+  - {id: BSL-1.0, text: shared}
+  - {id: WTFPL, text: shared}
+  - {id: CDLA-Permissive-2.0, text: shared}
+  - {id: MPL-2.0, text: shared}
+  - {id: OFL-1.1, text: own}
+  # Wintun's own licence, shipped as a separate binary beside hole.exe that Hole uses only through its public API, which
+  # its section 3(d) allows. Not a licence of code linked into Hole.
+  - {id: LicenseRef-Wintun-Prebuilt-Binaries, text: own}
+
+# `declared`: components no package manager lists (fonts, shipped binaries, the Rust and Go standard libraries).
+declared:
+  - name: Inter
+    version: "4.001"
+    license: OFL-1.1
+    files: [ui/fonts/inter-latin.woff2]
+    texts:
+      - license: OFL-1.1
+        notice: "Copyright (c) 2016 The Inter Project Authors (https://github.com/rsms/inter)"
+        source: https://github.com/rsms/inter/blob/353b61b9f4430d5f420d56605a6e7993e0941470/LICENSE.txt
+  - name: Fira Code
+    version: "5.002"
+    license: OFL-1.1
+    files: [ui/fonts/firacode-latin.woff2]
+    texts:
+      - license: OFL-1.1
+        notice: "Copyright (c) 2014, The Fira Code Project Authors (https://github.com/tonsky/FiraCode)"
+        source: https://github.com/tonsky/FiraCode/blob/ecd367b040ad92a28b64fa93135775f7e2417b37/LICENSE
+  - name: Wintun
+    version: "0.14.1"
+    license: LicenseRef-Wintun-Prebuilt-Binaries
+    platforms: [windows]
+    files: [.cache/wintun/wintun.dll]
+    dir: .cache/wintun # LICENSE.txt of the pinned zip, kept beside the DLL by `cargo xtask wintun`
+    url: https://www.wintun.net/
+  # Linked into every Rust binary of the artifact, with third-party crates and the Unicode tables of its own. Its section is
+  # the pinned toolchain's copyright file for it, whole; the entry's licence is the one that file states for its own code.
+  - name: Rust standard library
+    version_from: rust-toolchain
+    text_from: rust-toolchain-copyright
+    license: MIT OR Apache-2.0
+    url: https://github.com/rust-lang/rust
+  # Linked into `ex-ray`. Its version and its `LICENSE` are those of the Go toolchain that builds `ex-ray` (`go env
+  # GOVERSION`, `go env GOROOT`), which is no file's pin: `go.mod`'s `toolchain` line is a minimum.
+  - name: Go standard library
+    version_from: go-toolchain
+    text_from: go-toolchain
+    license: BSD-3-Clause
+    url: https://go.dev/
+  # `hole.exe` links `WebView2LoaderStatic.lib` (`webview2-com-sys` selects the static loader on `msvc`), which
+  # Microsoft ships in the NuGet package `Microsoft.Web.WebView2`. The crate bundles the library without the package's
+  # licence; its x64 library is byte for byte that of SDK 1.0.3800.47.
+  # The package's `NOTICE.txt` covers `tools/wv2winrt`, which is not linked.
+  - name: Microsoft Edge WebView2 SDK
+    version: "1.0.3800.47"
+    license: BSD-3-Clause
+    platforms: [windows]
+    url: https://www.nuget.org/packages/Microsoft.Web.WebView2/1.0.3800.47
+    texts:
+      - license: BSD-3-Clause
+        source: https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.3800.47/microsoft.web.webview2.1.0.3800.47.nupkg (LICENSE.txt in the package)
+        text: "Copyright (C) Microsoft Corporation. All rights reserved.\n\
+          \n\
+          Redistribution and use in source and binary forms, with or without\n\
+          modification, are permitted provided that the following conditions are\n\
+          met:\n\
+          \n\
+          \   * Redistributions of source code must retain the above copyright\n\
+          notice, this list of conditions and the following disclaimer.\n\
+          \   * Redistributions in binary form must reproduce the above\n\
+          copyright notice, this list of conditions and the following disclaimer\n\
+          in the documentation and/or other materials provided with the\n\
+          distribution.\n\
+          \   * The name of Microsoft Corporation, or the names of its contributors \n\
+          may not be used to endorse or promote products derived from this\n\
+          software without specific prior written permission.\n\
+          \n\
+          THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS\n\
+          \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT\n\
+          LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR\n\
+          A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT\n\
+          OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,\n\
+          SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT\n\
+          LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,\n\
+          DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY\n\
+          THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT\n\
+          (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE\n\
+          OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE."
+  - name: ex-ray (code derived from shadowsocks/v2ray-plugin)
+    license: MIT
+    dir: crates/ex-ray # LICENSE carries the upstream MIT text
+    url: https://github.com/shadowsocks/v2ray-plugin
+
+# `overrides`: what a component's own files lack, for the component of one `ecosystem` (crate, go or npm) by name and
+# optional version. `license` sets the expression of a component whose ecosystem declares
+# none; `texts` supplies a licence text (`text`), only its holder line (`notice`), or, where upstream ships no licence
+# text at all, what upstream does state (`upstream_words`), each with the upstream URL it was read from.
+overrides:
+  # Go modules declare no licence. Each licence below was read from the module's own LICENSE file.
+  - {name: github.com/adrg/xdg, ecosystem: go, version: v0.5.3, platforms: [darwin], license: MIT}
+  - {name: github.com/andybalholm/brotli, ecosystem: go, version: v1.0.6, license: MIT}
+  - {name: github.com/golang/protobuf, ecosystem: go, version: v1.5.4, license: BSD-3-Clause}
+  - {name: github.com/gorilla/websocket, ecosystem: go, version: v1.5.3, license: BSD-2-Clause}
+  # The root LICENSE holds BSD-3-Clause for the Go and Klaus Post sources, with Apache-2.0 and MIT parts.
+  - {name: github.com/klauspost/compress, ecosystem: go, version: v1.17.4, license: BSD-3-Clause AND Apache-2.0 AND MIT}
+  - {name: github.com/klauspost/compress/internal/snapref, ecosystem: go, version: v1.17.4, license: BSD-3-Clause}
+  - {name: github.com/klauspost/compress/zstd/internal/xxhash, ecosystem: go, version: v1.17.4, license: MIT}
+  - {name: github.com/miekg/dns, ecosystem: go, version: v1.1.72, license: BSD-3-Clause}
+  - {name: github.com/pires/go-proxyproto, ecosystem: go, version: v0.12.0, license: Apache-2.0}
+  - {name: github.com/quic-go/quic-go, ecosystem: go, version: v0.59.1, license: MIT}
+  - {name: github.com/refraction-networking/utls, ecosystem: go, version: v1.8.2, license: BSD-3-Clause}
+  - {name: github.com/refraction-networking/utls/dicttls, ecosystem: go, version: v1.8.2, license: BSD-3-Clause}
+  - {name: github.com/v2fly/v2ray-core/v5, ecosystem: go, version: v5.52.0, license: MIT}
+  - {name: golang.org/x/crypto, ecosystem: go, version: v0.53.0, license: BSD-3-Clause}
+  - {name: golang.org/x/net, ecosystem: go, version: v0.56.0, license: BSD-3-Clause}
+  - {name: golang.org/x/sys, ecosystem: go, version: v0.49.0, license: BSD-3-Clause}
+  - {name: golang.org/x/text, ecosystem: go, version: v0.38.0, license: BSD-3-Clause}
+  - {name: google.golang.org/protobuf, ecosystem: go, version: v1.36.12, license: BSD-3-Clause}
+
+  # Crates and packages that ship no licence file: the text is upstream's, at the commit or tag named in `source`.
+  - name: alloc-stdlib
+    ecosystem: crate
+    version: "0.3.0"
+    texts:
+      - license: BSD-3-Clause
+        source: https://raw.githubusercontent.com/dropbox/rust-alloc-no-stdlib/0a81fd6928ea3b33c8cd484aa4575d50ffb98012/LICENSE
+        text: |
+          Copyright (c) 2016 Dropbox, Inc.
+          All rights reserved.
+
+          Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+          1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+          2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+          3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+          THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+  - name: shadowsocks-service
+    ecosystem: crate
+    version: "1.24.0"
+    texts:
+      - license: MIT
+        source: https://raw.githubusercontent.com/shadowsocks/shadowsocks-rust/bb276eda014a4717b1315e90462aeeda13e8ff5b/LICENSE
+        text: |
+          The MIT License (MIT)
+
+          Copyright (c) 2017 Y. T. CHUNG <zonyitoo@gmail.com>
+
+          Permission is hereby granted, free of charge, to any person obtaining a copy of
+          this software and associated documentation files (the "Software"), to deal in
+          the Software without restriction, including without limitation the rights to
+          use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+          the Software, and to permit persons to whom the Software is furnished to do so,
+          subject to the following conditions:
+
+          The above copyright notice and this permission notice shall be included in all
+          copies or substantial portions of the Software.
+
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+          IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+          FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+          COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+          IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+          CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+  - name: webview2-com
+    ecosystem: crate
+    version: "0.39.1"
+    platforms: [windows]
+    texts:
+      - license: MIT
+        source: https://raw.githubusercontent.com/wravery/webview2-rs/edc2caf886175ccaebe86078c9cfe1ae2a187328/LICENSE
+        text: &webview2_mit_text |
+          MIT License
+
+          Copyright (c) 2021 Bill Avery
+
+          Permission is hereby granted, free of charge, to any person obtaining a copy
+          of this software and associated documentation files (the "Software"), to deal
+          in the Software without restriction, including without limitation the rights
+          to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+          copies of the Software, and to permit persons to whom the Software is
+          furnished to do so, subject to the following conditions:
+
+          The above copyright notice and this permission notice shall be included in all
+          copies or substantial portions of the Software.
+
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+          IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+          FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+          AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+          LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+          OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+          SOFTWARE.
+
+  - name: webview2-com-sys
+    ecosystem: crate
+    version: "0.39.1"
+    platforms: [windows]
+    texts:
+      - license: MIT
+        source: https://raw.githubusercontent.com/wravery/webview2-rs/edc2caf886175ccaebe86078c9cfe1ae2a187328/LICENSE
+        text: *webview2_mit_text
+
+  - name: overlayscrollbars
+    ecosystem: npm
+    version: "2.17.0"
+    texts:
+      - license: MIT
+        source: https://raw.githubusercontent.com/KingSora/OverlayScrollbars/v2.17.0/LICENSE
+        text: |
+          MIT License
+
+          Copyright (c) 2022 Rene Haas
+
+          Permission is hereby granted, free of charge, to any person obtaining a copy
+          of this software and associated documentation files (the "Software"), to deal
+          in the Software without restriction, including without limitation the rights
+          to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+          copies of the Software, and to permit persons to whom the Software is
+          furnished to do so, subject to the following conditions:
+
+          The above copyright notice and this permission notice shall be included in all
+          copies or substantial portions of the Software.
+
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+          IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+          FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+          AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+          LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+          OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+          SOFTWARE.
+  # Upstream ships no licence text at all, so `upstream_words` holds what upstream does say, verbatim, and the standard
+  # text of the licence is printed after it, without a copyright line: no holder is invented.
+  # memalloc 0.1.0 and its upstream repository distribute no licence file and no copyright line. The words are the
+  # Cargo.toml lines and the README.md section.
+  - name: memalloc
+    ecosystem: crate
+    version: "0.1.0"
+    platforms: [windows]
+    texts:
+      - license: MIT
+        source: https://github.com/reem/rust-memalloc/blob/8deb399aa8a1ba864d41ccc1631ddc6ec8b1c1bb/README.md
+        upstream_words: |
+          authors = ["Jonathan Reem <jonathan.reem@gmail.com>"]
+          license = "MIT"
+
+          ## License
+
+          MIT
+
+  # The objc2 repository distributes no MIT text and no copyright line for these four crates: its LICENSE.md names the
+  # MIT licence by link only. The words are that file, as upstream distributes it at each crate's commit.
+  - name: objc2
+    ecosystem: crate
+    version: "0.6.4"
+    platforms: [darwin]
+    texts:
+      - license: MIT
+        source: https://raw.githubusercontent.com/madsmtm/objc2/8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md
+        upstream_words: &objc2_upstream_words |
+          # License
+
+          The licensing of these crates is a bit complicated:
+          - The crates `objc2`, `block2`, `objc2-foundation` and `objc2-encode` are
+            [currently][#23] licensed under [the MIT license][MIT].
+          - All other crates are trio-licensed under the [Zlib], [Apache-2.0] or [MIT]
+            license, at your option.
+
+          Furthermore, the crates are (usually automatically) derived from Apple SDKs,
+          and that may have implications for licensing, see below for details.
+
+          [#23]: https://github.com/madsmtm/objc2/issues/23
+          [MIT]: https://opensource.org/license/MIT
+          [Zlib]: https://zlib.net/zlib_license.html
+          [Apache-2.0]: https://www.apache.org/licenses/LICENSE-2.0
+
+
+          ## Apple SDKs
+
+          These crates are derived from Apple SDKs shipped with Xcode. You can obtain a
+          copy of the Xcode license at:
+
+          https://www.apple.com/legal/sla/docs/xcode.pdf
+
+          Or by typing `xcodebuild -license` in your terminal.
+
+          From reading the license, it is unclear whether distributing derived works
+          such as these crates are allowed?
+
+          But in any case, to practically use these crates, you will have to link, and
+          that only works when you have the correct Xcode SDK available to provide the
+          required `.tbd` files, which is why we choose to still use the normal SPDX
+          identifiers in the crates (Xcode is required to use the crates, and when using
+          Xcode you have already agreed to the Xcode license).
+  - name: block2
+    ecosystem: crate
+    version: "0.6.2"
+    platforms: [darwin]
+    texts:
+      - license: MIT
+        source: https://raw.githubusercontent.com/madsmtm/objc2/b4167b582b2f75f9a1be75495c41b765344fd03c/LICENSE.md
+        upstream_words: *objc2_upstream_words
+  - name: objc2-encode
+    ecosystem: crate
+    version: "4.1.0"
+    platforms: [darwin]
+    texts:
+      - license: MIT
+        source: https://raw.githubusercontent.com/madsmtm/objc2/8d214f5477365ffcbcbb7de058c86ed9a518efb7/LICENSE.md
+        upstream_words: *objc2_upstream_words
+  - name: objc2-foundation
+    ecosystem: crate
+    version: "0.3.2"
+    platforms: [darwin]
+    texts:
+      - license: MIT
+        source: https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md
+        upstream_words: *objc2_upstream_words

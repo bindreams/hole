@@ -61,6 +61,18 @@ targets:
     platforms: [windows/amd64]
     build: cargo xtask wintun
 
+  notices:
+    # The third-party notices (`NOTICES.md`) of the host platform's `hole` artifact, written to
+    # `.cache/notices/NOTICES.md`: the one path the staging and the macOS bundler read. It reads what the
+    # other targets leave: the Go module cache (`ex-ray`), `node_modules/` (`npm-install`) and, on Windows,
+    # the Wintun zip's licence beside the DLL (`wintun`). The crate sources it needs are downloaded by its
+    # own `cargo metadata --locked`; a retrying fetch (`.github/scripts/cargo-fetch.sh`) is for CI's lost
+    # network and would never end on a local failure that is not the network. Fails, naming the component and the entry of
+    # `.config/notices.yaml` that would settle it, on any component whose licence it cannot place.
+    depends: [ex-ray, wintun, npm-install]
+    platforms: [windows/amd64, darwin/amd64, darwin/arm64]
+    build: cargo xtask notices
+
   hole:
     # Builds the hole executable + sidecars in debug profile and stages the
     # canonical BINDIR. Release builds happen inside `hole-msi` / `hole-dmg`
@@ -80,7 +92,8 @@ targets:
     # demanding pre-built embedded assets at `ui/dist/`. The hole crate's
     # default = ["tauri/custom-protocol"] is meant for production builds
     # (hole-msi / hole-dmg) — see the frontend-build note.
-    depends: [galoshes, wintun]
+    # `notices`: the stage copies the same file list the installers do, and that list includes `NOTICES.md`.
+    depends: [galoshes, wintun, notices]
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     build:
       - cargo build --workspace --no-default-features --features tombstone/crash-dumps
@@ -111,7 +124,7 @@ targets:
     #
     # `frontend-build` is on the depends list so `ui/dist/` exists before the
     # Rust build — see the frontend-build note.
-    depends: [galoshes, wintun, frontend-build]
+    depends: [galoshes, wintun, frontend-build, notices]
     platforms: [windows/amd64]
     build:
       # A stale lockfile fails the same way on every attempt: check it offline before the retry.
@@ -126,7 +139,10 @@ targets:
     #
     # `frontend-build` is a dep so `node_modules/` (with `@tauri-apps/cli`)
     # exists before `npx tauri build` runs — see the frontend-build note.
-    depends: [galoshes, frontend-build]
+    #
+    # `notices` generates the file the bundler reads (`bundle.macOS.files`), and fails before the slow build on a
+    # licence the list does not allow.
+    depends: [galoshes, frontend-build, notices]
     platforms: [darwin/amd64, darwin/arm64]
     build:
       # A stale lockfile fails the same way on every attempt: check it offline before the retry.
@@ -203,6 +219,24 @@ targets:
     platforms: [darwin/amd64, darwin/arm64]
     run: uv run --directory dmg-installer pytest -v -m install_e2e
 
+  npm-install:
+    # `node_modules/` from `package-lock.json`, and nothing built. `frontend-build` (the Vite bundle) and
+    # `notices` (which reads npm's record of what is installed, `node_modules/.package-lock.json`) both depend on
+    # it, so a target that needs only the packages does not build the frontend.
+    #
+    # `npm install --no-save` does nothing when `node_modules/` already matches the lockfile (npm
+    # compares the two itself) and installs only the difference otherwise; it never writes the
+    # lockfile. `npm ci` would delete and reinstall `node_modules/` on every build, under a running
+    # `npm run dev`. Every platform `frontend-check` runs on, since it depends on this.
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build:
+      # A lockfile out of sync with package.json fails the same way on every attempt. A dry run
+      # without the network finds it (a lockfile that needs a registry lookup fails it), so it
+      # runs before the retry.
+      - npm ci --dry-run --offline --ignore-scripts --no-audit --no-fund
+      - .github/scripts/retry.sh npm install --no-save --no-audit --no-fund
+
   frontend-build:
     # Vite bundle of ui/ → ui/dist/. Pure JS/TS toolchain, platform-
     # independent output. The type-check (`cargo xtask run frontend-check`)
@@ -214,7 +248,7 @@ targets:
     # `beforeBuildCommand` (only `npx tauri build` does), so the frontend
     # has to be built ahead of the Rust build. For `hole-dmg`: `npx tauri
     # build` needs `node_modules/` populated (with `@tauri-apps/cli`)
-    # before it can even start; the `npm ci` step here provides that.
+    # before it can even start; the `npm-install` dependency provides that.
     # Tauri's own `beforeBuildCommand: "npm run build"` re-runs vite, but
     # we accept the redundancy to keep `npx tauri build` self-sufficient
     # for ad-hoc dev use outside the orchestrator.
@@ -226,14 +260,9 @@ targets:
     # Platforms cover every host that builds hole: linux/amd64 keeps the
     # Renovate `frontend-check` standalone path working, windows/amd64
     # satisfies `hole-msi`, darwin/{amd64,arm64} satisfies `hole-dmg`.
+    depends: npm-install
     platforms: [linux/amd64, windows/amd64, darwin/amd64, darwin/arm64]
-    build:
-      # A lockfile out of sync with package.json fails the same way on every attempt. A dry run
-      # without the network finds it (a lockfile that needs a registry lookup fails it), so it
-      # runs before the retry.
-      - npm ci --dry-run --offline --ignore-scripts --no-audit --no-fund
-      - .github/scripts/retry.sh npm ci --no-audit --no-fund
-      - npm run build
+    build: npm run build
 
   # ===== Test targets =======================================================
   # `build:` compiles test binaries (--no-run); `run:` is the canonical local
@@ -461,15 +490,11 @@ targets:
   frontend-check:
     # tsc --noEmit + Vitest unit tests. Platform-independent (tsc and
     # Vitest both read source files directly; no Vite bundle dependency).
-    # No `depends: frontend-build` — tsc reads source files directly; the
+    # `depends: npm-install`, not `frontend-build` — tsc reads source files directly; the
     # Vite bundle is an artifact, not an input to the type-check.
+    depends: npm-install
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     run:
-      # A lockfile out of sync with package.json fails the same way on every attempt. A dry run
-      # without the network finds it (a lockfile that needs a registry lookup fails it), so it
-      # runs before the retry.
-      - npm ci --dry-run --offline --ignore-scripts --no-audit --no-fund
-      - .github/scripts/retry.sh npm ci --no-audit --no-fund
       - npm run check
       - npm test
