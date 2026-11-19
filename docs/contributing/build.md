@@ -16,6 +16,15 @@ A few targets to know (`cargo xtask list` has the rest):
   ([Development](development.md)).
 - `hole-tests`: builds the Hole test binaries without running them; its run step is the canonical `cargo nextest` run.
 - `hole-msi`, `hole-dmg`: the Windows installer and the macOS disk image ([The installers](installers.md)).
+- `notices`: writes the third-party notices, `NOTICES.md`, of the host platform's `hole` artifact to
+  `.cache/notices/NOTICES.md`, the one path the staging and the macOS bundler read, however the host was named (`--os`
+  and `--arch` that resolve to the host write it too); any other platform's goes to `.cache/notices/<os>-<arch>/NOTICES.md`. `hole`, `hole-msi` and `hole-dmg` depend on it. A debug `hole` generates it too, because the staged
+  folder is the installers' file set, and the check fails only for whoever just changed a lockfile or
+  `.config/notices.yaml`, naming the entry to add. It needs `go`, `node_modules/` (the `npm-install` target, which only
+  installs packages and does nothing when they already match `package-lock.json`) and, on Windows, the Wintun zip. It
+  downloads the crate sources it reads itself (`cargo metadata --locked`, which fails at once on an out-of-date
+  `Cargo.lock`). It fails on a component whose license it cannot place
+  ([Licensing](../reference/licensing.md#how-the-file-is-made)).
 - `doc-hole`, `doc-ex-galoshes`: rustdoc with warnings denied, for the crates each platform builds. `doc-hole` is for
   Windows on amd64 and macOS, `doc-ex-galoshes` for Linux and Windows on arm64; the other one is an error on a host.
 - `prek`: every pre-commit hook over all files except Clippy, which the `clippy-hole` and `clippy-ex-galoshes` targets
@@ -60,7 +69,7 @@ target of a workspace crate is documented by no command.
 ## The staged directory
 
 `cargo xtask stage` copies a runnable set of files (the BINDIR) into a directory: `hole`, the `ex-ray` and `galoshes`
-plugins, debug symbols (`hole.pdb` on Windows, `hole.dSYM` on macOS) and, on Windows, `wintun.dll`. It matches what the
+plugins, debug symbols (`hole.pdb` on Windows, `hole.dSYM` on macOS), `NOTICES.md` and, on Windows, `wintun.dll`. It matches what the
 installer puts in `Program Files\hole\bin`.
 
 It exists because on Windows the running bridge locks its own executable, so a bridge cannot run from Cargo's `target/`

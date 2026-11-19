@@ -22,23 +22,31 @@ _UUID_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]
 # binary, surfaced to the human instead of stalling the job.
 _HOLE_VERSION_TIMEOUT_SECS = 60
 
+# The canonical BINDIR files that sit in Contents/Resources (placed by `bundle.macOS.files` in tauri.conf.json); every
+# other one sits in Contents/MacOS, next to the binary.
+_IN_RESOURCES = {"NOTICES.md"}
+
 
 def test_dmg_ships_full_canonical_bindir(installed_app: Path) -> None:
     """Every file the macOS bundle must hold ships in the .app payload.
 
     Derives the expected set from the single source of truth so a future bindir
-    addition nobody wired into the Tauri config fails here. We scan Contents/MacOS
-    without recursing, so the DWARF Mach-O named `hole` inside hole.dSYM cannot
-    falsely satisfy the `hole` entry.
+    addition nobody wired into the Tauri config fails here. Each file is looked for
+    in the folder it belongs to, by its exact path, so a file in the wrong one does
+    not pass and the DWARF Mach-O named `hole` inside hole.dSYM cannot falsely
+    satisfy the `hole` entry.
     """
     expected = canonical_darwin_bindir()
     contents = installed_app / "Contents"
-    present = {p.name for p in (contents / "MacOS").iterdir()}
-    missing = expected - present
+    missing = {
+        name
+        for name in expected
+        if not (contents / ("Resources" if name in _IN_RESOURCES else "MacOS") / name).exists()
+    }
     assert not missing, (
         f"Hole.app payload is missing canonical BINDIR file(s) {sorted(missing)} "
-        f"(searched Contents/MacOS). Expected (from "
-        f"`cargo xtask bindir-names --os darwin --bundle`): {sorted(expected)}."
+        f"(each is expected in Contents/Resources if it is one of {sorted(_IN_RESOURCES)}, else in Contents/MacOS). "
+        f"Expected (from `cargo xtask bindir-names --os darwin --bundle`): {sorted(expected)}."
     )
 
 

@@ -160,3 +160,29 @@ fn dsym_ships_as_a_sibling_of_the_binary() {
          resolve; got dest {dest:?}"
     );
 }
+
+#[skuld::test]
+fn notices_ship_in_contents_resources_through_macos_files() {
+    // `bundle.resources` is copied by `tauri-build` on every `cargo build` of `hole` and fails when its source is
+    // missing, which would put the generated notices on the path of every debug build. `bundle.macOS.files` is read
+    // only when the bundler assembles the `.app`. Either way the file lands in `Contents/Resources/`.
+    let conf = tauri_conf(Os::Darwin);
+    let notices = "NOTICES.md";
+    assert!(
+        !resources_dest_basenames(&conf).contains(&notices.to_string()),
+        "NOTICES.md must not be a `bundle.resources` entry"
+    );
+    let files = conf["bundle"]["macOS"]["files"]
+        .as_object()
+        .expect("bundle.macOS.files must be a map");
+    assert_eq!(
+        files.get("Resources/NOTICES.md").and_then(serde_json::Value::as_str),
+        Some(crate::notices::HOST_OUTPUT),
+        "bundle.macOS.files must put the file a bare `cargo xtask notices` writes at Resources/NOTICES.md; have {files:?}"
+    );
+
+    // The DMG build gets the file from the `notices` target, which runs the generator bare.
+    let manifest = crate::manifest::Manifest::parse(include_str!("../../build.yaml")).expect("build.yaml parses");
+    let dmg = manifest.get("hole-dmg").expect("hole-dmg target");
+    assert!(dmg.depends.contains(&"notices".to_string()), "{:?}", dmg.depends);
+}

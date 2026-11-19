@@ -7359,6 +7359,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spdx"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "646c5a367da914e3babcb9cd8e91c37ccaac42325b8f86f036513ad103f2a716"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10697,6 +10706,7 @@ dependencies = [
  "cargo_metadata 0.23.1",
  "clap",
  "ctrlc",
+ "dom_query",
  "dunce",
  "flate2",
  "hole-common",
@@ -10717,9 +10727,11 @@ dependencies = [
  "serde_yml 0.0.13",
  "sha2 0.11.0",
  "skuld",
+ "spdx",
  "syn 2.0.118",
  "tar",
  "tempfile",
+ "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
  "typst",
  "typst-as-lib",

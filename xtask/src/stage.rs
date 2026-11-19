@@ -61,6 +61,16 @@ pub(crate) fn stage_with(out_dir: &Path, files: &[BindirFile], link: LinkFn<'_>)
     Ok(())
 }
 
+/// Write `contents` to `dest` as a new file moved over it: a file that is a hard link of the old `dest` (a staged
+/// copy) keeps its content, and a reader never sees a short file.
+pub(crate) fn write_replacing(dest: &Path, contents: &[u8]) -> Result<()> {
+    let scratch = scratch_dir_beside(dest)?;
+    let staged = scratch.path().join(dest_file_name(dest)?);
+    std::fs::write(&staged, contents).with_context(|| format!("failed to write {}", staged.display()))?;
+    replace::replace_file(&staged, dest)
+        .with_context(|| format!("failed to move {} over {}", staged.display(), dest.display()))
+}
+
 fn stage_file(src: &Path, dest: &Path, link: LinkFn<'_>) -> Result<()> {
     // Validate the source exists with a clear error message — much more
     // useful than the cryptic "No such file or directory" you'd get

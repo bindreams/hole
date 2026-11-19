@@ -82,8 +82,8 @@ To work on the front end, install its dependencies once:
 npm install
 ```
 
-If you edit `package.json`, commit the resulting `package-lock.json` in the same commit. CI runs a strict `npm ci`, and
-rejects a lockfile that does not match.
+If you edit `package.json`, commit the resulting `package-lock.json` in the same commit. CI checks the lockfile
+with a strict `npm ci --dry-run`, and rejects one that does not match `package.json`.
 
 ## Run the tests once
 

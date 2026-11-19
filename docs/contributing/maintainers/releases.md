@@ -108,3 +108,13 @@ to do when it fails.
 
 [Ship blockers and stated limits](ship-blockers.md) lists conditions under which a `hole` release must not go out, and
 shortfalls that ship on purpose. Read it before running a `hole` draft.
+
+The release's milestone has no open issues: a ship blocker is an open issue in it. List the open milestones with their
+counts:
+
+```sh
+gh api -X GET "repos/bindreams/hole/milestones?state=open" --jq '.[] | "\(.title): \(.open_issues) open"'
+```
+
+The release's milestone must show 0. Each track has one (`hole 0.7.1`, `galoshes: next release` and so on); a "next
+release" milestone takes the version's name when that release is cut.

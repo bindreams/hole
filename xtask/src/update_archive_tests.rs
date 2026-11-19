@@ -23,6 +23,9 @@ fn fake_repo() -> tempfile::TempDir {
     let exray = root.join(".cache/ex-ray");
     fs::create_dir_all(&exray).unwrap();
     fs::write(exray.join(crate::ex_ray::output_name()), b"exray").unwrap();
+    let notices = root.join(crate::notices::HOST_OUTPUT);
+    fs::create_dir_all(notices.parent().unwrap()).unwrap();
+    fs::write(notices, b"notices").unwrap();
     dir
 }
 

@@ -441,6 +441,9 @@ fn hardening_failure(exe: &Path, kind: FileKind, error: &libsearch_guard::Verify
         FileKind::NotExecutable => {
             unreachable!("a file that is not an executable is never verified: {}", exe.display())
         }
+        FileKind::UpstreamLibrary => {
+            unreachable!("a file that is not an executable is never verified: {}", exe.display())
+        }
     };
     let violated = || {
         anyhow::anyhow!(

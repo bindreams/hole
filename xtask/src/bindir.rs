@@ -73,11 +73,22 @@ impl BindirFile {
     }
 }
 
-/// The host OS as a manifest [`Os`], or an error on a host outside the
-/// supported set (windows/darwin/linux) — the same platforms `bindir_files`
-/// already supports.
+/// The host OS, or an error on a host outside the supported set (windows/darwin/linux) — the same platforms
+/// `bindir_files` already supports.
 fn host_os() -> Result<Os> {
     Os::host().ok_or_else(|| anyhow!("host OS is not one of windows/darwin/linux; cannot resolve BINDIR"))
+}
+
+/// Where `cargo xtask wintun` leaves `wintun.dll`, relative to the repository root.
+const WINTUN_DLL: &str = ".cache/wintun/wintun.dll";
+
+/// The repository-relative path (with `/`) of a BINDIR file that ships as it came from upstream and that `cargo xtask`
+/// provisions: the path a `declared:` entry of the notices lists under `files:`. `None` for any other name.
+pub fn upstream_library_path(name: &str) -> Option<&'static str> {
+    match name {
+        "wintun.dll" => Some(WINTUN_DLL),
+        _ => None,
+    }
 }
 
 /// Resolve the canonical BINDIR file list for the host platform and given
@@ -103,11 +114,19 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
             "hole.pdb" => BindirFile::new(target_dir.join("hole.pdb"), name),
             // macOS `split-debuginfo = "packed"` emits a self-contained `.dSYM` bundle.
             "hole.dSYM" => BindirFile::directory(target_dir.join("hole.dSYM"), name),
-            "ex-ray" | "ex-ray.exe" => BindirFile::new(existing_file(ex_ray.clone())?, name),
+            "ex-ray" | "ex-ray.exe" => BindirFile::new(existing_file(ex_ray.clone(), "cargo xtask deps")?, name),
             // galoshes is a workspace member, built into the unified `target/release/`.
             "galoshes" | "galoshes.exe" => BindirFile::new(repo_root.join("target").join("release").join(&name), name),
-            // wintun.dll — downloaded by `cargo xtask wintun` into `.cache/wintun/`.
-            "wintun.dll" => BindirFile::new(repo_root.join(".cache").join("wintun").join("wintun.dll"), name),
+            // wintun.dll — downloaded by `cargo xtask wintun`; `upstream_library_path` says where.
+            "wintun.dll" => {
+                let path = upstream_library_path(&name).expect("`wintun.dll` is an upstream library");
+                BindirFile::new(repo_root.join(path), name)
+            }
+            // What a bare `cargo xtask notices` generated for this host's platform.
+            "NOTICES.md" => BindirFile::new(
+                existing_file(repo_root.join(crate::notices::HOST_OUTPUT), "cargo xtask notices")?,
+                name,
+            ),
             other => return Err(anyhow!("BINDIR name {other:?} has no source mapping in bindir_files")),
         };
         files.push(file);
@@ -116,15 +135,12 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
     Ok(files)
 }
 
-/// `path` itself, or a "run `cargo xtask deps`" error when it is not a file or is empty
+/// `path` itself, or a "run `provider`" error when it is not a file or is empty
 /// (`crates/hole/build.rs` stubs a missing host sidecar as an empty file).
-fn existing_file(path: PathBuf) -> Result<PathBuf> {
+fn existing_file(path: PathBuf, provider: &str) -> Result<PathBuf> {
     let non_empty = std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() > 0);
     if !non_empty {
-        return Err(anyhow!(
-            "{} is missing or empty. Did `cargo xtask deps` run?",
-            path.display()
-        ));
+        return Err(anyhow!("{} is missing or empty. Did `{provider}` run?", path.display()));
     }
     Ok(path)
 }
