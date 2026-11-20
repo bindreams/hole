@@ -1812,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "dump"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64 0.22.1",
  "dump-macros",
@@ -1823,7 +1823,7 @@ dependencies = [
 
 [[package]]
 name = "dump-macros"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "dump",
  "hole-test-observability",
@@ -2876,7 +2876,7 @@ dependencies = [
 
 [[package]]
 name = "handle-holders"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "hole-test-observability",
  "skuld",
@@ -3263,7 +3263,7 @@ dependencies = [
 
 [[package]]
 name = "hole"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3327,7 +3327,7 @@ dependencies = [
 
 [[package]]
 name = "hole-bridge"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3403,7 +3403,7 @@ dependencies = [
 
 [[package]]
 name = "hole-common"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cosca",
  "dirs 7.0.0",
@@ -3443,7 +3443,7 @@ dependencies = [
 
 [[package]]
 name = "hole-test-observability"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "ctor",
  "hole-common",
@@ -8708,7 +8708,7 @@ dependencies = [
 
 [[package]]
 name = "tun-engine"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -8746,7 +8746,7 @@ dependencies = [
 
 [[package]]
 name = "tun-engine-macros"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "hole-test-observability",
  "proc-macro2",
