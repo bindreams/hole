@@ -19,6 +19,9 @@ either without you installing anything. Without a plugin, Hole speaks plain Shad
   [glossary](reference/glossary.md) explains the terms, and the [command line](reference/cli.md) lists the commands.
 - **How it works:** the picture below, then [how Hole is put together](how-it-works/overview.md) and the pages that
   follow it.
+- **Hostile networks:** the [knowledge base](knowledge-base/index.md) has
+  [recommendations](knowledge-base/hostile-networks.md) for networks that block VPNs, and the
+  [field reports](knowledge-base/field-reports/index.md) behind them.
 - **Contributing:** [Contributing](contributing/index.md) covers building Hole, running its tests and developing it. How
   it is put together starts at the [architecture overview](contributing/architecture/overview.md).
 
@@ -61,8 +64,20 @@ The TUN device and the routes <how-it-works/tun.md>
 Shadowsocks and its plugins <how-it-works/plugins.md>
 ECH and DoH <how-it-works/ech-and-doh.md>
 DNS through the tunnel <how-it-works/dns.md>
+The reachability check <how-it-works/reachability-check.md>
 UDP: dropped, never bypassed <how-it-works/udp.md>
 The kill switch <how-it-works/kill-switch.md>
+```
+
+```{toctree}
+---
+caption: Knowledge base
+hidden:
+---
+Knowledge base <knowledge-base/index.md>
+Recommendations for hostile networks <knowledge-base/hostile-networks.md>
+ECH in practice <knowledge-base/ech-in-practice.md>
+Field reports <knowledge-base/field-reports/index.md>
 ```
 
 ```{toctree}
