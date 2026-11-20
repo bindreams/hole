@@ -8,7 +8,7 @@ Most of the settings below are plugin options: the `plugin_opts` string of a ser
 passes to [the plugin](../how-it-works/plugins.md). The server side of each one is in the server's own documentation;
 for a Postern server, [Postern's](https://postern.readthedocs.io/en/latest/).
 
-## Put the server where the network can reach it
+## Choosing where to host the server
 
 A network can block whole address ranges of hosting providers. A server in such a range fails whatever name it uses:
 the connection is accepted and the TLS handshake then gets no answer. In June 2026, from an MGTS connection in Russia,
@@ -26,7 +26,7 @@ proxied by Cloudflare stopped after about 17 KB on every attempt, while the same
 completed.
 ```
 
-## Hide the server's name
+## Hiding the server's name
 
 With `tls` set, every connection announces the server's domain in its TLS handshake, where the network can read it.
 {term}`ECH` encrypts that name. Hole uses it when `host` is a domain whose DNS publishes an ECH config, which is up to
@@ -43,17 +43,17 @@ With `ech=always`, tell the people using the config that a failed connect can be
 ordinary connection failure, and only the {term}`bridge`'s log names ECH.
 [ECH in practice](ech-in-practice.md#failure-modes-of-ech) covers the other ways ECH can fail.
 
-## Test from the network that matters
+## Testing from the client's network
 
 A server that answers from your desk can be blocked from theirs. Before you rely on a config, have someone on that
 network press **Test** on the server's entry in Hole's dashboard. Test opens a tunnel through the server and
 makes a request through it, and its result tells a network block from a mistake in the config:
 
-| Test says                                                                    | Meaning                                                                                                |
-| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| "The network is blocking the connection to this server…"                     | The handshake was reset or ignored. [Move the server](#put-the-server-where-the-network-can-reach-it). |
-| "Server rejected the connection (wrong password, cipher, or plugin config)." | Hole's {term}`reachability check` did not find the handshake blocked. Check the config.                |
-| "No response from the server."                                               | Nothing answered. See [Diagnosing a failed connection](#diagnosing-a-failed-connection).               |
+| Test says                                                                    | Meaning                                                                                    |
+| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| "The network is blocking the connection to this server…"                     | The handshake was reset or ignored. [Move the server](#choosing-where-to-host-the-server). |
+| "Server rejected the connection (wrong password, cipher, or plugin config)." | Hole's {term}`reachability check` did not find the handshake blocked. Check the config.    |
+| "No response from the server."                                               | Nothing answered. See [Diagnosing a failed connection](#diagnosing-a-failed-connection).   |
 
 A passing Test shows that the server answers and the config works. Connecting also runs Hole's DNS
 {term}`self-test`, so have them connect as well.
@@ -126,7 +126,7 @@ a network you trust: if the server answers there, the network is what kills the 
 
 Then send the ClientHello to another host at the same provider. If that fails too, the provider's range is blocked, as
 in [the June 2026 report](field-reports/2026-06-tls-handshake-block.md). If it answers, only your server's address is. Either way the remedy is to
-[move the server](#put-the-server-where-the-network-can-reach-it), and for a blocked range that means another provider
+[move the server](#choosing-where-to-host-the-server), and for a blocked range that means another provider
 or a CDN.
 
 ### Tunnel stops carrying traffic

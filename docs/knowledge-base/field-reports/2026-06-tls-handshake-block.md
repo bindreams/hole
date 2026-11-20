@@ -56,7 +56,7 @@ Russian providers can do. The measurements do not show who applied it or how the
 
 A server in these LeaseWeb and OVH ranges cannot be reached over TLS from this network, and another address in the same
 ranges will not help. The tests covered three /24 ranges of LeaseWeb and one of OVH, not the whole address space of
-either. [Recommendations for hostile networks](../hostile-networks.md#put-the-server-where-the-network-can-reach-it)
+either. [Recommendations for hostile networks](../hostile-networks.md#choosing-where-to-host-the-server)
 covers moving the server.
 
 Waiting longer does not help. Hole's self-test timed out because the handshake never completed, and no timeout turns a
