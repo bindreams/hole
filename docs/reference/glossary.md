@@ -10,6 +10,16 @@ bridge
   The privileged half of Hole. It runs as a background service with administrator rights, owns the {term}`TUN` device
   and the routes, and does what the app asks over a local socket. See [How Hole is put together](../how-it-works/overview.md).
 
+CDN
+  Content delivery network: a company's servers, spread over many locations, that receive a website's traffic and pass
+  it on to the site's own server. Many unrelated sites share a CDN's addresses. See
+  [Content delivery network](https://en.wikipedia.org/wiki/Content_delivery_network).
+
+ClientHello
+  The first message of a TLS handshake, sent by the client. It lists what the client supports and, in its {term}`SNI`
+  extension, normally names the server in the clear. See
+  [RFC 8446, section 4.1.2](https://www.rfc-editor.org/rfc/rfc8446#section-4.1.2).
+
 cover
   The operating-system firewall rule the {term}`bridge` installs to block outgoing traffic that is not on a short permit
   list. The **standing** cover is the {term}`kill switch`; a **transient** cover is a bounded block for one connect
@@ -41,6 +51,13 @@ galoshes
   A {term}`SIP003 plugin` that embeds {term}`ex-ray` and adds UDP support by carrying many streams over one multiplexed
   connection. See [Distributions](distributions.md).
 
+keepalive
+  A probe a connection sends when it has been quiet, so the sender can tell a dead connection from an idle one. Hole has
+  two. {term}`galoshes` probes its transport once nothing has arrived for an interval, and treats the transport as dead if
+  still nothing arrives; see [the galoshes transport](../contributing/architecture/galoshes-transport.md#telling-that-the-transport-is-dead).
+  ex-ray's `tcp-keepalive` option is the operating system's TCP keepalive on the socket to the server; see
+  {src}`ex-ray's README <crates/ex-ray/README.md>`.
+
 kill switch
   An optional setting, off by default, that the tray calls **Lockdown**. While it is on and Hole is connecting or
   connected, traffic that would leave outside the tunnel is blocked, including to devices on your local network such as
@@ -54,9 +71,21 @@ Postern
   A self-hosted portal that runs Shadowsocks servers and gives each person you invite a ready-made client config. It is
   Hole's companion project. See [its documentation](https://postern.readthedocs.io).
 
+reachability check
+  A connection the {term}`bridge` makes straight to the server's address, beside every connect and after a failed
+  **Test**, to tell a
+  network that blocks the handshake from a server that rejects the config. See
+  [The reachability check](../how-it-works/reachability-check.md).
+
+self-test
+  The check the {term}`bridge` runs before it opens the {term}`TUN` device: one test DNS lookup, sent through the
+  {term}`DNS forwarder` and the proxy. Hole reports "Connected" only once it is answered. It runs only with the forwarder
+  on. See [DNS through the tunnel](../how-it-works/dns.md#what-hole-checks-first).
+
 SNI
   Server Name Indication: the name of the server a client wants to reach, which a TLS handshake normally sends unencrypted.
-  {term}`ECH` is what hides it. See [ECH and DoH](../how-it-works/ech-and-doh.md).
+  {term}`ECH` is what hides it. See [ECH and DoH](../how-it-works/ech-and-doh.md) and
+  [RFC 6066, section 3](https://www.rfc-editor.org/rfc/rfc6066#section-3).
 
 Shadowsocks
   An encrypted proxy protocol. A client sends traffic to a Shadowsocks server, which forwards it to the open internet.
@@ -74,6 +103,17 @@ SIP003 plugin
   A program that Shadowsocks starts on each end to wrap its traffic in another protocol, such as WebSocket over TLS.
   SIP003 is the specification of how it is started and configured. See
   [Shadowsocks and its plugins](../how-it-works/plugins.md) and [the specification](https://shadowsocks.org/doc/sip003.html).
+
+TCP Fast Open
+  An extension to TCP that lets a client put data in the first packet of a connection, the SYN, saving a round trip on
+  repeat connections to the same server. See [TCP Fast Open: expediting web services](https://lwn.net/Articles/508865/)
+  and [RFC 7413](https://www.rfc-editor.org/rfc/rfc7413).
+
+TSPU
+  The traffic-inspection equipment that Russian internet providers install, which can block or slow connections by
+  address, protocol or content. See
+  [TSPU: Russia's Decentralized Censorship System](https://doi.org/10.1145/3517745.3561461) and the
+  [field reports](../knowledge-base/field-reports/index.md).
 
 TUN
   A virtual network adapter that a program creates through the operating system. Hole routes the machine's traffic into

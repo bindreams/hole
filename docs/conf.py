@@ -28,7 +28,7 @@ extensions = [
 ]
 # No colon_fence: the mdformat-myst prek hook escapes colon fences, so the
 # docs use backtick-fenced directives exclusively.
-myst_enable_extensions = ["substitution"]
+myst_enable_extensions = ["fieldlist", "substitution"]
 myst_heading_anchors = 3
 myst_substitutions = versions
 
