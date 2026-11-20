@@ -1,0 +1,89 @@
+/* Hand-drawn SVG diagrams, included inline so they follow the theme's colours and the page's font. */
+
+/* On a narrow screen the diagram keeps a readable size and scrolls sideways. */
+.diagram-scroll {
+  overflow-x: auto;
+  margin: 1rem 0;
+}
+
+.diagram {
+  display: block;
+  width: 100%;
+  min-width: 600px;
+  height: auto;
+  font-family: inherit;
+  font-size: 16px;
+}
+
+.diagram text {
+  fill: var(--color-foreground-primary);
+  text-anchor: middle;
+}
+
+.diagram .dg-title {
+  font-weight: 600;
+  text-anchor: start;
+}
+
+/* A label drawn over a pattern keeps a margin of page background around its letters. */
+.diagram .dg-halo {
+  font-weight: 600;
+  paint-order: stroke;
+  stroke: var(--color-background-primary);
+  stroke-width: 5px;
+  stroke-linejoin: round;
+}
+
+.diagram .dg-line {
+  fill: none;
+  stroke: var(--color-foreground-primary);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.diagram .dg-node {
+  fill: var(--color-background-primary);
+  stroke: var(--color-foreground-primary);
+  stroke-width: 2;
+  stroke-linejoin: round;
+}
+
+.diagram .dg-dot {
+  fill: var(--color-foreground-primary);
+}
+
+.diagram .dg-frame {
+  fill: var(--color-background-secondary);
+  stroke: var(--color-foreground-muted);
+  stroke-width: 1.5;
+}
+
+.diagram .dg-hostile {
+  stroke: #d9534f;
+  stroke-width: 1.5;
+  stroke-opacity: 0.7;
+}
+
+.diagram .dg-hostile-band {
+  fill: #d9534f;
+  fill-opacity: 0.3;
+}
+
+.diagram .dg-tunnel-back {
+  fill: var(--color-background-primary);
+}
+
+.diagram .dg-tunnel {
+  fill: var(--color-brand-primary);
+  fill-opacity: 0.2;
+  stroke: var(--color-brand-primary);
+  stroke-width: 2;
+}
+
+.diagram .dg-tunnel-mouth {
+  fill: var(--color-brand-primary);
+  fill-opacity: 0.55;
+  stroke: var(--color-brand-primary);
+  stroke-width: 2;
+}

@@ -40,3 +40,8 @@ extlinks = {"src": (f"https://github.com/bindreams/hole/blob/{source_ref}/%s", "
 exclude_patterns = ["_build"]
 
 html_theme = "furo"
+html_static_path = ["_static"]
+html_css_files = ["diagrams.css"]
+
+# The extension's default is a fixed 500px box, which pads a wide diagram and squeezes a tall one.
+mermaid_height = "auto"

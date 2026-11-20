@@ -6,14 +6,18 @@ Hole is an app for Windows and Mac computers. Switch it on and the computer's in
 Hole is a client, not a VPN service: it comes with no server and there is nothing to sign up for. The first step is
 getting a server, and that is the step that takes the longest.
 
-```{mermaid}
-flowchart LR
-    subgraph computer["Your computer"]
-        apps["Your apps"] --> hole["Hole"]
-    end
-    hole == "encrypted tunnel" ==> network["The network you are on<br/>Wi-Fi, internet provider, any filtering"]
-    network == "encrypted tunnel" ==> server["The server<br/>run by you or someone you know"]
-    server --> web["Websites and services"]
+```{raw} html
+<div class="diagram-scroll">
+```
+
+```{raw} html
+---
+file: overview.svg
+---
+```
+
+```{raw} html
+</div>
 ```
 
 The network you are on sees one encrypted connection to the server. It does not see which sites you open, and a site

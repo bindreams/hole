@@ -1,0 +1,48 @@
+<svg class="diagram" viewBox="0 0 736 228" role="img" xmlns="http://www.w3.org/2000/svg"
+     aria-label="Apps on your computer send their traffic into Hole. Hole carries it through the hostile network inside an encrypted tunnel to the server, and the server passes it on to the internet.">
+  <defs>
+    <pattern id="overview-hatch" width="14" height="14" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect class="dg-hostile-band" width="6" height="14"/>
+    </pattern>
+  </defs>
+
+  <!-- Hostile network: the environment the connection crosses -->
+  <rect class="dg-hostile" x="222" y="8" width="282" height="212" rx="8" fill="url(#overview-hatch)"/>
+  <text class="dg-halo" x="363" y="68">Hostile network</text>
+
+  <!-- Your computer -->
+  <rect class="dg-frame" x="4" y="40" width="196" height="164" rx="10"/>
+  <rect class="dg-node" x="19" y="52" width="22" height="15" rx="2"/>
+  <path class="dg-line" d="M14 71H46"/>
+  <text class="dg-title" x="56" y="68">Your computer</text>
+
+  <rect class="dg-node" x="24" y="105" width="48" height="38" rx="4"/>
+  <path class="dg-line" d="M24 116H72"/>
+  <circle class="dg-dot" cx="31" cy="110.5" r="1.6"/>
+  <circle class="dg-dot" cx="37" cy="110.5" r="1.6"/>
+  <circle class="dg-dot" cx="43" cy="110.5" r="1.6"/>
+  <text x="48" y="186">Apps</text>
+  <path class="dg-line" d="M72 124H142"/>
+  <text x="150" y="186">Hole</text>
+
+  <!-- Encrypted tunnel: a sleeve from Hole to the server -->
+  <path class="dg-tunnel-back" d="M150 102H540V146H150A8 22 0 0 1 150 102Z"/>
+  <path class="dg-tunnel" d="M150 102H540V146H150A8 22 0 0 1 150 102Z"/>
+  <ellipse class="dg-tunnel-mouth" cx="150" cy="124" rx="8" ry="22"/>
+  <text x="363" y="129.5">Encrypted tunnel</text>
+
+  <!-- Server -->
+  <rect class="dg-node" x="540" y="90" width="52" height="20" rx="3"/>
+  <rect class="dg-node" x="540" y="114" width="52" height="20" rx="3"/>
+  <rect class="dg-node" x="540" y="138" width="52" height="20" rx="3"/>
+  <circle class="dg-dot" cx="550" cy="100" r="2.2"/>
+  <circle class="dg-dot" cx="550" cy="124" r="2.2"/>
+  <circle class="dg-dot" cx="550" cy="148" r="2.2"/>
+  <path class="dg-line" d="M560 100H582M560 124H582M560 148H582"/>
+  <text x="566" y="186">Server</text>
+
+  <!-- Internet -->
+  <path class="dg-line" d="M592 124H634"/>
+  <path class="dg-node" d="M650 146a16 16 0 0 1 -2 -31.9a22 22 0 0 1 42 -9a17 17 0 0 1 26 14a13.5 13.5 0 0 1 -2 26.9z"/>
+  <text x="682" y="186">Internet</text>
+</svg>
