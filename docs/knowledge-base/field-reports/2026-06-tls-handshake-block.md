@@ -23,6 +23,8 @@ well.
 1. 25 June: Hole is changed to recognise this failure and report it as a network block
    ([the reachability check](../../how-it-works/reachability-check.md)).
 1. By August 2026 the server is behind Cloudflare.
+1. 19 November 2026: from the same connection, the handshake completes with nearly every host in the same ranges
+   ([report](2026-11-cloudflare-and-direct-tunnels.md)).
 
 ## Measurements
 

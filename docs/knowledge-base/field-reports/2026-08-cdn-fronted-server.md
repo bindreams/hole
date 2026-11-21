@@ -95,3 +95,8 @@ Two connections from the same machine, at the same time as a failing attempt:
   Cloudflare. If it is cut the same way, neither ECH nor the server's name is what the network reacts to.
 
 [Diagnosing a failed connection](../hostile-networks.md#diagnosing-a-failed-connection) has the commands.
+
+In November 2026 both were run from the test machine's network, against another server behind Cloudflare
+([report](2026-11-cloudflare-and-direct-tunnels.md)). Cloudflare's own sites worked from that connection. The
+server's Cloudflare address answered for a minute under the name of Cloudflare's own site and went silent after 5.5 KB
+under the server's name, without ECH.
