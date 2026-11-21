@@ -1,0 +1,65 @@
+<svg class="diagram" viewBox="0 0 736 262" role="img" xmlns="http://www.w3.org/2000/svg"
+     aria-label="Packets arrive from the TUN device at Hole's TCP/IP stack, which turns them into connections. The filter rules send each connection one of three ways: Proxy, to the Shadowsocks client; Bypass, to the real network; Block, nowhere.">
+  <!-- Glyphs: ethernet-port, layers, funnel, lock, router and ban from Lucide 1.77.0 (https://lucide.dev), ISC and MIT licences, text in _static/licenses/lucide.txt. -->
+  <!-- Packets become connections, and the rules decide each one -->
+  <path class="dg-line" d="M84 124L164 124"/>
+  <path class="dg-arrowhead" d="M174 124L164 129L164 119z"/>
+  <path class="dg-line" d="M224 124L304 124"/>
+  <path class="dg-arrowhead" d="M314 124L304 129L304 119z"/>
+  <path class="dg-line" d="M364 124C450 124 410 40 500 40L604 40"/>
+  <path class="dg-arrowhead" d="M614 40L604 45L604 35z"/>
+  <path class="dg-line" d="M364 124L604 124"/>
+  <path class="dg-arrowhead" d="M614 124L604 129L604 119z"/>
+  <path class="dg-line" d="M364 124C450 124 410 208 500 208L604 208"/>
+  <path class="dg-arrowhead" d="M614 208L604 213L604 203z"/>
+
+  <!-- Nodes -->
+  <rect class="dg-machine" x="36" y="100" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(48 112)">
+    <path d="M10 8v1" />
+    <path d="M14 8v1" />
+    <path d="M18 8v1" />
+    <path d="M19 17a2 2 0 00-1.765 1.059l-.47.882A2 2 0 0115 20H9a2 2 0 01-1.765-1.059l-.47-.882A2 2 0 005 17H4a2 2 0 01-2-2V6a2 2 0 012-2h16a2 2 0 012 2v9a2 2 0 01-2 2z" />
+    <path d="M6 8v1" />
+  </g>
+  <rect class="dg-machine" x="176" y="100" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(188 112)">
+    <path d="M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83z" />
+    <path d="M2 12a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 12" />
+    <path d="M2 17a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 17" />
+  </g>
+  <rect class="dg-machine" x="316" y="100" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(328 112)">
+    <path d="M10 20a1 1 0 0 0 .553.895l2 1A1 1 0 0 0 14 21v-7a2 2 0 0 1 .517-1.341L21.74 4.67A1 1 0 0 0 21 3H3a1 1 0 0 0-.742 1.67l7.225 7.989A2 2 0 0 1 10 14z" />
+  </g>
+  <rect class="dg-machine" x="616" y="16" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(628 28)">
+    <rect width="18" height="11" x="3" y="11" rx="2" ry="2" />
+    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+  </g>
+  <rect class="dg-machine" x="616" y="100" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(628 112)">
+    <rect width="20" height="8" x="2" y="14" rx="2" />
+    <path d="M6.01 18H6" />
+    <path d="M10.01 18H10" />
+    <path d="M15 10v4" />
+    <path d="M17.84 7.17a4 4 0 0 0-5.66 0" />
+    <path d="M20.66 4.34a8 8 0 0 0-11.31 0" />
+  </g>
+  <rect class="dg-machine" x="616" y="184" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(628 196)">
+    <circle cx="12" cy="12" r="10" />
+    <path d="M4.929 4.929 19.07 19.071" />
+  </g>
+
+  <!-- Labels: a node's under the node, a decision's under its line -->
+  <text x="60" y="170">TUN device</text>
+  <text x="200" y="170">TCP/IP stack</text>
+  <text x="340" y="170">Filter rules</text>
+  <text x="554" y="62">Proxy</text>
+  <text x="554" y="146">Bypass</text>
+  <text x="554" y="230">Block</text>
+  <text x="640" y="86">Shadowsocks client</text>
+  <text x="640" y="170">Real network</text>
+  <text x="640" y="254">Closed or discarded</text>
+</svg>

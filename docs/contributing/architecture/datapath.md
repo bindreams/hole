@@ -7,14 +7,18 @@ bypassed](../../how-it-works/udp.md).
 
 ## The path of a flow
 
-```{mermaid}
-flowchart TB
-    tun["TUN device"] --> driver["Driver (tun-engine): packet loop and TCP/IP stack"]
-    driver -- "new TCP connection, new UDP flow" --> router["HoleRouter (bridge): filter decision, then cascade"]
-    router --> proxy["Socks5Endpoint: the Shadowsocks client's listener"]
-    router --> bypass["InterfaceEndpoint: a socket on the real interface"]
-    router --> dns["LocalDnsEndpoint: the DNS forwarder"]
-    router --> drops["DropSink: records a drop, nothing is served"]
+```{raw} html
+<div class="diagram-scroll">
+```
+
+```{raw} html
+---
+file: datapath.svg
+---
+```
+
+```{raw} html
+</div>
 ```
 
 The `Driver` ({src}`crates/tun-engine/src/engine/driver.rs`, in `tun-engine`) runs the packet loop and the TCP/IP stack

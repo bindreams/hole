@@ -12,19 +12,12 @@ to work, the application would reach its destination, but with its address, and 
 encrypted, visible to the network the tunnel is there to hide from. Hole counts that as a leak and prefers a flow that
 fails to one that leaks.
 
-```{mermaid}
-flowchart TD
-    udp["A UDP flow"] --> dns{"UDP to port 53, and the DNS forwarder is on?"}
-    dns -- "yes" --> fwd["Answered by the DNS forwarder, whatever the rules say"]
-    dns -- "no" --> action{"What do the filter rules say?"}
-    action -- "Block" --> d1["Dropped"]
-    action -- "Bypass" --> v6{"IPv6 destination and no working IPv6 on the real network?"}
-    v6 -- "yes" --> d2["Dropped"]
-    v6 -- "no" --> direct["Sent directly, outside the tunnel"]
-    action -- "Proxy" --> cap{"Can the connection to the server carry UDP?"}
-    cap -- "yes" --> relay["Relayed through the tunnel"]
-    cap -- "no" --> d3["Dropped"]
-```
+| The UDP flow                                          | What happens to it                                                                                             |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Goes to port 53 while the {term}`DNS forwarder` is on | Answered by the DNS forwarder, whatever the rules say                                                          |
+| A rule says **Block**                                 | Dropped                                                                                                        |
+| A rule says **Bypass**                                | Sent directly, outside the tunnel. Dropped if the destination is IPv6 and the real network has no working IPv6 |
+| **Proxy**, by a rule or because no rule matches       | Relayed through the tunnel if the connection to the server can carry UDP. Dropped if it cannot                 |
 
 Only the last drop is the UDP rule. The others are a **Block** rule doing what it says, and a **Bypass** flow that has no
 usable route. Drops are logged by the {term}`bridge`, once per rule and destination for a stretch of time rather than per packet.

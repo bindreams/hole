@@ -79,15 +79,14 @@ Four settings are best left alone:
 
 A connection to the server passes three points in turn, and a hostile network can stop it at each one.
 
-```{mermaid}
-flowchart LR
-    tcp{"TCP connect<br/>answered?"} -- yes --> tls{"ClientHello<br/>answered?"}
-    tls -- yes --> up{"Tunnel carries<br/>traffic?"}
-    tcp -- no --> f1["No reply to the TCP connection"]
-    tls -- no --> f2["TLS handshake blocked"]
-    up -- "then stops" --> f3["Tunnel stops carrying traffic"]
-    up -- never --> other["Check the password,<br/>cipher and plugin options"]
-```
+| How far the connection gets                         | Failure                                                           |
+| --------------------------------------------------- | ----------------------------------------------------------------- |
+| The TCP connect is not answered                     | [No reply to the TCP connection](#no-reply-to-the-tcp-connection) |
+| The TCP connect is answered, the ClientHello is not | [TLS handshake blocked](#tls-handshake-blocked)                   |
+| The tunnel carries traffic, then stops              | [Tunnel stops carrying traffic](#tunnel-stops-carrying-traffic)   |
+
+A tunnel that comes up and never carries traffic is none of the three: check the password, the cipher and the plugin
+options.
 
 The first two can be checked from a machine on that network without Hole. The TLS check applies only to a server with
 `tls` in its plugin options.

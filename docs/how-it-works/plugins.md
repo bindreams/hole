@@ -22,10 +22,18 @@ address of the server, as environment variables (`SS_LOCAL_HOST` and `SS_LOCAL_P
 `SS_REMOTE_PORT`) and a free-form option string (`SS_PLUGIN_OPTIONS`). The plugin listens on the local address, wraps
 what arrives, and connects to the server, where a matching plugin unwraps it before the Shadowsocks server sees it.
 
-```{mermaid}
-flowchart LR
-    ss["Shadowsocks client"] -->|"plain Shadowsocks"| plugin["Plugin"]
-    plugin -->|"wrapped: for example WebSocket over TLS"| server["Server-side plugin, then Shadowsocks server"]
+```{raw} html
+<div class="diagram-scroll">
+```
+
+```{raw} html
+---
+file: plugin-wrapping.svg
+---
+```
+
+```{raw} html
+</div>
 ```
 
 Hole runs the plugin as a child process of the bridge. It picks a free loopback port, starts the plugin, and waits for

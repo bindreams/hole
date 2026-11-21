@@ -72,15 +72,18 @@ An application's packets arrive at the TUN device as raw IP. Hole runs a small T
 (the `smoltcp` library) that answers the application as if it were the remote server, completing each TCP handshake
 and reading each UDP datagram. Each connection or UDP flow becomes one unit of work that the bridge routes on its own.
 
-```{mermaid}
-flowchart TD
-    pkt["Packets from an app, via the TUN device"] --> stack["Hole's TCP/IP stack"]
-    stack --> peek["TCP: read the first bytes for a domain name (only when a filter rule names a domain)"]
-    peek --> rules["Filter rules: the last matching rule wins"]
-    stack -- "UDP: IP address only" --> rules
-    rules -- "Proxy" --> proxy["Relay through the local Shadowsocks client"]
-    rules -- "Bypass" --> bypass["Open a socket on the real network interface"]
-    rules -- "Block" --> drop["Close (TCP) or discard (UDP)"]
+```{raw} html
+<div class="diagram-scroll">
+```
+
+```{raw} html
+---
+file: filter-decision.svg
+---
+```
+
+```{raw} html
+</div>
 ```
 
 For TCP, if any {term}`filter` rule names a domain, the bridge waits briefly for the first bytes the application sends and

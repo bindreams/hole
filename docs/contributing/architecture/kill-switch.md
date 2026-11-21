@@ -134,33 +134,26 @@ cover**, then DNS. The routes come first, so between the route install and the c
 TUN device and nothing else is blocked yet. SOCKS-only mode returns from `acquire` before any routing step: it installs
 no cover and does not refresh an adopted one.
 
-```{mermaid}
-sequenceDiagram
-    participant PM as ProxyManager
-    participant R as Routing
-    participant OS as Firewall (WFP or pf)
-    PM->>PM: standing_cover_expected()
-    PM->>R: install(routes)
-    Note over PM,R: traffic now flows into the TUN device
-    PM->>PM: re-read the intent under the cover lock
-    PM->>R: install_lockdown(server, tun, app_ids)
-    R->>OS: pre-delete runtime-valued filters, add the set, commit
-    PM->>PM: Session holds the cover
-    PM->>R: Dns apply, when the DNS forwarder is on
-```
+Around the cover, the start takes these steps:
 
-- `standing_cover_expected()` is true when the intent is `On`, or when this run adopted a cover, and false when the
-  intent is `Off`. An `Unreadable` intent with no adopted cover answers no: the start installs nothing, and the tray
-  reads `Lockdown: On (warning: not engaged)`.
-- The intent is read again under the cover lock right before the install. An `Off` that an Unblock recorded in the
-  meantime wins over the earlier answer.
-- The install is **fatal**. A failed engage aborts the start, and the session's teardown releases the routes. What a
-  failed start does to the cover is T3 to T6 in [Transitions](#transitions).
-- Ticking Lockdown while connected only records the intent. `turn_lockdown_on` installs nothing, so the block arrives at
-  the next connect ([#1271](https://github.com/bindreams/hole/issues/1271)).
-- Engaging over an adopted cover is safe. The engage deletes every filter whose condition holds a runtime value (the TUN
-  LUID, the server address, the App-ID paths) inside its own transaction and adds them again, so a stale value from the
-  previous run cannot survive the engage; the persistent block-all stays in force throughout.
+1. `ProxyManager` calls `standing_cover_expected()`. It is true when the intent is `On`, or when this run adopted a
+   cover, and false when the intent is `Off`. An `Unreadable` intent with no adopted cover answers no: the start
+   installs nothing, and the tray reads `Lockdown: On (warning: not engaged)`.
+1. `Routing::install` installs the routes. Traffic now flows into the TUN device.
+1. `ProxyManager` reads the intent again, under the cover lock. An `Off` that an Unblock recorded in the meantime wins
+   over the earlier answer.
+1. `Routing::install_lockdown` installs the cover in the firewall (WFP or pf). The install is
+   **fatal**: a failed engage aborts the start, and the session's teardown releases the routes. What a failed start
+   does to the cover is T3 to T6 in [Transitions](#transitions).
+1. The `Session` holds the cover.
+1. `Dns` is applied, when the DNS forwarder is on.
+
+Ticking Lockdown while connected only records the intent. `turn_lockdown_on` installs nothing, so the block arrives at
+the next connect ([#1271](https://github.com/bindreams/hole/issues/1271)).
+
+Engaging over an adopted cover is safe. The engage deletes every filter whose condition holds a runtime value (the TUN
+LUID, the server address, the App-ID paths) inside its own transaction and adds them again, so a stale value from the
+previous run cannot survive the engage; the persistent block-all stays in force throughout.
 
 ## Transitions
 
@@ -195,27 +188,21 @@ session leaves it), T12 (Unblock Network does not disconnect, although its label
 connect** (every start lifts it). They are what the code does today. Open issues sit behind T8, T12 and T16; T6 is
 deliberate in the code.
 
-```{mermaid}
-stateDiagram-v2
-    [*] --> Absent
-    Absent --> Live: T1 connect with the intent On
-    Absent --> Live: T5 Windows read-back failure, the connect fails
-    Live --> Live: T1 connect re-engages in place
-    Live --> Live: T10 settings restart, update or shutdown
-    Live --> Live: T8 Disconnect or Exit, no session
-    Live --> Live: bridge exits or crashes, filters stay
-    Live --> Absent: T7 Disconnect or Exit, session running
-    Live --> Absent: T9 proxy or plugin found dead
-    Live --> Absent: T6 connect fails after the install
-    Live --> Absent: T4 macOS failed ruleset load
-    Live --> Absent: T11 untick Lockdown
-    Live --> Absent: T12 Unblock Network
-    Live --> Absent: T13 unlock, T14 release-covers
-    Live --> Absent: T15 next start, intent Off
-    Live --> Absent: T16 next start, target Off, or intent Off or Unset
-    Live --> Recorded: T17 macOS reboot, pf off and the record stays
-    Recorded --> Live: T1 macOS connect installs from the record
-    Recorded --> Absent: T16 next start releases the record
+Only a connect installs a cover: T1, and T5 where the read-back then fails. A macOS reboot leaves the record without the
+rule (T17). Every other row releases the cover or leaves it as it is, as its last column says.
+
+```{raw} html
+<div class="diagram-scroll">
+```
+
+```{raw} html
+---
+file: cover-states.svg
+---
+```
+
+```{raw} html
+</div>
 ```
 
 A session's teardown settles its cover with `teardown_cover_disposition` in {src}`crates/bridge/src/reconciler.rs`
