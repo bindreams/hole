@@ -20,6 +20,12 @@ The first and third rows are where `auto` gives the name away. `always` is for p
 disconnected. It also makes {term}`ex-ray` refuse to start without TLS or without a {term}`DoH` address to fetch the
 config from.
 
+A fourth failure is outside the client: the network drops connections whose ClientHello carries ECH. In November 2026,
+from an MGTS connection, connections to Cloudflare with ECH almost never carried anything, while connections to the
+same address without it carried a first exchange
+([report](field-reports/2026-11-cloudflare-and-direct-tunnels.md)). `auto` does not fall back in this case: the config was fetched, so ECH is sent on every attempt. Only
+`ech=never` connects, with the name in the clear.
+
 ```{note}
 When `always` refuses, Hole shows a general tunnel failure. Only the {term}`bridge`'s log names ECH
 ([where it is](../contributing/architecture/logging.md)).

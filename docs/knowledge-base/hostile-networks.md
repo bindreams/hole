@@ -13,7 +13,8 @@ for a Postern server, [Postern's](https://postern.readthedocs.io/en/latest/).
 A network can block whole address ranges of hosting providers. A server in such a range fails whatever name it uses:
 the connection is accepted and the TLS handshake then gets no answer. In June 2026, from an MGTS connection in Russia,
 [every host tested](field-reports/2026-06-tls-handshake-block.md) in ranges of LeaseWeb and OVH failed this way, while
-hosts at Hetzner and DigitalOcean answered.
+hosts at Hetzner and DigitalOcean answered. In November 2026 the same ranges
+[answered again](field-reports/2026-11-cloudflare-and-direct-tunnels.md) from that connection.
 
 If the server's range is blocked, move the server to a provider that still answers from that network, or put it behind a
 CDN. A CDN proxies HTTP, so the server has to speak WebSocket over TLS: set the plugin options `tls` and
@@ -21,9 +22,10 @@ CDN. A CDN proxies HTTP, so the server has to speak WebSocket over TLS: set the 
 
 ```{warning}
 A CDN is not a guarantee. In August 2026 [a server behind Cloudflare](field-reports/2026-08-cdn-fronted-server.md)
-could not carry traffic for clients in Russia. In November 2026, from an MGTS connection, a download from a domain
-proxied by Cloudflare stopped after about 17 KB on every attempt, while the same download straight from the server
-completed.
+could not carry traffic for clients in Russia. In November 2026, from an MGTS connection,
+[tunnels through Cloudflare](field-reports/2026-11-cloudflare-and-direct-tunnels.md) failed for 42 hours while tunnels straight to the same server passed every probe. A
+download from the domain proxied by Cloudflare stopped after about 17 KB on every attempt, and the same download
+straight from the server completed.
 ```
 
 ## Hiding the server's name
@@ -142,3 +144,7 @@ was reset about 20 seconds after it was made, having carried only its first exch
 {term}`galoshes` recovers from this by itself: it replaces a connection that was reset, and its {term}`keepalive` notices
 one that has gone silent. Both need galoshes on the server as well as in the config. Hole keeps showing **Connected**
 throughout, and the reconnects appear in the [bridge's log](../contributing/architecture/logging.md).
+
+Reconnecting helps only if the new connection fares better. In November 2026 galoshes replaced a stalled connection
+through Cloudflare about once a minute for 40 hours, and five of some 4,100 connections carried traffic
+([report](field-reports/2026-11-cloudflare-and-direct-tunnels.md)).
