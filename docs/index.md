@@ -15,7 +15,7 @@ either without you installing anything. Without a plugin, Hole speaks plain Shad
 
 ## Where to start
 
-- **Using Hole:** the [README](https://github.com/bindreams/hole#readme) has the download and the server options. The
+- **Using Hole:** [Getting started](getting-started/index.md) goes from getting a server to a working connection. The
   [glossary](reference/glossary.md) explains the terms, and the [command line](reference/cli.md) lists the commands.
 - **How it works:** the picture below, then [how Hole is put together](how-it-works/overview.md) and the pages that
   follow it.
@@ -53,6 +53,14 @@ Component versions: hole {{ hole_version }}, galoshes {{ galoshes_version }}, ga
 
 Hole is free software under the [GNU GPL version 3 or later](reference/licensing.md); the source lives in the
 [GitHub repository](https://github.com/bindreams/hole).
+
+```{toctree}
+---
+caption: Using Hole
+hidden:
+---
+Getting started <getting-started/index.md>
+```
 
 ```{toctree}
 ---

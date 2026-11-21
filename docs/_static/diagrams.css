@@ -1,0 +1,117 @@
+/* Hand-written SVG diagrams, included inline so they follow the theme's colours and the page's font. */
+
+/* On a narrow screen the diagram keeps a readable size and scrolls sideways. */
+.diagram-scroll {
+  overflow-x: auto;
+  margin: 1rem 0;
+}
+
+.diagram {
+  display: block;
+  width: 100%;
+  min-width: 600px;
+  height: auto;
+  font-family: inherit;
+  font-size: 16px;
+}
+
+.diagram text {
+  fill: var(--color-foreground-primary);
+  text-anchor: middle;
+}
+
+/* The name of an area, as opposed to the label of one object. */
+.diagram .dg-area {
+  font-weight: 600;
+}
+
+.diagram .dg-start {
+  text-anchor: start;
+}
+
+/* A label drawn over a pattern keeps a margin of page background around its letters. */
+.diagram .dg-halo {
+  paint-order: stroke;
+  stroke: var(--color-background-primary);
+  stroke-width: 5px;
+  stroke-linejoin: round;
+}
+
+.diagram .dg-line {
+  fill: none;
+  stroke: var(--color-foreground-primary);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* An icon from a 24-unit set: the set's own paths, drawn with the diagram's line. */
+.diagram .dg-icon {
+  fill: var(--color-background-primary);
+  stroke: var(--color-foreground-primary);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The same icon at twice the size keeps the 2px line. */
+.diagram .dg-icon.dg-x2 {
+  stroke-width: 1;
+}
+
+.diagram .dg-frame {
+  fill: var(--color-background-secondary);
+  stroke: var(--color-foreground-muted);
+  stroke-width: 1.5;
+}
+
+.diagram .dg-hostile {
+  stroke: #d9534f;
+  stroke-width: 1.5;
+  stroke-opacity: 0.7;
+}
+
+.diagram .dg-hostile-band {
+  fill: #d9534f;
+  fill-opacity: 0.3;
+}
+
+.diagram .dg-tunnel-back {
+  fill: var(--color-background-primary);
+}
+
+.diagram .dg-tunnel {
+  fill: var(--color-brand-primary);
+  fill-opacity: 0.2;
+  stroke: var(--color-brand-primary);
+  stroke-width: 2;
+}
+
+.diagram .dg-tunnel-mouth {
+  fill: var(--color-brand-primary);
+  fill-opacity: 0.55;
+  stroke: var(--color-brand-primary);
+  stroke-width: 2;
+}
+
+/* A machine or a network drawn as an outline: the page's background inside, the text's colour around. */
+.diagram .dg-machine {
+  fill: var(--color-background-primary);
+  stroke: var(--color-foreground-primary);
+  stroke-width: 2;
+  stroke-linejoin: round;
+}
+
+/* An app's tile keeps its own colours; the border separates a white or black tile from either theme's background. */
+.diagram .dg-tile {
+  stroke: var(--color-background-border);
+  stroke-width: 1;
+}
+
+.diagram .dg-glyph-light {
+  fill: none;
+  stroke: #fff;
+  stroke-width: 2.25;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}

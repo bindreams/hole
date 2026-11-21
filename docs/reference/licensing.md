@@ -19,6 +19,11 @@ Some libraries and plugins are Apache-2.0 so that others can reuse them. Each ca
 Code Hole builds on keeps its own license. The Go code vendored into ex-ray carries its license files under
 `crates/ex-ray/third_party/`.
 
+The diagrams in this documentation use icons from [Lucide](https://lucide.dev), under the ISC and MIT licenses. Their
+text is published with the documentation: {src}`docs/_static/licenses/lucide.txt`. The marks of other apps in a diagram
+come from [Simple Icons](https://simpleicons.org) (CC0). They are trademarks of their owners and stand for the apps
+themselves.
+
 ## What each artifact carries
 
 Every `hole` artifact carries one generated file, `NOTICES.md`: Hole's own license statement with the URL of the source

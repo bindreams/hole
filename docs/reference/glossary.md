@@ -20,10 +20,19 @@ ClientHello
   extension, normally names the server in the clear. See
   [RFC 8446, section 4.1.2](https://www.rfc-editor.org/rfc/rfc8446#section-4.1.2).
 
+config
+  A small `.json` file that describes one or more Shadowsocks servers: address, port, password, cipher and an optional
+  plugin. Hole imports it; whoever runs the server hands it out, and it is as private as a password. See
+  [Getting a server](../getting-started/server.md).
+
 cover
   The operating-system firewall rule the {term}`bridge` installs to block outgoing traffic that is not on a short permit
   list. The **standing** cover is the {term}`kill switch`; a **transient** cover is a bounded block for one connect
   attempt, which no start engages today. See [the contributor reference](../contributing/architecture/kill-switch.md).
+
+dashboard
+  Hole's main window: the list of servers, the filters, the settings, and the connection status. See
+  [Settings reference](../getting-started/settings.md).
 
 DoH
   DNS over HTTPS: DNS queries sent inside an HTTPS connection, so the network can neither read nor alter them. Hole uses
@@ -114,6 +123,10 @@ TSPU
   address, protocol or content. See
   [TSPU: Russia's Decentralized Censorship System](https://doi.org/10.1145/3517745.3561461) and the
   [field reports](../knowledge-base/field-reports/index.md).
+
+tray
+  Hole's icon in the Windows notification area or the macOS menu bar. Click it to open the {term}`dashboard`; right-click
+  it for the menu. See [Connecting](../getting-started/connect.md#the-tray).
 
 TUN
   A virtual network adapter that a program creates through the operating system. Hole routes the machine's traffic into
