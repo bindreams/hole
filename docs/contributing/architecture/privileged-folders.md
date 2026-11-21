@@ -1,10 +1,8 @@
 # Privileged code in folders a user may own
 
 The {term}`bridge` runs as root or SYSTEM, yet some of what it reads and writes sits under the interactive user's
-profile: the state directory when the bridge is started by hand, the log directory, the update marker. The user owns every
-folder on such a path, so the user can replace any component of it between two calls. This page is the rule set for code
-that acts in such a folder, and what keeps the rules from being forgotten. It is for a developer who adds a file the bridge
-reads or writes. Read it before adding a call to `std::fs`.
+profile: the state directory when the bridge is started by hand, the log directory, the update marker. The user owns
+every folder on such a path, so the user can replace any component of it between two calls.
 
 ## The threat
 
@@ -12,9 +10,9 @@ A path call (`create_dir_all`, `chown`, `rename`, `remove_file`, `File::create`)
 user who swaps a folder for a symlink between two calls sends the next call anywhere the bridge can reach: a `chown` of
 `/etc`, a write over a system file, a read of a file the user could not open. Every rule below removes one such step.
 
-{src}`util::dir::Dir <crates/util/src/dir.rs>` implements the rules once. Use it and
-do not re-derive them. Its module doc is the reference for the mechanics (`openat` with `O_NOFOLLOW` on Unix, `NtCreateFile`
-relative to the parent handle on Windows); this page is the why and the policy.
+{src}`util::dir::Dir <crates/util/src/dir.rs>` implements the rules once. Use it and do not re-derive them. Its module
+doc is the reference for the mechanics (`openat` with `O_NOFOLLOW` on Unix, `NtCreateFile` relative to the parent handle
+on Windows).
 
 ## The rules
 

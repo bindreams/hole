@@ -1,10 +1,9 @@
 # File lock and state files
 
 Two things in the {term}`bridge` live in a {term}`state directory` that the interactive user may own: a lock that says a
-bridge is running, and the files that hold state across a restart. Both are written by a privileged process into a folder
-an unprivileged user can tamper with, so both follow [the rules for privileged code in such
-folders](privileged-folders.md). This page covers how the lock and the state-file writers apply them. It is for a developer
-who adds a cross-process lock or a new state file.
+bridge is running, and the files that hold state across a restart. Both are written by a privileged process into a
+folder an unprivileged user can tamper with, so both follow [the rules for privileged code in such
+folders](privileged-folders.md).
 
 ## Cross-process locks
 

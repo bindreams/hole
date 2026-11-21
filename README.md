@@ -33,7 +33,7 @@ verify Hole is free of malware. To open it anyway:
   **Open Anyway** next to Hole.
 - **Earlier macOS:** Control-click Hole and choose **Open**.
 
-## Learn more
+## Documentation
 
 - [Getting started](https://hole.readthedocs.io/en/latest/getting-started/index.html) goes from getting a server to a working
   connection, step by step.

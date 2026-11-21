@@ -1,10 +1,8 @@
 # Cancellation and teardown
 
-A connect is a sequence of slow phases (the plugin chain, the proxy, the DNS self-test, the TUN device, routes, DNS), and
-the user can press Cancel in any of them. This page is the contract for code that runs inside a start: how a cancel
-travels, what a failed or cancelled start leaves behind (nothing), and what is allowed to wait without a bound. Read it
-before adding a phase or a long-lived resource to a {term}`bridge` start. The resources a start holds are listed in
-[what one connect holds](overview.md#what-one-connect-holds).
+A connect is a sequence of slow phases (the plugin chain, the proxy, the DNS self-test, the TUN device, routes, DNS),
+and the user can press Cancel in any of them. A failed or cancelled start leaves nothing behind. The resources a start
+holds are listed in [what one connect holds](overview.md#what-one-connect-holds).
 
 ## One cancel mechanism: tokens
 
@@ -63,10 +61,7 @@ Afterwards the chain ends only through `PluginChain::end`, or when a plugin exit
 its own, so SIGTERM or Ctrl+C reaches the chain only through the bridge's own shutdown, never as an apparent plugin
 death.
 
-```{admonition} Known limit: a plugin being spawned as the chain ends
----
-class: warning
----
+```{warning}
 `end` waits for garter's runner, not for the per-plugin tasks it spawned. A plugin that is being started at that instant
 may still spawn and record itself after `end` returns. Its own drop kills the process tree, and its record stays in the
 state file for the next reap to remove by identity. It happens only to a start that is cancelled, or fails its readiness

@@ -1,10 +1,9 @@
 # The proxy shutdown contract
 
 `ShadowsocksRunning::stop()` and its `Drop` ({src}`crates/bridge/src/proxy/shadowsocks.rs`) must close every socket the
-{term}`Shadowsocks` local server bound **before returning**. Otherwise an immediate restart on the same fixed port fails with
-`AddrInUse`. This page is for a developer changing how the proxy is started or stopped, or bumping `shadowsocks-service`:
-it says why a plain `abort()` is not enough, what the code does instead, and which property rests on a pinned
-dependency.
+{term}`Shadowsocks` local server bound **before returning**. Otherwise an immediate restart on the same fixed port fails
+with `AddrInUse`. A plain `abort()` is not enough for that, and one property of what the code does instead rests on a
+pinned dependency.
 
 ## Why a handle cannot be joined
 

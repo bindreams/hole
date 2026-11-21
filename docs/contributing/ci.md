@@ -5,8 +5,8 @@ messages](commit-messages.md)). {src}`.github/workflows/ci.yaml` has one job, `c
 and `linux`, each on `amd64` and `arm64`. A pull request therefore costs six runners, two of them macOS. Each runner builds, lints and tests what its platform ships. A **lane** is one kind of work, such as the Hole
 tests, an installer build or the lint, and the matrix flags in `ci.yaml` say which runners run which lanes.
 
-The comments in `ci.yaml` are the detailed description: why each step sits where it does, and the measurements behind the
-time budgets. This page is the map.
+The comments in `ci.yaml` are the detailed description: why each step sits where it does, and the measurements behind
+the time budgets.
 
 ## Required checks
 
@@ -67,7 +67,7 @@ names the units that rebuilt.
 CI's Hole test steps run exactly the command of the `hole-tests` target in {src}`build.yaml` (the audit
 `ci_test_hole_steps_match_the_hole_tests_target` holds them equal), with `SKULD_LABELS` and a nextest profile on top.
 
-The table shows POSIX syntax; [Set up and build](setup.md#run-the-tests-once) has the PowerShell form of `SKULD_LABELS`.
+The table shows POSIX syntax; [Setup and first build](setup.md#running-the-tests-once) has the PowerShell form of `SKULD_LABELS`.
 On Windows, run the elevated lane from an elevated shell. On macOS, never put `sudo` before `cargo xtask`: it builds
 first and leaves root-owned files in `target/`. CI builds as the user, then runs only `cargo nextest` under `sudo` over
 the built binaries, with `NEXTEST_PROFILE=tun`; the `hole-test-tun-macos` step in {src}`.github/workflows/ci.yaml` has

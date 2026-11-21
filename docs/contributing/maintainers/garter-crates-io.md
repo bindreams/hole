@@ -1,9 +1,8 @@
 # Publishing garter
 
-`garter` is released like the other [tracks](releases.md), and its publish workflow also runs `cargo publish`. This page
-covers what is different, and what to do when the publish fails.
+`garter` is released like the other [tracks](releases.md), and its publish workflow also runs `cargo publish`.
 
-## How it publishes
+## How the workflow publishes
 
 - **By trusted publishing: no token is stored.** {src}`.github/workflows/publish-release-garter.yaml` grants
   `id-token: write`, and `rust-lang/crates-io-auth-action` trades that for a short-lived crates.io token. The trusted

@@ -154,6 +154,6 @@ failure. The row's presence is ordered by `Device::build`: it waits for the IPv6
 `NoInterfaceRow` for IPv6 follows from `Assigned::Ipv6StackAbsent`, whose expiry-as-absence is contested in
 bindreams/hole#1301. No test asserts the row is present.
 
-## Read next
+## Related pages
 
 - [TCP accept refusal](tcp-admission.md): the TCP side of the packet loop.

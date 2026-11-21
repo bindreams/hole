@@ -7,7 +7,7 @@ Pull request titles and commit subjects follow [Conventional Commits](https://ww
 ```
 
 The scope is optional, and a trailing `!` after the type or scope marks a breaking change. The type is one of the values
-under `types:` in {src}`.github/workflows/semantic-pr.yaml`; that file is the list, and this page does not copy it.
+under `types:` in {src}`.github/workflows/semantic-pr.yaml`; that file is the list.
 
 ## Why the format matters
 

@@ -3,8 +3,7 @@
 Hole is used where the address of the server is the most sensitive value on the machine, so no log file, console, toast
 or support bundle may hold it. The mechanism has two halves that work at opposite ends: a **sink** that replaces the
 address in every byte written to a log, and **types** that make it hard to write the address or the password into a
-format string in the first place. This page is for a developer who logs, serializes or parses anything that can hold a
-server entry. It ends with the limits, which are part of the contract.
+format string in the first place.
 
 The address is the configured host, a hostname or an IP literal, in every textual form, plus the IP address the bridge
 resolved for it over {term}`DoH`. The password is protected by the types alone (see [the password](#the-password)).
@@ -180,11 +179,8 @@ This is not a total guarantee.
    `HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace`, and `bridge.log` is collected into the support bundle
    ([#1310](https://github.com/bindreams/hole/issues/1310)).
 
-```{admonition} Do not enable shadowsocks_service=trace against a real server
----
-class: warning
----
-Do not turn the directive on against a real server, and do not ship a bundle collected while it was on. Flooring the
+```{warning}
+Do not turn `shadowsocks_service=trace` on against a real server, and do not ship a bundle collected while it was on. Flooring the
 third-party directive in `build_filter` would close the leak at the cost of the diagnostic, and that trade has not been
 made.
 ```

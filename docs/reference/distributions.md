@@ -1,8 +1,8 @@
 # Distributions
 
-Nobody who only uses Hole needs this page: the installer is on the [releases page](https://github.com/bindreams/hole/releases/latest),
-and [Postern](https://postern.readthedocs.io) sets up the server-side plugins for you. It is for people who build their
-own server or tools.
+To use Hole you need only the installer from the [releases page](https://github.com/bindreams/hole/releases/latest);
+[Postern](https://postern.readthedocs.io) sets up the server-side plugins for you. The other products are for people who
+build their own server or tools.
 
 Four products ship from this repository. Each is tagged `releases/<product>/v<X.Y.Z>` and has its own
 [GitHub release](https://github.com/bindreams/hole/releases).

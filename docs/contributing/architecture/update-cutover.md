@@ -1,8 +1,7 @@
 # Update cutover
 
-An in-place update replaces the {term}`bridge`'s own running binary and restarts the service. This page covers what the
-`POST /v1/update-apply` handler does, how the swap stays all-or-nothing, why Windows and macOS restart differently, and what
-the update marker is for. It is for a developer who changes the update path. What becomes of the {term}`kill switch` across
+An in-place update replaces the {term}`bridge`'s own running binary and restarts the service. The
+`POST /v1/update-apply` handler does it, and the swap is all-or-nothing. What becomes of the {term}`kill switch` across
 the restart is on [the kill switch page](kill-switch.md#transitions) (T10, then T15 and T16 at the new bridge's start).
 
 ## The apply handler

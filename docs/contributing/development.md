@@ -1,10 +1,10 @@
 # Development
 
-This page runs Hole from your checkout. Dev mode creates a real TUN device and edits the machine's routing table, exactly
-as a release does, so the {term}`bridge` needs administrator rights. You start dev mode without them: only the bridge is
+Dev mode runs Hole from your checkout. It creates a real TUN device and edits the machine's routing table, exactly as a
+release does, so the {term}`bridge` needs administrator rights. You start dev mode without them: only the bridge is
 elevated.
 
-## Run dev mode
+## Running dev mode
 
 `````{tab-set}
 ---
@@ -71,7 +71,7 @@ The app needs membership of the `hole` group to open the bridge's socket. The fi
 your login session does not see it yet. The supervisor checks this on macOS, says so and exits; log out and back in (or
 reboot), then run it again. This happens once per machine.
 
-## Run the pieces yourself
+## Running the pieces yourself
 
 Separate terminals give you more control. Terminal 1 is the bridge. On macOS, build and stage as your normal user; only
 `bridge grant-access` and `bridge run` need `sudo`. On Windows, one elevated PowerShell does all of it.

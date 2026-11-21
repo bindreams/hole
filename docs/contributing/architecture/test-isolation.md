@@ -1,9 +1,7 @@
 # The seams: how tests stay off the machine
 
 Everything in the {term}`bridge` that changes the machine goes through one of three traits, so a unit test can swap the
-real operating system for a mock. This page is for a developer adding code that touches the operating system: it says
-which trait to use, what keeps the rule from eroding, and where a mock lives. The [architecture
-overview](overview.md#the-trait-seams) names the traits; this page is the contract.
+real operating system for a mock. The [architecture overview](overview.md#the-trait-seams) names the traits.
 
 A unit test that reached the real `netsh`, `route` or `pfctl` would change the routes of the machine it runs on, and on a
 shared CI runner that machine is every other job's machine too. The rule is therefore absolute for what changes the

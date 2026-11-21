@@ -1,11 +1,10 @@
 # Crash recovery
 
-The {term}`bridge` changes the machine: routes, a plugin process or two, and on Windows a diagnostics session. A bridge that
-is killed, loses power or crashes never runs its teardown. So while a proxy is active the bridge keeps small records in
-its {term}`state directory`, clears them on a clean shutdown, and replays them at the next start. This page lists what is
-recorded and what the replay does with each record. It is for a developer who adds state that has to survive a crash.
+The {term}`bridge` changes the machine: routes, a plugin process or two, and on Windows a diagnostics session. A bridge
+that is killed, loses power or crashes never runs its teardown. So while a proxy is active the bridge keeps small
+records in its {term}`state directory`, clears them on a clean shutdown, and replays them at the next start.
 
-## When it runs
+## When recovery runs
 
 All recovery runs after the IPC socket has bound, so a second bridge instance that fails the bind never touches the first
 one's state. The order, in {src}`crates/bridge/src/foreground.rs` and the two service entry points

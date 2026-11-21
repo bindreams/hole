@@ -1,9 +1,8 @@
 # Route ownership
 
-When Hole stops, or recovers from a crash, it deletes routes. It must delete only the routes it put in, because the route
-table is shared: if another VPN has taken over a prefix Hole failed to install, deleting that prefix takes the other VPN's
-tunnel down. This page covers how the code decides what is Hole's, and what the record holds. It is for a developer who
-changes route teardown, recovery or the record's format. It assumes [route commands and what failing
+When Hole stops, or recovers from a crash, it deletes routes. It must delete only the routes it put in, because the
+route table is shared: if another VPN has taken over a prefix Hole failed to install, deleting that prefix takes the
+other VPN's tunnel down. What a failed route command means is in [route commands and what failing
 means](route-failure-policy.md).
 
 ## The rule
@@ -110,14 +109,13 @@ leaves it as it is and deletes no route, because what it names cannot be told ap
 union; each survivor is cut to `planned_routes(server_ip)`, because an id with no possible teardown command can never
 drain and would keep `stale` non-empty for ever; an empty survivor is dropped.
 
-Without that, a reconnect to the same server, which shares `tun_name` and often `server_ip` with a carried-forward group,
-would issue a byte-identical delete twice. On Windows the first delete removes the route, the second finds it absent and
-exits non-zero, which Windows never counts as confirmed ([what counts as gone](#what-counts-as-gone)), so the group stays
-recorded. On macOS
-the split deletes are unscoped, so the second one removes whatever a third party claimed after the first freed the prefix,
-which is the harm this page exists to prevent. `recover_groups` also runs every group's split deletes before any bypass
-delete, and issues each distinct argv once across all groups: a split delete's argv depends on `tun_name` alone, so two
-groups with different servers can still produce the same command.
+Without that, a reconnect to the same server, which shares `tun_name` and often `server_ip` with a carried-forward
+group, would issue a byte-identical delete twice. On Windows the first delete removes the route, the second finds it
+absent and exits non-zero, which Windows never counts as confirmed ([what counts as gone](#what-counts-as-gone)), so the
+group stays recorded. On macOS the split deletes are unscoped, so the second one removes whatever a third party claimed
+after the first freed the prefix, which is the harm route ownership exists to prevent. `recover_groups` also runs every
+group's split deletes before any bypass delete, and issues each distinct argv once across all groups: a split delete's
+argv depends on `tun_name` alone, so two groups with different servers can still produce the same command.
 
 ## What counts as gone
 

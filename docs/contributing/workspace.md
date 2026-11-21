@@ -1,7 +1,6 @@
 # The workspace
 
-Hole is one Cargo workspace plus a Go module and a front end. This page says what each directory holds, which release
-group it belongs to, and how {term}`galoshes` ends up carrying {term}`ex-ray`.
+Hole is one Cargo workspace plus a Go module and a front end.
 
 ## What is where
 

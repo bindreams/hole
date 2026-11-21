@@ -1,7 +1,7 @@
 # Building in detail
 
-[Set up and build](setup.md) gets you a first build. This page covers what you need when that is not enough: choosing a
-target, the front-end toggle, the documentation checks, the staged directory and the hardened binaries.
+[Setup and first build](setup.md) gets you a first build. Beyond that there are targets to choose, the front-end toggle, the
+documentation checks, the staged directory and the hardened binaries.
 
 ## Targets
 

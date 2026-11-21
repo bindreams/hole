@@ -1,8 +1,8 @@
 # The datapath: from a packet to an endpoint
 
 The datapath is what happens to traffic once the routes have sent it into the {term}`TUN` device: the packet loop reads
-it, a router decides what to do with each connection or UDP flow, and an endpoint carries it. The user-level picture, which this page does not repeat, is in
-[the TUN device and the routes](../../how-it-works/tun.md) and [UDP: dropped, never
+it, a router decides what to do with each connection or UDP flow, and an endpoint carries it. The user-level picture is
+in [the TUN device and the routes](../../how-it-works/tun.md) and [UDP: dropped, never
 bypassed](../../how-it-works/udp.md).
 
 ## The path of a flow
@@ -122,7 +122,7 @@ listener is either the one the user enabled (**Local proxy server** on) or an in
 The dispatcher, the DNS forwarder and its self-test all dial the port `ProxyManager::acquire` ends up
 with (`socks5_port`), never the configured one blindly.
 
-## Read next
+## Related pages
 
 - [The TUN device](tun-device.md): the name, the addresses and IPv6 of the device the `Driver` reads.
 - [TCP accept refusal](tcp-admission.md): what the `Driver` does between a SYN and a connection reaching the router.

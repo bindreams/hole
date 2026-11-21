@@ -1,11 +1,11 @@
-# Set up and build
+# Setup and first build
 
-This page takes a machine with nothing on it to a first build and a first test run. It assumes Windows 11 on amd64 or
-macOS; the commands are the same on both except where a tab says otherwise. `hole`, `hole-tests` and every target that
-depends on them are built only on those, so on Linux or Windows on arm64 `cargo xtask build hole` is an error. Those
-hosts build the other targets, such as ex-ray, galoshes and garter; `cargo xtask list` shows what each platform supports.
+These steps take a machine with nothing on it to a first build and a first test run, on Windows 11 on amd64 or on macOS;
+the commands are the same on both except where a tab says otherwise. `hole`, `hole-tests` and every target that depends
+on them are built only on those, so on Linux or Windows on arm64 `cargo xtask build hole` is an error. Those hosts build
+the other targets, such as ex-ray, galoshes and garter; `cargo xtask list` shows what each platform supports.
 
-## Install the tools
+## Installing the tools
 
 | Tool                                                     | What needs it                                              | Which version                                                                                                                                                         |
 | -------------------------------------------------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -47,10 +47,7 @@ Running Hole in dev mode asks for your `sudo` password once, for the bridge only
 ```
 ````
 
-```{admonition} Rust and Go are exact pins
----
-class: note
----
+```{note}
 A new compiler release cannot turn `main` red on its own: Rust and Go are pinned to one version each, and Renovate
 proposes a bump as its own pull request, never merged automatically. Node is a range, and `prek`, `nextest`, Python and
 `uv` are installed unpinned in CI. If the same commit passes one day and fails the next, check those first.
@@ -85,7 +82,7 @@ npm install
 If you edit `package.json`, commit the resulting `package-lock.json` in the same commit. CI checks the lockfile
 with a strict `npm ci --dry-run`, and rejects one that does not match `package.json`.
 
-## Run the tests once
+## Running the tests once
 
 ```sh
 cargo xtask run hole-tests
@@ -119,7 +116,7 @@ SKULD_LABELS='!tun' cargo xtask run hole-tests
 
 [Testing](testing.md) explains the labels, and what else a test run needs.
 
-## Install the hooks
+## Installing the hooks
 
 ```sh
 prek install

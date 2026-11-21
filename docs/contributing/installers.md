@@ -1,8 +1,7 @@
 # The installers
 
-Hole ships as a Windows MSI and a macOS DMG. This page covers building each, checking what they contain, and the
-end-to-end runs that install them for real. The runs change the machine they run on, so read the warnings before you run
-one.
+Hole ships as a Windows MSI and a macOS DMG. The end-to-end runs that install them change the machine they run on, so
+read the warnings before you run one.
 
 ## Windows installer
 
