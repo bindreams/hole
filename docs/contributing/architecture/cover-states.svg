@@ -1,0 +1,30 @@
+<svg class="diagram" viewBox="0 0 736 230" role="img" xmlns="http://www.w3.org/2000/svg"
+     aria-label="The presence of a cover is Absent, Live or Recorded. A connect takes it from Absent or Recorded to Live. A release takes it from Live or Recorded to Absent. A macOS reboot takes it from Live to Recorded.">
+  <!-- The presence of a cover and what changes it -->
+  <!-- What changes the presence -->
+  <path class="dg-line" d="M152 40L304 40"/>
+  <path class="dg-arrowhead" d="M314 40L304 45L304 35z"/>
+  <path class="dg-line" d="M420 40L572 40"/>
+  <path class="dg-arrowhead" d="M582 40L572 45L572 35z"/>
+  <path class="dg-line" d="M340 64C292.1 125.3 187.2 129.7 134.5 73.6"/>
+  <path class="dg-arrowhead" d="M128 66L138.3 70.4L130.7 76.9z"/>
+  <path class="dg-line" d="M608 64C560.1 125.3 455.2 129.7 402.5 73.6"/>
+  <path class="dg-arrowhead" d="M396 66L406.3 70.4L398.7 76.9z"/>
+  <path class="dg-line" d="M652 64C543.8 231.2 205.4 235.9 89.6 74.3"/>
+  <path class="dg-arrowhead" d="M84 66L93.8 71.5L85.5 77.1z"/>
+
+  <!-- States -->
+  <rect class="dg-machine" x="48" y="16" width="104" height="48" rx="10.8"/>
+  <text x="100" y="46">Absent</text>
+  <rect class="dg-machine" x="316" y="16" width="104" height="48" rx="10.8"/>
+  <text x="368" y="46">Live</text>
+  <rect class="dg-machine" x="584" y="16" width="104" height="48" rx="10.8"/>
+  <text x="636" y="46">Recorded</text>
+
+  <!-- Labels: each under its arrow -->
+  <text x="234" y="62">Connect</text>
+  <text x="502" y="62">macOS reboot</text>
+  <text x="234" y="134">Release</text>
+  <text x="502" y="134">Connect</text>
+  <text x="368" y="213">Release</text>
+</svg>

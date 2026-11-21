@@ -16,21 +16,21 @@ the {term}`TUN` device, and sends them to the resolver you chose over a transpor
 
 ## The path of a lookup
 
-```{mermaid}
-sequenceDiagram
-    participant App as An application
-    participant OS as Operating system
-    participant T as TUN device and bridge
-    participant F as DNS forwarder
-    participant R as Your chosen resolver
-    App->>OS: Look up example.com
-    OS->>T: UDP to port 53 of a configured resolver address
-    T->>F: Intercept, whatever the filter rules say
-    F->>R: Same question, over the tunnel (DoH by default)
-    R-->>F: Answer
-    F-->>T: Reply with the application's own transaction ID
-    T-->>OS: Answer
-    OS-->>App: Address
+An application's lookup goes to the operating system, which sends it, as UDP to port 53, into the TUN device. The DNS
+forwarder picks it up there and asks your resolver through the tunnel. The answer returns the same way.
+
+```{raw} html
+<div class="diagram-scroll">
+```
+
+```{raw} html
+---
+file: dns-lookup-path.svg
+---
+```
+
+```{raw} html
+</div>
 ```
 
 Hole points the operating system's DNS at the resolver addresses in its settings. Public resolver addresses, such as the defaults, fall in the halves of
@@ -92,7 +92,8 @@ filter rules and [the UDP rule](udp.md). The resolvers stay in use for [looking 
 whether or not the forwarder is on.
 
 ```{dropdown} Where in the code
-The forwarder: {src}`crates/bridge/src/dns/forwarder.rs`. The in-tunnel intercept:
+How the forwarder works inside is in [the DNS forwarder](../contributing/architecture/dns-forwarder.md). The forwarder:
+{src}`crates/bridge/src/dns/forwarder.rs`. The in-tunnel intercept:
 {src}`crates/bridge/src/endpoint/local_dns.rs`. The self-test: {src}`crates/bridge/src/dns/self_test.rs`. The Windows
 filters: {src}`crates/tun-engine/src/dns_confine.rs`. The macOS entry: {src}`crates/tun-engine/src/dns_steer.rs`.
 ```

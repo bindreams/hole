@@ -21,34 +21,18 @@ sides live in `hole-common`.
 
 ## The layers
 
-```{mermaid}
-flowchart TB
-    subgraph app["hole (no arguments): the app, user rights"]
-        tray["Tray, settings, dashboard"]
-        client["Bridge client"]
-    end
-    client == "HTTP over AF_UNIX" ==> ipc
-    subgraph bridge["hole bridge run: administrator rights"]
-        ipc["ipc: axum handlers"]
-        boot["boot: recovery, then reconcile"]
-        pm["ProxyManager&lt;Proxy, Routing, Dns&gt;"]
-        subgraph session["Session: what one connect holds"]
-            direction LR
-            dns["Dns: resolver steering"]
-            disp["Dispatcher: TUN engine"]
-            chain["Plugin chain"]
-            proxy["Proxy: Shadowsocks client"]
-            routes["Routing: routes"]
-            cover["Routing: the kill-switch cover"]
-        end
-        ipc --> pm
-        boot --> pm
-        pm --> session
-    end
-    state[("State directory: bridge-*.json")]
-    pm -.-> state
-    boot -.-> state
-    session --> os["Operating system: TUN device, route table, WFP or pf, DNS settings"]
+```{raw} html
+<div class="diagram-scroll">
+```
+
+```{raw} html
+---
+file: layers.svg
+---
+```
+
+```{raw} html
+</div>
 ```
 
 - **`hole`** ({src}`crates/hole/`) is the binary: the Tauri app, the command line, and the entry points of the bridge.

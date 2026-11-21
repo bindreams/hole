@@ -22,24 +22,21 @@ register it at the first connect.
 
 ## What the bridge is made of
 
-```{mermaid}
-flowchart LR
-    app["Hole app"] == "local socket" ==> ipc
-    subgraph bridge["Hole bridge"]
-        ipc["Control API"]
-        engine["TUN engine and filter rules"]
-        dnsf["DNS forwarder"]
-        ss["Shadowsocks client (SOCKS5 listener on loopback)"]
-        ipc --> engine
-        engine --> ss
-        engine --> dnsf
-        dnsf --> ss
-    end
-    os["Your apps, through the TUN device"] --> engine
-    engine -. "Bypass rules: out the real network interface" .-> net["Internet"]
-    ss -. "optional" .-> plugin["Plugin process: ex-ray or galoshes"]
-    ss --> server["Your Shadowsocks server"]
-    plugin -.-> server
+Every app's traffic arrives at the bridge. The bridge sends it to your server through a {term}`Shadowsocks` client, or
+straight to the internet where a {term}`filter` rule says **Bypass**.
+
+```{raw} html
+<div class="diagram-scroll">
+```
+
+```{raw} html
+---
+file: bridge.svg
+---
+```
+
+```{raw} html
+</div>
 ```
 
 The pieces, each with its own page:
@@ -54,37 +51,22 @@ The pieces, each with its own page:
 
 ## What happens when you connect
 
-```{mermaid}
-sequenceDiagram
-    participant App as Hole app
-    participant B as Bridge
-    participant OS as Operating system
-    App->>B: Connect to this server
-    B->>B: Look up the server's name over DoH
-    B->>B: Start the plugin, if the config names one
-    B->>B: Start the Shadowsocks client
-    B->>B: Test the DNS forwarder through the proxy
-    B->>OS: Open the TUN device
-    B->>OS: Install the routes
-    B->>OS: Block everything else (kill switch on only)
-    B->>OS: Point DNS at the TUN device
-    B-->>App: Connected
-```
+The app asks the bridge to connect to a server, and the bridge works in this order:
 
-The order matters. With the DNS forwarder on, which is the default, it is chosen so that nothing about the machine
-changes until one lookup has gone through the proxy. With it off, there is no such test, and the TUN device and the
-routes go in as soon as the proxy is up.
+1. It looks up the server's name over {term}`DoH`, not through the operating system, before any tunnel exists. See
+   [ECH and DoH](ech-and-doh.md).
+1. It starts the {term}`SIP003 plugin`, if the config names one, and waits for it.
+1. It starts the {term}`Shadowsocks` client, pointed at the plugin, or at the server directly.
+1. With the DNS forwarder on, which is the default, it sends one test lookup through the proxy. If the lookup fails, the
+   connection fails here, before the bridge has changed any network setting.
+1. It opens the TUN device and installs the routes. This is the moment traffic starts to flow through Hole.
+1. With the {term}`kill switch` on, it blocks everything else, right after the routes.
+1. With the forwarder on, it points the operating system's DNS at the TUN device. With it off, Hole leaves DNS settings
+   alone.
+1. It tells the app that the connection is up.
 
-1. A server given by name is looked up over {term}`DoH`, not through the operating system, before any tunnel exists.
-   See [ECH and DoH](ech-and-doh.md).
-1. A configured {term}`SIP003 plugin` is started and waited for, and the {term}`Shadowsocks` client points at it, or at
-   the server directly.
-1. The test lookup runs only with the forwarder on. If it fails, the connection fails here, before the bridge has
-   changed any network setting.
-1. Only now does the bridge open the TUN device and install the routes, the moment traffic starts to flow through Hole.
-   With the {term}`kill switch` on, the block goes up right after the routes.
-1. Last, with the forwarder on, the operating system's DNS is pointed at the TUN device. With it off, Hole leaves DNS
-   settings alone.
+With the forwarder on, the order is chosen so that no network setting of the machine changes until one lookup has gone
+through the proxy. With it off, there is no such test, and the TUN device and the routes go in as soon as the proxy is up.
 
 A start that fails at any step releases everything it had already taken, including the kill switch's block, and
 reports an error. Disconnecting does the same release on purpose.

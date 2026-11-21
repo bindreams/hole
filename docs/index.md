@@ -27,27 +27,27 @@ either without you installing anything. Without a plugin, Hole speaks plain Shad
 
 ## Hole in one picture
 
-```{mermaid}
-flowchart LR
-    apps["Your apps"] --> tun["TUN device"]
-    tun --> ss
-    subgraph bridge["Hole bridge (administrator rights)"]
-        ss["Shadowsocks client"]
-        plugin["Plugin: ex-ray or galoshes"]
-    end
-    ss -->|"no plugin in the config"| server["Your Shadowsocks server"]
-    ss -. "optional: plugin in the config" .-> plugin
-    plugin -. "optional" .-> server
-    gui["Hole app (tray, settings)"] == "controls, over a local socket" ==> bridge
-```
-
 Hole is one program that runs in two modes. The **app** is what you click: the tray icon, the settings, the dashboard.
 It runs as you. The **bridge** is a background service with administrator rights, and it is the only part that changes
 how the machine's network behaves. The app tells the bridge what to do over a local socket.
 
 The bridge creates the {term}`TUN` device and points the machine's routes at it, so the traffic of every app lands in
 the bridge. It sends that traffic through a Shadowsocks client to your server. If the server's config names a
-{term}`SIP003 plugin`, the traffic goes through that plugin on the way, which disguises it (the dotted path).
+{term}`SIP003 plugin`, the traffic goes through that plugin on the way, which disguises it.
+
+```{raw} html
+<div class="diagram-scroll">
+```
+
+```{raw} html
+---
+file: app-and-bridge.svg
+---
+```
+
+```{raw} html
+</div>
+```
 
 Component versions: hole {{ hole_version }}, galoshes {{ galoshes_version }}, garter {{ garter_version }}, ex-ray {{ exray_version }}.
 

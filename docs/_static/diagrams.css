@@ -54,11 +54,6 @@
   stroke-linejoin: round;
 }
 
-/* The same icon at twice the size keeps the 2px line. */
-.diagram .dg-icon.dg-x2 {
-  stroke-width: 1;
-}
-
 .diagram .dg-frame {
   fill: var(--color-background-secondary);
   stroke: var(--color-foreground-muted);
@@ -87,19 +82,21 @@
   stroke-width: 2;
 }
 
-.diagram .dg-tunnel-mouth {
-  fill: var(--color-brand-primary);
-  fill-opacity: 0.55;
-  stroke: var(--color-brand-primary);
-  stroke-width: 2;
-}
-
 /* A machine or a network drawn as an outline: the page's background inside, the text's colour around. */
 .diagram .dg-machine {
   fill: var(--color-background-primary);
   stroke: var(--color-foreground-primary);
   stroke-width: 2;
   stroke-linejoin: round;
+}
+
+/* A part that may be absent. */
+.diagram .dg-optional {
+  stroke-dasharray: 5 4;
+}
+
+.diagram .dg-arrowhead {
+  fill: var(--color-foreground-primary);
 }
 
 /* An app's tile keeps its own colours; the border separates a white or black tile from either theme's background. */

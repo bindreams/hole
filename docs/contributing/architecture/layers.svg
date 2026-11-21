@@ -1,0 +1,79 @@
+<svg class="diagram" viewBox="0 0 736 242" role="img" xmlns="http://www.w3.org/2000/svg"
+     aria-label="The Hole app calls the bridge's ipc handlers. Inside the bridge, ipc and boot both drive ProxyManager, which owns the Session. The bridge changes the operating system and keeps its records in the state directory.">
+  <!-- Glyphs: arrow-left-right, power, workflow, link, cpu and folder from Lucide 1.77.0 (https://lucide.dev), ISC and MIT licences, text in _static/licenses/lucide.txt. -->
+  <!-- The bridge -->
+  <rect class="dg-frame" x="120" y="8" width="374" height="226" rx="10"/>
+
+  <!-- Who drives whom; the two arrows that leave the frame are the bridge as a whole -->
+  <path class="dg-line" d="M76 150L144 150"/>
+  <path class="dg-arrowhead" d="M154 150L144 155L144 145z"/>
+  <path class="dg-line" d="M204 150L274 150"/>
+  <path class="dg-arrowhead" d="M284 150L274 155L274 145z"/>
+  <path class="dg-line" d="M310 100L310 114"/>
+  <path class="dg-arrowhead" d="M310 124L305 114L315 114z"/>
+  <path class="dg-line" d="M310 70V80"/>
+  <path class="dg-line" d="M334 150C378 150 350 46 394 46L404 46"/>
+  <path class="dg-arrowhead" d="M414 46L404 51L404 41z"/>
+  <path class="dg-line" d="M494 46L614 46"/>
+  <path class="dg-arrowhead" d="M624 46L614 51L614 41z"/>
+  <path class="dg-line" d="M494 150L614 150"/>
+  <path class="dg-arrowhead" d="M624 150L614 155L614 145z"/>
+
+  <!-- Nodes -->
+  <image href="../../_static/icon-macos.svg" x="28" y="126" width="48" height="48"/>
+  <rect class="dg-tile" x="28" y="126" width="48" height="48" rx="10.8" fill="none"/>
+  <rect class="dg-machine" x="156" y="126" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(168 138)">
+    <path d="M8 3 4 7l4 4" />
+    <path d="M4 7h16" />
+    <path d="m16 21 4-4-4-4" />
+    <path d="M20 17H4" />
+  </g>
+  <rect class="dg-machine" x="286" y="22" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(298 34)">
+    <path d="M12 2v10" />
+    <path d="M18.4 6.6a9 9 0 1 1-12.77.04" />
+  </g>
+  <rect class="dg-machine" x="286" y="126" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(298 138)">
+    <rect width="8" height="8" x="3" y="3" rx="2" />
+    <path d="M7 11v4a2 2 0 0 0 2 2h4" />
+    <rect width="8" height="8" x="13" y="13" rx="2" />
+  </g>
+  <rect class="dg-machine" x="416" y="22" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(428 34)">
+    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+  </g>
+  <rect class="dg-machine" x="626" y="22" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(638 34)">
+    <path d="M12 20v2" />
+    <path d="M12 2v2" />
+    <path d="M17 20v2" />
+    <path d="M17 2v2" />
+    <path d="M2 12h2" />
+    <path d="M2 17h2" />
+    <path d="M2 7h2" />
+    <path d="M20 12h2" />
+    <path d="M20 17h2" />
+    <path d="M20 7h2" />
+    <path d="M7 20v2" />
+    <path d="M7 2v2" />
+    <rect x="4" y="4" width="16" height="16" rx="2" />
+    <rect x="8" y="8" width="8" height="8" rx="1" />
+  </g>
+  <rect class="dg-machine" x="626" y="126" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(638 138)">
+    <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+  </g>
+
+  <!-- Labels -->
+  <text class="dg-halo" x="310" y="92">boot</text>
+  <text x="440" y="92">Session</text>
+  <text x="650" y="92">Operating system</text>
+  <text x="52" y="196">Hole app</text>
+  <text x="180" y="196">ipc</text>
+  <text x="310" y="196">ProxyManager</text>
+  <text x="650" y="196">State directory</text>
+  <text class="dg-area dg-start" x="134" y="220">Hole bridge</text>
+</svg>

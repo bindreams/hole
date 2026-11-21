@@ -1,0 +1,72 @@
+<svg class="diagram" viewBox="0 0 736 248" role="img" xmlns="http://www.w3.org/2000/svg"
+     aria-label="Apps on your computer send their traffic into the TUN device, which hands it to the Hole bridge. The bridge sends it through an encrypted tunnel, by way of a plugin when the config names one, to the Shadowsocks server, which passes it on to the internet. The Hole app controls the bridge.">
+  <!-- Glyphs: ethernet-port, puzzle, server and terminal from Lucide 1.77.0 (https://lucide.dev), ISC and MIT licences, text in _static/licenses/lucide.txt.
+       Google Chrome, WhatsApp and Steam marks from Simple Icons 16.38.0 (CC0); the marks are trademarks of their
+       owners, shown to illustrate apps a person runs. -->
+  <!-- Your computer -->
+  <rect class="dg-frame" x="12" y="8" width="446" height="232" rx="10"/>
+
+  <!-- The traffic: apps, TUN device, bridge, then the tunnel through the plugin to the server and the internet -->
+  <path class="dg-tunnel-back" d="M290 148H632V164H290Z"/>
+  <path class="dg-tunnel" d="M290 148H632V164H290Z"/>
+  <path class="dg-line" d="M148 156H632V104M632 84V78"/>
+
+  <!-- The app controls the bridge -->
+  <path class="dg-line" d="M290 76V84M290 104V132"/>
+
+  <!-- Apps -->
+  <g transform="translate(-74 44)">
+    <path class="dg-line" d="M130 70C170 70 178 112 222 112M164 98C190 98 194 112 222 112M130 126C170 126 178 112 222 112M164 154C192 154 192 112 222 112"/>
+    <rect class="dg-tile" x="102" y="56" width="28" height="28" rx="6.5" fill="#ffffff"/>
+    <g transform="translate(108 62) scale(.6667)"><path fill="#4285F4" d="M12 0C8.21 0 4.831 1.757 2.632 4.501l3.953 6.848A5.454 5.454 0 0 1 12 6.545h10.691A12 12 0 0 0 12 0zM1.931 5.47A11.943 11.943 0 0 0 0 12c0 6.012 4.42 10.991 10.189 11.864l3.953-6.847a5.45 5.45 0 0 1-6.865-2.29zm13.342 2.166a5.446 5.446 0 0 1 1.45 7.09l.002.001h-.002l-5.344 9.257c.206.01.413.016.621.016 6.627 0 12-5.373 12-12 0-1.54-.29-3.011-.818-4.364zM12 16.364a4.364 4.364 0 1 1 0-8.728 4.364 4.364 0 0 1 0 8.728Z"/></g>
+    <rect class="dg-tile" x="136" y="84" width="28" height="28" rx="6.5" fill="#25D366"/>
+    <g transform="translate(142 90) scale(.6667)"><path fill="#ffffff" d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413Z"/></g>
+    <rect class="dg-tile" x="102" y="112" width="28" height="28" rx="6.5" fill="#1b2838"/>
+    <g transform="translate(108 118) scale(.6667)"><path fill="#ffffff" d="M11.979 0C5.678 0 .511 4.86.022 11.037l6.432 2.658c.545-.371 1.203-.59 1.912-.59.063 0 .125.004.188.006l2.861-4.142V8.91c0-2.495 2.028-4.524 4.524-4.524 2.494 0 4.524 2.031 4.524 4.527s-2.03 4.525-4.524 4.525h-.105l-4.076 2.911c0 .052.004.105.004.159 0 1.875-1.515 3.396-3.39 3.396-1.635 0-3.016-1.173-3.331-2.727L.436 15.27C1.862 20.307 6.486 24 11.979 24c6.627 0 11.999-5.373 11.999-12S18.605 0 11.979 0zM7.54 18.21l-1.473-.61c.262.543.714.999 1.314 1.25 1.297.539 2.793-.076 3.332-1.375.263-.63.264-1.319.005-1.949s-.75-1.121-1.377-1.383c-.624-.26-1.29-.249-1.878-.03l1.523.63c.956.4 1.409 1.5 1.009 2.455-.397.957-1.497 1.41-2.454 1.012H7.54zm11.415-9.303c0-1.662-1.353-3.015-3.015-3.015-1.665 0-3.015 1.353-3.015 3.015 0 1.665 1.35 3.015 3.015 3.015 1.663 0 3.015-1.35 3.015-3.015zm-5.273-.005c0-1.252 1.013-2.266 2.265-2.266 1.249 0 2.266 1.014 2.266 2.266 0 1.251-1.017 2.265-2.266 2.265-1.253 0-2.265-1.014-2.265-2.265z"/></g>
+    <rect class="dg-tile" x="136" y="140" width="28" height="28" rx="6.5" fill="#1e1e1e"/>
+    <g transform="translate(142 146) scale(.6667)"><path class="dg-glyph-light" d="M12 19h8M4 17l6-6-6-6"/></g>
+  </g>
+
+  <!-- TUN device -->
+  <rect class="dg-machine" x="144" y="132" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(156 144)">
+    <path d="M10 8v1" />
+    <path d="M14 8v1" />
+    <path d="M18 8v1" />
+    <path d="M19 17a2 2 0 00-1.765 1.059l-.47.882A2 2 0 0115 20H9a2 2 0 01-1.765-1.059l-.47-.882A2 2 0 005 17H4a2 2 0 01-2-2V6a2 2 0 012-2h16a2 2 0 012 2v9a2 2 0 01-2 2z" />
+    <path d="M6 8v1" />
+  </g>
+
+  <!-- Hole: one program, running as the app and as the bridge -->
+  <image href="_static/icon-macos.svg" x="266" y="28" width="48" height="48"/>
+  <rect class="dg-tile" x="266" y="28" width="48" height="48" rx="10.8" fill="none"/>
+  <image href="_static/icon-macos.svg" x="266" y="132" width="48" height="48"/>
+  <rect class="dg-tile" x="266" y="132" width="48" height="48" rx="10.8" fill="none"/>
+
+  <!-- Plugin: dashed, because a config does not have to name one -->
+  <rect class="dg-machine dg-optional" x="380" y="132" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(392 144)">
+    <path d="M15.39 4.39a1 1 0 0 0 1.68-.474 2.5 2.5 0 1 1 3.014 3.015 1 1 0 0 0-.474 1.68l1.683 1.682a2.414 2.414 0 0 1 0 3.414L19.61 15.39a1 1 0 0 1-1.68-.474 2.5 2.5 0 1 0-3.014 3.015 1 1 0 0 1 .474 1.68l-1.683 1.682a2.414 2.414 0 0 1-3.414 0L8.61 19.61a1 1 0 0 0-1.68.474 2.5 2.5 0 1 1-3.014-3.015 1 1 0 0 0 .474-1.68l-1.683-1.682a2.414 2.414 0 0 1 0-3.414L4.39 8.61a1 1 0 0 1 1.68.474 2.5 2.5 0 1 0 3.014-3.015 1 1 0 0 1-.474-1.68l1.683-1.682a2.414 2.414 0 0 1 3.414 0z" />
+  </g>
+
+  <!-- Server -->
+  <rect class="dg-machine" x="608" y="132" width="48" height="48" rx="10.8"/>
+  <g class="dg-icon" transform="translate(620 144)">
+    <rect width="20" height="8" x="2" y="2" rx="2" ry="2" />
+    <rect width="20" height="8" x="2" y="14" rx="2" ry="2" />
+    <line x1="6" x2="6.01" y1="6" y2="6" />
+    <line x1="6" x2="6.01" y1="18" y2="18" />
+  </g>
+
+  <!-- Internet -->
+  <path class="dg-machine" transform="translate(-36 8)" d="M636 70a16 16 0 0 1 -2 -31.9a22 22 0 0 1 42 -9a17 17 0 0 1 26 14a13.5 13.5 0 0 1 -2 26.9z"/>
+
+  <!-- Labels: each centred under its object. A line stops short of a label it would cross. -->
+  <text class="dg-halo" x="290" y="98">Hole app</text>
+  <text class="dg-halo" x="632" y="98">Internet</text>
+  <text x="168" y="202">TUN device</text>
+  <text x="290" y="202">Hole bridge</text>
+  <text x="404" y="202">Plugin</text>
+  <text x="632" y="202">Shadowsocks server</text>
+  <text class="dg-area" x="235" y="226">Your computer</text>
+</svg>
