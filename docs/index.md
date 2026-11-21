@@ -94,7 +94,7 @@ caption: Contributing
 hidden:
 ---
 Contributing <contributing/index.md>
-Set up and build <contributing/setup.md>
+Setup and first build <contributing/setup.md>
 The workspace <contributing/workspace.md>
 Architecture overview <contributing/architecture/overview.md>
 The kill switch <contributing/architecture/kill-switch.md>

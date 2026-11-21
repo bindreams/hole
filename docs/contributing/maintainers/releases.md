@@ -1,8 +1,8 @@
 # Releasing
 
-Hole is released as four independent products, each with its own version, tag and GitHub release. This page is for the
-person who cuts one: what a release ships, the two workflows that make it, and what each checks before it lets the
-release through. Withdrawing a defective one is [Withdrawing a release](withdrawal.md).
+Hole is released as four independent products, each with its own version, tag and GitHub release. Two workflows make a
+release, and each checks it before letting it through. Withdrawing a defective one is [Withdrawing a
+release](withdrawal.md).
 
 ## The four tracks
 

@@ -1,8 +1,7 @@
 # System tools and absolute paths
 
-The {term}`bridge` runs as root or SYSTEM and starts operating-system tools: `route`, `netsh`, `pfctl` and others. It never
-names one by a bare program name. This page covers how a spawn is built, what the compiler refuses, and how the same rule
-reaches plugins. It is for a developer who needs the bridge to run a new tool.
+The {term}`bridge` runs as root or SYSTEM and starts operating-system tools: `route`, `netsh`, `pfctl` and others. It
+never names one by a bare program name, and the same rule reaches plugins.
 
 ## Why a bare name is not allowed
 

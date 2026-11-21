@@ -1,9 +1,9 @@
 # Signing keys
 
 Every `hole` release's `SHA256SUMS` is signed with a [minisign](https://jedisct1.github.io/minisign/) key, and an
-installed copy of Hole accepts an update only if it is signed by a key that copy was built with. This page covers
-making a key pair and keeping it. Replacing the key in use is a separate procedure with an order that matters:
-[Rotating the signing key](minisign-key-rotation.md), which also lists every place the public key appears.
+installed copy of Hole accepts an update only if it is signed by a key that copy was built with. Replacing the key in
+use is a separate procedure with an order that matters: [Rotating the signing key](minisign-key-rotation.md), which also
+lists every place the public key appears.
 
 ## Making a key pair
 

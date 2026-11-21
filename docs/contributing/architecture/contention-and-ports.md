@@ -1,8 +1,7 @@
 # Spawn contention and port allocation
 
 Two small pieces of infrastructure absorb things the operating system does to a process that did nothing wrong: another
-program holding a freshly built executable, and a port that is free to ask for and then refused. This page covers both, and
-the rule for adding a new use of either. It is for a developer who spawns a child process or needs a free port.
+program holding a freshly built executable, and a port that is free to ask for and then refused.
 
 ## Spawn contention
 

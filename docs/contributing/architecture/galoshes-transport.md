@@ -2,8 +2,9 @@
 
 {term}`galoshes` puts every TCP connection and UDP exchange of a client onto streams of one {term}`yamux` connection to
 the server, and the embedded {term}`ex-ray` carries that one connection. One connection means one point of failure, so
-the yamux client in {src}`crates/galoshes/src/yamux.rs` has to notice when the connection is dead and replace it, and the
-tunnel must not hang meanwhile. This page covers how it does that, and the one option galoshes sets on ex-ray. The user-level summary is in [Shadowsocks and its
+the yamux client in {src}`crates/galoshes/src/yamux.rs` has to notice when the connection is dead and replace it, and
+the tunnel must not hang meanwhile. galoshes also sets one option on the embedded ex-ray ([the mux
+default](#the-mux-default)). The user-level summary is in [Shadowsocks and its
 plugins](../../how-it-works/plugins.md#galoshes).
 
 ## A session and its listeners

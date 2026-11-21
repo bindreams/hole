@@ -1,10 +1,10 @@
 # Windows service stop reporting
 
-When Windows stops the {term}`bridge` service, the Service Control Manager (SCM) waits for the service to report that it has
-stopped. A bridge that is stuck mid-teardown looks the same as one that is slow, unless it says where it is. This page covers
-how the service reports its progress through a stop, so a hang points at a step. It is for a developer who adds a teardown
-step, or who is debugging a wedged stop. The uninstall's side of the same stop, waiting it out, is under [the Windows service
-stop](kill-switch-uninstall.md#the-windows-service-stop). Only Windows CI exercises the SCM side.
+When Windows stops the {term}`bridge` service, the Service Control Manager (SCM) waits for the service to report that it
+has stopped. A bridge that is stuck mid-teardown looks the same as one that is slow, unless it says where it is. So the
+service reports its progress through a stop, and a hang points at a step. The uninstall's side of the same stop, waiting
+it out, is under [the Windows service stop](kill-switch-uninstall.md#the-windows-service-stop). Only Windows CI
+exercises the SCM side.
 
 ## Phases and checkpoints
 

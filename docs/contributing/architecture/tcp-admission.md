@@ -94,6 +94,6 @@ only silence in answer to the probes resets the socket to `Closed`, where the di
 are in {src}`crates/tun-engine/src/engine/config.rs`; the timeout default is the floor RFC 5382 REQ-5 sets for a
 transitory connection, and the interval is a quarter of it.
 
-## Read next
+## Related pages
 
 - [The TUN device](tun-device.md): the device the packet loop reads.

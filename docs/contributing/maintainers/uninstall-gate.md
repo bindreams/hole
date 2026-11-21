@@ -1,9 +1,9 @@
 # When an uninstall refuses to complete
 
 On Windows the MSI's `BridgeRelease` custom action releases every fail-closed {term}`cover` and turns the {term}`kill switch` off before the uninstaller deletes `hole.exe`. It is the one uninstall action whose failure aborts the uninstall
-(`Return="check"`), because the kill switch's filters are persistent: leaving them behind would be a host that stays blocked with no binary
-left to remove them. [Uninstall and the service](../architecture/kill-switch-uninstall.md) has the
-mechanism. This page is for the person whose uninstall stopped there.
+(`Return="check"`), because the kill switch's filters are persistent: leaving them behind would be a host that stays
+blocked with no binary left to remove them. [Uninstall and the service](../architecture/kill-switch-uninstall.md) has
+the mechanism.
 
 An uninstall that aborts at `BridgeRelease` is the gate working. Fix the cause first. The release talks to the Base
 Filtering Engine through `hole.exe`, so it fails when either is out of reach:

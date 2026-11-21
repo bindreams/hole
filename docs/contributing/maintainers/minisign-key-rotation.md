@@ -1,8 +1,7 @@
 # Rotating the signing key
 
-Every `hole` release's `SHA256SUMS` is signed with a minisign key ([Releasing](releases.md)). This page is the order in
-which to replace that key, and why the order matters: an installed copy of Hole trusts only the public key it was built
-with.
+Every `hole` release's `SHA256SUMS` is signed with a minisign key ([Releasing](releases.md)). Replacing that key has to
+be done in a fixed order, because an installed copy of Hole trusts only the public key it was built with.
 
 ## Who checks what
 

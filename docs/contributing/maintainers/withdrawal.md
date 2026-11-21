@@ -104,7 +104,7 @@ Of the `hole` banner's template, `garter` has no platforms to name (omit `on <pl
 
 Withdraw the version from crates.io, and put the caution banner on its GitHub release. The release is not deleted.
 `cargo yank` needs a crates.io token of a `garter` owner (`cargo login`); CI publishes with trusted publishing and holds
-none ([Publishing garter](garter-crates-io.md#how-it-publishes)).
+none ([Publishing garter](garter-crates-io.md#how-the-workflow-publishes)).
 
 ```sh
 cargo yank --version <X.Y.Z> garter

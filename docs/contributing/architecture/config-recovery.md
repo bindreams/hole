@@ -1,9 +1,7 @@
 # Config corruption recovery
 
-The app keeps the user's servers, passwords and settings in `config.json`. This page covers what the app does when that
-file cannot be read, and the one rule that keeps a bad read from becoming data loss. It is for a developer who changes how
-the config is loaded or saved. The config belongs to the unprivileged app; the bridge's records are a different matter
-([crash recovery](crash-recovery.md)).
+The app keeps the user's servers, passwords and settings in `config.json`. The config belongs to the unprivileged app;
+the bridge's records are a different matter ([crash recovery](crash-recovery.md)).
 
 ## One door
 

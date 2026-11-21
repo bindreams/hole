@@ -1,8 +1,7 @@
 # Architecture overview
 
-Hole is one Rust binary, `hole`, that runs as two programs. This page names the layers inside it, what a connect
-touches, and the three trait seams that keep operating-system changes out of unit tests. It is for a developer who knows
-Rust and not necessarily VPNs. The user-level picture is in [How Hole is put together](../../how-it-works/overview.md).
+Hole is one Rust binary, `hole`, that runs as two programs. The user-level picture is in [How Hole is put
+together](../../how-it-works/overview.md).
 
 ## Two modes, one binary
 

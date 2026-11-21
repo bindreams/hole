@@ -1,14 +1,11 @@
 # Contributing
 
-This section is for people who build, change and test Hole. It starts from a clean machine and ends at a change you can
-test and submit.
-
 Hole is a Rust workspace with a Go plugin ({term}`ex-ray`) and a TypeScript front end. One task runner, `cargo xtask`,
 drives the builds and the test runs.
 
-## Start here
+## Reading order
 
-1. [Set up and build](setup.md): install the tools, then build and test once.
+1. [Setup and first build](setup.md): install the tools, then build and test once.
 1. [The workspace](workspace.md): what each directory holds, and how {term}`galoshes` carries ex-ray.
 1. [Development](development.md): run Hole from a checkout, with the bridge elevated and the front end hot-reloading.
 1. [Testing](testing.md): run the tests, and the rules every test follows.

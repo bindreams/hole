@@ -1,11 +1,9 @@
 # Native crashes and test panics
 
-A Rust panic runs the panic hook, which logs it. A native fault does not: a segmentation fault or access violation, a stack
-overflow, `abort()`, an illegal instruction, heap corruption. The process just ends, and the log says nothing. The
-`tombstone` crate ({src}`crates/tombstone/`) closes that gap by leaving a {term}`crash marker`, and the next start reports
-it. This page covers what the marker is, what the handler may and may not do, and what each platform produces. It also
-covers the panic-dump hook that tests use. It is for a developer who touches crash handling, or who wonders why a macOS
-crash leaves no crash report.
+A Rust panic runs the panic hook, which logs it. A native fault does not: a segmentation fault or access violation, a
+stack overflow, `abort()`, an illegal instruction, heap corruption. The process just ends, and the log says nothing. The
+`tombstone` crate ({src}`crates/tombstone/`) closes that gap by leaving a {term}`crash marker`, and the next start
+reports it.
 
 ## The marker
 

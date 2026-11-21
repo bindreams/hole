@@ -1,10 +1,8 @@
 # Route commands and what failing means
 
 The {term}`bridge` points the machine's routes at the {term}`TUN` device by running the platform's `route` and `netsh`
-tools. Whether a failed command stops what is running is a security decision, and the code makes it by type. This page
-is for a developer who changes route install, teardown or recovery. It assumes [the architecture
-overview](overview.md). Which routes Hole may delete is a separate question, answered in [route
-ownership](route-ownership.md).
+tools. Whether a failed command stops what is running is a security decision, and the code makes it by type. Which
+routes Hole may delete is a separate question, answered in [route ownership](route-ownership.md).
 
 ## Two runners
 

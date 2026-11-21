@@ -1,9 +1,8 @@
 # Testing
 
-This page covers how to run Hole's tests, the rules a test follows, and what to check when a test fails only on Windows.
-How CI runs them is on [Continuous integration](ci.md).
+How CI runs the tests is on [Continuous integration](ci.md).
 
-## Run the tests
+## Running the tests
 
 Rust tests use [skuld](https://github.com/bindreams/skuld): write `#[skuld::test]`, not `#[test]` (a pre-commit hook
 rejects a bare one). A module's tests live in a sibling file: `foo.rs` has `foo_tests.rs`.
