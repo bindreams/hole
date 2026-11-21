@@ -43,3 +43,6 @@ html_theme = "furo"
 # The app icons are published too: the overview diagram shows Hole's own.
 html_static_path = ["_static", "../crates/hole/icons"]
 html_css_files = ["diagrams.css"]
+
+# The extension's default is a fixed 500px box, which pads a wide diagram and squeezes a tall one.
+mermaid_height = "auto"
