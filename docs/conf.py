@@ -40,3 +40,6 @@ extlinks = {"src": (f"https://github.com/bindreams/hole/blob/{source_ref}/%s", "
 exclude_patterns = ["_build"]
 
 html_theme = "furo"
+# The app icons are published too: the overview diagram shows Hole's own.
+html_static_path = ["_static", "../crates/hole/icons"]
+html_css_files = ["diagrams.css"]
