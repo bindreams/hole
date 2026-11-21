@@ -1,10 +1,9 @@
 # Windows: filters and the boot window
 
 The Windows cover is a set of filters in the Windows Filtering Platform (WFP), written by
-{src}`crates/tun-engine/src/routing/failclosed/windows.rs`. This page is the long reference for it: the filter set, the
-weight arbitration, and the part that needs argument, covering the window between the kernel starting and the Base
-Filtering Engine (BFE) starting. The module doc of that file is only a short summary that points here. It assumes [the
-kill switch](kill-switch.md).
+{src}`crates/tun-engine/src/routing/failclosed/windows.rs`, whose module doc is a short summary of what follows. The
+part that needs argument is the window between the kernel starting and the Base Filtering Engine (BFE) starting. The
+terms are defined in [the kill switch](kill-switch.md#vocabulary).
 
 ## The filter set
 

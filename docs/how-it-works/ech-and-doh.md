@@ -3,8 +3,7 @@
 When a client opens a TLS connection, the first message it sends, the ClientHello, normally carries the name of the
 server it wants to reach in the clear, as the server name indication ({term}`SNI`). Anyone watching the network can read
 it. For a proxy that is a problem: the name of the server's domain is visible, and a network that wants to block the
-proxy can block that name. This page covers the two techniques Hole uses so that the name is not exposed, {term}`ECH`
-and {term}`DoH`.
+proxy can block that name. Hole uses two techniques so that the name is not exposed: {term}`ECH` and {term}`DoH`.
 
 ## ECH hides the server's name
 

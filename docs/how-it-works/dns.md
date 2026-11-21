@@ -1,11 +1,9 @@
 # DNS through the tunnel
 
 A DNS lookup turns a name into an address, and it is the part of browsing that most obviously gives you away: the
-network you are on sees every name you ask for. It is also the part a tunnel most easily breaks. This page explains how
-Hole carries your lookups through the tunnel, what it changes on the machine to do so, and what it checks before it
-does.
+network you are on sees every name you ask for. It is also the part a tunnel most easily breaks.
 
-## The problem
+## Why Hole answers DNS itself
 
 Two things go wrong if Hole leaves DNS alone. The lookups go to whatever resolver the network handed out, and that
 resolver, and anyone watching the path to it, learns what you browse. And ordinary DNS is UDP, which [the UDP rule](udp.md)
@@ -75,7 +73,7 @@ your own DNS configuration is read or changed.
 
 On both platforms a failure to set this up fails the connection.
 
-## What Hole checks first
+## The test lookup before a connection
 
 Before it opens the TUN device, installs any route or touches any DNS setting, the bridge sends one test lookup,
 `example.com`, through the forwarder and the proxy. If the lookup is not answered, the connection fails with an error

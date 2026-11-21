@@ -1,8 +1,7 @@
 # The TUN device and the routes
 
 Hole captures traffic with a {term}`TUN` device, a virtual network adapter that the {term}`bridge` creates for the
-length of a connection. This page explains why, how the operating system is made to use it, and what happens to a
-connection once it arrives.
+length of a connection.
 
 ## Why not a system proxy
 

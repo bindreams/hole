@@ -5,14 +5,14 @@ carry on, now unencrypted and visible to the network, and nothing tells you. A {
 while it is in force, traffic that would leave the machine outside the tunnel is blocked instead of sent. Hole's kill
 switch is the **Lockdown** item in the tray menu. It is off by default.
 
-## What it is
+## A block in the operating system's firewall
 
-The kill switch is a rule in the operating system's own firewall, installed by the {term}`bridge`, and not a check
-inside Hole's own code. That is the point: a rule in the firewall stays in force if Hole stops, crashes or is being
-updated, which a check in a program that is not running cannot do. Windows holds it as persistent filters in the Windows
-Filtering Platform; macOS holds it as a ruleset that Hole loads into the `pf` packet filter.
+The kill switch is a block in the operating system's own firewall, installed by the {term}`bridge`. It is not a check
+inside Hole: a firewall rule stays in force when Hole stops, crashes or is being updated, and a check in a program that
+is not running does nothing. Windows holds the block as persistent filters in the Windows Filtering Platform; macOS
+holds it as a ruleset that Hole loads into the `pf` packet filter.
 
-While the rule is in force, an outgoing connection is allowed only if it is one of these:
+While the block is in force, an outgoing connection is allowed only if it is one of these:
 
 - traffic to the machine itself (loopback);
 - traffic through Hole's own {term}`TUN` device, so [everything the tunnel carries](tun.md) flows normally;
@@ -23,10 +23,10 @@ While the rule is in force, an outgoing connection is allowed only if it is one 
   That includes the connections the bridge opens for a **Bypass** rule, so on Windows Bypass traffic still leaves. macOS
   cannot tell programs apart, so there a Bypass rule's traffic is blocked like the rest.
 
-Everything else is blocked, and that includes devices on your local network, such as a printer or a file server. The rule
-stops connections leaving the machine and sets no rule against incoming ones.
+Everything else is blocked, and that includes devices on your local network, such as a printer or a file server. The
+block stops connections leaving the machine and does nothing about incoming ones.
 
-## When it is in force
+## When the block is in force
 
 Ticking **Lockdown** records a preference, which the bridge keeps across disconnects and restarts. The block is not
 installed until Hole next connects. During a connect, it goes up right after the routes, before DNS is pointed at the
@@ -34,9 +34,9 @@ tunnel. If you tick Lockdown while connected, nothing is blocked yet: the block 
 
 A connect in SOCKS-only mode has no tunnel, so it installs no block and does not refresh one that is already in force.
 
-After that, what happens to the block depends on whether you or Hole decided to disconnect. The last column names the
-row of the contributor reference's [transition table](../contributing/architecture/kill-switch.md#transitions) that
-holds the exact rule.
+After that, what happens to the block depends on whether you or Hole decided to disconnect. The **Rule** column names
+the row of the contributor reference's [transition table](../contributing/architecture/kill-switch.md#transitions) that
+states the case exactly.
 
 | What happens                                                         | The block                                                                                                                 | Rule        |
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------- |
@@ -61,32 +61,42 @@ does.
 
 Four rows read against what a kill switch is for: a failed connect lifts the block, Disconnect with no connection
 running leaves it, **Unblock Network** does not disconnect although its label says it does, and a start with **Do not
-connect** lifts it. This is what the code does today and not a mistake in how you read the table. Open issues sit behind
-the last three: [#1295](https://github.com/bindreams/hole/issues/1295),
-[#1282](https://github.com/bindreams/hole/issues/1282) and [#1294](https://github.com/bindreams/hole/issues/1294).
+connect** lifts it. Hole does all four today. Open issues track the last three:
+[#1295](https://github.com/bindreams/hole/issues/1295), [#1282](https://github.com/bindreams/hole/issues/1282) and
+[#1294](https://github.com/bindreams/hole/issues/1294).
 
 On macOS, a connection that restarts under the block has to look the server up again, and the block there lets through
 only TCP to the server's address. When the server is given by name the lookup can fail, the restart then fails, and the
 block stays until you choose **Unblock Network**.
 
+``````{important}
 If you are left with a block, choose **Unblock Network** in the tray. When the app cannot reach the bridge, stop the
-bridge service and then run `hole bridge unlock` (see the [command reference](../reference/cli.md)):
+bridge service and run [`hole bridge unlock`](../reference/cli.md#hole-bridge-unlock) as an administrator:
 
-````{tab-set}
+`````{tab-set}
 ---
 sync-group: os
 ---
-```{tab-item} Windows
+````{tab-item} Windows
 :sync: windows
 
-In an elevated PowerShell, run `Stop-Service -Name HoleBridge -Force`, then `hole bridge unlock`.
-```
-```{tab-item} macOS
-:sync: macos
-
-Run `sudo launchctl bootout system/com.hole.bridge`, then `sudo hole bridge unlock`.
+```powershell
+Stop-Service -Name HoleBridge -Force
+hole bridge unlock
 ```
 ````
+````{tab-item} macOS
+:sync: macos
+
+```sh
+sudo launchctl bootout system/com.hole.bridge
+sudo /Applications/Hole.app/Contents/MacOS/hole bridge unlock
+```
+````
+`````
+
+[Restoring internet access](../getting-started/troubleshooting.md#restoring-internet-access) has the whole procedure.
+``````
 
 ## What the block does not do
 
@@ -94,9 +104,8 @@ A connection that the list permits is not inspected: the server connection
 leaves outside the tunnel by design, and on Windows the programs of Hole itself are trusted to behave. It also protects
 only the computer it runs on, and only outgoing traffic.
 
-The contributor reference covers the rest in detail: the platform differences, how the block and the tunnel are
-reconciled toward the state you last asked for, and the cases in which a block outlives a connection.
-See [the kill switch](../contributing/architecture/kill-switch.md).
+The [contributor reference](../contributing/architecture/kill-switch.md) has the platform differences, how the block
+and the tunnel are reconciled toward the state you last asked for, and the cases in which a block outlives a connection.
 
 ```{dropdown} Where in the code
 The permitted set: `Routing::install_lockdown` in {src}`crates/tun-engine/src/routing.rs` and the platform code under

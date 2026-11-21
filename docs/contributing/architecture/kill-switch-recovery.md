@@ -1,9 +1,9 @@
 # Recovery, adoption and the cover lock
 
 The standing cover outlives the process that installed it, so a new bridge starts into a host that may already be
-blocked, and nothing in memory says whether that is wanted. This page covers what the bridge does about it at startup,
-the claim an adopted cover leaves in the process, and the lock that serialises every change to a cover. It assumes
-[the kill switch](kill-switch.md).
+blocked, and nothing in memory says whether that is wanted. At startup the bridge measures what is there and decides
+whether to keep it; a cover it keeps leaves a claim in the process, and one lock serialises every change to a cover. The
+terms are defined in [the kill switch](kill-switch.md#vocabulary).
 
 ## What a startup measures and reads
 

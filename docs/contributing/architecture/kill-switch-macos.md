@@ -3,7 +3,7 @@
 On macOS the cover is a pf ruleset that the bridge loads by running `pfctl`, because pf has no programmatic API and
 `pfctl` text I/O is the interface. It lives in {src}`crates/tun-engine/src/routing/failclosed/macos.rs`, whose module doc
 is the reference for each pf argument: it names the constant or function that owns every claim and the test that holds
-it. This page is the shape of it. It assumes [the kill switch](kill-switch.md).
+it. The terms are defined in [the kill switch](kill-switch.md#vocabulary).
 
 ## The ruleset
 
@@ -34,7 +34,7 @@ block drop out quick all label "hole-lockdown"
   cannot produce `Live`.
 - Neither ruleset carries a `block in`, so the cover blocks outgoing traffic only.
 
-### Loopback twice, and `no state`
+### Two loopback exemptions, and `no state` on every permit
 
 Loopback is exempted by `set skip on lo0` and by explicit `pass` rules, and both are mandatory. `pfctl` clears every
 interface's skip flag at the start of a load, before it parses and before the rules commit, so across that span loopback
