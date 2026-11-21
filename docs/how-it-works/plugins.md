@@ -1,8 +1,7 @@
 # Shadowsocks and its plugins
 
 Everything Hole proxies leaves the machine through a {term}`Shadowsocks` client that runs inside the {term}`bridge`.
-This page describes that client, the {term}`SIP003 plugin` that can sit between it and the server, and the two plugins
-Hole ships.
+A {term}`SIP003 plugin` can sit between that client and the server, and Hole ships two.
 
 ## The Shadowsocks client
 

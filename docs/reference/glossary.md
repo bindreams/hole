@@ -89,7 +89,7 @@ reachability check
 self-test
   The check the {term}`bridge` runs before it opens the {term}`TUN` device: one test DNS lookup, sent through the
   {term}`DNS forwarder` and the proxy. Hole reports "Connected" only once it is answered. It runs only with the forwarder
-  on. See [DNS through the tunnel](../how-it-works/dns.md#what-hole-checks-first).
+  on. See [DNS through the tunnel](../how-it-works/dns.md#the-test-lookup-before-a-connection).
 
 SNI
   Server Name Indication: the name of the server a client wants to reach, which a TLS handshake normally sends unencrypted.

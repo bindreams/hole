@@ -3,9 +3,8 @@
 A persistent cover has one sharp consequence: if Hole is uninstalled while the cover is in force, nothing is left that
 can remove it. On Windows the filters are persistent, BFE re-adds them every boot, nothing shipped with Windows takes
 them off (`netsh wfp` has no delete verb), and the uninstaller is about to delete the only binary that could. So the
-uninstall releases the covers first, and most of this page is the care taken to make that release safe and to make it
-tell the truth. It assumes [the kill switch](kill-switch.md). From [The Windows service stop](#the-windows-service-stop) on, the page is
-about the service's lifecycle and not about the cover; stop before it if your question is the kill switch.
+uninstall releases the covers first, and takes care that the release is safe and that what it reports is true. The
+terms are defined in [the kill switch](kill-switch.md#vocabulary).
 
 ## The three releases
 

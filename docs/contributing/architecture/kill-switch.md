@@ -1,9 +1,7 @@
 # The kill switch
 
 The {term}`kill switch` is an operating-system firewall rule that the {term}`bridge` installs and that outlives the
-bridge process. This page describes what the code does: what the rule permits, what puts it up and takes it down, which
-decisions are made where, and the behaviours that are under question today. The user's view of the same feature is
-[The kill switch](../../how-it-works/kill-switch.md).
+bridge process. The user's view of it is [The kill switch](../../how-it-works/kill-switch.md).
 
 ## Summary
 
@@ -157,8 +155,7 @@ previous run cannot survive the engage; the persistent block-all stays in force 
 
 ## Transitions
 
-This section is the one statement of what happens to a cover, event by event. The other pages name a row by its number
-and add nothing to it. Up to four inputs decide a row (the effective intent, the target, the presence and the startup
+Each row is one event and what it does to a cover. The other pages name a row by its number. Up to four inputs decide a row (the effective intent, the target, the presence and the startup
 preference); the row names the ones that matter. Where the platforms differ, the cell says so.
 
 | #       | Event                                                                                                                                                    | What decides it                                                                                                                                                                              | The cover afterwards                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
@@ -288,21 +285,29 @@ sits in front of the release, and in whether the records move before or after it
 action, which cannot work when the app cannot reach the bridge ([#1278](https://github.com/bindreams/hole/issues/1278)).
 In that case stop the service first, then run `unlock`:
 
-````{tab-set}
+`````{tab-set}
 ---
 sync-group: os
 ---
-```{tab-item} Windows
+````{tab-item} Windows
 :sync: windows
 
-Run `Stop-Service -Name HoleBridge -Force` in an elevated PowerShell, then `hole bridge unlock` as administrator.
-```
-```{tab-item} macOS
-:sync: macos
+In PowerShell run as administrator:
 
-Run `sudo launchctl bootout system/com.hole.bridge`, then `sudo hole bridge unlock`.
+```powershell
+Stop-Service -Name HoleBridge -Force
+hole bridge unlock
 ```
 ````
+````{tab-item} macOS
+:sync: macos
+
+```sh
+sudo launchctl bootout system/com.hole.bridge
+sudo /Applications/Hole.app/Contents/MacOS/hole bridge unlock
+```
+````
+`````
 
 ## The release contract
 
@@ -400,7 +405,7 @@ named under that table.
   can sweep or overwrite the other's cover ([#878](https://github.com/bindreams/hole/issues/878)).
 ```
 
-## Read next
+## Related pages
 
 - [Recovery, adoption and the cover lock](kill-switch-recovery.md): what the bridge does at startup, and what keeps two
   mutations of a cover from overlapping.

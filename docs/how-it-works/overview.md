@@ -1,8 +1,6 @@
 # How Hole is put together
 
-Hole is one program that runs in two modes, and the split between them explains most of how it behaves. This page
-introduces the two halves and walks through what happens between a click on **Connect** and the first byte through the
-tunnel. The pages after it zoom in on the parts.
+Hole is one program that runs in two modes, and the split between them explains most of how it behaves.
 
 ## Two modes
 

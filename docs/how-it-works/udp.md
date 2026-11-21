@@ -2,7 +2,7 @@
 
 Hole is a {term}`VPN client`, and one rule follows from that. When a UDP flow is supposed to go through the proxy and the
 connection to the server cannot carry UDP, Hole **drops** the flow. It does not send it around the tunnel to its
-destination, even though that would make the application work. This page explains the rule and who it affects.
+destination, even though that would make the application work.
 
 ## The rule
 
@@ -41,17 +41,17 @@ Hole does not guess from the plugin's name. Each plugin reports the transports i
 uses that report. The dashboard shows the result as the **UDP proxy** dot, red when UDP is unavailable on the current
 connection.
 
-## What you notice
+## What stops working
 
 With a TCP-only plugin, anything that is proxied and needs UDP stops working, and anything that can fall back to TCP
 does. A web browser that tries HTTP/3 over UDP falls back to ordinary HTTPS over TCP; a voice call, a game or a service
 with no TCP alternative does not connect. With the default settings DNS is not affected, because the forwarder carries it over TCP.
 
-If an application has to work without a UDP-capable plugin, there are two ways, and both are yours to choose:
+If an application has to work without a UDP-capable plugin, there are two ways:
 
 - Use a server and a client that run {term}`galoshes`. It carries UDP through the tunnel.
-- Add a **Bypass** rule for the destination. The traffic then goes outside the tunnel, with all that implies. It is
-  your decision to make, for a destination you choose, not a fallback Hole takes for you.
+- Add a **Bypass** rule for the destination. That traffic then leaves outside the tunnel, where the network can see it,
+  and only for the destinations you chose.
 
 ```{dropdown} Where in the code
 The cascade is `HoleRouter::resolve_endpoint` in {src}`crates/bridge/src/hole_router.rs`; the capability comes from the

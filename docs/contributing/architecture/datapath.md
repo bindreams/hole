@@ -70,7 +70,7 @@ Hole is a {term}`VPN client`. A flow whose decision is `Proxy` has to leave thro
 when the plugin on the connection to the server carries only TCP. The cascade drops it. It never falls back to the
 `bypass` endpoint, because that would send the flow to its destination outside the encrypted tunnel. Do not "fix" a
 failing UDP application by cascading to `InterfaceEndpoint`: the drop is the product's behaviour, and the user-facing
-escape (a Bypass rule the user writes) is in [the how-it-works page](../../how-it-works/udp.md#what-you-notice).
+escape (a Bypass rule the user writes) is in [the how-it-works page](../../how-it-works/udp.md#what-stops-working).
 
 Where `supports_udp` comes from for the proxy endpoint:
 
