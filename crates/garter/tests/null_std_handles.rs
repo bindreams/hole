@@ -1,9 +1,9 @@
 //! A Windows service has no standard handles, and neither has a GUI-subsystem program
 //! nobody redirected: `GetStdHandle` answers null for all three. Hole's bridge is both.
 //! It starts every plugin through `BinaryPlugin`, which pipes the plugin's stdout and
-//! stderr and leaves its stdin to inherit, so the plugin inherits a null handle. A spawn
-//! that cannot pass "nothing" on fails there and nowhere else: every other test in this
-//! package hosts its plugins in the test process, whose handles the test runner supplied.
+//! stderr and gives it a null stdin, so no slot is left to inherit the host's null handle.
+//! A spawn that has to pass "nothing" on fails there and nowhere else: every other test in
+//! this package hosts its plugins in the test process, whose handles the test runner supplied.
 //!
 //! So the plugin here is hosted by a helper that nulls its own three handles first
 //! (`MOCK_PLUGIN_NULL_STD_HOST`, src/bin/mock-plugin.rs) and then starts a plugin
