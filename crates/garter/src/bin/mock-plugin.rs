@@ -255,6 +255,51 @@ async fn run_hygiene_grandchild(
     Ok(())
 }
 
+/// Stand in for a host with no standard handles, which is what a Windows service and a
+/// GUI-subsystem program are: null this process's three, run ourselves as a plugin
+/// through garter's own spawn, and report on the control channel how the start ended,
+/// in one line: `ready`, or the error `run` returned.
+#[cfg(windows)]
+async fn run_null_std_host(control_addr: std::ffi::OsString) -> Result<(), Box<dyn std::error::Error>> {
+    use garter::ChainPlugin;
+    use tokio::io::AsyncWriteExt;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+
+    // The plugin below inherits this environment and must run as a plain plugin.
+    std::env::remove_var("MOCK_PLUGIN_NULL_STD_HOST");
+    let addr = control_addr.to_str().expect("MOCK_PLUGIN_NULL_STD_HOST is valid utf-8");
+    let mut control = TcpStream::connect(addr).await?;
+
+    for slot in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: replaces an entry of this process's own standard-handle table; nothing here reads the old one.
+        unsafe { SetStdHandle(slot, HANDLE(std::ptr::null_mut())) }?;
+    }
+
+    let plugin =
+        garter::BinaryPlugin::new(std::env::current_exe()?, None).readiness(garter::ReadinessMode::ExpectSitrep);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    // Nothing connects to the plugin, so the remote is never dialled.
+    let local = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+    let remote = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9));
+    let run = plugin.run(local, remote, shutdown.clone(), ready_tx);
+    tokio::pin!(run);
+
+    let verdict = tokio::select! {
+        Ok(Ok(_)) = ready_rx => {
+            shutdown.cancel();
+            let _ = run.await;
+            "ready".to_string()
+        }
+        ended = &mut run => format!("the plugin's run ended before it was ready: {ended:?}"),
+    };
+    let line = format!("{}{}", verdict.replace(char::from(10), " "), char::from(10));
+    control.write_all(line.as_bytes()).await?;
+    control.flush().await?;
+    Ok(())
+}
+
 /// Spawn the long-lived grandchild `MOCK_PLUGIN_SPAWN_GRANDCHILD` asks for: it inherits our stdio.
 /// With `await_up`, returns only once the grandchild has dialed `callback_addr` and holds that
 /// connection, so a caller that exits next leaves a live descendant behind.
@@ -368,6 +413,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(sentinel) => run_hygiene_grandchild(sentinel, addr).await,
             None => run_hygiene_probe(addr).await,
         };
+    }
+
+    // Knob: MOCK_PLUGIN_NULL_STD_HOST=<control addr> — become a plugin host with no
+    // standard handles (tests/null_std_handles.rs).
+    #[cfg(windows)]
+    if let Some(addr) = std::env::var_os("MOCK_PLUGIN_NULL_STD_HOST") {
+        return run_null_std_host(addr).await;
     }
 
     let local_host = std::env::var("SS_LOCAL_HOST")?;

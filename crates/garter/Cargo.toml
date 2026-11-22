@@ -88,6 +88,11 @@ name = "handle_hygiene"
 path = "tests/handle_hygiene.rs"
 harness = false
 
+[[test]]
+name = "null_std_handles"
+path = "tests/null_std_handles.rs"
+harness = false
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # `exit_watch`: waitid(WNOWAIT), the exit watch for a kernel without pidfd_open. cosca depends on the same crate.
 rustix = { version = "1", features = ["process"] }
