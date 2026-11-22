@@ -8,6 +8,7 @@ SOCKS-only mode, so no TUN device, route or DNS setting is involved, and the ser
 import http.server
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -130,6 +131,25 @@ def ss_server(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[dict]:
 # The journey ==========================================================================================================
 
 
+def refuse_if_listening(port: int) -> None:
+    """Fail the case when something already listens on `port`, before this case's start.
+
+    `hole proxy start` exits 0 for a proxy that is already running, and the installed Windows `hole.exe` delivers no
+    output to a pipe to say so. Without this check an earlier case's surviving proxy would carry this case's fetch and
+    the case would pass without its own start having brought a proxy up. A refused connect is the answer that nothing
+    listens; the proxy's SOCKS listener is what this case fetches through.
+    """
+    try:
+        socket.create_connection(("127.0.0.1", port)).close()
+    except ConnectionRefusedError:
+        return
+    pytest.fail(
+        f"something already listens on 127.0.0.1:{port} before this case started its proxy: "
+        "a proxy an earlier case left running, or another program",
+        pytrace=False,
+    )
+
+
 def connect_and_fetch(
     hole: InstalledHole, server: dict, plugin: str | None, target: tuple[int, str], tmp_path: Path
 ) -> None:
@@ -155,6 +175,7 @@ def connect_and_fetch(
     fetched_ok = False
     # The stop runs whatever the start did, so no case leaves a proxy for the next one to find.
     try:
+        refuse_if_listening(SOCKS_PORT)
         started = hole.run(
             "proxy",
             "start",
@@ -165,9 +186,7 @@ def connect_and_fetch(
             "--local-port",
             str(SOCKS_PORT),
         )
-        # Exit 0 is also the CLI's answer for a proxy that is already running. The line that says so is on stdout,
-        # which the installed Windows `hole.exe` does not deliver to a pipe; there the stop below is the only guard.
-        if started.returncode != 0 or "proxy already running" in started.stdout:
+        if started.returncode != 0:
             pytest.fail(hole.report(f"the installed bridge did not start {case}", started), pytrace=False)
         fetched = subprocess.run(
             [
