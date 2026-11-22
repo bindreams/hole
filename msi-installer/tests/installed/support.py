@@ -24,7 +24,7 @@ import pytest
 from rich.console import Console
 
 from conftest import REPO_ROOT, canonical_windows_bindir
-from msi_installer.e2e_tools import e2e_env, provision_e2e_tools
+from msi_installer.e2e_tools import e2e_env, provision_e2e_tools, provision_gsudo
 from windows_installer import installed_hole_product_codes, msi_product_code
 
 SCRIPTS = REPO_ROOT / ".github" / "scripts"
@@ -35,6 +35,7 @@ RUN_AT_MEDIUM = SCRIPTS / "run-at-medium.ps1"
 E2E_MEDIUM = SCRIPTS / "e2e-medium.ps1"
 VERIFY_GSUDO = SCRIPTS / "verify-gsudo-deelevation.ps1"
 DUMP_UNINSTALL = SCRIPTS / "dump-uninstall-diagnostics.ps1"
+RECORD_RUN = SCRIPTS / "record-run.ps1"
 
 # Failure bounds on the child processes the E2E phases start: a wedged phase fails here, naming itself, so the fixture's
 # uninstall still runs inside the CI step's own (much larger) timeout.
@@ -54,7 +55,7 @@ LOG_DIR_ENV = "MSI_TEST_LOG_DIR"
 # `sc query` on an unregistered service.
 _ERROR_SERVICE_DOES_NOT_EXIST = 1060
 
-# The pause between two reads of a service that is still starting.
+# The pause between two reads of a service that is still starting or stopping.
 _SERVICE_REREAD_SECONDS = 0.25
 
 # `dwCurrentState` as `sc query` prints it: `STATE : <number> <NAME>`.
@@ -104,6 +105,15 @@ def e2e_environment() -> dict[str, str]:
     if not (REPO_ROOT / "node_modules").is_dir():
         pytest.fail("the E2E needs the repo's node_modules: run `cargo xtask build frontend-build`")
     return e2e_env(os.environ, provision_e2e_tools(REPO_ROOT, Console(stderr=True)))
+
+
+@pytest.fixture(scope="session")
+def gsudo_environment() -> dict[str, str]:
+    """This process's environment with gsudo ahead on PATH, for a child that only de-elevates (`RUN_AT_MEDIUM`).
+
+    Unlike `e2e_environment` it needs neither `node_modules` nor the WebView drivers.
+    """
+    return e2e_env(os.environ, [provision_gsudo(REPO_ROOT, Console(stderr=True))])
 
 
 # PowerShell scripts ===================================================================================================
@@ -217,6 +227,25 @@ def wait_until_service_running() -> None:
     while (state := service_state()) == "START_PENDING":
         time.sleep(_SERVICE_REREAD_SECONDS)
     assert state == "RUNNING", f"the {SERVICE} service is {state}, not RUNNING"
+
+
+def _control_service(verb: str) -> None:
+    result = subprocess.run(["sc.exe", verb, SERVICE], capture_output=True, text=True, errors="replace")
+    assert result.returncode == 0, f"`sc {verb} {SERVICE}` exited {result.returncode}: {result.stdout.strip()}"
+
+
+def restart_service() -> None:
+    """Stop the service, start it again, and return once it is RUNNING: a second start of the same install.
+
+    Both waits re-read the state with no cap, as `wait_until_service_running` does. The bridge reports RUNNING only
+    after it has bound its socket and set the socket's access list, so a request made after this meets the new start.
+    """
+    _control_service("stop")
+    while (state := service_state()) == "STOP_PENDING":
+        time.sleep(_SERVICE_REREAD_SECONDS)
+    assert state == "STOPPED", f"the {SERVICE} service is {state} after a stop, not STOPPED"
+    _control_service("start")
+    wait_until_service_running()
 
 
 def missing_canonical_files() -> set[str]:
@@ -460,6 +489,8 @@ def read_msi_log(log: Path) -> str:
 CLI_LOG = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "hole" / "logs" / "gui-cli.log"
 # The service's own log, beside it.
 BRIDGE_LOG = CLI_LOG.with_name("bridge.log")
+# The socket the service listens on (`default_bridge_socket_path`, `crates/common/src/protocol.rs`).
+BRIDGE_SOCKET = CLI_LOG.parents[1] / "hole-bridge.sock"
 
 # Hole logs this when it sends the Stop; the SCM's observed state follows on indented lines
 # (`Look { observed: Running, ... }`).
@@ -534,6 +565,18 @@ def log_gained(baseline: LogBaseline) -> str:
     else:
         raise cannot(f"neither {log.name} nor {rotated_log.name} continues the log as it was at the baseline")
     return gained.decode("utf-8", errors="replace")
+
+
+def hole_command_report(what: str, result: subprocess.CompletedProcess[str], bridge_log: LogBaseline) -> str:
+    """The text of a failed `hole` command: `what`, how `result` ended, and what the bridge logged since `bridge_log`."""
+    try:
+        log = log_gained(bridge_log)
+    except AssertionError as e:
+        log = f"({e})"
+    return (
+        f"{what}: exit {result.returncode}\n--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}\n"
+        f"=== {BRIDGE_LOG} since the test began ===\n{log}"
+    )
 
 
 def _log_records(text: str) -> list[list[str]]:

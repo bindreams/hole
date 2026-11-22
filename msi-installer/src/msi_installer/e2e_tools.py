@@ -39,10 +39,14 @@ def cache_dir(root: Path) -> Path:
     return root / ".cache" / "installer-e2e"
 
 
+def _pins() -> dict:
+    with open(E2E_TOOLS_PATH, "rb") as f:
+        return tomllib.load(f)
+
+
 def provision_e2e_tools(root: Path, console: Console) -> list[Path]:
     """Fetch the tools missing from the cache; return the directories to prepend to a child's PATH."""
-    with open(E2E_TOOLS_PATH, "rb") as f:
-        pins = tomllib.load(f)
+    pins = _pins()
     cache = cache_dir(root)
     cache.mkdir(parents=True, exist_ok=True)
     return [
@@ -50,6 +54,14 @@ def provision_e2e_tools(root: Path, console: Console) -> list[Path]:
         _ensure_msedgedriver(cache, console),
         _ensure_gsudo(cache, pins["gsudo"], console),
     ]
+
+
+def provision_gsudo(root: Path, console: Console) -> Path:
+    """Fetch gsudo alone if the cache lacks it; return its directory. For a test that de-elevates and drives no
+    WebView, so needs neither driver."""
+    cache = cache_dir(root)
+    cache.mkdir(parents=True, exist_ok=True)
+    return _ensure_gsudo(cache, _pins()["gsudo"], console)
 
 
 def e2e_env(base: Mapping[str, str], tool_dirs: list[Path]) -> dict[str, str]:
@@ -146,8 +158,9 @@ def _webview2_runtime_version() -> str:
 
 
 def _ensure_gsudo(cache: Path, pin: Mapping[str, str], console: Console) -> Path:
-    """gsudo runs the dashboard E2E at Medium integrity: runners are High integrity, which WebView2 Runtime 150+
-    refuses a DevTools loopback to (MicrosoftEdge/WebView2Feedback#5640), so tauri-driver cannot attach."""
+    """gsudo runs a child at Medium integrity. The dashboard E2E needs it because runners are High integrity, which
+    WebView2 Runtime 150+ refuses a DevTools loopback to (MicrosoftEdge/WebView2Feedback#5640), so tauri-driver cannot
+    attach; the member-access test needs it to reach the bridge as a user who is not elevated."""
     version = pin["version"]
     out = cache / f"gsudo-v{version}"
     exe = out / "x64" / "gsudo.exe"

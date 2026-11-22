@@ -1,0 +1,161 @@
+"""The user the installer granted reaches the installed bridge as themselves, before and after the bridge restarts.
+
+Every other installed case talks to the bridge from this elevated process, which the socket's Administrators entry
+admits whatever the bridge granted anyone else. Here the requests come from a child that is not elevated and whose
+token was made before the install. Windows adds a new group membership to a token only at the next sign-in, so that
+token has no `hole` group in it, and the child is admitted only by what the bridge wrote into the socket's access list
+for the user. The bridge writes that list at every start, so the test restarts the service twice: an in-app update, a
+crash restart and a manual restart all start the bridge again inside the same sign-in session.
+
+A request is the whole connection of `connect_journey`, to a server with no plugin: it needs the `ss_plugin_server`
+example built (`cargo build -p plugin-e2e --example ss_plugin_server`). The child is de-elevated with `gsudo`, as the
+dashboard E2E is.
+"""
+
+import json
+import shutil
+import subprocess
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+from connect_journey import connect_and_fetch
+from connect_journey import ss_server, target  # noqa: F401 (fixtures)
+from support import (
+    BIN_DIR,
+    BRIDGE_LOG,
+    BRIDGE_SOCKET,
+    HOLE_CLI_TIMEOUT_SECONDS,
+    RECORD_RUN,
+    RUN_AT_MEDIUM,
+    SERVICE,
+    LogBaseline,
+    hole_command_report,
+    log_dir,
+    restart_service,
+    run_ps,
+    take_log_baseline,
+)
+from support import gsudo_environment, installed_hole, msi_path  # noqa: F401 (fixtures)
+
+pytestmark = pytest.mark.system_wide
+
+# This module's install and uninstall logs (`installed_hole`).
+MSIEXEC_LOG_STEM = "msi-member-access"
+
+# Where `record-run.ps1` reads its spec from.
+SPEC_ENV = "HOLE_RECORD_RUN_SPEC"
+
+ADMINISTRATORS_SID = "S-1-5-32-544"
+
+
+@dataclass
+class UnelevatedMember:
+    """The installed `hole.exe`, run by a child of this process that `gsudo` de-elevated."""
+
+    # The service's log as the test found it: a failure shows what the log gained since.
+    bridge_log: LogBaseline
+    # With gsudo on PATH.
+    environment: Mapping[str, str]
+    # A folder the child can read and write: the specs and results of the runs, and the journey's server entry.
+    scratch: Path
+    # Where the test is, for a failure's text.
+    phase: str = "before any restart"
+    runs: int = 0
+    # How the child's own connect to the bridge's socket went after its last command: `None` is accepted.
+    socket_refusal: str | None = None
+
+    def recorded(self, *args: str) -> dict:
+        """Run `hole.exe args` in the de-elevated child; return what `record-run.ps1` recorded of the run and of the
+        child's token. A child still running at `HOLE_CLI_TIMEOUT_SECONDS` is killed and raises `TimeoutError`."""
+        self.runs += 1
+        spec = self.scratch / f"run-{self.runs}.json"
+        result = self.scratch / f"run-{self.runs}-result.json"
+        spec.write_text(
+            json.dumps({
+                "exe": str(BIN_DIR / "hole.exe"),
+                "arguments": subprocess.list2cmdline(args),
+                "socket": str(BRIDGE_SOCKET),
+                "result": str(result),
+            }),
+            encoding="utf-8",
+        )
+        code = run_ps(
+            RUN_AT_MEDIUM,
+            {"Script": str(RECORD_RUN)},
+            env={**self.environment, SPEC_ENV: str(spec)},
+            timeout_seconds=HOLE_CLI_TIMEOUT_SECONDS,
+            phase=f"`hole {' '.join(args)}` in the de-elevated child",
+        )
+        assert result.is_file(), (
+            f"the de-elevated child recorded nothing for `hole {' '.join(args)}` (the launcher exited {code}): "
+            "see its output above"
+        )
+        record = json.loads(result.read_text(encoding="utf-8"))
+        self.socket_refusal = record["socket_refusal"]
+        return record
+
+    def run(self, *args: str) -> subprocess.CompletedProcess[str]:
+        command = [str(BIN_DIR / "hole.exe"), *args]
+        try:
+            record = self.recorded(*args)
+        except TimeoutError as e:
+            # Returned as a failed command, not raised, as `InstalledCli.run` does: the journey reports those.
+            return subprocess.CompletedProcess(command, returncode=-1, stdout="", stderr=f"(killed: {e})")
+        return subprocess.CompletedProcess(command, record["exit_code"], record["stdout"], record["stderr"])
+
+    def report(self, what: str, result: subprocess.CompletedProcess[str]) -> str:
+        # `hole` can exit ahead of its own stderr, so the child's own connect is what says why a command failed.
+        connect = "accepted" if self.socket_refusal is None else f"refused: {self.socket_refusal}"
+        return hole_command_report(
+            f"{self.phase}, as the user, not elevated: {what}\n"
+            f"the same user's own connect to {BRIDGE_SOCKET} after its last `hole` command was {connect}",
+            result,
+            self.bridge_log,
+        )
+
+
+@pytest.fixture
+def member(installed_hole: Path, gsudo_environment: dict[str, str]) -> UnelevatedMember:
+    # Not `tmp_path`: pytest makes it with mode 0o700, which on Windows admits only its owner, and a folder this
+    # elevated process makes is owned by Administrators. A folder made without a mode inherits its parent's access.
+    scratch = log_dir() / "member-access"
+    # Emptied, so a result read below is one this run wrote.
+    shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir()
+    return UnelevatedMember(take_log_baseline(BRIDGE_LOG), gsudo_environment, scratch)
+
+
+def assert_only_the_bridges_grant_admits(record: dict) -> None:
+    """The child is who the test is about: a member of `hole` that neither Administrators nor the group in its own
+    token would admit. Otherwise the run passes whatever the bridge did, so it fails here and says which way."""
+    assert record["exit_code"] == 0, f"the de-elevated child could not run the installed `hole version`: {record}"
+    enabled = set(record["enabled_group_sids"])
+    assert ADMINISTRATORS_SID not in enabled, (
+        "the child still holds Administrators as an enabled group, so the de-elevation did not take: the socket's "
+        "Administrators entry admits it whatever the bridge granted the user"
+    )
+    group = record["hole_group_sid"]
+    assert group is not None, "there is no `hole` group after the install"
+    assert group not in enabled, (
+        "the child's token already carries the `hole` group, so its sign-in is newer than the membership: the group's "
+        "entry admits it, and the run cannot show what a restart does to a user who has not signed in again"
+    )
+    assert isinstance(record["hole_member_sids"], list) and record["user_sid"] in record["hole_member_sids"], (
+        f"the user this test runs as ({record['user_sid']}) is not a member of `hole` ({record['hole_member_sids']}): "
+        "the installer adds the user of the console session, and this run is someone else"
+    )
+
+
+@pytest.mark.parametrize("ss_server", ["none"], indirect=True)
+def test_the_installing_user_reaches_the_bridge_before_and_after_restarts(
+    member: UnelevatedMember, ss_server: dict, target: tuple[int, str]
+):
+    assert_only_the_bridges_grant_admits(member.recorded("version"))
+
+    connect_and_fetch(member, ss_server, None, target, member.scratch)
+    for restart in (1, 2):
+        restart_service()
+        member.phase = f"after restart {restart} of the {SERVICE} service"
+        connect_and_fetch(member, ss_server, None, target, member.scratch)

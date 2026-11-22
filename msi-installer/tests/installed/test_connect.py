@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 from connect_journey import SERVER_IDS, SERVERS, connect_and_fetch
 from connect_journey import ss_server, target  # noqa: F401 (fixtures)
-from support import BIN_DIR, BRIDGE_LOG, HOLE_CLI_TIMEOUT_SECONDS, LogBaseline, log_gained, take_log_baseline
+from support import BIN_DIR, BRIDGE_LOG, HOLE_CLI_TIMEOUT_SECONDS, LogBaseline, hole_command_report, take_log_baseline
 from support import installed_hole, msi_path  # noqa: F401 (fixtures)
 
 pytestmark = pytest.mark.system_wide
@@ -58,14 +58,7 @@ class InstalledCli:
             )
 
     def report(self, what: str, result: subprocess.CompletedProcess[str]) -> str:
-        try:
-            log = log_gained(self.bridge_log)
-        except AssertionError as e:
-            log = f"({e})"
-        return (
-            f"{what}: exit {result.returncode}\n--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}\n"
-            f"=== {BRIDGE_LOG} since the test began ===\n{log}"
-        )
+        return hole_command_report(what, result, self.bridge_log)
 
 
 @pytest.fixture
