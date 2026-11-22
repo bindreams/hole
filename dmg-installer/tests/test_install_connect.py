@@ -21,7 +21,6 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
 
 import pytest
 from connect_journey import SERVER_IDS, SERVERS, connect_and_fetch, report_teardown_failure
@@ -88,8 +87,11 @@ class Bridge:
         """Run the installed app's `hole` as root."""
         return sudo(str(self.hole), *args)
 
-    def fail(self, what: str, result: subprocess.CompletedProcess[str]) -> NoReturn:
-        pytest.fail(f"{what}: {describe(result)}\n=== bridge log ===\n{bridge_log()}", pytrace=False)
+    def report(self, what: str, result: subprocess.CompletedProcess[str]) -> str:
+        return f"{what}: {describe(result)}\n=== bridge log ===\n{bridge_log()}"
+
+    def fail(self, what: str, result: subprocess.CompletedProcess[str]) -> None:
+        pytest.fail(self.report(what, result), pytrace=False)
 
 
 # Fixtures =============================================================================================================

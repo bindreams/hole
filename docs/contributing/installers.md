@@ -74,8 +74,8 @@ records both of its ProductCodes, so the cleanup removes whichever of the two an
 
 The tools the E2E needs (`tauri-driver`, `msedgedriver`, `gsudo`) download into `.cache/installer-e2e/`; nothing is added
 to `PATH` outside the test's child processes. Each phase that starts child processes has a failure bound
-(`GSUDO_SELFTEST_TIMEOUT_SECONDS` and `DASHBOARD_E2E_TIMEOUT_SECONDS` in
-{src}`msi-installer/tests/installed/support.py`), so a wedged phase fails by name and the uninstall still runs. Install
+(`GSUDO_SELFTEST_TIMEOUT_SECONDS`, `DASHBOARD_E2E_TIMEOUT_SECONDS` and, for each `hole` command of the connect case,
+`HOLE_CLI_TIMEOUT_SECONDS` in {src}`msi-installer/tests/installed/support.py`), so a wedged phase fails by name and the uninstall still runs. Install
 and uninstall logs go to `target\msi-test-logs\`, or to `MSI_TEST_LOG_DIR`. Nothing asserts what remains in
 `C:\ProgramData\hole` after the uninstall.
 

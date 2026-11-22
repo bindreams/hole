@@ -41,6 +41,8 @@ DUMP_UNINSTALL = SCRIPTS / "dump-uninstall-diagnostics.ps1"
 GSUDO_SELFTEST_TIMEOUT_SECONDS = 5 * 60
 DASHBOARD_E2E_TIMEOUT_SECONDS = 5 * 60
 DIAGNOSTICS_TIMEOUT_SECONDS = 5 * 60
+# One `hole` CLI command of the connect test: a bridge that never answers fails the case, with its log.
+HOLE_CLI_TIMEOUT_SECONDS = 2 * 60
 
 SERVICE = "HoleBridge"
 INSTALL_DIR = Path(os.environ.get("ProgramW6432", r"C:\Program Files")) / "hole"

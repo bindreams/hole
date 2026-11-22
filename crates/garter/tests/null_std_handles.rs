@@ -34,7 +34,10 @@ async fn a_plugin_starts_from_a_process_with_no_standard_handles() {
     cmd.stderr(cosca::Stdio::null()).unwrap();
     let mut helper = cmd.spawn().unwrap();
 
+    // Biased: a helper that dialled, reported and exited before this is polled leaves both branches ready, and its
+    // report is the one to read.
     let conn = tokio::select! {
+        biased;
         accepted = control.accept() => accepted.expect("the helper dials the control channel").0,
         exited = helper.wait() => panic!("the helper exited before dialling the control channel: {exited:?}"),
     };

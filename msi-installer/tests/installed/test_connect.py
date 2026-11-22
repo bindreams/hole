@@ -4,22 +4,33 @@ Every other test that starts a proxy runs a bridge built for the test, as a chil
 service, which the service manager started from the installed `hole.exe`, through the installed `hole.exe` CLI, for a
 server behind each bundled plugin and for one with no plugin.
 
-A separate file with its own install: a failed connect then cannot change what the dashboard E2E or the upgrade meets.
+A separate file with its own install and its own `msiexec` logs: a failed connect then cannot change what the dashboard
+E2E or the upgrade meets, and the lifecycle's logs survive it.
 The connection itself is `connect_journey`, shared with the macOS installer suite. It needs the `ss_plugin_server`
 example built (`cargo build -p plugin-e2e --example ss_plugin_server`) and the working tree's `galoshes` and `ex-ray`
 builds, which serve the other end.
 """
 
 import subprocess
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
 
 import pytest
 from connect_journey import SERVER_IDS, SERVERS, connect_and_fetch
 from connect_journey import ss_server, target  # noqa: F401 (fixtures)
-from support import BIN_DIR, BRIDGE_LOG, LogBaseline, log_gained, take_log_baseline
-from support import installed_hole, msi_path  # noqa: F401 (fixtures)
+from support import (
+    BIN_DIR,
+    BRIDGE_LOG,
+    HOLE_CLI_TIMEOUT_SECONDS,
+    LogBaseline,
+    RestartManager,
+    install_run,
+    log_dir,
+    log_gained,
+    take_log_baseline,
+)
+from support import msi_path  # noqa: F401 (fixtures)
 
 pytestmark = pytest.mark.system_wide
 
@@ -32,25 +43,54 @@ class InstalledCli:
     bridge_log: LogBaseline
 
     def run(self, *args: str) -> subprocess.CompletedProcess[str]:
-        # `hole` writes UTF-8; the default decoding is the ANSI code page.
-        return subprocess.run(
-            [str(BIN_DIR / "hole.exe"), *args], capture_output=True, text=True, encoding="utf-8", errors="replace"
-        )
+        command = [str(BIN_DIR / "hole.exe"), *args]
+        try:
+            # `hole` writes UTF-8; the default decoding is the ANSI code page.
+            return subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=HOLE_CLI_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as e:
+            # `subprocess.run` killed it. Returned as a failed command, not raised: the journey reports those, and a
+            # stop that hangs after a failed start must not replace that failure.
+            return subprocess.CompletedProcess(
+                command,
+                returncode=-1,
+                stdout=e.stdout if isinstance(e.stdout, str) else "",
+                stderr=f"{e.stderr if isinstance(e.stderr, str) else ''}\n(killed: no exit within {HOLE_CLI_TIMEOUT_SECONDS}s)",
+            )
 
-    def fail(self, what: str, result: subprocess.CompletedProcess[str]) -> NoReturn:
+    def report(self, what: str, result: subprocess.CompletedProcess[str]) -> str:
         try:
             log = log_gained(self.bridge_log)
         except AssertionError as e:
             log = f"({e})"
-        pytest.fail(
+        return (
             f"{what}: exit {result.returncode}\n--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}\n"
-            f"=== {BRIDGE_LOG} since the test began ===\n{log}",
-            pytrace=False,
+            f"=== {BRIDGE_LOG} since the test began ===\n{log}"
         )
 
 
+@pytest.fixture(scope="module")
+def installed_hole(msi_path: Path, request: pytest.FixtureRequest) -> Iterator[None]:
+    """Install `msi_path` with its bridge running; always uninstall, through Hole's own stop of the running service."""
+    logs = log_dir()
+    with install_run(
+        request,
+        msi_path,
+        install_log=logs / "msi-connect-install.log",
+        uninstall_log=logs / "msi-connect-uninstall.log",
+        restart_manager=RestartManager.OFF,
+    ):
+        yield
+
+
 @pytest.fixture
-def hole(installed_hole: Path) -> InstalledCli:
+def hole(installed_hole: None) -> InstalledCli:
     return InstalledCli(take_log_baseline(BRIDGE_LOG))
 
 

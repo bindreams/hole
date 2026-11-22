@@ -13,7 +13,7 @@ import sys
 import threading
 from collections.abc import Iterator
 from pathlib import Path
-from typing import NoReturn, Protocol
+from typing import Protocol
 
 import pytest
 
@@ -37,8 +37,8 @@ class InstalledHole(Protocol):
         """Run the installed `hole` with `args`, with the rights to reach the bridge."""
         ...
 
-    def fail(self, what: str, result: subprocess.CompletedProcess[str]) -> NoReturn:
-        """Fail the test with `what`, `result` and what the installed bridge logged."""
+    def report(self, what: str, result: subprocess.CompletedProcess[str]) -> str:
+        """The text of a failure: `what`, how `result` ended, and what the installed bridge logged."""
         ...
 
 
@@ -87,7 +87,8 @@ def ss_server(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[dict]:
     server entry, `plugin_opts` among them only for a plugin.
     """
     kind: str = request.param
-    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", REPO_ROOT / "target"))
+    # Cargo reads a relative `CARGO_TARGET_DIR` from where it ran, the repo root; pytest runs in the suite's folder.
+    target_dir = REPO_ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
     exe = (
         target_dir / "debug" / "examples" / ("ss_plugin_server.exe" if sys.platform == "win32" else "ss_plugin_server")
     )
@@ -147,13 +148,23 @@ def connect_and_fetch(
     config = tmp_path / "server.json"
     config.write_text(json.dumps(entry), encoding="utf-8")
 
-    started = hole.run(
-        "proxy", "start", "--config-file", str(config), "--tunnel-mode", "socks-only", "--local-port", str(SOCKS_PORT)
-    )
-    if started.returncode != 0:
-        hole.fail(f"the installed bridge could not start {case}", started)
     fetched_ok = False
+    # The stop runs whatever the start did, so no case leaves a proxy for the next one to find.
     try:
+        started = hole.run(
+            "proxy",
+            "start",
+            "--config-file",
+            str(config),
+            "--tunnel-mode",
+            "socks-only",
+            "--local-port",
+            str(SOCKS_PORT),
+        )
+        # The exit code is all there is to read: the CLI also exits 0 for a proxy that is already running, and the
+        # line that tells the two apart is on stdout, which the installed Windows `hole.exe` does not deliver to a pipe.
+        if started.returncode != 0:
+            pytest.fail(hole.report(f"the installed bridge did not start {case}", started), pytrace=False)
         fetched = subprocess.run(
             [
                 "curl",
@@ -172,13 +183,12 @@ def connect_and_fetch(
             errors="replace",
         )
         if fetched.returncode != 0 or fetched.stdout != expected_body:
-            hole.fail(f"a request through {case} did not reach the target (expected {expected_body!r})", fetched)
+            pytest.fail(
+                hole.report(f"a request through {case} did not reach the target (expected {expected_body!r})", fetched),
+                pytrace=False,
+            )
         fetched_ok = True
     finally:
         stopped = hole.run("proxy", "stop")
         if stopped.returncode != 0:
-            report_teardown_failure(
-                f"hole proxy stop failed: exit {stopped.returncode}\n--- stdout ---\n{stopped.stdout}\n"
-                f"--- stderr ---\n{stopped.stderr}",
-                primary_ok=fetched_ok,
-            )
+            report_teardown_failure(hole.report("hole proxy stop failed", stopped), primary_ok=fetched_ok)

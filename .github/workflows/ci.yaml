@@ -710,8 +710,8 @@ jobs:
       # verdicts. A failed lifecycle with a clean cleanup does not hide the TUN lane.
       #
       # Last-resort kill: the harness bounds each phase itself (msiexec 3 min; gsudo self-test,
-      # dashboard E2E and each diagnostics dump 5 min), so a wedged phase fails by name and the
-      # fixture still uninstalls first. The step's 75 leaves margin over those bounds for the
+      # dashboard E2E and each diagnostics dump 5 min; each `hole` command of the connect case
+      # 2 min), so a wedged phase fails by name and the fixture still uninstalls first. The step's 75 leaves margin over those bounds for the
       # unbounded phases (tool provisioning, the build, process listing).
       - id: installer-tests
         name: Install, E2E and uninstall the MSI
