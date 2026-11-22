@@ -934,7 +934,7 @@ async fn handle_refresh_access<P: Proxy + 'static, R: Routing + 'static>(
     });
     match task.await {
         Ok(Ok(())) => {
-            info!("socket access list refreshed from the hole group");
+            info!("socket access list set again");
             Ok(Json(EmptyResponse {}))
         }
         Ok(Err(e)) => {
@@ -1429,7 +1429,7 @@ pub(crate) const SDDL_BASE: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 /// When `protect` is false, inherited ACEs are preserved. This is used for
 /// the final DACL in [`apply_socket_permissions`] (adding the `hole` group).
 #[cfg(target_os = "windows")]
-pub fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Result<()> {
+pub(crate) fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Result<()> {
     use windows::core::HSTRING;
     use windows::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
 
@@ -1568,20 +1568,14 @@ fn with_sddl_dacl(
 /// A member's own entry is what admits a user who has not signed in since joining the group. Windows fixes a token's
 /// groups at sign-in, so such a user's processes do not carry the group, but a token always carries its user's SID.
 ///
-/// Without a `hole` group the socket admits SYSTEM and Administrators only. If the group's members cannot be read, or
-/// the list with them cannot be set, the group's own entry is set alone ([`set_access_list`]) and the error is
-/// returned.
+/// Without a `hole` group the socket admits SYSTEM and Administrators only, and that is `Ok`. A group that cannot be
+/// looked up is an error and the socket is left as it was. If the group's members cannot be read, or the list with
+/// them cannot be set, the group's own entry is set alone ([`set_access_list`]) and the error is returned.
 #[cfg(target_os = "windows")]
 fn apply_socket_permissions(path: &Path) -> std::io::Result<()> {
-    let group_sid = match crate::group::group_sid() {
-        Ok(sid) => sid,
-        Err(e) => {
-            warn!(
-                error = &e as &dyn std::error::Error,
-                "'hole' group not found, IPC restricted to admin-only"
-            );
-            return set_dacl_from_sddl(path, SDDL_BASE, false);
-        }
+    let Some(group_sid) = crate::group::group_sid()? else {
+        warn!("'hole' group not found, IPC restricted to admin-only");
+        return set_dacl_from_sddl(path, SDDL_BASE, false);
     };
     let (member_sids, unread) = match crate::group::member_sids() {
         Ok(sids) => (sids, None),
@@ -1600,8 +1594,7 @@ fn apply_socket_permissions(path: &Path) -> std::io::Result<()> {
 ///
 /// If that list cannot be set, the group's own entry is set without the members, and the error says so. An access list
 /// holds 64 KB, about 1800 members, and a group with more must not lose the entry that admits the members whose
-/// tokens carry it. On the socket of a running bridge that replaces a list that named members with one that does
-/// not: the next start would have set the same.
+/// tokens carry it.
 #[cfg(target_os = "windows")]
 pub(crate) fn set_access_list(path: &Path, group_sid: &str, member_sids: &[String]) -> std::io::Result<()> {
     let Err(with_members) = set_dacl_from_sddl(path, &build_sddl(group_sid, member_sids), false) else {
@@ -1629,12 +1622,9 @@ pub(crate) fn set_access_list(path: &Path, group_sid: &str, member_sids: &[Strin
 /// talk to the bridge once it's running. Idempotent.
 ///
 /// Creates the `hole` group if missing and adds the current interactive user
-/// to it. The bridge reads the group when it binds its socket
-/// ([`apply_socket_permissions`] on Windows), so this runs before the bridge
-/// starts: `install_bridge` calls it before it registers the service, and
-/// `bridge grant-access` calls it for a user the install did not add and for
-/// the dev workflow, before the foreground bridge starts. `grant-access` then
-/// asks a bridge that is already running to read the group again.
+/// to it. The bridge reads the group when it binds its socket, so this must run
+/// before the bridge starts; a bridge already running is told to read it again
+/// (`handle_refresh_access`).
 ///
 /// # Testing
 ///
@@ -1684,7 +1674,9 @@ pub(crate) fn build_sddl(group_sid: &str, member_sids: &[String]) -> String {
 /// (`bind_restricted` in `socket.rs`) leaves the socket with mode 0600. This
 /// function then sets ownership to root:hole and widens the mode to 0660. Only
 /// the bridge calls it, on its own socket: at each bind, and when a client asks
-/// it to refresh ([`handle_refresh_access`]). A socket left root-only is an error.
+/// it to refresh ([`handle_refresh_access`]). A socket left root-only is an error, except where there is no `hole` group:
+/// then it is set to mode 0600 and that is `Ok`. A group that cannot be looked up is an error and the socket is left as
+/// it was.
 #[cfg(target_os = "macos")]
 fn apply_socket_permissions(path: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
@@ -1699,25 +1691,15 @@ fn apply_socket_permissions(path: &Path) -> std::io::Result<()> {
         )
     })?;
 
-    let gid = match crate::group::group_gid(crate::group::GROUP_NAME) {
-        Ok(Some(gid)) => Some(gid),
-        Ok(None) => {
-            warn!("'hole' group not found, restricting socket to root-only");
-            None
-        }
-        Err(e) => {
-            warn!(
-                error = &e as &dyn std::error::Error,
-                "could not look up the 'hole' group, restricting socket to root-only"
-            );
-            None
-        }
-    };
-    let Some(gid) = gid else {
+    let Some(gid) = crate::group::group_gid(crate::group::GROUP_NAME)? else {
+        warn!("'hole' group not found, restricting socket to root-only");
         // SAFETY: `c_path` is a valid null-terminated CString. chmod on a valid
         // path is always safe to call.
-        unsafe {
-            libc::chmod(c_path.as_ptr(), 0o600);
+        if unsafe { libc::chmod(c_path.as_ptr(), 0o600) } != 0 {
+            return Err(std::io::Error::other(format!(
+                "chmod 0600 failed ({}); the socket may have incorrect permissions",
+                std::io::Error::last_os_error()
+            )));
         }
         return Ok(());
     };
@@ -1729,9 +1711,16 @@ fn apply_socket_permissions(path: &Path) -> std::io::Result<()> {
     unsafe {
         if libc::chown(c_path.as_ptr(), 0, gid) != 0 {
             let chown = std::io::Error::last_os_error();
-            libc::chmod(c_path.as_ptr(), 0o600);
+            let left = if libc::chmod(c_path.as_ptr(), 0o600) == 0 {
+                "the socket is left root-only".to_owned()
+            } else {
+                format!(
+                    "chmod 0600 failed too ({}); the socket may have incorrect permissions",
+                    std::io::Error::last_os_error()
+                )
+            };
             return Err(std::io::Error::other(format!(
-                "chown to root:hole failed ({chown}); the socket is left root-only"
+                "chown to root:hole failed ({chown}); {left}"
             )));
         }
         if libc::chmod(c_path.as_ptr(), 0o660) != 0 {

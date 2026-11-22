@@ -633,7 +633,6 @@ async fn post_unblock(client: &mut TestClient) -> http::Response<hyper::body::In
     client.send(req).await
 }
 
-#[cfg(target_os = "windows")]
 async fn post_refresh_access(client: &mut TestClient) -> http::Response<hyper::body::Incoming> {
     let req = http::Request::builder()
         .method("POST")
@@ -3158,12 +3157,12 @@ fn a_member_list_too_long_for_an_access_list_still_admits_the_group() {
 /// Windows prints them. Without a `hole` group that is SYSTEM and Administrators.
 #[cfg(target_os = "windows")]
 fn trustees_of_the_group_now() -> Vec<String> {
-    let sddl = match crate::group::group_sid() {
-        Ok(group) => {
+    let sddl = match crate::group::group_sid().expect("the lookup of the `hole` group") {
+        Some(group) => {
             let members = crate::group::member_sids().expect("the members of a `hole` group that exists");
             crate::ipc::build_sddl(&group, &members)
         }
-        Err(_) => crate::ipc::SDDL_BASE.to_owned(),
+        None => crate::ipc::SDDL_BASE.to_owned(),
     };
     // Windows prints some SIDs as aliases, so both sides go through its printer.
     own_trustees(&crate::test_support::dacl::printed_sddl(&sddl))
@@ -3237,6 +3236,38 @@ fn a_refresh_request_sets_the_access_list_the_account_database_gives() {
             own_trustees(&sddl),
             expected,
             "the request did not set the access list the group gives: {sddl}"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+/// A bridge whose socket's name is gone cannot set its list, for real on both platforms: the set names the socket by
+/// path. The refresh must say so, with a written sentence and not the error's text, which names a path.
+#[skuld::test]
+fn a_refresh_that_cannot_set_the_access_list_answers_500() {
+    rt().block_on(async {
+        let path = test_socket_path("refresh-access-unset");
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+        let mut client = TestClient::connect(&path).await;
+        std::fs::remove_file(&path).expect("the socket's name, removed after the client connected");
+
+        let resp = post_refresh_access(&mut client).await;
+
+        assert_eq!(
+            resp.status(),
+            500,
+            "a refresh that set nothing must error, not answer success"
+        );
+        let body = parse_error_body(resp).await;
+        assert_eq!(
+            body.message, "the bridge could not set its socket's access list from the hole group",
+            "the body is a written sentence, not the internal error's text"
         );
 
         drop(client);

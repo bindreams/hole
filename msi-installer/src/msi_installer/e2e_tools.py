@@ -160,7 +160,7 @@ def _webview2_runtime_version() -> str:
 def _ensure_gsudo(cache: Path, pin: Mapping[str, str], console: Console) -> Path:
     """gsudo runs a child at Medium integrity. The dashboard E2E needs it because runners are High integrity, which
     WebView2 Runtime 150+ refuses a DevTools loopback to (MicrosoftEdge/WebView2Feedback#5640), so tauri-driver cannot
-    attach; the member-access test needs it to reach the bridge as a user who is not elevated."""
+    attach."""
     version = pin["version"]
     out = cache / f"gsudo-v{version}"
     exe = out / "x64" / "gsudo.exe"

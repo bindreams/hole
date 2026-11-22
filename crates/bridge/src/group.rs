@@ -78,7 +78,7 @@ pub(crate) fn group_gid(name: &str) -> io::Result<Option<libc::gid_t>> {
 /// On Windows: queries the physical console session via WTS APIs.
 ///
 /// Returns `Err` if the user cannot be determined (e.g. headless install).
-pub fn installing_username() -> io::Result<String> {
+pub(crate) fn installing_username() -> io::Result<String> {
     os::installing_username()
 }
 
@@ -103,15 +103,17 @@ pub fn resolve_real_user() -> io::Result<RealUser> {
     os::resolve_real_user()
 }
 
-/// Look up the SID of any account (user or group) as a string (e.g. `S-1-5-21-...`).
+/// Look up the SID of any account (user or group) as a string (e.g. `S-1-5-21-...`). `None` when there is no such
+/// account; an error when the lookup could not be made.
 #[cfg(target_os = "windows")]
-pub fn lookup_sid(name: &str) -> io::Result<String> {
+pub(crate) fn lookup_sid(name: &str) -> io::Result<Option<String>> {
     os::lookup_sid(name)
 }
 
-/// Look up the SID of the `hole` group as a string (e.g. `S-1-5-21-...`).
+/// The SID of the `hole` group as a string (e.g. `S-1-5-21-...`). `None` when there is no such group; an error when
+/// the lookup could not be made.
 #[cfg(target_os = "windows")]
-pub fn group_sid() -> io::Result<String> {
+pub fn group_sid() -> io::Result<Option<String>> {
     lookup_sid(GROUP_NAME)
 }
 
@@ -405,9 +407,11 @@ mod os {
         Ok(username)
     }
 
-    /// Look up any account name (user or group) and return its SID as a string.
-    pub fn lookup_sid(name: &str) -> io::Result<String> {
+    /// Look up any account name (user or group) and return its SID as a string. `ERROR_NONE_MAPPED` is the answer
+    /// "no such account" and is `None`; any other failure is an error.
+    pub fn lookup_sid(name: &str) -> io::Result<Option<String>> {
         use windows::core::PWSTR;
+        use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED};
         use windows::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
 
         let account_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
@@ -422,7 +426,7 @@ mod os {
         // pointers are None (size query only). `sid_size` and `domain_size` are
         // out-parameters filled with required sizes. Expected to fail with
         // ERROR_INSUFFICIENT_BUFFER.
-        let _ = unsafe {
+        let first = unsafe {
             LookupAccountNameW(
                 None,
                 windows::core::PCWSTR(account_name.as_ptr()),
@@ -433,9 +437,11 @@ mod os {
                 &mut sid_type,
             )
         };
-
-        if sid_size == 0 {
-            return Err(io::Error::other(format!("account '{name}' not found")));
+        match first {
+            Ok(()) => {}
+            Err(e) if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() => {}
+            Err(e) if e.code() == ERROR_NONE_MAPPED.to_hresult() => return Ok(None),
+            Err(e) => return Err(io::Error::other(format!("LookupAccountNameW failed for '{name}': {e}"))),
         }
 
         // Second call: fill buffers
@@ -469,7 +475,7 @@ mod os {
 
         // SAFETY: `sid_ptr` contains a valid SID written by the successful
         // LookupAccountNameW call, and `sid_buf` outlives this call.
-        unsafe { sid_to_string(sid_ptr) }
+        unsafe { sid_to_string(sid_ptr) }.map(Some)
     }
 
     /// The members of the local group `group`, each as a SID string, read at level 0: the SID alone, so a member

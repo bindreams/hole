@@ -59,7 +59,6 @@ class UnelevatedMember:
 
     # The service's log as the test found it: a failure shows what the log gained since.
     bridge_log: LogBaseline
-    # With gsudo on PATH.
     environment: Mapping[str, str]
     # A folder the child can read and write: the specs and results of the runs, and the journey's server entry.
     scratch: Path

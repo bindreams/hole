@@ -201,10 +201,11 @@ pub enum ElevationResult {
 }
 
 /// Map the elevated run into a result. The result file (when the child wrote one)
-/// is authoritative over the exit code: the child exits 1 on any bridge error,
-/// and when a bridge did not set its access list in `grant-access`, but the file
-/// says why. A missing/unreadable file falls back to the SetupError axis —
-/// never to "denied".
+/// is authoritative over the exit code. The child exits 1 on any bridge error,
+/// and also when a running bridge did not set its access list in `grant-access`;
+/// in that case the file still holds the send's outcome, and why the refresh
+/// failed is in `gui-cli.log`. A missing/unreadable file falls back to the
+/// SetupError axis — never to "denied".
 pub fn elevation_result_from(
     run: Result<(), &crate::setup::SetupError>,
     file: Option<ElevatedOutcome>,

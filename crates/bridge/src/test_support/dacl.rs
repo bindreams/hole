@@ -10,10 +10,8 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
 
-/// Read `path`'s DACL back as an SDDL string. Round-tripping through SDDL
-/// rather than walking ACEs with `GetAce` keeps the unsafe surface to two
-/// calls and makes the assertion readable: the protected flag shows up as
-/// `D:P` and each ACE as a `(A;;...;SID)` clause.
+/// Read `path`'s DACL back as an SDDL string: the protected flag shows up as `D:P` and each ACE as a
+/// `(A;;...;SID)` clause.
 pub(crate) fn dacl_sddl(path: &Path) -> String {
     let wide = HSTRING::from(path.as_os_str());
     let mut psd = PSECURITY_DESCRIPTOR::default();
@@ -31,7 +29,6 @@ pub(crate) fn dacl_sddl(path: &Path) -> String {
             None,
             &mut psd,
         )
-        // Returns WIN32_ERROR, not Result — `.ok()` converts it.
         .ok()
         .expect("GetNamedSecurityInfoW failed");
     }

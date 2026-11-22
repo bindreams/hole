@@ -4,11 +4,10 @@
 mod windows {
     #[skuld::test]
     fn group_sid_format() {
-        // group_sid() should return a SID string starting with S-1-
+        // group_sid() should return a SID string starting with S-1-, or None.
         // On CI / dev machines, the group likely doesn't exist.
-        // Just verify the function doesn't panic and returns a reasonable error.
-        let result = crate::group::group_sid();
-        if let Ok(sid) = result {
+        let result = crate::group::group_sid().expect("the lookup of the `hole` group");
+        if let Some(sid) = result {
             assert!(sid.starts_with("S-1-"), "SID should start with S-1-, got: {sid}");
         }
     }
@@ -17,14 +16,20 @@ mod windows {
     fn lookup_sid_resolves_current_user() {
         // The current user always has a SID — this must succeed.
         let username = crate::group::installing_username().expect("should detect current user");
-        let sid = crate::group::lookup_sid(&username).expect("lookup_sid should resolve current user");
+        let sid = crate::group::lookup_sid(&username)
+            .expect("lookup_sid should resolve current user")
+            .expect("the current user has an account");
         assert!(sid.starts_with("S-1-"), "SID should start with S-1-, got: {sid}");
     }
 
+    /// An account that is not there is an answer, not a failure: the caller must be able to tell it from a lookup
+    /// that could not be made. No name makes `LookupAccountNameW` fail in another way (measured: 257 and 100000
+    /// characters, a lone surrogate, illegal characters, a domain that does not exist and a server form all answer
+    /// "none mapped"), so the failure arm has no test.
     #[skuld::test]
-    fn lookup_sid_nonexistent_returns_error() {
+    fn a_missing_account_is_not_an_error() {
         let result = crate::group::lookup_sid("nonexistent_user_that_does_not_exist_12345");
-        assert!(result.is_err());
+        assert_eq!(result.expect("a lookup that found no such account is a failure"), None);
     }
 
     /// The name this machine gives the account with `sid`: a built-in group's name follows the display language.

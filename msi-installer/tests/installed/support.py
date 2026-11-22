@@ -235,7 +235,7 @@ def _control_service(verb: str) -> None:
 
 
 def restart_service() -> None:
-    """Stop the service, start it again, and return once it is RUNNING: a second start of the same install.
+    """Stop the service, start it again, and return once it is RUNNING.
 
     Both waits re-read the state with no cap, as `wait_until_service_running` does. The bridge reports RUNNING only
     after it has bound its socket and set the socket's access list, so a request made after this meets the new start.
