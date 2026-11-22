@@ -268,8 +268,6 @@ def assert_nothing_installed() -> None:
 
 # Install and uninstall ================================================================================================
 
-INSTALL_LOG_NAME = "msi-install.log"
-
 # Written once a run is about to install, removed once the machine is verified empty. It sits at a fixed place under
 # `target\`, not in `MSI_TEST_LOG_DIR`, so the cleanup finds it whatever log dir the run used. The cleanup uninstalls
 # only the product it names, so a Hole the harness did not install is never removed.
@@ -330,10 +328,6 @@ def install_msi(msi: Path, log: Path, restart_manager: RestartManager = RestartM
     }
     code = run_ps(INVOKE_MSIEXEC, params)
     assert code == 0, f"installing {msi} failed (exit {code})"
-
-
-def install_log_path() -> Path:
-    return log_dir() / INSTALL_LOG_NAME
 
 
 def marker_path() -> Path:
@@ -806,12 +800,16 @@ def installed_hole(msi_path: Path, request: pytest.FixtureRequest) -> Iterator[P
 
     The uninstall meets the running bridge service: Hole's own uninstall must have stopped it
     (`assert_msiexec_stopped_a_running_bridge`).
+
+    Each module that uses it installs for itself. A module names its `msiexec` logs with `MSIEXEC_LOG_STEM`
+    (`<stem>-install.log`, `<stem>-uninstall.log`; `msi` without it), so one module's logs do not overwrite another's.
     """
+    stem = getattr(request.module, "MSIEXEC_LOG_STEM", "msi")
     with install_run(
         request,
         msi_path,
-        install_log=install_log_path(),
-        uninstall_log=log_dir() / "msi-uninstall.log",
+        install_log=log_dir() / f"{stem}-install.log",
+        uninstall_log=log_dir() / f"{stem}-uninstall.log",
         restart_manager=RestartManager.OFF,
     ):
         yield INSTALL_DIR

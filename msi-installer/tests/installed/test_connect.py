@@ -12,27 +12,19 @@ builds, which serve the other end.
 """
 
 import subprocess
-from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 from connect_journey import SERVER_IDS, SERVERS, connect_and_fetch
 from connect_journey import ss_server, target  # noqa: F401 (fixtures)
-from support import (
-    BIN_DIR,
-    BRIDGE_LOG,
-    HOLE_CLI_TIMEOUT_SECONDS,
-    LogBaseline,
-    RestartManager,
-    install_run,
-    log_dir,
-    log_gained,
-    take_log_baseline,
-)
-from support import msi_path  # noqa: F401 (fixtures)
+from support import BIN_DIR, BRIDGE_LOG, HOLE_CLI_TIMEOUT_SECONDS, LogBaseline, log_gained, take_log_baseline
+from support import installed_hole, msi_path  # noqa: F401 (fixtures)
 
 pytestmark = pytest.mark.system_wide
+
+# This module's install and uninstall logs (`installed_hole`).
+MSIEXEC_LOG_STEM = "msi-connect"
 
 
 @dataclass(frozen=True)
@@ -61,7 +53,8 @@ class InstalledCli:
                 command,
                 returncode=-1,
                 stdout=e.stdout if isinstance(e.stdout, str) else "",
-                stderr=f"{e.stderr if isinstance(e.stderr, str) else ''}\n(killed: no exit within {HOLE_CLI_TIMEOUT_SECONDS}s)",
+                stderr=(e.stderr if isinstance(e.stderr, str) else "")
+                + f"\n(killed: no exit within {HOLE_CLI_TIMEOUT_SECONDS}s)",
             )
 
     def report(self, what: str, result: subprocess.CompletedProcess[str]) -> str:
@@ -75,22 +68,8 @@ class InstalledCli:
         )
 
 
-@pytest.fixture(scope="module")
-def installed_hole(msi_path: Path, request: pytest.FixtureRequest) -> Iterator[None]:
-    """Install `msi_path` with its bridge running; always uninstall, through Hole's own stop of the running service."""
-    logs = log_dir()
-    with install_run(
-        request,
-        msi_path,
-        install_log=logs / "msi-connect-install.log",
-        uninstall_log=logs / "msi-connect-uninstall.log",
-        restart_manager=RestartManager.OFF,
-    ):
-        yield
-
-
 @pytest.fixture
-def hole(installed_hole: None) -> InstalledCli:
+def hole(installed_hole: Path) -> InstalledCli:
     return InstalledCli(take_log_baseline(BRIDGE_LOG))
 
 

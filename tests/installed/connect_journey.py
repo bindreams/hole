@@ -34,7 +34,11 @@ class InstalledHole(Protocol):
     """The installed product, as one platform's suite reaches it."""
 
     def run(self, *args: str) -> subprocess.CompletedProcess[str]:
-        """Run the installed `hole` with `args`, with the rights to reach the bridge."""
+        """Run the installed `hole` with `args`, with the rights to reach the bridge.
+
+        A command that never exits is the platform's to bound: Windows kills it and returns it as a failed command,
+        macOS leaves it to the CI step's time limit.
+        """
         ...
 
     def report(self, what: str, result: subprocess.CompletedProcess[str]) -> str:
@@ -161,9 +165,9 @@ def connect_and_fetch(
             "--local-port",
             str(SOCKS_PORT),
         )
-        # The exit code is all there is to read: the CLI also exits 0 for a proxy that is already running, and the
-        # line that tells the two apart is on stdout, which the installed Windows `hole.exe` does not deliver to a pipe.
-        if started.returncode != 0:
+        # Exit 0 is also the CLI's answer for a proxy that is already running. The line that says so is on stdout,
+        # which the installed Windows `hole.exe` does not deliver to a pipe; there the stop below is the only guard.
+        if started.returncode != 0 or "proxy already running" in started.stdout:
             pytest.fail(hole.report(f"the installed bridge did not start {case}", started), pytrace=False)
         fetched = subprocess.run(
             [
