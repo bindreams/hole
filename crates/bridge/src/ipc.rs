@@ -1491,7 +1491,7 @@ fn with_sddl_dacl(
 /// to prevent a TOCTOU race. This function then sets the final permissions,
 /// adding the `hole` group on both platforms.
 ///
-/// On Windows: [`set_socket_access_list`]; a failure is reported and leaves the socket to SYSTEM and Administrators.
+/// On Windows: [`set_socket_access_list`], which says what a failure leaves the socket with; the failure is reported.
 /// On macOS: sets ownership to root:hole with mode 0660.
 #[cfg(target_os = "windows")]
 fn apply_socket_permissions(path: &Path) {
@@ -1509,8 +1509,9 @@ fn apply_socket_permissions(path: &Path) {
 /// socket of a running bridge. A member added or removed while a bridge runs is therefore picked up by its next start
 /// or by `grant-access`, not at once.
 ///
-/// Without a `hole` group the socket admits SYSTEM and Administrators only. If the group's members cannot be read,
-/// the group's own entry is still set, and the error is returned.
+/// Without a `hole` group the socket admits SYSTEM and Administrators only. If the group's members cannot be read, or
+/// the list with them cannot be set ([`set_access_list`]), the group's own entry is still set, and the error is
+/// returned.
 #[cfg(target_os = "windows")]
 pub fn set_socket_access_list(path: &Path) -> std::io::Result<()> {
     let group_sid = match crate::group::group_sid() {
@@ -1532,8 +1533,22 @@ pub fn set_socket_access_list(path: &Path) -> std::io::Result<()> {
         members = ?member_sids,
         "restricting IPC to SYSTEM + Administrators + the hole group and its members"
     );
-    set_dacl_from_sddl(path, &build_sddl(&group_sid, &member_sids), false)?;
+    set_access_list(path, &group_sid, &member_sids)?;
     unread.map_or(Ok(()), Err)
+}
+
+/// Sets the access list of the socket at `path` for a group with these members ([`build_sddl`]).
+///
+/// If that list cannot be set, the group's own entry is set without the members and the error is returned: an access
+/// list holds 64 KB, and a group with more members than fit must not lose the entry that admits the members whose
+/// tokens carry it.
+#[cfg(target_os = "windows")]
+pub(crate) fn set_access_list(path: &Path, group_sid: &str, member_sids: &[String]) -> std::io::Result<()> {
+    let Err(e) = set_dacl_from_sddl(path, &build_sddl(group_sid, member_sids), false) else {
+        return Ok(());
+    };
+    set_dacl_from_sddl(path, &build_sddl(group_sid, &[]), false)?;
+    Err(e)
 }
 
 /// Set up IPC access control so that the current interactive user can
@@ -1550,7 +1565,7 @@ pub fn set_socket_access_list(path: &Path) -> std::io::Result<()> {
 ///
 /// This function is not covered by a unit test. Its idempotence is a
 /// property of the primitives it composes: `group::create_group` is
-/// idempotent (macOS: verifies post-failure with `getgrnam(3)`;
+/// idempotent (macOS: verifies post-failure with `group_exists`;
 /// Windows: detects error code 1379) and `group::add_user_to_group`
 /// is idempotent (macOS: `dseditgroup -o edit -a` is naturally
 /// idempotent; Windows: detects error code 1378). It runs end to end in the
@@ -1591,7 +1606,7 @@ pub(crate) fn build_sddl(group_sid: &str, member_sids: &[String]) -> String {
 /// Set socket file ownership to root:hole and mode 0660 on macOS.
 ///
 /// This is the second phase of socket permission setup. The first phase
-/// (umask guard in `socket.rs`) creates the socket with mode 0600. This
+/// (`bind_restricted` in `socket.rs`) leaves the socket with mode 0600. This
 /// function then sets ownership to root:hole and widens the mode to 0660.
 #[cfg(target_os = "macos")]
 fn apply_socket_permissions(path: &Path) {

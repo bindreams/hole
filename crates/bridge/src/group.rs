@@ -138,7 +138,7 @@ mod os {
         // "Create called on existing record - do you want to overwrite, y or
         // n :", depending on whether stdin is a tty) and exits non-zero. We
         // can't tell that case apart from a real failure by parsing stderr
-        // (the messages are localized). Instead, on failure we ask `getgrnam`
+        // (the messages are localized). Instead, on failure we ask `group_exists`
         // whether the group exists; if it does, our caller's intent is met
         // and we return success — broadening the success condition from
         // "create succeeded" to "the group exists at end of attempt", which
@@ -161,7 +161,7 @@ mod os {
     pub fn delete_group() -> io::Result<()> {
         // EAFP, mirror of `create_group`: macOS `dseditgroup -o delete` on a
         // missing group exits non-zero with a localized "not found" stderr.
-        // Use `getgrnam` to verify post-failure and avoid stderr-substring
+        // Use `group_exists` to verify post-failure and avoid stderr-substring
         // matching that breaks under non-English locales.
         let output = SystemTool::Dseditgroup
             .command()?

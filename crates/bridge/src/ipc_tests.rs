@@ -3084,6 +3084,59 @@ fn own_trustees(sddl: &str) -> Vec<String> {
         .collect()
 }
 
+/// The trustees a socket must name of its own for `group_sid` and `member_sids`, as Windows prints them. Written out
+/// here, not built by the code under test.
+#[cfg(target_os = "windows")]
+fn printed_trustees(group_sid: &str, member_sids: &[&str]) -> Vec<String> {
+    let mut sddl = format!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{group_sid})");
+    for member in member_sids {
+        sddl.push_str(&format!("(A;;GA;;;{member})"));
+    }
+    own_trustees(&crate::test_support::dacl::printed_sddl(&sddl))
+}
+
+/// The group and members are stated here, so this does not depend on whether the machine has a `hole` group.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn the_access_list_set_on_a_socket_names_the_group_and_each_member() {
+    let path = test_socket_path("set-access-list");
+    let _listener = crate::socket::LocalListener::bind_restricted(&path).unwrap();
+
+    crate::ipc::set_access_list(
+        &path,
+        GROUP_SID,
+        &[MEMBER_SID.to_owned(), WELL_KNOWN_MEMBER_SID.to_owned()],
+    )
+    .unwrap();
+
+    assert_eq!(
+        own_trustees(&crate::test_support::dacl::dacl_sddl(&path)),
+        printed_trustees(GROUP_SID, &[MEMBER_SID, WELL_KNOWN_MEMBER_SID])
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An access list holds 64 KB. A group with more members than fit must still be admitted as a group: its members who
+/// have signed in since they joined carry it in their tokens.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn a_member_list_too_long_for_an_access_list_still_admits_the_group() {
+    let path = test_socket_path("long-access-list");
+    let _listener = crate::socket::LocalListener::bind_restricted(&path).unwrap();
+    let members: Vec<String> = (0..3000)
+        .map(|n| format!("S-1-5-21-1234567890-1234567890-1234567890-{}", 2000 + n))
+        .collect();
+
+    let result = crate::ipc::set_access_list(&path, GROUP_SID, &members);
+
+    assert!(result.is_err(), "3000 members fitted into one access list");
+    assert_eq!(
+        own_trustees(&crate::test_support::dacl::dacl_sddl(&path)),
+        printed_trustees(GROUP_SID, &[])
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
 /// `IpcServer::bind` is the bind every bridge makes, and each one sets the socket's access list from the account
 /// database as it is at that moment. A second bind of the same path is a bridge restart.
 ///
