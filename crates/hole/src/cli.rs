@@ -1091,6 +1091,11 @@ fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
 /// next one reads the group when it binds. Used by the elevation prompt
 /// (`elevation.rs`, which explains why the group alone does not admit the user
 /// yet) and by dev-console before it starts the foreground dev bridge.
+///
+/// Exit code: 1 when the group cannot be prepared (nothing more is done). Otherwise, with a bridge that set its list or
+/// no bridge listening, 0, or the send's code when `--then-send` or `--then-send-file` was given. When a bridge is
+/// there and did not set its list, 1, or the send's code if that is non-zero; the send runs all the same, so the
+/// request, and the result file the elevation prompt reads, are not lost to the refresh.
 fn handle_grant_access(
     then_send: Option<String>,
     then_send_file: Option<std::path::PathBuf>,
@@ -1101,31 +1106,49 @@ fn handle_grant_access(
         return 1;
     }
 
-    match refresh_bridge_access(&hole_common::protocol::default_bridge_socket_path()) {
+    grant_access_at(
+        &hole_common::protocol::default_bridge_socket_path(),
+        then_send,
+        then_send_file,
+        result_file,
+    )
+}
+
+/// [`handle_grant_access`] after the group is prepared, against the bridge socket at `socket_path`.
+fn grant_access_at(
+    socket_path: &std::path::Path,
+    then_send: Option<String>,
+    then_send_file: Option<std::path::PathBuf>,
+    result_file: Option<std::path::PathBuf>,
+) -> i32 {
+    let refresh = refresh_bridge_access(socket_path);
+    match &refresh {
         RefreshBridgeAccessOutcome::Refreshed => {
             cli_log!(info, "the bridge set its socket's access list from the hole group")
         }
         RefreshBridgeAccessOutcome::NoBridge => {}
         RefreshBridgeAccessOutcome::Failed(why) => {
             cli_log!(
-                warn,
-                "warning: the bridge did not set its socket's access list from the hole group: {why}"
+                error,
+                "the bridge did not set its socket's access list from the hole group: {why}"
             )
         }
     }
 
     // Optionally proxy a command to the bridge
-    match (then_send, then_send_file) {
-        (Some(b64), _) => handle_ipc_send_b64(&b64),
-        (_, Some(path)) => match crate::elevation::read_request_file(&path) {
-            Ok(request) => send_bridge_request(request, result_file.as_deref()),
+    let send = match (then_send, then_send_file) {
+        (Some(b64), _) => Some(ipc_send_b64_at(&b64, socket_path)),
+        (_, Some(path)) => Some(match crate::elevation::read_request_file(&path) {
+            Ok(request) => send_bridge_request_at(request, result_file.as_deref(), socket_path),
             Err(e) => {
                 cli_log!(error, "{e}");
                 1
             }
-        },
-        (None, None) => 0,
-    }
+        }),
+        (None, None) => None,
+    };
+
+    refresh.exit_code(send)
 }
 
 /// What asking a running bridge to refresh its socket's access list came to.
@@ -1137,6 +1160,22 @@ enum RefreshBridgeAccessOutcome {
     NoBridge,
     /// A bridge is there and the list was not set; the text says why.
     Failed(String),
+}
+
+impl RefreshBridgeAccessOutcome {
+    /// The exit code of `grant-access` given what the refresh came to and the exit code of the send that followed, if
+    /// one was asked for.
+    fn exit_code(&self, send: Option<i32>) -> i32 {
+        match self {
+            RefreshBridgeAccessOutcome::Refreshed => send.unwrap_or(0),
+            RefreshBridgeAccessOutcome::NoBridge => send.unwrap_or(0),
+            // The user the command added is not admitted yet: never 0, even when the send worked.
+            RefreshBridgeAccessOutcome::Failed(_) => match send {
+                Some(code) if code != 0 => code,
+                _ => 1,
+            },
+        }
+    }
 }
 
 /// What an answer from the bridge (or its absence) means for a refresh request.
@@ -1203,6 +1242,10 @@ fn decode_b64_request(base64_request: &str) -> Result<hole_common::protocol::Bri
 }
 
 fn handle_ipc_send_b64(base64_request: &str) -> i32 {
+    ipc_send_b64_at(base64_request, &hole_common::protocol::default_bridge_socket_path())
+}
+
+fn ipc_send_b64_at(base64_request: &str, socket_path: &std::path::Path) -> i32 {
     let request = match decode_b64_request(base64_request) {
         Ok(r) => r,
         Err(msg) => {
@@ -1211,7 +1254,7 @@ fn handle_ipc_send_b64(base64_request: &str) -> i32 {
         }
     };
 
-    send_bridge_request(request, None)
+    send_bridge_request_at(request, None, socket_path)
 }
 
 /// CLI disposition for a typed start failure: process exit code + an optional error
@@ -1232,9 +1275,22 @@ pub(crate) fn start_error_cli(e: &hole_common::protocol::StartError) -> (i32, Op
 /// typed outcome there for the parent to read back across stripped stdio; the
 /// exit-code map is unchanged and a result-file write failure only logs a warn.
 fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_file: Option<&std::path::Path>) -> i32 {
+    send_bridge_request_at(
+        request,
+        result_file,
+        &hole_common::protocol::default_bridge_socket_path(),
+    )
+}
+
+/// [`send_bridge_request`] against the bridge socket at `socket_path`.
+fn send_bridge_request_at(
+    request: hole_common::protocol::BridgeRequest,
+    result_file: Option<&std::path::Path>,
+    socket_path: &std::path::Path,
+) -> i32 {
     use hole_common::protocol::BridgeResponse;
 
-    let inner = send_bridge_request_inner(request);
+    let inner = send_bridge_request_inner_at(request, socket_path);
 
     if let Some(path) = result_file {
         let outcome = crate::elevation::classify_elevated_send(&inner);

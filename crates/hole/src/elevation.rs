@@ -202,8 +202,9 @@ pub enum ElevationResult {
 
 /// Map the elevated run into a result. The result file (when the child wrote one)
 /// is authoritative over the exit code: the child exits 1 on any bridge error,
-/// but the file says why. A missing/unreadable file falls back to the SetupError
-/// axis — never to "denied".
+/// and when a bridge did not set its access list in `grant-access`, but the file
+/// says why. A missing/unreadable file falls back to the SetupError axis —
+/// never to "denied".
 pub fn elevation_result_from(
     run: Result<(), &crate::setup::SetupError>,
     file: Option<ElevatedOutcome>,

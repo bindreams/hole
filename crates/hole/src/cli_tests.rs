@@ -1446,3 +1446,213 @@ fn grant_access_takes_the_bridges_answer_to_a_refresh_as_its_own() {
         super::RefreshBridgeAccessOutcome::Failed(ClientError::VersionMismatch { bridge: None }.to_string())
     );
 }
+
+// What `grant-access` returns =========================================================================================
+
+/// A bridge on a real socket. The refresh route answers with `refresh` (no route at all when `None`, which is a 404),
+/// the unblock route, which these tests send, answers with `send`. It counts the unblock requests it served.
+struct MockBridge {
+    sends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    // Dropping the runtime stops the accept loop and the connections it serves.
+    _rt: tokio::runtime::Runtime,
+}
+
+impl MockBridge {
+    fn bind(socket_path: &Path, refresh: Option<axum::http::StatusCode>, send: axum::http::StatusCode) -> Self {
+        use hole_common::protocol::{ErrorResponse, ROUTE_REFRESH_ACCESS, ROUTE_UNBLOCK};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let answer = |status: axum::http::StatusCode| {
+            (
+                status,
+                axum::Json(ErrorResponse {
+                    message: "mock bridge".into(),
+                }),
+            )
+        };
+        let sends = Arc::new(AtomicUsize::new(0));
+        let counted = sends.clone();
+        let mut router = axum::Router::new().route(
+            ROUTE_UNBLOCK,
+            axum::routing::post(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                async move { answer(send) }
+            }),
+        );
+        if let Some(status) = refresh {
+            router = router.route(
+                ROUTE_REFRESH_ACCESS,
+                axum::routing::post(move || async move { answer(status) }),
+            );
+        }
+        let router = router.layer(axum::middleware::map_response(
+            |mut resp: axum::response::Response| async move {
+                resp.headers_mut().insert(
+                    "x-hole-bridge-version",
+                    axum::http::HeaderValue::from_static(hole::version::VERSION),
+                );
+                resp
+            },
+        ));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let listener = rt.block_on(async { hole_bridge::socket::LocalListener::bind(socket_path).unwrap() });
+        rt.spawn(async move {
+            loop {
+                let stream = listener.accept().await.unwrap();
+                let router = router.clone();
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                        use tower::ServiceExt;
+                        let router = router.clone();
+                        async move {
+                            Ok::<_, std::convert::Infallible>(
+                                router.oneshot(req.map(axum::body::Body::new)).await.unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        Self { sends, _rt: rt }
+    }
+
+    fn sends(&self) -> usize {
+        self.sends.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// What `grant-access --then-send-file` (an unblock request) made of one run against the bridge at `socket_path`: its
+/// exit code and the result file it left.
+fn grant_access_then_send(socket_path: &Path) -> (i32, std::io::Result<crate::elevation::ElevatedOutcome>) {
+    let dir = tempfile::tempdir().unwrap();
+    let request_file = dir.path().join("request.json");
+    let result_file = dir.path().join("result.json");
+    std::fs::write(
+        &request_file,
+        serde_json::to_vec(&hole_common::protocol::BridgeRequest::Unblock).unwrap(),
+    )
+    .unwrap();
+
+    let code = super::grant_access_at(socket_path, None, Some(request_file), Some(result_file.clone()));
+
+    (code, crate::elevation::read_result_file(&result_file))
+}
+
+#[skuld::test]
+fn grant_access_exit_code_follows_the_refresh_and_the_send() {
+    use super::RefreshBridgeAccessOutcome::{Failed, NoBridge, Refreshed};
+
+    // The send's own code, or 0 when none was asked for.
+    for outcome in [Refreshed, NoBridge] {
+        assert_eq!(outcome.exit_code(None), 0, "{outcome:?}");
+        assert_eq!(outcome.exit_code(Some(0)), 0, "{outcome:?}");
+        assert_eq!(outcome.exit_code(Some(1)), 1, "{outcome:?}");
+        assert_eq!(outcome.exit_code(Some(2)), 2, "{outcome:?}");
+    }
+
+    // A refresh that failed never exits 0; a send that failed says its own code.
+    let failed = Failed("set failed".into());
+    assert_eq!(failed.exit_code(None), 1);
+    assert_eq!(failed.exit_code(Some(0)), 1);
+    assert_eq!(failed.exit_code(Some(1)), 1);
+    assert_eq!(failed.exit_code(Some(2)), 2);
+}
+
+#[skuld::test]
+fn grant_access_exits_0_when_no_bridge_listens() {
+    let code = super::grant_access_at(&absent_socket_path("exit-nobridge"), None, None, None);
+
+    assert_eq!(code, 0);
+}
+
+#[skuld::test]
+fn grant_access_exits_0_when_the_bridge_refreshed() {
+    use axum::http::StatusCode;
+    let path = absent_socket_path("exit-refreshed");
+    let bridge = MockBridge::bind(&path, Some(StatusCode::OK), StatusCode::OK);
+
+    let code = super::grant_access_at(&path, None, None, None);
+
+    assert_eq!(code, 0);
+    assert_eq!(bridge.sends(), 0);
+}
+
+#[skuld::test]
+fn grant_access_exits_1_when_the_bridge_answers_the_refresh_with_an_error() {
+    use axum::http::StatusCode;
+    let path = absent_socket_path("exit-refresh-500");
+    let bridge = MockBridge::bind(&path, Some(StatusCode::INTERNAL_SERVER_ERROR), StatusCode::OK);
+
+    let code = super::grant_access_at(&path, None, None, None);
+
+    assert_eq!(code, 1);
+    assert_eq!(bridge.sends(), 0);
+}
+
+#[skuld::test]
+fn grant_access_exits_1_when_the_bridge_has_no_refresh_route() {
+    use axum::http::StatusCode;
+    let path = absent_socket_path("exit-refresh-404");
+    let _bridge = MockBridge::bind(&path, None, StatusCode::OK);
+
+    let code = super::grant_access_at(&path, None, None, None);
+
+    assert_eq!(code, 1);
+}
+
+#[skuld::test]
+fn grant_access_exits_the_sends_code_when_the_refresh_succeeded() {
+    use axum::http::StatusCode;
+    let path = absent_socket_path("exit-send-after-refresh");
+    let bridge = MockBridge::bind(&path, Some(StatusCode::OK), StatusCode::OK);
+
+    let (code, result) = grant_access_then_send(&path);
+
+    assert_eq!(code, 0);
+    assert_eq!(bridge.sends(), 1);
+    assert!(
+        matches!(result, Ok(crate::elevation::ElevatedOutcome::Success)),
+        "{result:?}"
+    );
+}
+
+#[skuld::test]
+fn grant_access_still_sends_and_exits_1_when_the_refresh_failed_and_the_send_succeeds() {
+    use axum::http::StatusCode;
+    let path = absent_socket_path("exit-refresh-500-send-ok");
+    let bridge = MockBridge::bind(&path, Some(StatusCode::INTERNAL_SERVER_ERROR), StatusCode::OK);
+
+    let (code, result) = grant_access_then_send(&path);
+
+    assert_eq!(code, 1);
+    assert_eq!(bridge.sends(), 1, "the send runs even when the refresh failed");
+    assert!(
+        matches!(result, Ok(crate::elevation::ElevatedOutcome::Success)),
+        "{result:?}"
+    );
+}
+
+#[skuld::test]
+fn grant_access_exits_1_when_the_refresh_failed_and_the_send_failed() {
+    use axum::http::StatusCode;
+    let path = absent_socket_path("exit-refresh-500-send-500");
+    let bridge = MockBridge::bind(
+        &path,
+        Some(StatusCode::INTERNAL_SERVER_ERROR),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    );
+
+    let (code, result) = grant_access_then_send(&path);
+
+    assert_eq!(code, 1);
+    assert_eq!(bridge.sends(), 1);
+    assert!(
+        matches!(result, Ok(crate::elevation::ElevatedOutcome::BridgeError { .. })),
+        "{result:?}"
+    );
+}

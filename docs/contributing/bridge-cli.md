@@ -35,6 +35,10 @@ Options of `bridge run`:
 IPC request afterwards (`--then-send`, `--then-send-file`). The GUI's elevated paths run these commands, and pass
 `--result-file` to `grant-access` and `ipc-send` to read the outcome back across stripped stdio.
 
+`bridge grant-access` exits 0 once the user is in the group and the running bridge, if there is one, has read the group
+again; with a send, it exits with the send's code. If a running bridge did not read the group, it exits 1, or the
+send's code when that is not 0, and it still runs the send first.
+
 `ipc-send` and the `hole proxy` commands below connect to the installed bridge's default socket. Only the GUI reads
 `HOLE_BRIDGE_SOCKET` to find another, which is how a dev app finds a dev bridge ([Development](development.md)), so a
 bridge started with `--socket-path` cannot be driven from them.
