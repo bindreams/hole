@@ -25,25 +25,51 @@ pub fn add_user_to_group(username: &str) -> io::Result<()> {
 
 /// Returns `true` if a local group with the given name exists.
 ///
-/// macOS: wraps POSIX `getgrnam(3)` (locale-independent; queries the same
-/// `opendirectoryd` backend `dseditgroup` writes to). A name containing a
-/// NUL byte is, by definition, not a valid POSIX group name and returns
-/// `false` rather than panicking.
-///
 /// Used internally by `create_group` and `delete_group` for EAFP-style
-/// idempotency. `pub(crate)` for the test module.
+/// idempotency. `pub(crate)` for the test module. A lookup that fails is
+/// `false`, as a group that is not there.
 #[cfg(target_os = "macos")]
 pub(crate) fn group_exists(name: &str) -> bool {
-    // A name with an embedded NUL is not a valid POSIX group name; libc
-    // would see only the prefix. Return `false` rather than panic.
+    matches!(group_gid(name), Ok(Some(_)))
+}
+
+/// The gid of the local group `name`; `None` when there is no such group.
+///
+/// macOS: POSIX `getgrnam_r(3)` (locale-independent; queries the same
+/// `opendirectoryd` backend `dseditgroup` writes to). Not `getgrnam(3)`, which
+/// answers through a buffer the whole process shares: this runs wherever a
+/// socket is bound, and two threads of one process may bind. A name containing
+/// a NUL byte is, by definition, not a valid POSIX group name and is `None`.
+#[cfg(target_os = "macos")]
+pub(crate) fn group_gid(name: &str) -> io::Result<Option<libc::gid_t>> {
     let Ok(cname) = std::ffi::CString::new(name) else {
-        return false;
+        return Ok(None);
     };
-    // SAFETY: getgrnam returns a pointer into a libc-owned process-wide
-    // static buffer (or NULL). We only `is_null`-check, never dereference
-    // — so concurrent callers racing the static buffer cannot corrupt our
-    // observation. The CString outlives the call.
-    unsafe { !libc::getgrnam(cname.as_ptr()).is_null() }
+    let mut buf = vec![0u8; 1024];
+    loop {
+        // SAFETY: `group` is plain data; the all-zero value is valid and getgrnam_r overwrites it.
+        let mut grp: libc::group = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        // SAFETY: cname is NUL-terminated; grp/buf/result outlive the call.
+        let rc = unsafe {
+            libc::getgrnam_r(
+                cname.as_ptr(),
+                &mut grp,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        // A null result with rc 0 is "no such group". `gr_gid` is read from `grp`, which this call owns.
+        return Ok((!result.is_null()).then_some(grp.gr_gid));
+    }
 }
 
 /// Detect the real interactive user behind an elevated session.

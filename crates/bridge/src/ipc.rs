@@ -192,12 +192,7 @@ impl IpcServer {
         version: &str,
         log_dir: PathBuf,
     ) -> std::io::Result<Self> {
-        #[cfg(not(test))]
         let listener = LocalListener::bind_restricted(path)?;
-        #[cfg(test)]
-        let listener = LocalListener::bind(path)?;
-
-        #[cfg(not(test))]
         apply_socket_permissions(path);
 
         let state = Arc::new(IpcState::new(proxy, version, log_dir));
@@ -1498,7 +1493,7 @@ fn with_sddl_dacl(
 ///
 /// On Windows: [`set_socket_access_list`]; a failure is reported and leaves the socket to SYSTEM and Administrators.
 /// On macOS: sets ownership to root:hole with mode 0660.
-#[cfg(all(target_os = "windows", not(test)))]
+#[cfg(target_os = "windows")]
 fn apply_socket_permissions(path: &Path) {
     if let Err(e) = set_socket_access_list(path) {
         warn!(error = &e as &dyn std::error::Error, "failed to set socket permissions");
@@ -1598,7 +1593,7 @@ pub(crate) fn build_sddl(group_sid: &str, member_sids: &[String]) -> String {
 /// This is the second phase of socket permission setup. The first phase
 /// (umask guard in `socket.rs`) creates the socket with mode 0600. This
 /// function then sets ownership to root:hole and widens the mode to 0660.
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(target_os = "macos")]
 fn apply_socket_permissions(path: &Path) {
     use std::ffi::CString;
 
@@ -1621,44 +1616,32 @@ fn apply_socket_permissions(path: &Path) {
         }
     };
 
-    // Compile-time check: GROUP_NAME must not contain interior null bytes.
-    const _: () = {
-        let bytes = crate::group::GROUP_NAME.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            assert!(bytes[i] != 0, "GROUP_NAME must not contain null bytes");
-            i += 1;
+    let gid = match crate::group::group_gid(crate::group::GROUP_NAME) {
+        Ok(Some(gid)) => Some(gid),
+        Ok(None) => {
+            warn!("'hole' group not found, restricting socket to root-only");
+            None
+        }
+        Err(e) => {
+            warn!(
+                error = &e as &dyn std::error::Error,
+                "could not look up the 'hole' group, restricting socket to root-only"
+            );
+            None
         }
     };
-
-    // Look up the 'hole' group GID
-    let group_name = CString::new(crate::group::GROUP_NAME).expect("GROUP_NAME verified at compile time");
-    // SAFETY: `group_name` is a valid null-terminated CString kept alive for the
-    // call. getgrnam returns a pointer into a libc-owned process-wide static
-    // buffer; per POSIX it is not thread-safe (see also `group::os::group_exists`).
-    // We read `gr_gid` below before any other libc call could overwrite that
-    // buffer, and the bridge's apply-socket-permissions path is single-threaded
-    // at this point.
-    let grp = unsafe { libc::getgrnam(group_name.as_ptr()) };
-
-    if grp.is_null() {
-        warn!("'hole' group not found, restricting socket to root-only");
+    let Some(gid) = gid else {
         // SAFETY: `c_path` is a valid null-terminated CString. chmod on a valid
         // path is always safe to call.
         unsafe {
             libc::chmod(c_path.as_ptr(), 0o600);
         }
         return;
-    }
-
-    // SAFETY: `grp` was checked non-null above and points to valid static storage
-    // from getgrnam. We read `gr_gid` immediately before any call that could
-    // invalidate the static buffer.
-    let gid = unsafe { (*grp).gr_gid };
+    };
     info!(gid = gid, "setting socket ownership to root:hole, mode 0660");
 
     // SAFETY: `c_path` is a valid null-terminated CString for the path argument.
-    // `gid` is a valid group ID obtained from getgrnam. chown/chmod return 0 on
+    // `gid` is a valid group ID obtained from `group_gid`. chown/chmod return 0 on
     // success and -1 on failure; we check the return value.
     unsafe {
         if libc::chown(c_path.as_ptr(), 0, gid) != 0 {

@@ -318,10 +318,7 @@ fn ready_notify_connects_and_writes_token() {
     // HONESTY NOTE: this pins `notify_ready`'s CONTRACT; the PLACEMENT
     // (called in `run_inner` right after `IpcServer::bind` returns, i.e.
     // after `apply_socket_permissions`) is verified by code review, like
-    // the sibling recovery-call placements. (`apply_socket_permissions`
-    // is `#[cfg(not(test))]` inside `IpcServer::bind`, so the
-    // after-permissions ordering cannot be asserted in a test build even
-    // in principle.)
+    // the sibling recovery-call placements: no test here calls `run_inner`.
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -16,6 +16,8 @@
 //! `mod test_support;` declaration in `lib.rs`.
 #![allow(dead_code)]
 
+#[cfg(target_os = "windows")]
+pub(crate) mod dacl;
 pub(crate) mod dist_fixture;
 pub(crate) mod dist_harness;
 pub(crate) mod dist_harness_panic_hook_tests;

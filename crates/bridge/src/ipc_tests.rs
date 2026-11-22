@@ -3072,8 +3072,62 @@ fn the_dacl_builder_logs_no_text_of_a_sid_it_rejects() {
     assert!(!logs.contains("hunter2"), "the rejected text reached the log: {logs}");
 }
 
-// bind() smoke tests — the production-path bind, which in cfg(test) uses
-// the unrestricted LocalListener::bind and skips apply_socket_permissions.
+// The access list a bind sets (Windows only) ==========================================================================
+
+/// The trustees `sddl` names in entries of its own, in order: the entries a folder passed down are left out.
+#[cfg(target_os = "windows")]
+fn own_trustees(sddl: &str) -> Vec<String> {
+    crate::test_support::dacl::aces(sddl)
+        .into_iter()
+        .filter(|ace| !ace.is_inherited())
+        .map(|ace| ace.trustee)
+        .collect()
+}
+
+/// `IpcServer::bind` is the bind every bridge makes, and each one sets the socket's access list from the account
+/// database as it is at that moment. A second bind of the same path is a bridge restart.
+///
+/// What this shows depends on the machine. Without a `hole` group it shows the two base entries; with one, the group
+/// and each member. That a member's own entry admits a user whose token has no group is the installed test's to show
+/// (`msi-installer/tests/installed/test_member_access.py`): it needs a second token.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn every_bind_sets_the_access_list_the_account_database_gives() {
+    use crate::test_support::dacl::{aces, dacl_sddl, printed_sddl};
+
+    let expected = match crate::group::group_sid() {
+        Ok(group) => {
+            let members = crate::group::member_sids().expect("the members of a `hole` group that exists");
+            crate::ipc::build_sddl(&group, &members)
+        }
+        Err(_) => crate::ipc::SDDL_BASE.to_owned(),
+    };
+    // Windows prints some SIDs as aliases, so both sides go through its printer.
+    let expected = own_trustees(&printed_sddl(&expected));
+    let path = test_socket_path("access-list");
+
+    for bind in ["first", "second"] {
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
+
+        let sddl = dacl_sddl(&path);
+        assert_eq!(
+            own_trustees(&sddl),
+            expected,
+            "the {bind} bind did not set the access list the group gives: {sddl}"
+        );
+        assert!(
+            aces(&sddl)
+                .iter()
+                .filter(|ace| !ace.is_inherited())
+                .all(|ace| ace.kind == "A" && ace.rights == "FA"),
+            "the {bind} bind set an entry that is not full control: {sddl}"
+        );
+
+        drop(server);
+    }
+}
+
+// bind() smoke tests: the bind every bridge makes.
 
 #[skuld::test]
 fn bind_accepts_connection() {
