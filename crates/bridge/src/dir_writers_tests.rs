@@ -286,31 +286,6 @@ fn macos_writers() -> Vec<Writer> {
     }]
 }
 
-/// The Windows rows. Another platform lists their sources and runs none of them.
-#[cfg(windows)]
-fn windows_writers() -> Vec<Writer> {
-    vec![Writer {
-        name: "the installer SID, written",
-        sources: &["crates/bridge/src/ipc.rs"],
-        names: &[crate::ipc::INSTALLER_USER_SID_FILE],
-        at_a_planted_name: AtAPlantedName::Replaces,
-        runs_here: true,
-        run: |dir, _| crate::ipc::write_installer_user_sid(dir, "S-1-5-32-545"),
-    }]
-}
-
-#[cfg(not(windows))]
-fn windows_writers() -> Vec<Writer> {
-    vec![Writer {
-        name: "the installer SID (Windows)",
-        sources: &["crates/bridge/src/ipc.rs"],
-        names: &[],
-        at_a_planted_name: AtAPlantedName::Replaces,
-        runs_here: false,
-        run: |_, _| unreachable!("a row of another platform is not run"),
-    }]
-}
-
 /// The plugin-folder rows (unix). Another platform lists their sources and runs none of them.
 #[cfg(unix)]
 fn plugin_folder_writers() -> Vec<Writer> {
@@ -613,7 +588,6 @@ fn writers() -> Vec<Writer> {
         },
     ];
     rows.extend(macos_writers());
-    rows.extend(windows_writers());
     rows.extend(plugin_folder_writers());
     rows
 }

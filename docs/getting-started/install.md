@@ -135,9 +135,8 @@ VPN, your account is not yet allowed to talk to the bridge. This happens when a 
 expected, and it is safe to answer.
 
 - **Yes** asks the operating system for administrator permission once and gives your account standing access, by adding
-  it to a local group named `hole`. On Windows, group membership takes effect only after you sign out and in. Until
-  then Hole reaches the bridge through a temporary grant that a bridge restart, such as an update, drops, so the
-  operating system's administrator prompt can return before you sign out and in.
+  it to a local group named `hole`. The access starts at once and holds across restarts and updates; you do not need to
+  sign out.
 - **No** asks the operating system for administrator permission for this one action.
 
 Either way, Hole shows this dialog only once. After **No**, the next time Hole needs permission the operating system's

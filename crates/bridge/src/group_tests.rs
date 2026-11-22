@@ -26,6 +26,64 @@ mod windows {
         let result = crate::group::lookup_sid("nonexistent_user_that_does_not_exist_12345");
         assert!(result.is_err());
     }
+
+    /// The name this machine gives the account with `sid`: a built-in group's name follows the display language.
+    fn account_name(sid: &str) -> String {
+        use windows::core::{HSTRING, PWSTR};
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows::Win32::Security::{LookupAccountSidW, PSID, SID_NAME_USE};
+
+        let mut psid = PSID::default();
+        // SAFETY: the string outlives the call; `psid` receives a LocalAlloc'd SID freed below.
+        unsafe { ConvertStringSidToSidW(&HSTRING::from(sid), &mut psid) }.expect("ConvertStringSidToSidW failed");
+        let mut name = vec![0u16; 256];
+        let mut domain = vec![0u16; 256];
+        let (mut name_len, mut domain_len) = (name.len() as u32, domain.len() as u32);
+        let mut kind = SID_NAME_USE::default();
+        // SAFETY: `psid` is the valid SID from above; each buffer is as long as its length says.
+        unsafe {
+            LookupAccountSidW(
+                None,
+                psid,
+                Some(PWSTR(name.as_mut_ptr())),
+                &mut name_len,
+                Some(PWSTR(domain.as_mut_ptr())),
+                &mut domain_len,
+                &mut kind,
+            )
+        }
+        .expect("LookupAccountSidW failed");
+        // SAFETY: `psid` came from LocalAlloc in ConvertStringSidToSidW and is freed once.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(psid.0)));
+        }
+        String::from_utf16(&name[..name_len as usize]).expect("an account name is UTF-16")
+    }
+
+    /// Windows puts INTERACTIVE and Authenticated Users in the built-in Users group on every install, so the
+    /// expected members do not come from the function under test. Neither is a user account: a member is listed
+    /// whatever kind of account it is.
+    #[skuld::test]
+    fn the_members_of_a_builtin_group_are_read_as_sids() {
+        let users = account_name("S-1-5-32-545");
+
+        let members = crate::group::os::member_sids(&users).expect("the members of the built-in Users group");
+
+        for well_known in ["S-1-5-4", "S-1-5-11"] {
+            assert!(
+                members.iter().any(|member| member == well_known),
+                "{well_known} is not among the members of {users}: {members:?}"
+            );
+        }
+    }
+
+    #[skuld::test]
+    fn members_of_a_group_that_does_not_exist_are_an_error() {
+        let missing = format!("hole_test_missing_{}", std::process::id());
+
+        assert!(crate::group::os::member_sids(&missing).is_err());
+    }
 }
 
 // macOS-specific tests ================================================================================================

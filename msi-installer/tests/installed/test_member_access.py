@@ -7,6 +7,9 @@ token has no `hole` group in it, and the child is admitted only by what the brid
 for the user. The bridge writes that list at every start, so the test restarts the service twice: an in-app update, a
 crash restart and a manual restart all start the bridge again inside the same sign-in session.
 
+The second test takes the user out of the group and restarts the bridge, then runs the elevated
+`hole bridge grant-access` the app offers a refused user, and connects with no further restart.
+
 A request is the whole connection of `connect_journey`, to a server with no plugin: it needs the `ss_plugin_server`
 example built (`cargo build -p plugin-e2e --example ss_plugin_server`). The child is de-elevated with `gsudo`, as the
 dashboard E2E is.
@@ -159,3 +162,50 @@ def test_the_installing_user_reaches_the_bridge_before_and_after_restarts(
         restart_service()
         member.phase = f"after restart {restart} of the {SERVICE} service"
         connect_and_fetch(member, ss_server, None, target, member.scratch)
+
+
+def remove_from_hole_group(user_sid: str) -> None:
+    """Take `user_sid` out of the `hole` group, from this elevated process."""
+    removed = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", f"Remove-LocalGroupMember -Group hole -Member '{user_sid}'"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    assert removed.returncode == 0, f"could not take {user_sid} out of `hole`: {removed.stderr}"
+
+
+@pytest.mark.parametrize("ss_server", ["none"], indirect=True)
+def test_grant_access_admits_a_user_while_the_bridge_runs(
+    member: UnelevatedMember, ss_server: dict, target: tuple[int, str]
+):
+    """An elevated `hole bridge grant-access`, which the app runs for a user the bridge refused, admits that user to a
+    bridge that is already running.
+
+    The user starts outside the group, with a bridge that started without them: then nothing but `grant-access` can
+    be what lets them in.
+    """
+    before = member.recorded("version")
+    assert_only_the_bridges_grant_admits(before)
+    remove_from_hole_group(before["user_sid"])
+    restart_service()
+    outside = member.recorded("version")
+    assert outside["socket_refusal"] is not None, (
+        f"the user still connects to {BRIDGE_SOCKET} after leaving `hole` and a bridge restart, so this run cannot "
+        "show that `grant-access` is what admits them"
+    )
+
+    granted = subprocess.run(
+        [str(BIN_DIR / "hole.exe"), "bridge", "grant-access"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=HOLE_CLI_TIMEOUT_SECONDS,
+    )
+    assert granted.returncode == 0, hole_command_report(
+        "the elevated `hole bridge grant-access` failed", granted, member.bridge_log
+    )
+
+    member.phase = "after an elevated `hole bridge grant-access`, with no bridge restart"
+    connect_and_fetch(member, ss_server, None, target, member.scratch)

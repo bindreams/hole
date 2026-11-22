@@ -50,7 +50,9 @@ A third install connects as the user the installer granted
 test process, which the socket's Administrators entry admits whatever the bridge granted anyone else. This one runs the
 installed `hole.exe` from a child that `gsudo` de-elevated, whose token was made before the install and so carries no
 `hole` group. It connects to the server with no plugin, restarts the `HoleBridge` service, connects again, and does
-both once more. It fails before the first connect when the child still holds Administrators, already carries the group,
+both once more. A second test takes the user out of the group, restarts the service, checks that the user is now
+refused, runs an elevated `hole bridge grant-access` and connects with no further restart. Each fails before its first
+connect when the child still holds Administrators, already carries the group,
 or is not the user the installer added. The child cannot read pytest's own temporary folder, so its files are in
 `member-access\` under the log folder. A failure also says how the child's own connect to the bridge's socket went:
 `hole` can exit before its own error text reaches a pipe.

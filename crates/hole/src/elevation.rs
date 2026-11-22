@@ -13,11 +13,11 @@
 //
 // When the user is first added to the `hole` group (either at install time or
 // via `grant-access`), no running process will reflect that membership until
-// the user logs out and back in. To provide immediate access, the elevated
-// `grant-access` command adds the user's own SID directly to the bridge
-// socket's DACL (a user's own SID is always present in their token). The
-// per-user SID is cleaned up on bridge restart, when the group membership
-// will have taken effect after re-login.
+// the user logs out and back in. So the bridge socket's DACL names each member
+// of the group by its own SID as well (a user's own SID is always present in
+// their token). The bridge writes that list at every start, and the elevated
+// `grant-access` command rewrites it on the live socket, which gives the user
+// it has just added immediate access.
 
 use crate::setup;
 use crate::state::AppState;

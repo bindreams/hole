@@ -1349,7 +1349,7 @@ async fn handle_version<P: Proxy + 'static, R: Routing + 'static>(
 
 /// Base SDDL for socket access control: SYSTEM + Administrators only.
 /// Used as the restrictive initial DACL (with `P` flag) in `socket.rs`,
-/// and as the base for the final DACL (with `hole` group appended) here.
+/// and as the base for the final DACL (the `hole` group and its members appended) here.
 #[cfg(target_os = "windows")]
 pub(crate) const SDDL_BASE: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 
@@ -1360,7 +1360,7 @@ pub(crate) const SDDL_BASE: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 /// DACL in `socket.rs` (SYSTEM + Administrators only, before `listen()`).
 ///
 /// When `protect` is false, inherited ACEs are preserved. This is used for
-/// the final DACL in `apply_socket_permissions` (adding the `hole` group).
+/// the final DACL in [`set_socket_access_list`] (adding the `hole` group).
 #[cfg(target_os = "windows")]
 pub fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Result<()> {
     use windows::core::HSTRING;
@@ -1496,107 +1496,60 @@ fn with_sddl_dacl(
 /// to prevent a TOCTOU race. This function then sets the final permissions,
 /// adding the `hole` group on both platforms.
 ///
-/// On Windows: sets a DACL restricting access to SYSTEM, Administrators, and the `hole` group.
-/// If an `installer-user-sid` file exists (written by `install_bridge` in `setup.rs`),
-/// the SID it contains is also added to the DACL, then the file is deleted. This is a
-/// workaround for the Windows token snapshot limitation: process tokens are immutable
-/// snapshots of group memberships captured at logon time, so a newly-added group
-/// membership is not reflected in any running process's token until the user logs out
-/// and back in. Adding the user's own SID directly to the DACL provides immediate
-/// access without requiring re-login. The per-user SID is cleaned up on the next
-/// bridge restart (when the group membership will have taken effect after re-login).
-///
+/// On Windows: [`set_socket_access_list`]; a failure is reported and leaves the socket to SYSTEM and Administrators.
 /// On macOS: sets ownership to root:hole with mode 0660.
 #[cfg(all(target_os = "windows", not(test)))]
 fn apply_socket_permissions(path: &Path) {
-    let mut extra_sids = Vec::new();
-    if let Some(sid) = take_installer_user_sid(&installer_user_sid_dir()) {
-        info!(sid = %sid, "including installer user SID in socket DACL");
-        extra_sids.push(sid);
-    }
-    let extra_refs: Vec<&str> = extra_sids.iter().map(|s| s.as_str()).collect();
-    let sddl = build_sddl(&extra_refs);
-    if let Err(e) = set_dacl_from_sddl(path, &sddl, false) {
+    if let Err(e) = set_socket_access_list(path) {
         warn!(error = &e as &dyn std::error::Error, "failed to set socket permissions");
     }
 }
 
-/// Name of the file where the installing user's SID is stored temporarily.
+/// Sets the access list of the bridge's socket at `path`: SYSTEM, Administrators, the `hole` group, and each member of
+/// the group by its own SID, as the account database holds them now.
 ///
-/// Written by [`prepare_ipc_access`], read and deleted by
-/// `apply_socket_permissions()` on bridge startup.
+/// A member's own entry is what admits a user who has not signed in since joining the group. Windows fixes a token's
+/// groups at sign-in, so such a user's processes do not carry the group, but a token always carries its user's SID.
+/// The list is built from the group every time: by the bridge at each bind, and by `hole bridge grant-access` on the
+/// socket of a running bridge. A member added or removed while a bridge runs is therefore picked up by its next start
+/// or by `grant-access`, not at once.
+///
+/// Without a `hole` group the socket admits SYSTEM and Administrators only. If the group's members cannot be read,
+/// the group's own entry is still set, and the error is returned.
 #[cfg(target_os = "windows")]
-pub(crate) const INSTALLER_USER_SID_FILE: &str = "installer-user-sid";
-
-/// The folder of [`INSTALLER_USER_SID_FILE`]: the `hole` folder of `%ProgramData%`, which the system owns but to which
-/// a standard user can add names (it inherits `BUILTIN\Users:(CI)(WD,AD,WEA,WA)` from `%ProgramData%`, and nothing in
-/// the installer narrows it). The file is read and written as a state file: through a handle on the folder, and a
-/// read refuses a file the folder's owner cannot vouch for, so a name a user planted does not grant its SID access.
-#[cfg(target_os = "windows")]
-pub fn installer_user_sid_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into())).join("hole")
-}
-
-/// The SID the installer left in `dir`, as text. `NotFound` for a missing file or folder.
-#[cfg(target_os = "windows")]
-pub(crate) fn read_installer_user_sid(dir: &Path) -> std::io::Result<String> {
-    let bytes = util::dir::ReadDir::open(dir)?.read_vouched(INSTALLER_USER_SID_FILE.as_ref())?;
-    String::from_utf8(bytes)
-        .map(|sid| sid.trim().to_owned())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "the installer SID file is not text"))
-}
-
-/// Reads and removes the installer's SID in `dir`; `None` when there is no usable one. The file is removed after a
-/// read, because the per-user SID is a temporary bridge that is no longer needed after the bridge restarts (group
-/// membership will be in the token after re-login). A file that could not be read (a name a user planted, or a read
-/// error) is left, and reported. Text that is not a SID is removed and reported without the text: the folder is one a
-/// user can add names to, and `bridge.log` is one the user can read.
-#[cfg(target_os = "windows")]
-pub(crate) fn take_installer_user_sid(dir: &Path) -> Option<String> {
-    let sid = match read_installer_user_sid(dir) {
+pub fn set_socket_access_list(path: &Path) -> std::io::Result<()> {
+    let group_sid = match crate::group::group_sid() {
         Ok(sid) => sid,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
             warn!(
                 error = &e as &dyn std::error::Error,
-                "could not read the installer user SID file; ignoring it"
+                "'hole' group not found, IPC restricted to admin-only"
             );
-            return None;
+            return set_dacl_from_sddl(path, SDDL_BASE, false);
         }
     };
-    if let Err(e) = crate::socket::remove_name(dir, INSTALLER_USER_SID_FILE.as_ref()) {
-        warn!(
-            error = &e as &dyn std::error::Error,
-            "could not remove the installer user SID file"
-        );
-    }
-    if !is_valid_sid_string(&sid) {
-        warn!("the installer user SID file does not hold a SID; ignoring it");
-        return None;
-    }
-    Some(sid)
-}
-
-/// Writes `sid` as the installer's SID in `dir`, making the folder if it is missing. The file is replaced as a whole,
-/// by name through a handle: a link a user planted at the name is replaced and what it leads to is left alone.
-#[cfg(target_os = "windows")]
-pub(crate) fn write_installer_user_sid(dir: &Path, sid: &str) -> std::io::Result<()> {
-    util::dir::Dir::open(dir, true, None)?
-        .write_atomic(INSTALLER_USER_SID_FILE.as_ref(), sid.as_bytes(), None, |_| Ok(()))
+    let (member_sids, unread) = match crate::group::member_sids() {
+        Ok(sids) => (sids, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    info!(
+        group = %group_sid,
+        members = ?member_sids,
+        "restricting IPC to SYSTEM + Administrators + the hole group and its members"
+    );
+    set_dacl_from_sddl(path, &build_sddl(&group_sid, &member_sids), false)?;
+    unread.map_or(Ok(()), Err)
 }
 
 /// Set up IPC access control so that the current interactive user can
 /// talk to the bridge once it's running. Idempotent.
 ///
-/// Specifically: creates the `hole` group if missing, adds the current
-/// interactive user to it, and on Windows writes that user's SID to the
-/// `installer-user-sid` file so the next `apply_socket_permissions` call
-/// includes it in the socket DACL (working around the Windows token-snapshot
-/// limitation).
-///
-/// Used by both `install_bridge` (where it's called once before service
-/// registration) and by `bridge grant-access` (where it's called by the
-/// dev workflow before starting the foreground bridge).
+/// Creates the `hole` group if missing and adds the current interactive user
+/// to it. The bridge reads the group when it binds its socket
+/// ([`set_socket_access_list`] on Windows), so this runs before the bridge
+/// starts: `install_bridge` calls it before it registers the service, and
+/// `bridge grant-access` calls it for a user the install did not add and for
+/// the dev workflow, before the foreground bridge starts.
 ///
 /// # Testing
 ///
@@ -1605,21 +1558,13 @@ pub(crate) fn write_installer_user_sid(dir: &Path, sid: &str) -> std::io::Result
 /// idempotent (macOS: verifies post-failure with `getgrnam(3)`;
 /// Windows: detects error code 1379) and `group::add_user_to_group`
 /// is idempotent (macOS: `dseditgroup -o edit -a` is naturally
-/// idempotent; Windows: detects error code 1378). The SID file write
-/// unconditionally replaces the file. No unit test asserts its effects; it runs
-/// only end to end in the installer lanes.
+/// idempotent; Windows: detects error code 1378). It runs end to end in the
+/// installer lanes, where the Windows member-access test asserts its effect.
 pub fn prepare_ipc_access() -> std::io::Result<()> {
     crate::group::create_group()?;
     let user = crate::group::installing_username()?;
     crate::group::add_user_to_group(&user)?;
     info!(user = %user, group = %crate::group::GROUP_NAME, "prepared IPC access");
-
-    #[cfg(target_os = "windows")]
-    {
-        let sid = crate::group::lookup_sid(&user)?;
-        write_installer_user_sid(&installer_user_sid_dir(), &sid)?;
-        info!(sid = %sid, "wrote installer user SID");
-    }
     Ok(())
 }
 
@@ -1632,39 +1577,19 @@ pub(crate) fn is_valid_sid_string(s: &str) -> bool {
     s.starts_with("S-") && s.len() > 3 && s[2..].bytes().all(|b| b.is_ascii_digit() || b == b'-')
 }
 
-/// Build the SDDL string for the socket file DACL.
-///
-/// Always includes SYSTEM + Administrators + the `hole` group (if it exists).
-/// Additional per-user SIDs can be appended via `extra_sids` — this is used
-/// as a temporary workaround for the Windows token snapshot limitation (see
-/// [`apply_socket_permissions`] and the doc comment on `handle_grant_access`
-/// in `cli.rs`).
+/// The socket's access list as SDDL: SYSTEM and Administrators ([`SDDL_BASE`]), then full control for the group and
+/// for each of its members, in the order given. A string that is not a SID is left out and reported without its
+/// text, so nothing passed here can add an entry of its own.
 #[cfg(target_os = "windows")]
-pub fn build_sddl(extra_sids: &[&str]) -> String {
-    let base = SDDL_BASE;
-
-    let mut sddl = match crate::group::group_sid() {
-        Ok(sid) => {
-            info!(sid = %sid, "restricting IPC to SYSTEM + Administrators + hole group");
-            format!("{base}(A;;GA;;;{sid})")
-        }
-        Err(e) => {
-            warn!(
-                error = &e as &dyn std::error::Error,
-                "'hole' group not found, IPC restricted to admin-only"
-            );
-            base.to_string()
-        }
-    };
-
-    for sid in extra_sids {
+pub(crate) fn build_sddl(group_sid: &str, member_sids: &[String]) -> String {
+    let mut sddl = SDDL_BASE.to_owned();
+    for sid in std::iter::once(group_sid).chain(member_sids.iter().map(String::as_str)) {
         if is_valid_sid_string(sid) {
             sddl.push_str(&format!("(A;;GA;;;{sid})"));
         } else {
             warn!("ignoring malformed SID string in DACL");
         }
     }
-
     sddl
 }
 

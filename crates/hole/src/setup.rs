@@ -500,11 +500,11 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
         }
     }
 
-    // Create access group, add installing user, and (on Windows) write the
-    // installer SID file so the bridge includes it in the socket DACL on
-    // first startup. Shared with `bridge grant-access` used by dev-console.
-    // Failing here is fatal: without the hole group, the GUI cannot connect
-    // after install, so the installer must not silently continue.
+    // Create the access group and add the installing user, before the service
+    // starts: the bridge reads the group's members when it binds its socket.
+    // Shared with `bridge grant-access`. Failing here is fatal: without the
+    // hole group, the GUI cannot connect after install, so the installer must
+    // not silently continue.
     hole_bridge::ipc::prepare_ipc_access()?;
 
     install_bridge_with(

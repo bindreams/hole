@@ -1082,59 +1082,31 @@ fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
 
 /// Handle the `bridge grant-access` command.
 ///
-/// Creates the `hole` group, adds the current user to it, and on Windows
-/// writes the user's SID to the `installer-user-sid` file so the bridge
-/// includes it in the socket DACL on next startup. If the bridge is
-/// already running, also updates the live socket DACL directly so the
-/// GUI can connect without re-login. Used both by the installer (to set
-/// up IPC access at install time) and by dev-console (to prepare IPC access
-/// before the foreground dev bridge starts).
-///
-/// The direct-DACL-update path is a workaround for the Windows
-/// token-snapshot limitation: process tokens are immutable snapshots of
-/// group memberships captured at logon time. There is no Win32 API to
-/// refresh a process's token to pick up new group memberships, and
-/// `klist purge`/`nltest` only affect Kerberos/AD tickets, not local group
-/// tokens. Adding the user's own SID directly to the DACL provides immediate
-/// access — a user's own SID is always present in their token.
+/// Creates the `hole` group and adds the current user to it. On Windows, if a
+/// bridge is listening on the default socket, it then rebuilds that socket's
+/// access list from the group, with the function the bridge itself calls at
+/// every start (`set_socket_access_list`), so the user it has just added is
+/// admitted at once, without a bridge restart and without signing out. Used by
+/// the elevation prompt (`elevation.rs`, which explains why the group alone
+/// does not admit the user yet) and by dev-console before it starts the
+/// foreground dev bridge.
 fn handle_grant_access(
     then_send: Option<String>,
     then_send_file: Option<std::path::PathBuf>,
     result_file: Option<std::path::PathBuf>,
 ) -> i32 {
-    // Create group + add user + (on Windows) write installer SID file.
     if let Err(e) = hole_bridge::ipc::prepare_ipc_access() {
         cli_log!(error, "failed to prepare IPC access: {e}");
         return 1;
     }
 
-    // On Windows, if the bridge is already running, also update the live
-    // socket DACL directly so the GUI can connect immediately without
-    // waiting for a bridge restart.
     #[cfg(target_os = "windows")]
     {
         let socket_path = hole_common::protocol::default_bridge_socket_path();
         if socket_path.exists() {
-            match hole_bridge::group::installing_username() {
-                Ok(username) => match hole_bridge::group::lookup_sid(&username) {
-                    Ok(user_sid) => {
-                        let sddl = hole_bridge::ipc::build_sddl(&[&user_sid]);
-                        if let Err(e) = hole_bridge::ipc::set_dacl_from_sddl(&socket_path, &sddl, false) {
-                            cli_log!(warn, "warning: failed to update live socket DACL: {e}");
-                        } else {
-                            cli_log!(info, "updated live socket DACL with user SID");
-                        }
-                    }
-                    Err(e) => {
-                        cli_log!(warn, "warning: could not look up user SID: {e}");
-                    }
-                },
-                Err(e) => {
-                    cli_log!(
-                        warn,
-                        "warning: could not determine installing user for live DACL update: {e}"
-                    );
-                }
+            match hole_bridge::ipc::set_socket_access_list(&socket_path) {
+                Ok(()) => cli_log!(info, "updated the live socket's access list from the hole group"),
+                Err(e) => cli_log!(warn, "warning: failed to update the live socket's access list: {e}"),
             }
         }
     }

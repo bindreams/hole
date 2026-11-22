@@ -89,6 +89,13 @@ pub fn group_sid() -> io::Result<String> {
     lookup_sid(GROUP_NAME)
 }
 
+/// The SID of every member of the `hole` group, as the account database holds them now: users, groups and well-known
+/// SIDs alike, unresolved. A running process's token is not consulted, so a member added a moment ago is listed.
+#[cfg(target_os = "windows")]
+pub fn member_sids() -> io::Result<Vec<String>> {
+    os::member_sids(GROUP_NAME)
+}
+
 // macOS implementation ================================================================================================
 
 #[cfg(target_os = "macos")]
@@ -375,7 +382,6 @@ mod os {
     /// Look up any account name (user or group) and return its SID as a string.
     pub fn lookup_sid(name: &str) -> io::Result<String> {
         use windows::core::PWSTR;
-        use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
         use windows::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
 
         let account_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
@@ -435,12 +441,82 @@ mod os {
         }
         .map_err(|e| io::Error::other(format!("LookupAccountNameW failed: {e}")))?;
 
-        // Convert SID to string
         // SAFETY: `sid_ptr` contains a valid SID written by the successful
-        // LookupAccountNameW call. `string_sid` is an out-parameter that Windows
+        // LookupAccountNameW call, and `sid_buf` outlives this call.
+        unsafe { sid_to_string(sid_ptr) }
+    }
+
+    /// The members of the local group `group`, each as a SID string, read at level 0: the SID alone, so a member
+    /// whose account can no longer be resolved to a name is still listed. Every page is read; there is no cap.
+    pub fn member_sids(group: &str) -> io::Result<Vec<String>> {
+        use windows::core::{HSTRING, PCWSTR};
+        use windows::Win32::Foundation::ERROR_MORE_DATA;
+        use windows::Win32::NetworkManagement::NetManagement::{
+            NERR_Success, NetApiBufferFree, NetLocalGroupGetMembers, LOCALGROUP_MEMBERS_INFO_0, MAX_PREFERRED_LENGTH,
+        };
+
+        let group_wide = HSTRING::from(group);
+        let mut sids = Vec::new();
+        // Zero on the first call; the API advances it and it is passed back unchanged.
+        let mut resume: usize = 0;
+        loop {
+            let mut buffer: *mut u8 = std::ptr::null_mut();
+            let mut read: u32 = 0;
+            let mut total: u32 = 0;
+            // SAFETY: `group_wide` is a valid null-terminated string kept alive for the call; the server name is
+            // null (this machine). The out-parameters are stack locals. On success and on ERROR_MORE_DATA the API
+            // allocates `buffer`, which is freed below with NetApiBufferFree on every path.
+            let status = unsafe {
+                NetLocalGroupGetMembers(
+                    PCWSTR::null(),
+                    &group_wide,
+                    0,
+                    &mut buffer,
+                    MAX_PREFERRED_LENGTH,
+                    &mut read,
+                    &mut total,
+                    Some(&mut resume),
+                )
+            };
+            let page = if buffer.is_null() {
+                Ok(())
+            } else {
+                // SAFETY: a non-null `buffer` holds `read` LOCALGROUP_MEMBERS_INFO_0 entries, each pointing at a
+                // valid SID inside the same allocation, which stays alive until the free below.
+                let page = unsafe {
+                    std::slice::from_raw_parts(buffer.cast::<LOCALGROUP_MEMBERS_INFO_0>(), read as usize)
+                        .iter()
+                        .try_for_each(|member| sid_to_string(member.lgrmi0_sid).map(|sid| sids.push(sid)))
+                };
+                // SAFETY: `buffer` was allocated by NetLocalGroupGetMembers and is freed exactly once.
+                unsafe { NetApiBufferFree(Some(buffer.cast())) };
+                page
+            };
+            page?;
+            if status == NERR_Success {
+                return Ok(sids);
+            }
+            if status != ERROR_MORE_DATA.0 {
+                return Err(io::Error::other(format!(
+                    "NetLocalGroupGetMembers failed for '{group}': error {status}"
+                )));
+            }
+        }
+    }
+
+    /// `sid` as a string (`S-1-...`).
+    ///
+    /// # Safety
+    ///
+    /// `sid` points at a valid SID that stays alive for the call.
+    unsafe fn sid_to_string(sid: windows::Win32::Security::PSID) -> io::Result<String> {
+        use windows::core::PWSTR;
+        use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+        // SAFETY: the caller vouches for `sid`. `string_sid` is an out-parameter that Windows
         // allocates via LocalAlloc; we free it with LocalFree below.
         let mut string_sid = PWSTR::null();
-        unsafe { ConvertSidToStringSidW(sid_ptr, &mut string_sid) }
+        unsafe { ConvertSidToStringSidW(sid, &mut string_sid) }
             .map_err(|e| io::Error::other(format!("ConvertSidToStringSidW failed: {e}")))?;
 
         // SAFETY: `string_sid.0` is a valid null-terminated UTF-16 string allocated
