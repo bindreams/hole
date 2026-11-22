@@ -127,8 +127,9 @@ pub(crate) struct IpcState<P: Proxy, R: Routing> {
     /// The socket this server listens on: the file whose access list a refresh request rebuilds.
     pub(crate) socket_path: PathBuf,
     /// Held across a refresh request's read of the group and its write of the list, so two requests in flight cannot
-    /// interleave them and leave the list of the one that read first.
-    pub(crate) access_refresh: Mutex<()>,
+    /// interleave them and leave the list of the one that read first. The guard is owned by the blocking task that
+    /// does the work, not by the handler: a client that disconnects drops the handler, and the task still runs.
+    pub(crate) access_refresh: Arc<Mutex<()>>,
     /// Test-only rendezvous, mirroring `MockProxy`'s `start_gate`/
     /// `start_entered`: if set, `persist_after_start` fires `persist_entered`
     /// on entry, then awaits `persist_gate`, before doing any write. Lets a
@@ -170,7 +171,7 @@ impl<P: Proxy, R: Routing> IpcState<P, R> {
             version: version.to_owned(),
             log_dir,
             socket_path,
-            access_refresh: Mutex::new(()),
+            access_refresh: Arc::new(Mutex::new(())),
             #[cfg(test)]
             persist_gate: None,
             #[cfg(test)]
@@ -921,13 +922,17 @@ const ACCESS_NOT_REFRESHED: &str = "the bridge could not set its socket's access
 /// is set. Takes nothing from the client, so any client the socket admits may send it.
 ///
 /// Blocking OS calls (the group's members, the list), so they run on the blocking pool. The read and the write are
-/// one section under [`IpcState::access_refresh`].
+/// one section under [`IpcState::access_refresh`], whose guard moves into the blocking task.
 async fn handle_refresh_access<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _one_at_a_time = state.access_refresh.lock().await;
+    let one_at_a_time = Arc::clone(&state.access_refresh).lock_owned().await;
     let path = state.socket_path.clone();
-    match tokio::task::spawn_blocking(move || apply_socket_permissions(&path)).await {
+    let task = tokio::task::spawn_blocking(move || {
+        let _one_at_a_time = one_at_a_time;
+        apply_socket_permissions(&path)
+    });
+    match task.await {
         Ok(Ok(())) => {
             info!("socket access list refreshed from the hole group");
             Ok(Json(EmptyResponse {}))
