@@ -16,8 +16,8 @@
 // the user logs out and back in. So the bridge socket's DACL names each member
 // of the group by its own SID as well (a user's own SID is always present in
 // their token). The bridge writes that list at every start, and the elevated
-// `grant-access` command rewrites it on the live socket, which gives the user
-// it has just added immediate access.
+// `grant-access` command asks the running bridge to write it again, which gives
+// the user it has just added immediate access.
 
 use crate::setup;
 use crate::state::AppState;

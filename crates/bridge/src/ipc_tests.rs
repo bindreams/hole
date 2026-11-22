@@ -633,6 +633,17 @@ async fn post_unblock(client: &mut TestClient) -> http::Response<hyper::body::In
     client.send(req).await
 }
 
+#[cfg(target_os = "windows")]
+async fn post_refresh_access(client: &mut TestClient) -> http::Response<hyper::body::Incoming> {
+    let req = http::Request::builder()
+        .method("POST")
+        .uri(hole_common::protocol::ROUTE_REFRESH_ACCESS)
+        .header("host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    client.send(req).await
+}
+
 async fn post_reload(client: &mut TestClient, config: &ProxyConfig) -> http::Response<hyper::body::Incoming> {
     let body_bytes = serde_json::to_vec(config).unwrap();
     let req = http::Request::builder()
@@ -1691,7 +1702,7 @@ fn ipc_state_with_persist_gate(
     )));
     let gate = Arc::new(tokio::sync::Notify::new());
     let (entered_tx, entered_rx) = oneshot::channel();
-    let mut state = IpcState::new(proxy, "test", dir);
+    let mut state = IpcState::new(proxy, "test", dir, PathBuf::new());
     state.persist_gate = Some(gate.clone());
     state.persist_entered = std::sync::Mutex::new(Some(entered_tx));
     (Arc::new(state), gate, entered_rx)
@@ -3143,6 +3154,21 @@ fn a_member_list_too_long_for_an_access_list_still_admits_the_group() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The trustees a socket's own entries must name for the `hole` group as the account database holds it now, as
+/// Windows prints them. Without a `hole` group that is SYSTEM and Administrators.
+#[cfg(target_os = "windows")]
+fn trustees_of_the_group_now() -> Vec<String> {
+    let sddl = match crate::group::group_sid() {
+        Ok(group) => {
+            let members = crate::group::member_sids().expect("the members of a `hole` group that exists");
+            crate::ipc::build_sddl(&group, &members)
+        }
+        Err(_) => crate::ipc::SDDL_BASE.to_owned(),
+    };
+    // Windows prints some SIDs as aliases, so both sides go through its printer.
+    own_trustees(&crate::test_support::dacl::printed_sddl(&sddl))
+}
+
 /// `IpcServer::bind` is the bind every bridge makes, and each one sets the socket's access list from the account
 /// database as it is at that moment. A second bind of the same path is a bridge restart.
 ///
@@ -3152,17 +3178,9 @@ fn a_member_list_too_long_for_an_access_list_still_admits_the_group() {
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn every_bind_sets_the_access_list_the_account_database_gives() {
-    use crate::test_support::dacl::{aces, dacl_sddl, printed_sddl};
+    use crate::test_support::dacl::{aces, dacl_sddl};
 
-    let expected = match crate::group::group_sid() {
-        Ok(group) => {
-            let members = crate::group::member_sids().expect("the members of a `hole` group that exists");
-            crate::ipc::build_sddl(&group, &members)
-        }
-        Err(_) => crate::ipc::SDDL_BASE.to_owned(),
-    };
-    // Windows prints some SIDs as aliases, so both sides go through its printer.
-    let expected = own_trustees(&printed_sddl(&expected));
+    let expected = trustees_of_the_group_now();
     let path = test_socket_path("access-list");
 
     for bind in ["first", "second"] {
@@ -3184,6 +3202,47 @@ fn every_bind_sets_the_access_list_the_account_database_gives() {
 
         drop(server);
     }
+}
+
+/// A request to a running bridge to refresh its socket's access list sets what the account database says. The list
+/// is replaced beforehand by one naming a group and a member stated here (no machine has them), so the two lists
+/// differ whether or not the machine has a `hole` group. That the user the request admits is one the socket refused
+/// before is the installed test's to show (`test_grant_access_admits_a_user_while_the_bridge_runs`): it needs a second
+/// token.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn a_refresh_request_sets_the_access_list_the_account_database_gives() {
+    use crate::test_support::dacl::dacl_sddl;
+
+    rt().block_on(async {
+        let path = test_socket_path("refresh-access");
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
+        let expected = trustees_of_the_group_now();
+        crate::ipc::set_access_list(&path, GROUP_SID, &[MEMBER_SID.to_owned()]).unwrap();
+        assert_ne!(
+            own_trustees(&dacl_sddl(&path)),
+            expected,
+            "the list set beforehand is the one the account database gives, so the request could change nothing"
+        );
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let status = post_refresh_access(&mut client).await.status();
+        let sddl = dacl_sddl(&path);
+
+        assert_eq!(status, 200, "the request was not served");
+        assert_eq!(
+            own_trustees(&sddl),
+            expected,
+            "the request did not set the access list the group gives: {sddl}"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
 }
 
 // bind() smoke tests: the bind every bridge makes.
@@ -3348,7 +3407,7 @@ fn redacting_capture() -> (
 
 fn ipc_state(proxy: Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>) -> Arc<IpcState<MockProxy, MockRouting>> {
     let log_dir = tempfile::tempdir().unwrap().keep();
-    Arc::new(IpcState::new(proxy, "test", log_dir))
+    Arc::new(IpcState::new(proxy, "test", log_dir, PathBuf::new()))
 }
 
 fn redaction_config() -> ProxyConfig {
@@ -3420,7 +3479,12 @@ async fn test_server_request_arms_the_configured_and_the_resolved_address() {
         },
         host_as_rendered: Default::default(),
     });
-    let mut state = IpcState::new(mock_proxy(), "test", tempfile::tempdir().unwrap().keep());
+    let mut state = IpcState::new(
+        mock_proxy(),
+        "test",
+        tempfile::tempdir().unwrap().keep(),
+        PathBuf::new(),
+    );
     state.test_server_config = crate::server_test::TestConfig {
         bootstrap: crate::dns::bootstrap::BootstrapResolver::with_querier(probe.clone()),
         preflight_timeout: std::time::Duration::from_millis(500),

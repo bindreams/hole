@@ -1386,3 +1386,63 @@ fn foreground_source_makes_a_relative_folder_absolute() {
     };
     assert!(dir.is_absolute(), "{dir:?}");
 }
+
+// Asking a running bridge to refresh its access list ==================================================================
+
+/// A socket name nobody listens on, with nothing at it.
+fn absent_socket_path(suffix: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("hole-cli-refresh-{}-{suffix}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+#[skuld::test]
+fn grant_access_with_no_bridge_asks_nothing() {
+    let outcome = super::refresh_bridge_access(&absent_socket_path("absent"));
+
+    assert_eq!(outcome, super::RefreshBridgeAccessOutcome::NoBridge);
+}
+
+/// A bridge that died leaves its socket's name behind: connecting to it is refused, as when nothing was ever there.
+#[skuld::test]
+fn grant_access_with_a_stale_socket_name_asks_nothing() {
+    let path = absent_socket_path("stale");
+    drop(hole_bridge::socket::bind(&path).unwrap());
+    assert!(
+        path.exists(),
+        "the name a closed listener leaves is what this test stands on"
+    );
+
+    let outcome = super::refresh_bridge_access(&path);
+
+    assert_eq!(outcome, super::RefreshBridgeAccessOutcome::NoBridge);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The answers a bridge can give, stated here: what the command makes of each is what is asserted.
+#[skuld::test]
+fn grant_access_takes_the_bridges_answer_to_a_refresh_as_its_own() {
+    use crate::bridge_client::ClientError;
+    use hole_common::protocol::BridgeResponse;
+
+    let outcome = |answer| super::refresh_bridge_access_outcome(answer);
+
+    assert_eq!(
+        outcome(Ok(BridgeResponse::Ack)),
+        super::RefreshBridgeAccessOutcome::Refreshed
+    );
+    assert_eq!(
+        outcome(Ok(BridgeResponse::Error {
+            message: "set failed".into()
+        })),
+        super::RefreshBridgeAccessOutcome::Failed("bridge error: set failed".into())
+    );
+    assert_eq!(
+        outcome(Err(ClientError::PermissionDenied)),
+        super::RefreshBridgeAccessOutcome::Failed(ClientError::PermissionDenied.to_string())
+    );
+    assert_eq!(
+        outcome(Err(ClientError::VersionMismatch { bridge: None })),
+        super::RefreshBridgeAccessOutcome::Failed(ClientError::VersionMismatch { bridge: None }.to_string())
+    );
+}

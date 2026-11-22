@@ -1082,14 +1082,15 @@ fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
 
 /// Handle the `bridge grant-access` command.
 ///
-/// Creates the `hole` group and adds the current user to it. On Windows, if a
-/// bridge is listening on the default socket, it then rebuilds that socket's
-/// access list from the group, with the function the bridge itself calls at
-/// every start (`set_socket_access_list`), so the user it has just added is
-/// admitted at once, without a bridge restart and without signing out. Used by
-/// the elevation prompt (`elevation.rs`, which explains why the group alone
-/// does not admit the user yet) and by dev-console before it starts the
-/// foreground dev bridge.
+/// Creates the `hole` group and adds the current user to it. If a bridge is
+/// listening on the default socket, it then asks that bridge to rebuild the
+/// socket's access list from the group and waits for the answer, so the user it
+/// has just added is admitted when the command returns, without a bridge restart
+/// and without signing out. The bridge is the only process that writes its
+/// socket's access list. With no bridge listening there is nothing to ask: the
+/// next one reads the group when it binds. Used by the elevation prompt
+/// (`elevation.rs`, which explains why the group alone does not admit the user
+/// yet) and by dev-console before it starts the foreground dev bridge.
 fn handle_grant_access(
     then_send: Option<String>,
     then_send_file: Option<std::path::PathBuf>,
@@ -1100,14 +1101,16 @@ fn handle_grant_access(
         return 1;
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        let socket_path = hole_common::protocol::default_bridge_socket_path();
-        if socket_path.exists() {
-            match hole_bridge::ipc::set_socket_access_list(&socket_path) {
-                Ok(()) => cli_log!(info, "updated the live socket's access list from the hole group"),
-                Err(e) => cli_log!(warn, "warning: failed to update the live socket's access list: {e}"),
-            }
+    match refresh_bridge_access(&hole_common::protocol::default_bridge_socket_path()) {
+        RefreshBridgeAccessOutcome::Refreshed => {
+            cli_log!(info, "the bridge set its socket's access list from the hole group")
+        }
+        RefreshBridgeAccessOutcome::NoBridge => {}
+        RefreshBridgeAccessOutcome::Failed(why) => {
+            cli_log!(
+                warn,
+                "warning: the bridge did not set its socket's access list from the hole group: {why}"
+            )
         }
     }
 
@@ -1123,6 +1126,50 @@ fn handle_grant_access(
         },
         (None, None) => 0,
     }
+}
+
+/// What asking a running bridge to refresh its socket's access list came to.
+#[derive(Debug, PartialEq)]
+enum RefreshBridgeAccessOutcome {
+    /// The bridge answered: it has set its socket's access list from the group.
+    Refreshed,
+    /// Nothing listens on the socket.
+    NoBridge,
+    /// A bridge is there and the list was not set; the text says why.
+    Failed(String),
+}
+
+/// What an answer from the bridge (or its absence) means for a refresh request.
+fn refresh_bridge_access_outcome(
+    answer: Result<hole_common::protocol::BridgeResponse, crate::bridge_client::ClientError>,
+) -> RefreshBridgeAccessOutcome {
+    use crate::bridge_client::ClientError;
+    use hole_common::protocol::BridgeResponse;
+
+    match answer {
+        Ok(BridgeResponse::Ack) => RefreshBridgeAccessOutcome::Refreshed,
+        Ok(BridgeResponse::Error { message }) => RefreshBridgeAccessOutcome::Failed(format!("bridge error: {message}")),
+        Ok(other) => unreachable!("the client answers a refresh request with Ack or Error, not {other:?}"),
+        // A name nobody bound, or one a dead bridge left behind: no bridge. The next one to start reads the group.
+        Err(ClientError::Connection(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            RefreshBridgeAccessOutcome::NoBridge
+        }
+        Err(e) => RefreshBridgeAccessOutcome::Failed(e.to_string()),
+    }
+}
+
+/// Asks the bridge listening at `socket_path` to rebuild its socket's access list from the `hole` group, and returns
+/// once it has answered.
+fn refresh_bridge_access(socket_path: &std::path::Path) -> RefreshBridgeAccessOutcome {
+    refresh_bridge_access_outcome(send_bridge_request_inner_at(
+        hole_common::protocol::BridgeRequest::RefreshAccess,
+        socket_path,
+    ))
 }
 
 /// Decode the `--base64` elevation payload, or return a message safe to log.
@@ -1250,6 +1297,7 @@ pub(crate) fn arm_request_redaction(request: &hole_common::protocol::BridgeReque
         | BridgeRequest::Diagnostics
         | BridgeRequest::SetLockdown { .. }
         | BridgeRequest::Unblock
+        | BridgeRequest::RefreshAccess
         | BridgeRequest::ApplyUpdate { .. } => {}
     }
 }

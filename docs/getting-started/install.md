@@ -136,7 +136,9 @@ expected, and it is safe to answer.
 
 - **Yes** asks the operating system for administrator permission once and gives your account standing access, by adding
   it to a local group named `hole`. On Windows the access starts at once and holds across restarts and in-app updates;
-  you do not need to sign out.
+  you do not need to sign out. The one limit is a `hole` group of more than about 1,800 members, too many for the
+  bridge's access list: a member who has not signed in since joining is refused until they sign out and in, or the
+  group is trimmed.
 - **No** asks the operating system for administrator permission for this one action.
 
 Either way, Hole shows this dialog only once. After **No**, the next time Hole needs permission the operating system's

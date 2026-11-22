@@ -40,7 +40,8 @@ on Windows).
    `rename` on a path. The same holds for the stale socket (`socket::remove`, `util::dir::make_dir_and_free_name`), whose
    folder on Windows is the `hole` folder of `%ProgramData%`, to which a standard user can add names. A socket's bind,
    and the mode or ACL set on it afterwards, still name it by path, because no platform binds relative to a directory
-   handle.
+   handle. The bridge is the only process that sets them, on its own socket: `hole bridge grant-access` asks the
+   running bridge to set them again and never touches the socket itself.
 1. **Set mode and owner through the open file.** `fchown`, `fchmod` and the Windows ACL go to the handle of a temp file,
    before it is renamed into place (`Dir::write_atomic`, `Dir::stage`).
 1. **Never touch a path after a rename.** Once the temp file has its final name the writer does nothing to that name, so a

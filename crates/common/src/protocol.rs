@@ -99,6 +99,10 @@ pub enum BridgeRequest {
     /// and turn the kill-switch intent off. Maps to `POST /v1/unblock` — the
     /// tray's escape from a cover stranded by an unclean exit.
     Unblock,
+    /// Ask the running bridge to rebuild its socket's access list from the `hole` group as the account database
+    /// holds it now. Maps to `POST /v1/refresh-access`. Takes nothing and sets nothing a client names; sent by
+    /// `hole bridge grant-access` after it adds a user to the group.
+    RefreshAccess,
     /// Apply a verified update via the service-manager cutover. Maps to
     /// `POST /v1/update-apply`. `consent` is the informed-consent seam: REQUIRED
     /// true for a lockdown-off update (the standing cover holds the gap under
@@ -167,6 +171,7 @@ impl dump::Dump for BridgeRequest {
             | BridgeRequest::Diagnostics
             | BridgeRequest::SetLockdown { .. }
             | BridgeRequest::Unblock
+            | BridgeRequest::RefreshAccess
             | BridgeRequest::ApplyUpdate { .. } => dump::from_serialize(self),
         }
     }
