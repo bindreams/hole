@@ -3129,7 +3129,13 @@ fn a_member_list_too_long_for_an_access_list_still_admits_the_group() {
 
     let result = crate::ipc::set_access_list(&path, GROUP_SID, &members);
 
-    assert!(result.is_err(), "3000 members fitted into one access list");
+    let error = result
+        .expect_err("3000 members fitted into one access list")
+        .to_string();
+    assert!(
+        error.contains("3000 members") && error.contains("the group alone is admitted"),
+        "the error does not say what the socket was left with: {error}"
+    );
     assert_eq!(
         own_trustees(&crate::test_support::dacl::dacl_sddl(&path)),
         printed_trustees(GROUP_SID, &[])

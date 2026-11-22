@@ -184,7 +184,7 @@ impl IpcServer {
     /// Bind to the given Unix domain socket path.
     ///
     /// Removes any stale socket file, creates parent directories, binds with
-    /// restrictive initial permissions (umask on macOS, DACL on Windows), and
+    /// restrictive initial permissions (mode 0600 on macOS, DACL on Windows), and
     /// then applies the final OS-level access control (adding the `hole` group).
     pub fn bind_with_log_dir<P: Proxy + 'static, R: Routing + 'static>(
         path: &Path,
@@ -1487,7 +1487,7 @@ fn with_sddl_dacl(
 /// Apply OS-level access control to the socket file.
 ///
 /// This is the second phase of socket permission setup. The first phase
-/// (in `socket.rs`) applies a restrictive DACL/umask during socket creation
+/// (in `socket.rs`) applies a restrictive DACL or mode during socket creation
 /// to prevent a TOCTOU race. This function then sets the final permissions,
 /// adding the `hole` group on both platforms.
 ///
@@ -1510,7 +1510,7 @@ fn apply_socket_permissions(path: &Path) {
 /// or by `grant-access`, not at once.
 ///
 /// Without a `hole` group the socket admits SYSTEM and Administrators only. If the group's members cannot be read, or
-/// the list with them cannot be set ([`set_access_list`]), the group's own entry is still set, and the error is
+/// the list with them cannot be set, the group's own entry is set alone ([`set_access_list`]) and the error is
 /// returned.
 #[cfg(target_os = "windows")]
 pub fn set_socket_access_list(path: &Path) -> std::io::Result<()> {
@@ -1528,27 +1528,42 @@ pub fn set_socket_access_list(path: &Path) -> std::io::Result<()> {
         Ok(sids) => (sids, None),
         Err(e) => (Vec::new(), Some(e)),
     };
+    set_access_list(path, &group_sid, &member_sids)?;
     info!(
         group = %group_sid,
         members = ?member_sids,
-        "restricting IPC to SYSTEM + Administrators + the hole group and its members"
+        "IPC restricted to SYSTEM + Administrators + the hole group and its members"
     );
-    set_access_list(path, &group_sid, &member_sids)?;
     unread.map_or(Ok(()), Err)
 }
 
 /// Sets the access list of the socket at `path` for a group with these members ([`build_sddl`]).
 ///
-/// If that list cannot be set, the group's own entry is set without the members and the error is returned: an access
-/// list holds 64 KB, and a group with more members than fit must not lose the entry that admits the members whose
-/// tokens carry it.
+/// If that list cannot be set, the group's own entry is set without the members, and the error says so. An access list
+/// holds 64 KB, about 1800 members, and a group with more must not lose the entry that admits the members whose
+/// tokens carry it. On the socket of a running bridge that replaces a list that named members with one that does
+/// not: the next start would have set the same.
 #[cfg(target_os = "windows")]
 pub(crate) fn set_access_list(path: &Path, group_sid: &str, member_sids: &[String]) -> std::io::Result<()> {
-    let Err(e) = set_dacl_from_sddl(path, &build_sddl(group_sid, member_sids), false) else {
+    let Err(with_members) = set_dacl_from_sddl(path, &build_sddl(group_sid, member_sids), false) else {
         return Ok(());
     };
-    set_dacl_from_sddl(path, &build_sddl(group_sid, &[]), false)?;
-    Err(e)
+    if member_sids.is_empty() {
+        return Err(with_members);
+    }
+    let members = member_sids.len();
+    Err(std::io::Error::other(
+        match set_dacl_from_sddl(path, &build_sddl(group_sid, &[]), false) {
+            Ok(()) => format!(
+                "the access list could not be set with the group's {members} members ({with_members}); the group \
+                 alone is admitted, so a member who has not signed in since joining is refused"
+            ),
+            Err(group_alone) => format!(
+                "the access list could not be set with the group's {members} members ({with_members}), nor for the \
+                 group alone ({group_alone})"
+            ),
+        },
+    ))
 }
 
 /// Set up IPC access control so that the current interactive user can
