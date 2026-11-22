@@ -8,7 +8,9 @@ python-platform = "all"
 
 # `docs/conf.py` and `scripts/validate-docs.py` both import `docs/_versions.py`
 # after a sys.path insert, which ty cannot see.
-extra-paths = ["docs"]
+#
+# The two installer suites import `tests/installed/connect_journey.py` through pytest's `pythonpath`.
+extra-paths = ["docs", "tests/installed"]
 
 [rules]
 # PEP 723 inline script dependencies are not visible to ty's module resolver.

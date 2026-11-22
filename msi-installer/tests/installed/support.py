@@ -41,6 +41,8 @@ DUMP_UNINSTALL = SCRIPTS / "dump-uninstall-diagnostics.ps1"
 GSUDO_SELFTEST_TIMEOUT_SECONDS = 5 * 60
 DASHBOARD_E2E_TIMEOUT_SECONDS = 5 * 60
 DIAGNOSTICS_TIMEOUT_SECONDS = 5 * 60
+# One `hole` CLI command of the connect test: a bridge that never answers fails the case, with its log.
+HOLE_CLI_TIMEOUT_SECONDS = 2 * 60
 
 SERVICE = "HoleBridge"
 INSTALL_DIR = Path(os.environ.get("ProgramW6432", r"C:\Program Files")) / "hole"
@@ -266,8 +268,6 @@ def assert_nothing_installed() -> None:
 
 # Install and uninstall ================================================================================================
 
-INSTALL_LOG_NAME = "msi-install.log"
-
 # Written once a run is about to install, removed once the machine is verified empty. It sits at a fixed place under
 # `target\`, not in `MSI_TEST_LOG_DIR`, so the cleanup finds it whatever log dir the run used. The cleanup uninstalls
 # only the product it names, so a Hole the harness did not install is never removed.
@@ -303,7 +303,7 @@ class RestartManager(Enum):
         match self:
             case RestartManager.OFF:
                 bridge_failure = _bridge_failure_before_uninstall()
-                baseline = take_cli_log_baseline()
+                baseline = take_log_baseline(CLI_LOG)
                 return partial(_assert_uninstall_met_a_running_bridge, bridge_failure, baseline, log)
             case RestartManager.ON:
                 return partial(_assert_restart_manager_shut_the_service_down, log) if tests_passed else None
@@ -328,10 +328,6 @@ def install_msi(msi: Path, log: Path, restart_manager: RestartManager = RestartM
     }
     code = run_ps(INVOKE_MSIEXEC, params)
     assert code == 0, f"installing {msi} failed (exit {code})"
-
-
-def install_log_path() -> Path:
-    return log_dir() / INSTALL_LOG_NAME
 
 
 def marker_path() -> Path:
@@ -462,7 +458,8 @@ def read_msi_log(log: Path) -> str:
 
 # `hole bridge uninstall` logs here: the `--log-dir` the custom actions in `hole.wxs` pass.
 CLI_LOG = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "hole" / "logs" / "gui-cli.log"
-CLI_LOG_ROTATED = CLI_LOG.with_name(CLI_LOG.name + ".1")
+# The service's own log, beside it.
+BRIDGE_LOG = CLI_LOG.with_name("bridge.log")
 
 # Hole logs this when it sends the Stop; the SCM's observed state follows on indented lines
 # (`Look { observed: Running, ... }`).
@@ -471,15 +468,21 @@ _RUNNING = re.compile(r"\bRunning\b")
 
 
 @dataclass(frozen=True)
-class CliLogBaseline:
-    """The CLI log as it stood before an `msiexec` call: the bytes of the active file and of `gui-cli.log.1`.
+class LogBaseline:
+    """A log of Hole's as it stood at one moment: the bytes of the active file `log` and of `<log>.1`.
 
-    `unreadable` is why they could not be read, if so: the proof then cannot be made, and `cli_log_gained` says so.
+    `unreadable` is why they could not be read, if so: what the log gained since cannot then be determined, and
+    `log_gained` says so.
     """
 
+    log: Path
     active: bytes
     rotated: bytes | None
     unreadable: str | None = None
+
+
+def _rotated(log: Path) -> Path:
+    return log.with_name(log.name + ".1")
 
 
 def _read_if_present(path: Path) -> bytes | None:
@@ -489,44 +492,47 @@ def _read_if_present(path: Path) -> bytes | None:
         return None
 
 
-def take_cli_log_baseline() -> CliLogBaseline:
-    """Record the CLI log before an `msiexec` call. A log that does not exist is an empty baseline.
+def take_log_baseline(log: Path) -> LogBaseline:
+    """Record `log` (the CLI log before an `msiexec` call, the bridge's before a request). A log that does not exist
+    is an empty baseline.
 
     Never raises, so it can run ahead of an uninstall that must not be skipped; any other failure to read is kept in
-    the baseline and fails the proof afterwards.
+    the baseline and fails `log_gained` afterwards.
     """
     try:
-        return CliLogBaseline(_read_if_present(CLI_LOG) or b"", _read_if_present(CLI_LOG_ROTATED))
+        return LogBaseline(log, _read_if_present(log) or b"", _read_if_present(_rotated(log)))
     except OSError as e:
-        return CliLogBaseline(b"", None, unreadable=repr(e))
+        return LogBaseline(log, b"", None, unreadable=repr(e))
 
 
-def cli_log_gained(baseline: CliLogBaseline) -> str:
-    """The text the CLI log gained since `baseline`, oldest first. Fails when that cannot be determined exactly.
+def log_gained(baseline: LogBaseline) -> str:
+    """The text the log gained since `baseline`, oldest first. Fails when that cannot be determined exactly.
 
-    The one fact relied on is `DirRotate` (`crates/common/src/logging/dir_rotate.rs`): the active file is renamed over
-    `gui-cli.log.1` at the size limit, and a write that straddles the limit is split exactly there. So after one
-    rotation `.1` is the baseline's active file followed by what was gained before the split, and the active file holds
-    the rest; a record split between them is rejoined by reading `.1` then the active file.
+    The one fact relied on is `DirRotate` (`crates/common/src/logging/dir_rotate.rs`), which writes `gui-cli.log` and
+    `bridge.log` alike: the active file is renamed over `<log>.1` at the size limit, and a write that straddles the
+    limit is split exactly there. So after one rotation `.1` is the baseline's active file followed by what was gained
+    before the split, and the active file holds the rest; a record split between them is rejoined by reading `.1` then
+    the active file.
     """
+    log, rotated_log = baseline.log, _rotated(baseline.log)
 
     def cannot(why: str) -> AssertionError:
-        return AssertionError(f"the stop proof could not be made: {why}")
+        return AssertionError(f"what {log.name} gained could not be determined: {why}")
 
     if baseline.unreadable is not None:
-        raise cannot(f"{CLI_LOG} could not be read before the call ({baseline.unreadable})")
+        raise cannot(f"{log} could not be read at the baseline ({baseline.unreadable})")
     try:
-        active = _read_if_present(CLI_LOG) or b""
-        rotated = _read_if_present(CLI_LOG_ROTATED)
+        active = _read_if_present(log) or b""
+        rotated = _read_if_present(rotated_log)
     except OSError as e:
-        raise cannot(f"{CLI_LOG} could not be read after the call ({e!r})") from e
+        raise cannot(f"{log} could not be read afterwards ({e!r})") from e
 
     if rotated == baseline.rotated and active.startswith(baseline.active):
         gained = active[len(baseline.active) :]
     elif rotated is not None and rotated != baseline.rotated and rotated.startswith(baseline.active):
         gained = rotated[len(baseline.active) :] + active
     else:
-        raise cannot(f"neither {CLI_LOG.name} nor {CLI_LOG_ROTATED.name} continues the log as it was before the call")
+        raise cannot(f"neither {log.name} nor {rotated_log.name} continues the log as it was at the baseline")
     return gained.decode("utf-8", errors="replace")
 
 
@@ -550,12 +556,12 @@ def stops_sent_to_a_running_service(text: str) -> int:
     return sum(1 for record in _log_records(text) if _is_stop_of_a_running_service(record))
 
 
-def assert_msiexec_stopped_a_running_bridge(baseline: CliLogBaseline, msi_log: Path) -> None:
+def assert_msiexec_stopped_a_running_bridge(baseline: LogBaseline, msi_log: Path) -> None:
     """Hole's uninstall stopped a RUNNING service during the `msiexec` call, and Restart Manager did not do it first.
 
-    `baseline` is `take_cli_log_baseline()` taken before the call: only what the log gained since counts.
+    `baseline` is `take_log_baseline(CLI_LOG)` taken before the call: only what the log gained since counts.
     """
-    gained = cli_log_gained(baseline)
+    gained = log_gained(baseline)
     assert stops_sent_to_a_running_service(gained) > 0, (
         f"`hole bridge uninstall` did not stop a running {SERVICE} service: no `{_STOP_RECORD}` record with a "
         f"Running look in what {CLI_LOG} gained during the msiexec call:\n{gained}"
@@ -599,13 +605,13 @@ def stop_came_from_the_uninstall(text: str) -> bool:
     return False
 
 
-def assert_stop_came_from_the_uninstall(baseline: CliLogBaseline) -> None:
+def assert_stop_came_from_the_uninstall(baseline: LogBaseline) -> None:
     """The Running stop that `assert_msiexec_stopped_a_running_bridge` finds is the old product's uninstall's.
 
     The new product's `hole bridge install` also stops an installed bridge, so during an upgrade the stop alone does
     not say which command sent it.
     """
-    gained = cli_log_gained(baseline)
+    gained = log_gained(baseline)
     assert stop_came_from_the_uninstall(gained), (
         f"no Running `{_STOP_RECORD}` record is followed by `{_UNINSTALLED}` before a line only `hole bridge install` "
         f"writes, or the install found a bridge to reinstall, in what {CLI_LOG} gained during the msiexec call:\n"
@@ -623,7 +629,7 @@ def _bridge_failure_before_uninstall() -> Exception | None:
 
 
 def _assert_uninstall_met_a_running_bridge(
-    bridge_failure: Exception | None, baseline: CliLogBaseline, uninstall_log: Path
+    bridge_failure: Exception | None, baseline: LogBaseline, uninstall_log: Path
 ) -> None:
     if bridge_failure is not None:
         raise AssertionError(f"the uninstall did not meet a running bridge: {bridge_failure}") from bridge_failure
@@ -794,12 +800,16 @@ def installed_hole(msi_path: Path, request: pytest.FixtureRequest) -> Iterator[P
 
     The uninstall meets the running bridge service: Hole's own uninstall must have stopped it
     (`assert_msiexec_stopped_a_running_bridge`).
+
+    Each module that uses it installs for itself. A module names its `msiexec` logs with `MSIEXEC_LOG_STEM`
+    (`<stem>-install.log`, `<stem>-uninstall.log`; `msi` without it), so one module's logs do not overwrite another's.
     """
+    stem = getattr(request.module, "MSIEXEC_LOG_STEM", "msi")
     with install_run(
         request,
         msi_path,
-        install_log=install_log_path(),
-        uninstall_log=log_dir() / "msi-uninstall.log",
+        install_log=log_dir() / f"{stem}-install.log",
+        uninstall_log=log_dir() / f"{stem}-uninstall.log",
         restart_manager=RestartManager.OFF,
     ):
         yield INSTALL_DIR

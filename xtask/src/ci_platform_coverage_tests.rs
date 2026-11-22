@@ -707,6 +707,7 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
         "installer-pytest",
         "installer-build-msi",
         "installer-smoke",
+        "installer-test-server",
         "installer-tests",
         "installer-cleanup",
         "installer-upload-msi-logs",

@@ -297,6 +297,9 @@ impl ChainPlugin for BinaryPlugin {
         for (k, v) in &self.extra_env {
             cmd.env(k, v);
         }
+        // Stated, not left to inherit: an unset stdin is the host's, and a host
+        // started by the Windows service manager has none to give.
+        cmd.stdin(Stdio::null())?;
         cmd.stdout(Stdio::pipe())?;
         cmd.stderr(Stdio::pipe())?;
         cmd.kill_on_drop(true);

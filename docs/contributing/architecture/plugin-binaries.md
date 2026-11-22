@@ -114,6 +114,9 @@ own privileges and never writes the folder.
 
 The foreground default, `BuildDir`, runs whatever sits beside the executable.
 
+A plugin never inherits the bridge's standard handles: its stdout and stderr are pipes the bridge reads, and its stdin is
+null. The service has no standard handles to pass on, so an inherited slot would make the spawn fail there only.
+
 ## Plugins that extract themselves
 
 {term}`galoshes` unpacks its embedded `ex-ray` at run time, and it needs a folder only root can write. `PluginSource::runtime_dir`

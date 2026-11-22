@@ -36,6 +36,15 @@ expects Restart Manager to stop the service. The lifecycle runs against any MSI 
 also needs the working tree's staged files (`target\release\installer-stage`, from `cargo xtask build hole-msi`) and an MSI
 under test whose version is not lower than the tree's.
 
+Between the two, the lane installs once more and connects ({src}`msi-installer/tests/installed/test_connect.py`): the
+installed `hole.exe` asks the `HoleBridge` service the MSI registered to start a SOCKS-only proxy for a server behind
+`galoshes`, one behind `v2ray-plugin` and one with no plugin, and `curl` fetches a page through each. This is the
+only test in which the service the service manager started runs a plugin; the bridge's own end-to-end tests start it
+as a child of the test. A failure prints what `C:\ProgramData\hole\logs\bridge.log` gained during the case. It runs
+against any MSI too, a published release included. The server is the `ss_plugin_server` example of
+{src}`crates/plugin-e2e/`, with the working tree's `galoshes` and `ex-ray` builds on its side, so the plugins of the
+MSI under test must still speak to the tree's.
+
 ```{warning}
 This installs Hole system-wide on the machine you run it on. Use a throwaway machine or virtual machine, not the one you
 work on.
@@ -47,9 +56,11 @@ cargo xtask run hole-msi-install-tests    # MSI_UNDER_TEST=<path\to\hole.msi> te
 cargo xtask run hole-msi-cleanup          # after an interrupted run
 ```
 
-It needs the MSI built beforehand (`cargo xtask build hole-msi`, or the one `MSI_UNDER_TEST` names) and the repo's
-`node_modules`; the target builds neither, so run `cargo xtask build frontend-build` once if `hole-msi` has not left
-them. The run refuses to start, before it changes anything, when:
+It needs the MSI built beforehand (`cargo xtask build hole-msi`, or the one `MSI_UNDER_TEST` names), the repo's
+`node_modules`, and for the connect case `cargo build -p plugin-e2e --example ss_plugin_server` plus the `galoshes` and
+`ex-ray` builds `hole-msi` leaves (`cargo xtask build galoshes` alone builds both). The target builds none of these, so
+run `cargo xtask build frontend-build` once if `hole-msi` has not left `node_modules`. The run refuses to start, before
+it changes anything, when:
 
 - the shell is not elevated, or there is no MSI at `target\release\hole.msi` (or at the path `MSI_UNDER_TEST` names);
 - a Hole MSI product is registered, the `HoleBridge` service exists, `C:\Program Files\hole` exists (even empty), its
@@ -63,12 +74,16 @@ records both of its ProductCodes, so the cleanup removes whichever of the two an
 
 The tools the E2E needs (`tauri-driver`, `msedgedriver`, `gsudo`) download into `.cache/installer-e2e/`; nothing is added
 to `PATH` outside the test's child processes. Each phase that starts child processes has a failure bound
-(`GSUDO_SELFTEST_TIMEOUT_SECONDS` and `DASHBOARD_E2E_TIMEOUT_SECONDS` in
-{src}`msi-installer/tests/installed/support.py`), so a wedged phase fails by name and the uninstall still runs. Install
+(`GSUDO_SELFTEST_TIMEOUT_SECONDS`, `DASHBOARD_E2E_TIMEOUT_SECONDS` and, for each `hole` command of the connect case,
+`HOLE_CLI_TIMEOUT_SECONDS` in {src}`msi-installer/tests/installed/support.py`), so a wedged phase fails by name and
+the uninstall still runs. The connect case's own server has none: it is the tree's code, and one that never reports
+ready ends at the CI step's limit. Install
 and uninstall logs go to `target\msi-test-logs\`, or to `MSI_TEST_LOG_DIR`. Nothing asserts what remains in
 `C:\ProgramData\hole` after the uninstall.
 
-In CI the `installer-tests` step runs this target, and `installer-cleanup` (which always runs) runs the cleanup. The TUN
+In CI the `installer-tests` step runs this target, and `installer-cleanup` (which always runs) runs the cleanup. The
+connect case's server is built by its own step, `installer-test-server`, right after the MSI build and before
+`hole-build`: `installer-tests` runs after `hole-build`, and no step after that one may compile ([CI](ci.md)). The TUN
 test lane runs only once the cleanup passed or no MSI was built.
 
 ## macOS installer
@@ -110,6 +125,8 @@ Three things about the payload are checked by `hole-dmg-tests` ({src}`dmg-instal
 cargo xtask run hole-dmg-install-e2e
 ```
 
-installs the built app's bridge as root, connects through each bundled plugin with `hole proxy start`, and uninstalls.
+installs the built app's bridge as root, connects with `hole proxy start` to a server behind each bundled plugin and to
+one with no plugin, fetches a page through each, and uninstalls. The connection is the same code the Windows lane runs
+({src}`tests/installed/connect_journey.py`).
 It is meant for CI: it needs passwordless `sudo`, refuses to run over an existing install, and expects `hole-dmg` to
 have built the app and `cargo build -p plugin-e2e --example ss_plugin_server` to have built the test's server.
