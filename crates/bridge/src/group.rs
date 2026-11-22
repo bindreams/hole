@@ -113,14 +113,14 @@ pub(crate) fn lookup_sid(name: &str) -> io::Result<Option<String>> {
 /// The SID of the `hole` group as a string (e.g. `S-1-5-21-...`). `None` when there is no such group; an error when
 /// the lookup could not be made.
 #[cfg(target_os = "windows")]
-pub fn group_sid() -> io::Result<Option<String>> {
+pub(crate) fn group_sid() -> io::Result<Option<String>> {
     lookup_sid(GROUP_NAME)
 }
 
 /// The SID of every member of the `hole` group, as the account database holds them now: users, groups and well-known
 /// SIDs alike, unresolved. A running process's token is not consulted, so a member added a moment ago is listed.
 #[cfg(target_os = "windows")]
-pub fn member_sids() -> io::Result<Vec<String>> {
+pub(crate) fn member_sids() -> io::Result<Vec<String>> {
     os::member_sids(GROUP_NAME)
 }
 
@@ -478,8 +478,10 @@ mod os {
         unsafe { sid_to_string(sid_ptr) }.map(Some)
     }
 
-    /// The members of the local group `group`, each as a SID string, read at level 0: the SID alone, so a member
-    /// whose account can no longer be resolved to a name is still listed. Every page is read; there is no cap.
+    /// The members of the local group `group`, each as a SID string, read at level 0: the SID alone. A member whose
+    /// account no longer resolves to a name (a deleted domain account) is listed all the same; resolving each SID to
+    /// a name would fail on it. A deleted local account is no longer a member: Windows takes it out of its groups.
+    /// Every page is read; there is no cap.
     pub fn member_sids(group: &str) -> io::Result<Vec<String>> {
         use windows::core::{HSTRING, PCWSTR};
         use windows::Win32::Foundation::ERROR_MORE_DATA;

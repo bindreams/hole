@@ -29,7 +29,10 @@ mod windows {
     #[skuld::test]
     fn a_missing_account_is_not_an_error() {
         let result = crate::group::lookup_sid("nonexistent_user_that_does_not_exist_12345");
-        assert_eq!(result.expect("a lookup that found no such account is a failure"), None);
+        assert_eq!(
+            result.expect("the lookup of a missing account answers Ok(None), not an error"),
+            None
+        );
     }
 
     /// The name this machine gives the account with `sid`: a built-in group's name follows the display language.
