@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from support import (
+    CLI_LOG,
     RESTART_MANAGER_DISABLED,
     RESTART_MANAGER_PROPERTY,
     SERVICE,
@@ -20,7 +21,7 @@ from support import (
     install_run,
     log_dir,
     missing_canonical_files,
-    take_cli_log_baseline,
+    take_log_baseline,
     wait_until_service_running,
 )
 from support import msi_path, service_registered  # noqa: F401 (fixtures)
@@ -59,7 +60,7 @@ def previous_hole(msi_path: Path, request: pytest.FixtureRequest) -> Iterator[st
 def test_upgrade_over_a_running_bridge(msi_path: Path, previous_hole: str):
     """The old product's `BridgeUninstall` stops the running service; the new one is registered and RUNNING after."""
     log = log_dir() / "msi-upgrade-install.log"
-    cli_log_baseline = take_cli_log_baseline()
+    cli_log_baseline = take_log_baseline(CLI_LOG)
     install_msi(msi_path, log, RestartManager.OFF)
 
     assert installed_hole_product_codes() == [msi_product_code(msi_path)], "the upgrade must leave only the new product"

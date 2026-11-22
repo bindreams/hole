@@ -436,6 +436,15 @@ jobs:
         shell: pwsh
         run: target\release\hole.exe version
 
+      # The Shadowsocks server the lifecycle's connect case dials. Built here because nothing after `hole-build` may
+      # compile, and `installer-tests` runs after it.
+      - id: installer-test-server
+        name: Build the install test's server
+        if: ${{ !cancelled() && steps.installer-build-msi.outcome == 'success' }}
+        timeout-minutes: 20
+        shell: bash
+        run: cargo build -p plugin-e2e --example ss_plugin_server
+
       # DMG assembly + signature-consistency tests (`dmg-installer/`): catches an
       # unsigned .app bundle that launches "damaged" under Gatekeeper quarantine.
       # One build+test via the run-cascade (builds hole-dmg once, then the
@@ -474,7 +483,7 @@ jobs:
       # The bound on the wait for the installed bridge to answer: a bridge that
       # stays up but never answers ends here, and the cleanup step prints its log.
       - id: dmg-install-e2e
-        name: Install the bridge and connect through the bundled plugins
+        name: Install the bridge and connect through it
         if: ${{ !cancelled() && steps.dmg-install-server.outcome == 'success' }}
         timeout-minutes: 5
         shell: bash
@@ -689,9 +698,10 @@ jobs:
               + package(hole-test-observability)'
 
       # Installer lifecycle (Windows) ===================================================================================
-      # The sequence (install, verify, de-elevated dashboard E2E, uninstall, verify) is the
-      # msi-installer harness (`msi-installer/tests/installed/`). It drives the INSTALLED binary
-      # through WebDriver over loopback, so it runs before the TUN lane.
+      # The sequence (install, verify, de-elevated dashboard E2E, uninstall, verify; then install,
+      # connect through the installed service, uninstall; then the upgrade) is the msi-installer
+      # harness (`msi-installer/tests/installed/`). It drives the INSTALLED binary through WebDriver
+      # and a SOCKS proxy over loopback, so it runs before the TUN lane.
       #
       # `installer-cleanup` runs `always()` after `installer-tests`: an idempotent uninstall that
       # verifies nothing is left. That step is the TUN lane's gate: the lane runs only once nothing

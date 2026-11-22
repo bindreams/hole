@@ -187,7 +187,14 @@ targets:
     # ELEVATED shell: it changes the machine (docs/contributing/installers.md).
     # `cargo xtask run hole-msi-cleanup` finishes an interrupted run.
     #
-    # Run in this order: the upgrade refuses a machine with Hole on it (see test_upgrade.py).
+    # The connect case (test_connect.py) asks the installed service to start a
+    # proxy against a server from the working tree: it needs `ss_plugin_server`
+    # (`cargo build -p plugin-e2e --example ss_plugin_server`) and the tree's
+    # galoshes and ex-ray builds, which `hole-msi` leaves. Nothing here compiles:
+    # in CI this runs after `hole-build`, where a compile fails the job.
+    #
+    # Run in this order: each file installs for itself, and the upgrade refuses a
+    # machine with Hole on it (see test_upgrade.py).
     #
     # No `depends`: `frontend-build` would `npm ci` and rebuild ui/dist, which
     # CI's `hole-build` has already compiled in. The E2E needs the `node_modules`
@@ -198,7 +205,7 @@ targets:
       - uv lock --check --offline --directory msi-installer
       - .github/scripts/retry.sh uv sync --directory msi-installer --group dev
       - uv run --directory msi-installer --group dev provision-e2e-tools
-    run: uv run --directory msi-installer --group dev pytest -v -s -m system_wide tests/installed/test_lifecycle.py tests/installed/test_upgrade.py
+    run: uv run --directory msi-installer --group dev pytest -v -s -m system_wide tests/installed/test_lifecycle.py tests/installed/test_connect.py tests/installed/test_upgrade.py
 
   hole-msi-cleanup:
     # Uninstalls what an interrupted `hole-msi-install-tests` left (a step timeout
@@ -209,7 +216,7 @@ targets:
 
   hole-dmg-install-e2e:
     # Installs the built Hole.app's bridge as root and connects through each
-    # bundled plugin, on the layout a user's machine has. It mutates the
+    # bundled plugin and without one, on the layout a user's machine has. It mutates the
     # host (root daemon, launchd job) and needs passwordless sudo, so it is its
     # own target: `hole-dmg-tests` stays safe to run locally.
     #
