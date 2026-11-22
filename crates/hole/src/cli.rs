@@ -1092,10 +1092,8 @@ fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
 /// (`elevation.rs`, which explains why the group alone does not admit the user
 /// yet) and by dev-console before it starts the foreground dev bridge.
 ///
-/// Exit code: 1 when the group cannot be prepared (nothing more is done). Otherwise, with a bridge that set its list or
-/// no bridge listening, 0, or the send's code when `--then-send` or `--then-send-file` was given. When a bridge is
-/// there and did not set its list, 1, or the send's code if that is non-zero; the send runs all the same, so the
-/// request, and the result file the elevation prompt reads, are not lost to the refresh.
+/// Exit code: 1 if the group cannot be prepared; otherwise see [`RefreshBridgeAccessOutcome::exit_code`]. The send runs
+/// even when the refresh failed, so the request and the result file the elevation prompt reads are not lost.
 fn handle_grant_access(
     then_send: Option<String>,
     then_send_file: Option<std::path::PathBuf>,
@@ -1189,7 +1187,9 @@ fn refresh_bridge_access_outcome(
         Ok(BridgeResponse::Ack) => RefreshBridgeAccessOutcome::Refreshed,
         Ok(BridgeResponse::Error { message }) => RefreshBridgeAccessOutcome::Failed(format!("bridge error: {message}")),
         Ok(other) => unreachable!("the client answers a refresh request with Ack or Error, not {other:?}"),
-        // A name nobody bound, or one a dead bridge left behind: no bridge. The next one to start reads the group.
+        // Refused: nothing listens, or the name was left by a dead bridge; the next start reads the group. A live bridge
+        // with a full queue of unaccepted connections may refuse too; that takes 128 clients connecting at once, which
+        // this command does not guard against.
         Err(ClientError::Connection(e))
             if matches!(
                 e.kind(),
