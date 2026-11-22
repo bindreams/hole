@@ -1,15 +1,13 @@
 //! A Windows service has no standard handles, and neither has a GUI-subsystem program
-//! nobody redirected: `GetStdHandle` answers null for all three. Hole's bridge is both.
-//! It starts every plugin through `BinaryPlugin`, which pipes the plugin's stdout and
+//! nobody redirected: `GetStdHandle` answers null for all three.
+//! Such a host starts every plugin through `BinaryPlugin`, which pipes the plugin's stdout and
 //! stderr and gives it a null stdin, so no slot is left to inherit the host's null handle.
 //! A spawn that has to pass "nothing" on fails there and nowhere else: every other test in
 //! this package hosts its plugins in the test process, whose handles the test runner supplied.
 //!
-//! So the plugin here is hosted by a helper that nulls its own three handles first
-//! (`MOCK_PLUGIN_NULL_STD_HOST`, src/bin/mock-plugin.rs) and then starts a plugin
-//! through garter's production spawn. The helper stands in for one difference between
-//! a test and the installed service; `msi-installer/tests/installed/test_connect.py`
-//! asks the service itself.
+//! The plugin is hosted by a helper that nulls its own three handles (`MOCK_PLUGIN_NULL_STD_HOST`,
+//! src/bin/mock-plugin.rs) and then spawns through garter's production path. The real service is
+//! covered by `msi-installer/tests/installed/test_connect.py`.
 
 #![allow(clippy::disallowed_methods)] // test fixture: spawns the workspace's own mock-plugin binary, not an OS tool
 
@@ -52,7 +50,8 @@ async fn a_plugin_starts_from_a_process_with_no_standard_handles() {
         "a host with no standard handles could not start its plugin"
     );
 
-    helper.wait().await.unwrap();
+    let status = helper.wait().await.unwrap();
+    assert!(status.success(), "the helper failed after reporting: {status}");
 }
 
 hole_test_observability::register!();

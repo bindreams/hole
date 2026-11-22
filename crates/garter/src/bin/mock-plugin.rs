@@ -289,6 +289,7 @@ async fn run_null_std_host(control_addr: std::ffi::OsString) -> Result<(), Box<d
     let verdict = tokio::select! {
         Ok(Ok(_)) = ready_rx => {
             shutdown.cancel();
+            // How the plugin ends is not what this reports; drain it so the host does not exit mid-shutdown.
             let _ = run.await;
             "ready".to_string()
         }

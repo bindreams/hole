@@ -5,7 +5,7 @@ service, which the service manager started from the installed `hole.exe`, throug
 server behind each bundled plugin and for one with no plugin.
 
 A separate file with its own install and its own `msiexec` logs: a failed connect then cannot change what the dashboard
-E2E or the upgrade meets, and the lifecycle's logs survive it.
+E2E or the upgrade meets.
 The connection itself is `connect_journey`, shared with the macOS installer suite. It needs the `ss_plugin_server`
 example built (`cargo build -p plugin-e2e --example ss_plugin_server`) and the working tree's `galoshes` and `ex-ray`
 builds, which serve the other end.
@@ -47,8 +47,8 @@ class InstalledCli:
                 timeout=HOLE_CLI_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as e:
-            # `subprocess.run` killed it. Returned as a failed command, not raised: the journey reports those, and a
-            # stop that hangs after a failed start must not replace that failure.
+            # Returned as a failed command, not raised: the journey reports those, and a stop that hangs after a
+            # failed start must not replace that failure.
             return subprocess.CompletedProcess(
                 command,
                 returncode=-1,

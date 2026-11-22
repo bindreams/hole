@@ -82,8 +82,8 @@ and uninstall logs go to `target\msi-test-logs\`, or to `MSI_TEST_LOG_DIR`. Noth
 `C:\ProgramData\hole` after the uninstall.
 
 In CI the `installer-tests` step runs this target, and `installer-cleanup` (which always runs) runs the cleanup. The
-connect case's server is built by its own step, `installer-test-server`, before `hole-build`: no step after that one may
-compile ([CI](ci.md)). The TUN
+connect case's server is built by its own step, `installer-test-server`, right after the MSI build and before
+`hole-build`: `installer-tests` runs after `hole-build`, and no step after that one may compile ([CI](ci.md)). The TUN
 test lane runs only once the cleanup passed or no MSI was built.
 
 ## macOS installer
