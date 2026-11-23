@@ -159,11 +159,9 @@ async fn an_ipv6_udp_datagram_round_trips() {
 
 // Datagrams addressed to the link =====================================================================================
 
-/// The operating system sends LLMNR, mDNS and NetBIOS lookups out of the TUN as
-/// it does out of every adapter. Each is addressed to a group or to the link,
-/// which no proxy can deliver to, so none may become a flow. The datagrams that
-/// must still be carried sit next to the ones that must not. The harness's TUN
-/// is `10.255.0.1/24`, so its directed broadcast is `10.255.0.255`.
+/// Datagrams addressed to a group or to the link (LLMNR, mDNS, NetBIOS) must open
+/// no flow; unicast neighbours must still open one. The harness's TUN is
+/// `10.255.0.1/24`, so its directed broadcast is `10.255.0.255`.
 ///
 /// The read error queued behind the datagrams ends the engine without cancelling
 /// any task, and the receiver closes when the last router clone is dropped, so
@@ -183,14 +181,25 @@ async fn datagrams_addressed_to_a_group_or_to_the_link_open_no_flow() {
         v6("ff02::1:3", 5355),
         v6("ff02::fb", 5353),
         v6("ff0e::1", 9),
+        v4("224.0.0.251", 53),
+        v6("ff02::fb", 53),
+        v4("169.254.0.0", 137),
+        v4("169.254.169.254", 80),
+        v4("169.254.255.255", 5355),
+        v6("fe80::1", 5355),
+        v6("febf:ffff::1", 5355),
     ];
     let carried = [
         v4("223.255.255.255", 53000),
         v4("10.255.0.254", 137),
         v4("10.255.1.255", 137),
         v4("8.8.8.8", 443),
-        v6("fe80::1", 5355),
+        v4("8.8.8.8", 53),
+        v4("169.253.255.255", 80),
+        v4("169.255.0.0", 80),
         v6("2001:db8::1", 443),
+        v6("fe7f:ffff::1", 5355),
+        v6("fec0::1", 5355),
     ];
 
     for dst in dropped.into_iter().chain(carried) {
@@ -231,20 +240,32 @@ fn the_directed_broadcast_address_is_the_tuns_own() {
     assert!(!to(cidr("10.255.0.1/31"), "10.255.0.1"));
     assert!(!to(cidr("10.255.0.1/32"), "10.255.0.1"));
     assert!(!to(None, "10.255.0.255"));
-    // Unicast neighbours of the addresses above stay carried.
     let tun = cidr("10.255.0.1/24");
     for dst in [
         "223.255.255.255",
         "10.255.0.254",
         "10.255.1.255",
         "8.8.8.8",
-        "fe80::1",
+        "169.253.255.255",
+        "169.255.0.0",
+        "fe7f:ffff::1",
+        "fec0::1",
         "2001:db8::1",
     ] {
         assert!(!to(tun, dst), "{dst} is not addressed to the link");
     }
-    // Not tied to the TUN: multicast and the limited broadcast are addressed to the link whatever the prefix.
-    assert!(to(None, "224.0.0.252"));
-    assert!(to(None, "255.255.255.255"));
-    assert!(to(None, "ff02::1:3"));
+    // Not tied to the TUN: multicast, the limited broadcast and link-local addresses are addressed to the link
+    // whatever the prefix.
+    for dst in [
+        "224.0.0.252",
+        "255.255.255.255",
+        "169.254.0.0",
+        "169.254.255.255",
+        "ff02::1:3",
+        "fe80::1",
+        "febf:ffff::1",
+    ] {
+        assert!(to(None, dst), "{dst} is addressed to the link");
+        assert!(to(tun, dst), "{dst} is addressed to the link");
+    }
 }

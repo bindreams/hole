@@ -12,17 +12,18 @@ to work, the application would reach its destination, but with its address, and 
 encrypted, visible to the network the tunnel is there to hide from. Hole counts that as a leak and prefers a flow that
 fails to one that leaks.
 
-| The UDP flow                                          | What happens to it                                                                                             |
-| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Goes to a multicast group or to the link              | Dropped, whatever the rules say                                                                                |
-| Goes to port 53 while the {term}`DNS forwarder` is on | Answered by the DNS forwarder, whatever the rules say                                                          |
-| A rule says **Block**                                 | Dropped                                                                                                        |
-| A rule says **Bypass**                                | Sent directly, outside the tunnel. Dropped if the destination is IPv6 and the real network has no working IPv6 |
-| **Proxy**, by a rule or because no rule matches       | Relayed through the tunnel if the connection to the server can carry UDP. Dropped if it cannot                 |
+| The UDP flow                                                           | What happens to it                                                                                             |
+| ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Goes to a multicast group, a broadcast address or a link-local address | Dropped, whatever the rules say                                                                                |
+| Goes to port 53 while the {term}`DNS forwarder` is on                  | Answered by the DNS forwarder, whatever the rules say                                                          |
+| A rule says **Block**                                                  | Dropped                                                                                                        |
+| A rule says **Bypass**                                                 | Sent directly, outside the tunnel. Dropped if the destination is IPv6 and the real network has no working IPv6 |
+| **Proxy**, by a rule or because no rule matches                        | Relayed through the tunnel if the connection to the server can carry UDP. Dropped if it cannot                 |
 
 Only the last drop is the UDP rule. The others are a **Block** rule doing what it says, a **Bypass** flow that has no
-usable route, and a datagram to a multicast group or to the link. The operating system sends its LLMNR, mDNS and
-NetBIOS name lookups there, and no server can deliver them, so Hole drops them without a log entry. The {term}`bridge`
+usable route, and a datagram to a multicast group, a broadcast address or a link-local address (`169.254.0.0/16`,
+`fe80::/10`). The operating system sends its LLMNR, mDNS and NetBIOS name lookups there, and no server can deliver
+them, so Hole drops them without a log entry. The {term}`bridge`
 logs the other drops, once per rule and destination for a stretch of time rather than per packet. The UDP rule's entry
 is a warning that names the plugin that cannot carry the flow.
 

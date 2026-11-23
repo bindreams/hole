@@ -376,7 +376,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
             _ => return false,
         };
 
-        // A datagram addressed to a group or to the link has no recipient behind a proxy.
         if is_addressed_to_the_link(parsed.dst.ip(), self.tun_ipv4) {
             return true;
         }
@@ -460,14 +459,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
     }
 }
 
-/// Whether `dst` is a multicast group, the limited broadcast address or the TUN subnet's directed broadcast
-/// address: a destination on the TUN's own link, which no flow to a server can reach.
+/// Whether `dst` is a multicast group, the limited broadcast address, the TUN subnet's directed broadcast address
+/// or a link-local unicast address (`169.254.0.0/16`, `fe80::/10`): a destination on the TUN's own link, which no
+/// flow to a server can reach.
 fn is_addressed_to_the_link(dst: IpAddr, tun_ipv4: Option<Ipv4Cidr>) -> bool {
     match dst {
         IpAddr::V4(v4) => {
-            v4.is_multicast() || v4.is_broadcast() || tun_ipv4.and_then(|cidr| cidr.broadcast()) == Some(v4)
+            v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_link_local()
+                || tun_ipv4.and_then(|cidr| cidr.broadcast()) == Some(v4)
         }
-        IpAddr::V6(v6) => v6.is_multicast(),
+        IpAddr::V6(v6) => v6.is_multicast() || v6.is_unicast_link_local(),
     }
 }
 
