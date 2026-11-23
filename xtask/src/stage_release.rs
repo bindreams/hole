@@ -391,7 +391,7 @@ pub fn list(tag: &str) -> Result<()> {
 fn resolve_installer(lane: Lane, repo_root: &Path, installer_override: Option<OsString>) -> Result<PathBuf> {
     let release = repo_root.join("target").join("release");
     let Some(installer) = lane.installer() else {
-        bail!("the plugins lane stages no installer");
+        bail!("the {lane:?} lane stages no installer");
     };
     let built = (installer.built)(&release)?;
     if let Some(given) = installer_override.filter(|p| !p.is_empty()) {
