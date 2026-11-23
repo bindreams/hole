@@ -188,6 +188,7 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_tee" => scenario_tee(),
         "redirect_multiline" => scenario_multiline(),
         "redirect_open_line" => scenario_open_line(),
+        "redirect_slow_relay" => scenario_slow_relay(),
         "redirect_no_loop" => scenario_no_loop(),
         "lossy_backpressure" => scenario_lossy_backpressure(),
         "echo_stderr" => scenario_echo_stderr(),
@@ -381,6 +382,57 @@ fn scenario_open_line() {
     let _ = std::io::stderr().write_all(b"open-line-no-newline");
     let _ = std::io::stderr().flush();
     let result = finish(&mut harness);
+    write_result(&result);
+}
+
+/// Lines keep arriving while the relay thread is held up (each tracing event takes `EVENT_DELAY`, a fault injected to
+/// widen the window; nothing waits on it). `flush` must return only once every line has gone through the tee.
+fn scenario_slow_relay() {
+    use std::fs::OpenOptions;
+    const LINES: usize = 15;
+    const EVENT_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+    struct SlowWriter;
+    impl Write for SlowWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(EVENT_DELAY);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(|| SlowWriter)
+            .with_ansi(false),
+    );
+    tracing::subscriber::set_global_default(subscriber).expect("set_global_default in child");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stdout_path = dir.path().join("tee-stdout.bin");
+    let stdout_file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&stdout_path)
+        .expect("open stdout tee file");
+    let mut relays = crate::logging::redirect_stdio_to_tracing_with_writers_for_tests(
+        Box::new(std::io::sink()),
+        Box::new(stdout_file),
+    )
+    .expect("redirect with custom writers");
+
+    for i in 0..LINES {
+        let _ = writeln!(std::io::stdout(), "slow-line-{i}");
+    }
+    relays.flush().expect("relay flush");
+
+    let result = ChildResult {
+        tee_stdout: std::fs::read_to_string(&stdout_path).unwrap_or_default(),
+        ..ChildResult::default()
+    };
     write_result(&result);
 }
 

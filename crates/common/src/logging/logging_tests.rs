@@ -219,6 +219,15 @@ fn redirect_delivers_an_open_line_at_a_drain(#[fixture(temp_dir)] dir: &Path) {
     assert_eq!(relayed, ["open-line-no-newline"], "relayed lines: {relayed:?}");
 }
 
+/// `flush` waits for a relay that is behind: every line written before it has gone through the tee when it returns.
+#[skuld::test]
+fn redirect_flush_waits_for_a_slow_relay(#[fixture(temp_dir)] dir: &Path) {
+    let result = run_child("redirect_slow_relay", dir);
+    let teed: Vec<&str> = result.tee_stdout.lines().collect();
+    let expected: Vec<String> = (0..15).map(|i| format!("slow-line-{i}")).collect();
+    assert_eq!(teed, expected, "the tee holds {} of 15 lines", teed.len());
+}
+
 #[skuld::test]
 fn redirect_does_not_loop(#[fixture(temp_dir)] dir: &Path) {
     let result = run_child("redirect_no_loop", dir);
