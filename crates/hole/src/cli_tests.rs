@@ -1407,7 +1407,10 @@ fn grant_access_with_no_bridge_asks_nothing() {
 #[skuld::test]
 fn grant_access_with_a_stale_socket_name_asks_nothing() {
     let path = absent_socket_path("stale");
-    drop(hole_bridge::socket::bind(&path).unwrap());
+    // Unix's listener needs a reactor; the runtime is gone before `refresh_bridge_access` builds its own.
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async { drop(hole_bridge::socket::bind(&path).unwrap()) });
     assert!(
         path.exists(),
         "the name a closed listener leaves is what this test stands on"
