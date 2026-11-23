@@ -511,9 +511,12 @@ fn scenario_relay_thread_ended(ended: Stream) {
     let thread = std::mem::replace(&mut relay(&mut relays, ended)._thread, std::thread::spawn(|| {}));
     thread.join().expect("the relay thread catches the panic");
 
-    // Rust's stdout holds a line that is not complete; `flush` writes it into the pipe that nobody reads any more.
+    // Rust's stdout holds a line that is not complete; `flush` writes it into the pipe that nobody reads any more. The
+    // buffer keeps what it could not write, so `flush` meets the same failure again.
     if let Stream::Stdout = ended {
         write!(std::io::stdout(), "a line that is not complete").expect("buffered");
+        let failure = std::io::stdout().flush().expect_err("the pipe has no reader");
+        assert_eq!(failure.kind(), std::io::ErrorKind::BrokenPipe, "{failure}");
     }
 
     // The same hook on a thread that is not a relay: the previous hook must run there, or the check above proves nothing.
