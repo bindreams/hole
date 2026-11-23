@@ -559,7 +559,8 @@ fn the_dmg_lane_resolves_the_one_built_dmg_and_checks_its_override() {
     let given = Some(OsString::from("target/release/bundle/dmg/Hole_1.2.3_aarch64.dmg"));
     assert_eq!(resolve_installer(Lane::Dmg, repo.path(), given).unwrap(), dmg);
     let given = Some(OsString::from("target/release/bundle/dmg/missing.dmg"));
-    assert!(resolve_installer(Lane::Dmg, repo.path(), given).is_err());
+    let err = resolve_installer(Lane::Dmg, repo.path(), given).unwrap_err();
+    assert!(err.to_string().contains("missing.dmg"), "{err}");
 
     std::fs::write(repo.path().join("target/release/other.dmg"), b"other").unwrap();
     let given = Some(OsString::from("target/release/other.dmg"));

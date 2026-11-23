@@ -52,7 +52,7 @@ impl Lane {
         }
     }
 
-    /// The installer this lane stages. The plugins lane stages none.
+    /// The installer this lane stages.
     fn installer(self) -> Option<Installer> {
         match self {
             Lane::Msi => Some(Installer {
