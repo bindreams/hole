@@ -18,6 +18,8 @@ use tokio::time::Instant;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+mod driver_tests;
 pub(crate) mod keepalive;
 #[cfg(test)]
 mod keepalive_tests;
@@ -159,6 +161,8 @@ pub(crate) async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite
     let mut pending_opens: Vec<Option<OpenStreamReply>> = Vec::new();
 
     std::future::poll_fn(|cx| {
+        let mut created = false;
+
         // 1. Service pending outbound stream requests.
         for slot in pending_opens.iter_mut() {
             if slot.is_none() {
@@ -211,6 +215,7 @@ pub(crate) async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite
                     match conn.poll_new_outbound(cx) {
                         std::task::Poll::Ready(Ok(stream)) => {
                             let _ = reply.send(Ok(stream));
+                            created = true;
                         }
                         std::task::Poll::Ready(Err(e)) => {
                             let _ = reply.send(Err(e));
@@ -227,6 +232,15 @@ pub(crate) async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite
                 }
                 std::task::Poll::Pending => break,
             }
+        }
+
+        // Poll again after step 3 created a substream (step 1's are followed by step 2's poll). yamux wakes the driver
+        // for a new substream's frames only when the connection had no substreams; otherwise only a poll made after
+        // the creation subscribes to them, and the first frame would sit unsent until something unrelated wakes the
+        // driver (up to 30 s). Creating before step 2 instead would count a substream the connection has not yet
+        // released against the new one.
+        if created {
+            cx.waker().wake_by_ref();
         }
 
         std::task::Poll::Pending
