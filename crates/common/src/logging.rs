@@ -31,6 +31,7 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
@@ -89,7 +90,13 @@ impl Delivery {
     fn sink(self, lossy: bool, target: Box<dyn Write + Send>) -> (Sink, Option<WorkerGuard>) {
         let target = util::redact::RedactingWriter::new(target);
         match self {
-            Delivery::Synchronous => (Sink::Synchronous(Arc::new(Mutex::new(Box::new(target)))), None),
+            Delivery::Synchronous => (
+                Sink::Synchronous(Arc::new(SyncTarget {
+                    writer: Mutex::new(Box::new(target)),
+                    writing: AtomicU64::new(0),
+                })),
+                None,
+            ),
             Delivery::NonBlocking => {
                 let (writer, guard) = NonBlockingBuilder::default().lossy(lossy).finish(target);
                 (Sink::NonBlocking(writer), Some(guard))
@@ -101,14 +108,54 @@ impl Delivery {
 /// A writer built by [`Delivery::sink`]: one handle for a tracing layer (it is a `MakeWriter`) or for a relay's tee.
 #[derive(Clone)]
 pub(crate) enum Sink {
-    Synchronous(Arc<Mutex<Box<dyn Write + Send>>>),
+    Synchronous(Arc<SyncTarget>),
     NonBlocking(NonBlocking),
+}
+
+/// The writer behind a synchronous sink, and the thread that is inside a call to it.
+pub(crate) struct SyncTarget {
+    writer: Mutex<Box<dyn Write + Send>>,
+    /// The number of the thread that holds `writer` (see [`thread_number`]), or 0.
+    writing: AtomicU64,
+}
+
+impl SyncTarget {
+    /// Run `f` on the writer, holding its lock. The panic hook logs through the sinks on the thread that panicked,
+    /// before the panic unwinds out of the writer and releases the lock, so a thread that comes back here while it
+    /// is already inside the writer would wait for itself: that call is dropped and returns `reentered`. The writer
+    /// is the one that failed, and the hook's record still reaches the other sink.
+    fn locked<R>(&self, reentered: R, f: impl FnOnce(&mut (dyn Write + Send)) -> R) -> R {
+        let me = thread_number();
+        // Only this thread stores its own number, so finding it here means this thread holds the lock.
+        if self.writing.load(Ordering::Relaxed) == me {
+            return reentered;
+        }
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.writing.store(me, Ordering::Relaxed);
+        struct Release<'a>(&'a AtomicU64);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.store(0, Ordering::Relaxed);
+            }
+        }
+        let _release = Release(&self.writing);
+        f(&mut **writer)
+    }
+}
+
+/// A number for the calling thread, unique in the process and never 0.
+fn thread_number() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    std::thread_local! {
+        static NUMBER: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    NUMBER.with(|number| *number)
 }
 
 impl Write for Sink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            Sink::Synchronous(target) => target.lock().unwrap_or_else(PoisonError::into_inner).write(buf),
+            Sink::Synchronous(target) => target.locked(Ok(buf.len()), |writer| writer.write(buf)),
             Sink::NonBlocking(writer) => writer.write(buf),
         }
     }
@@ -116,14 +163,14 @@ impl Write for Sink {
     /// One lock for the whole buffer, so a line from one thread is not split by another's.
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         match self {
-            Sink::Synchronous(target) => target.lock().unwrap_or_else(PoisonError::into_inner).write_all(buf),
+            Sink::Synchronous(target) => target.locked(Ok(()), |writer| writer.write_all(buf)),
             Sink::NonBlocking(writer) => writer.write_all(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            Sink::Synchronous(target) => target.lock().unwrap_or_else(PoisonError::into_inner).flush(),
+            Sink::Synchronous(target) => target.locked(Ok(()), |writer| writer.flush()),
             Sink::NonBlocking(writer) => writer.flush(),
         }
     }

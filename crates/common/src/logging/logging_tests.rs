@@ -210,7 +210,8 @@ fn redirect_handles_multiline(#[fixture(temp_dir)] dir: &Path) {
 }
 
 /// A drain that meets a line with no newline yet still delivers the text before the marker, and nothing of the marker.
-/// A complete line that looks like a marker is output too: no drain is waiting for its nonce. On each stream.
+/// A complete line that looks like a marker is output too, and answers no drain request: the process cannot know a
+/// request's nonce. On each stream.
 #[skuld::test]
 fn redirect_delivers_an_open_line_at_a_drain(#[fixture(temp_dir)] dir: &Path) {
     for (scenario, target) in [
