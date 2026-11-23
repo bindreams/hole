@@ -22,10 +22,10 @@ fails to one that leaks.
 
 Only the last drop is the UDP rule. The others are a **Block** rule doing what it says, a **Bypass** flow that has no
 usable route, and a datagram to a multicast group, a broadcast address or a link-local address (`169.254.0.0/16`,
-`fe80::/10`). The operating system sends its LLMNR, mDNS and NetBIOS name lookups there, and no server can deliver
-them, so Hole drops them without a log entry. The {term}`bridge`
-logs the other drops, once per rule and destination for a stretch of time rather than per packet. The UDP rule's entry
-is a warning that names the plugin that cannot carry the flow.
+`fe80::/10`). The operating system sends its LLMNR, mDNS and NetBIOS name lookups to groups and broadcast addresses. A
+link-local address is valid only on the link the datagram leaves from, and no server sits on it. Hole drops all of
+these without a log entry. The {term}`bridge` logs the other drops, once per rule and destination for a stretch of time
+rather than per packet. The UDP rule's entry is a warning that names the plugin that cannot carry the flow.
 
 ## Who can carry UDP
 
