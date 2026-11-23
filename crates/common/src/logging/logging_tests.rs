@@ -293,6 +293,65 @@ fn drain_after_the_relay_thread_ended_releases_and_completes(#[fixture(temp_dir)
     assert_eq!(result.tee_stdout.lines().collect::<Vec<_>>(), expected);
 }
 
+/// A write made from inside the target's own write, on the same thread, is written after the write it interrupted: the
+/// sink's lock is not entered a second time (the thread would wait for itself), and the line is not lost. A warning
+/// raised during a log rotation, or the panic hook after a writer panicked, is such a write.
+#[skuld::test]
+fn a_write_made_from_inside_a_synchronous_write_is_written_after_it() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    struct Reenter {
+        sink: Arc<Mutex<Option<super::Sink>>>,
+        seen: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Write for Reenter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.seen.lock().unwrap().extend_from_slice(buf);
+            if buf
+                == b"outer
+"
+            {
+                let mut sink = self.sink.lock().unwrap().clone().expect("the sink is set");
+                sink.write_all(
+                    b"inner
+",
+                )
+                .expect("a re-entrant write");
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let slot = Arc::new(Mutex::new(None));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (mut sink, guard) = super::Delivery::Synchronous.sink(
+        false,
+        Box::new(Reenter {
+            sink: Arc::clone(&slot),
+            seen: Arc::clone(&seen),
+        }),
+    );
+    *slot.lock().unwrap() = Some(sink.clone());
+
+    sink.write_all(
+        b"outer
+",
+    )
+    .expect("the outer write");
+
+    assert!(guard.is_none(), "a synchronous sink has nothing queued");
+    assert_eq!(
+        String::from_utf8_lossy(&seen.lock().unwrap()),
+        "outer
+inner
+"
+    );
+}
+
 /// `flush` waits for relays that are behind: every line written to either stream before it has gone through that
 /// stream's tee when it returns. Each stream is the slower one in turn, so a drain of one stream that is missing is
 /// not hidden by the time the other's takes.

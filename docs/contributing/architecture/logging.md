@@ -80,16 +80,19 @@ hook.
 Which writers a process gets depends on its kind (`ProcessKind`, passed to `init`). A one-shot command writes
 synchronously: its relay thread writes each line to the original handle itself, and the stderr and file layers write
 through a mutex. Nothing is lossy and no timer runs at exit, so a command's output, its errors and its `gui-cli.log`
-lines are delivered by the time its guard has dropped; a caller that reads late holds the command, as it holds any program.
+lines are delivered by the time its guard has dropped. A caller that reads late holds the command, as it holds any
+program. A write made from inside a sink's own write (a warning raised during a rotation, the panic hook after a writer
+panicked) is queued and written when the first returns, because the thread cannot take its own lock again.
+
 The bridge and the GUI keep non-blocking writers, so that a wedged terminal cannot block them. What that costs at exit:
 the guards of those writers wait for their worker for at most a second (the bound is inside `tracing-appender`), so a
 reader that stalls past it loses the lines still queued.
 
-Whatever ends the process before the relay threads have caught up loses the last lines. Dropping the `LogGuard` waits for
-them: it writes a marker line, carrying a random nonce, to each redirected stream, and blocks until that stream's reader
-thread has read it. `process::exit` skips destructors, so `dispatch` drops the CLI's guard before it exits. The wait has
-no limit, like the file writer's: a stalled disk that blocks the relay thread holds the exit too. The GUI leaves through
-the event loop's own `process::exit` and does not drain.
+Whatever ends the process before the relay threads have caught up loses the last lines. Dropping the `LogGuard` waits
+for them: it writes a marker line, carrying a random nonce, to each redirected stream, and blocks until that stream's
+reader thread has read it. `process::exit` skips destructors, so `dispatch` drops the CLI's guard before it exits. The
+wait has no limit, like the file writer's: a stalled disk that blocks the relay thread holds the exit too. The GUI
+leaves through the event loop's own `process::exit` and does not drain.
 
 The most visible case is WebView2 on Windows, which writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
 straight to the inherited stderr. They land in `gui.log` through the relay. **A Chromium line is a real log record:

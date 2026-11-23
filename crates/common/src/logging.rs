@@ -31,9 +31,8 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::{JoinHandle, ThreadId};
 use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
@@ -93,7 +92,8 @@ impl Delivery {
             Delivery::Synchronous => (
                 Sink::Synchronous(Arc::new(SyncTarget {
                     writer: Mutex::new(Box::new(target)),
-                    writing: AtomicU64::new(0),
+                    holder: Mutex::new(None),
+                    deferred: Mutex::new(Vec::new()),
                 })),
                 None,
             ),
@@ -112,65 +112,77 @@ pub(crate) enum Sink {
     NonBlocking(NonBlocking),
 }
 
-/// The writer behind a synchronous sink, and the thread that is inside a call to it.
+/// The writer behind a synchronous sink, the thread that is inside a call to it, and what that thread's own writes
+/// left behind.
 pub(crate) struct SyncTarget {
     writer: Mutex<Box<dyn Write + Send>>,
-    /// The number of the thread that holds `writer` (see [`thread_number`]), or 0.
-    writing: AtomicU64,
+    holder: Mutex<Option<ThreadId>>,
+    /// Bytes written to the sink by the holder from inside the writer, to be written once the writer returns.
+    deferred: Mutex<Vec<u8>>,
+}
+
+/// Lock `mutex`, ignoring that a panic poisoned it: the data is a writer or a byte queue, and a panic leaves both
+/// usable.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl SyncTarget {
-    /// Run `f` on the writer, holding its lock. The panic hook logs through the sinks on the thread that panicked,
-    /// before the panic unwinds out of the writer and releases the lock, so a thread that comes back here while it
-    /// is already inside the writer would wait for itself: that call is dropped and returns `reentered`. The writer
-    /// is the one that failed, and the hook's record still reaches the other sink.
-    fn locked<R>(&self, reentered: R, f: impl FnOnce(&mut (dyn Write + Send)) -> R) -> R {
-        let me = thread_number();
-        // Only this thread stores its own number, so finding it here means this thread holds the lock.
-        if self.writing.load(Ordering::Relaxed) == me {
-            return reentered;
+    /// Run `f` on the writer, holding its lock. `None` when this thread already holds the lock: a thread that
+    /// came back here would wait for itself. That happens when the writer logs (a warning raised during a rotation),
+    /// and when the panic hook logs after the writer panicked, before the unwinding releases the lock.
+    fn locked<R>(&self, f: impl FnOnce(&mut (dyn Write + Send)) -> R) -> Option<R> {
+        let me = std::thread::current().id();
+        if *lock(&self.holder) == Some(me) {
+            return None;
         }
-        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        self.writing.store(me, Ordering::Relaxed);
-        struct Release<'a>(&'a AtomicU64);
+        let mut writer = lock(&self.writer);
+        *lock(&self.holder) = Some(me);
+        struct Release<'a>(&'a Mutex<Option<ThreadId>>);
         impl Drop for Release<'_> {
             fn drop(&mut self) {
-                self.0.store(0, Ordering::Relaxed);
+                *lock(self.0) = None;
             }
         }
-        let _release = Release(&self.writing);
-        f(&mut **writer)
+        let _release = Release(&self.holder);
+        Some(f(&mut **writer))
     }
-}
 
-/// A number for the calling thread, unique in the process and never 0.
-fn thread_number() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    std::thread_local! {
-        static NUMBER: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    /// Write `buf`, then whatever the writer's own writes left in `deferred`.
+    fn write_all(&self, buf: &[u8]) -> io::Result<()> {
+        let written = self.locked(|writer| {
+            writer.write_all(buf)?;
+            loop {
+                let later = std::mem::take(&mut *lock(&self.deferred));
+                if later.is_empty() {
+                    return Ok(());
+                }
+                writer.write_all(&later)?;
+            }
+        });
+        written.unwrap_or_else(|| {
+            lock(&self.deferred).extend_from_slice(buf);
+            Ok(())
+        })
     }
-    NUMBER.with(|number| *number)
 }
 
 impl Write for Sink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Sink::Synchronous(target) => target.locked(Ok(buf.len()), |writer| writer.write(buf)),
-            Sink::NonBlocking(writer) => writer.write(buf),
-        }
+        self.write_all(buf).map(|()| buf.len())
     }
 
     /// One lock for the whole buffer, so a line from one thread is not split by another's.
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         match self {
-            Sink::Synchronous(target) => target.locked(Ok(()), |writer| writer.write_all(buf)),
+            Sink::Synchronous(target) => target.write_all(buf),
             Sink::NonBlocking(writer) => writer.write_all(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            Sink::Synchronous(target) => target.locked(Ok(()), |writer| writer.flush()),
+            Sink::Synchronous(target) => target.locked(|writer| writer.flush()).unwrap_or(Ok(())),
             Sink::NonBlocking(writer) => writer.flush(),
         }
     }
@@ -206,8 +218,8 @@ struct DrainState {
 }
 
 impl Drain {
-    fn lock(&self) -> std::sync::MutexGuard<'_, DrainState> {
-        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock(&self) -> MutexGuard<'_, DrainState> {
+        lock(&self.state)
     }
 
     /// Register a request. `None` when the relay thread has ended: there is nothing left to wait for. Otherwise
