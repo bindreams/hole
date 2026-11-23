@@ -1,13 +1,10 @@
-//! What [`drive_connection`] promises the code that asks it for substreams: a substream that was asked for and
-//! written to has reached the peer, whatever else the connection is doing.
+//! A substream that was asked for and written to has reached the peer, whatever else the connection is doing. When the
+//! connection ends, the driver finishes and its caller learns it.
 //!
-//! Every party runs on one single-threaded executor, over an in-memory pipe, with no tokio runtime and no clock. The
-//! executor is run until no task is woken. A driver that fails to poll the connection after creating a substream
-//! leaves that substream's first frame unsent, and nothing wakes it until an unrelated event (inbound data, another
-//! open, yamux's own ping about ten seconds later), so a test that polled the driver again unprompted, or waited on a
-//! timer, would send the frame itself and could not see the defect.
+//! Everything runs on one single-threaded executor over an in-memory pipe, run until no task is woken. A test that
+//! polled the driver unprompted, or waited on a timer, would send the frame itself and hide a missed poll.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -15,6 +12,7 @@ use std::sync::Arc;
 use futures::executor::LocalPool;
 use futures::task::LocalSpawnExt as _;
 use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::DuplexStream;
 use tokio::sync::mpsc;
 use tokio_util::compat::TokioAsyncReadCompatExt as _;
 
@@ -23,42 +21,86 @@ use crate::yamux::{drive_connection, open_stream, OpenStreamReply, StreamTag, Tr
 /// What the peer read from one accepted substream: the tag byte and the payload byte.
 type Received = Rc<RefCell<Vec<[u8; 2]>>>;
 
-/// A client connection driven by [`drive_connection`] and a peer connection driven by the same function, as the
-/// galoshes server drives its half, joined by an in-memory pipe. The peer records what each accepted substream
-/// delivered.
+/// The error an open request was answered with, once it was answered.
+type OpenError = Rc<RefCell<Option<yamux::ConnectionError>>>;
+
+/// A client connection driven by [`drive_connection`], joined by an in-memory pipe to a peer connection driven the
+/// same way, or to an idle pipe end.
 struct Rig {
     pool: LocalPool,
     open_tx: mpsc::Sender<OpenStreamReply>,
     received: Received,
+    /// Set when the client's driver future has finished.
+    driver_done: Rc<Cell<bool>>,
+    /// Set when the client's inbound channel reports closed.
+    inbound_closed: Rc<Cell<bool>>,
+    /// The far end of a peerless rig's pipe, kept open so that the client's own failure is the only event.
+    _idle_peer_io: Option<DuplexStream>,
 }
 
 impl Rig {
     fn new() -> Self {
+        let (client_io, peer_io) = tokio::io::duplex(256 * 1024);
+        let mut rig = Self::client_half(client_io, yamux::Config::default());
+        rig.spawn_peer(peer_io);
+        rig
+    }
+
+    /// A client with `config` whose far pipe end is held open and never read: a refused open then cannot be followed
+    /// by a wake from a peer that noticed the connection ending.
+    fn without_peer(config: yamux::Config) -> Self {
+        let (client_io, peer_io) = tokio::io::duplex(256 * 1024);
+        let mut rig = Self::client_half(client_io, config);
+        rig._idle_peer_io = Some(peer_io);
+        rig
+    }
+
+    fn client_half(client_io: DuplexStream, config: yamux::Config) -> Self {
         let pool = LocalPool::new();
         let spawner = pool.spawner();
-        let (client_io, peer_io) = tokio::io::duplex(256 * 1024);
 
         let tapped = TransportLivenessTap::new(client_io.compat(), Arc::new(AtomicU64::new(0)));
-        let client = yamux::Connection::new(tapped, yamux::Config::default(), yamux::Mode::Client);
+        let client = yamux::Connection::new(tapped, config, yamux::Mode::Client);
         let (open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(32);
-        let (inbound_tx, client_inbound_rx) = mpsc::channel::<yamux::Stream>(32);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<yamux::Stream>(32);
+        let driver_done = Rc::new(Cell::new(false));
+        let done = Rc::clone(&driver_done);
         spawner
             .spawn_local(async move {
-                // Held so that the channel stays open, as the session's receiver keeps it in production.
-                let _client_inbound_rx = client_inbound_rx;
                 drive_connection(client, open_rx, inbound_tx).await;
+                done.set(true);
+            })
+            .unwrap();
+        let inbound_closed = Rc::new(Cell::new(false));
+        let closed = Rc::clone(&inbound_closed);
+        spawner
+            .spawn_local(async move {
+                while inbound_rx.recv().await.is_some() {}
+                closed.set(true);
             })
             .unwrap();
 
+        Self {
+            pool,
+            open_tx,
+            received: Received::default(),
+            driver_done,
+            inbound_closed,
+            _idle_peer_io: None,
+        }
+    }
+
+    /// Drive `peer_io` as the galoshes server drives its half, recording what each accepted substream delivers.
+    fn spawn_peer(&mut self, peer_io: DuplexStream) {
+        let spawner = self.pool.spawner();
         let peer = yamux::Connection::new(peer_io.compat(), yamux::Config::default(), yamux::Mode::Server);
         let (peer_open_tx, peer_open_rx) = mpsc::channel::<OpenStreamReply>(32);
         let (peer_inbound_tx, mut peer_inbound_rx) = mpsc::channel::<yamux::Stream>(64);
-        let received = Received::default();
-        let sink = Rc::clone(&received);
+        let sink = Rc::clone(&self.received);
         let accept_spawner = spawner.clone();
         spawner
             .spawn_local(async move {
-                // The server half never opens substreams; it holds the sender, as `serve_underlying` does.
+                // The server half never opens substreams; it holds the sender to keep the channel open.
                 let _peer_open_tx = peer_open_tx;
                 drive_connection(peer, peer_open_rx, peer_inbound_tx).await;
             })
@@ -78,15 +120,9 @@ impl Rig {
                 }
             })
             .unwrap();
-
-        Self {
-            pool,
-            open_tx,
-            received,
-        }
     }
 
-    /// Ask the driver for a substream and write `payload` on it, then keep it open.
+    /// Open a substream, write `payload`, and hold it open.
     fn open_and_write(&self, payload: u8) {
         let open_tx = self.open_tx.clone();
         self.pool
@@ -98,6 +134,23 @@ impl Rig {
                 std::future::pending::<()>().await;
             })
             .unwrap();
+    }
+
+    /// Ask the driver for a substream it cannot open; the error it answers with lands in the returned cell.
+    fn open_expecting_refusal(&self) -> OpenError {
+        let answer = OpenError::default();
+        let slot = Rc::clone(&answer);
+        let open_tx = self.open_tx.clone();
+        self.pool
+            .spawner()
+            .spawn_local(async move {
+                let Err(error) = open_stream(&open_tx).await else {
+                    panic!("the open was not refused");
+                };
+                *slot.borrow_mut() = Some(error);
+            })
+            .unwrap();
+        answer
     }
 
     fn received(&self) -> Vec<[u8; 2]> {
@@ -125,5 +178,36 @@ fn a_substream_opened_beside_an_idle_one_reaches_the_peer_without_another_wake()
         vec![[tcp, b'a'], [tcp, b'b']],
         "the second substream, asked for and written to while the first is open, must reach the peer \
          before anything else happens on the connection"
+    );
+}
+
+#[skuld::test]
+fn a_refused_open_ends_the_connection_and_the_driver_tells_its_caller() {
+    let mut config = yamux::Config::default();
+    config.set_max_num_streams(1);
+    let mut rig = Rig::without_peer(config);
+
+    rig.open_and_write(b'a');
+    rig.pool.run_until_stalled();
+    assert!(
+        !rig.driver_done.get() && !rig.inbound_closed.get(),
+        "precondition: the first substream is open and the connection is alive"
+    );
+
+    let answer = rig.open_expecting_refusal();
+    rig.pool.run_until_stalled();
+
+    assert!(
+        matches!(*answer.borrow(), Some(yamux::ConnectionError::TooManyStreams)),
+        "the open request is answered with the refusal, got {:?}",
+        answer.borrow()
+    );
+    assert!(
+        rig.driver_done.get(),
+        "yamux ends the connection on a refused open, so the driver must finish"
+    );
+    assert!(
+        rig.inbound_closed.get(),
+        "the driver finished, so the inbound channel must report closed"
     );
 }

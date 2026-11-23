@@ -161,7 +161,7 @@ pub(crate) async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite
     let mut pending_opens: Vec<Option<OpenStreamReply>> = Vec::new();
 
     std::future::poll_fn(|cx| {
-        let mut created = false;
+        let mut connection_changed = false;
 
         // 1. Service pending outbound stream requests.
         for slot in pending_opens.iter_mut() {
@@ -215,10 +215,11 @@ pub(crate) async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite
                     match conn.poll_new_outbound(cx) {
                         std::task::Poll::Ready(Ok(stream)) => {
                             let _ = reply.send(Ok(stream));
-                            created = true;
+                            connection_changed = true;
                         }
                         std::task::Poll::Ready(Err(e)) => {
                             let _ = reply.send(Err(e));
+                            connection_changed = true;
                         }
                         std::task::Poll::Pending => {
                             pending_opens.push(Some(reply));
@@ -234,12 +235,11 @@ pub(crate) async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite
             }
         }
 
-        // Poll again after step 3 created a substream (step 1's are followed by step 2's poll). yamux wakes the driver
-        // for a new substream's frames only when the connection had no substreams; otherwise only a poll made after
-        // the creation subscribes to them, and the first frame would sit unsent until something unrelated wakes the
-        // driver (up to 30 s). Creating before step 2 instead would count a substream the connection has not yet
-        // released against the new one.
-        if created {
+        // Step 3 changes the connection after step 2's poll (step 1's changes are followed by it). yamux wakes the
+        // driver for a new substream's frames only when the connection had no substreams, and a refused open ends the
+        // connection without waking it; either waits for a poll the driver makes itself, so wake once. Creating
+        // before step 2 would count a substream the connection has not yet released against the new one.
+        if connection_changed {
             cx.waker().wake_by_ref();
         }
 
