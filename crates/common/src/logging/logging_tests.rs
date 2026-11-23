@@ -232,6 +232,19 @@ fn redirect_flush_waits_for_a_slow_relay(#[fixture(temp_dir)] dir: &Path) {
     assert_eq!(teed, expected, "the tee holds {} of 15 lines", teed.len());
 }
 
+/// A drain does not depend on the standard handle still being there: the markers go through the relay's own pipe end.
+#[skuld::test]
+fn redirect_drains_after_the_standard_output_is_closed(#[fixture(temp_dir)] dir: &Path) {
+    let result = run_child("redirect_replaced_handle", dir);
+    let relayed: Vec<&str> = result
+        .events
+        .iter()
+        .filter(|e| e.target == "hole::stdout_relay")
+        .map(|e| e.message.as_str())
+        .collect();
+    assert_eq!(relayed, ["before-the-close"], "relayed lines: {relayed:?}");
+}
+
 #[skuld::test]
 fn redirect_does_not_loop(#[fixture(temp_dir)] dir: &Path) {
     let result = run_child("redirect_no_loop", dir);

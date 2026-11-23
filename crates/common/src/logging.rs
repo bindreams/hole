@@ -40,8 +40,9 @@ use util::dir::Dir;
 //
 // A line written to stdout or stderr reaches the caller through a relay thread and a non-blocking tee, and
 // `process::exit` ends both without waiting. `LogGuard::drop` therefore drains: it writes a marker line into each
-// redirected stream's pipe, through a write end the relay keeps for it, and waits until that stream's relay thread has read
-// it, which means the thread has handed every earlier line to its tee and to the tracing layers. Dropping the tee guard then writes the tee's queue out.
+// redirected stream's pipe, through a write end the relay keeps, and waits until the relay thread has read it. The
+// thread has then handed every earlier line to its tee and to the tracing layers; dropping the tee guard writes the
+// tee's queue out.
 
 /// The text that starts a drain marker line; the line is this and a request number.
 const DRAIN_MARKER: &str = "__hole_relay_flush__";
@@ -104,8 +105,9 @@ struct Relay {
     _thread: JoinHandle<()>,
     tee_guard: Option<WorkerGuard>,
     drain: std::sync::Arc<Drain>,
-    /// A second write end of the stream's pipe, for the markers: they reach the relay whatever the process later does to
-    /// its standard handle.
+    stream: Stream,
+    /// A second write end of the stream's pipe, for the markers: they reach the relay whatever the process later does
+    /// to its standard handle.
     marker_writer: os_pipe::PipeWriter,
 }
 
@@ -131,6 +133,7 @@ impl Relay {
             _thread: thread,
             tee_guard: Some(tee_guard),
             drain,
+            stream,
             marker_writer,
         })
     }
@@ -149,9 +152,25 @@ impl Relay {
             return Ok(());
         };
         let marker = format!("{DRAIN_MARKER}{id}\n");
-        if let Err(e) = self.marker_writer.write_all(marker.as_bytes()) {
+        // Under the stream's own lock, so the marker cannot land between the pieces of one `eprintln!`.
+        let written = match self.stream {
+            Stream::Stderr => {
+                let _held = io::stderr().lock();
+                self.marker_writer.write_all(marker.as_bytes())
+            }
+            Stream::Stdout => {
+                let _held = io::stdout().lock();
+                self.marker_writer.write_all(marker.as_bytes())
+            }
+        };
+        if let Err(e) = written {
             self.drain.cancel(id);
-            return Err(e);
+            // No reader is left on the pipe: the relay thread has ended and holds nothing.
+            return if e.kind() == io::ErrorKind::BrokenPipe {
+                Ok(())
+            } else {
+                Err(e)
+            };
         }
         // An answer, or the end of the relay thread (which drops the sender): either way the thread holds nothing that
         // was written before the marker.
@@ -406,10 +425,8 @@ fn redirect_fd(stream: Stream, write_end: &os_pipe::PipeWriter) -> io::Result<()
     };
     let h = HANDLE(write_end.as_raw_handle() as _);
 
-    // Duplicate the write end so SetStdHandle has an independent handle that
-    // outlives the PipeWriter wrapper's Drop. Without this, after we drop
-    // `write_end`, the kernel handle that STD_*_HANDLE references would be
-    // closed, and any subprocess inheriting it would see EBADF.
+    // Duplicate the write end so the standard handle is its own, inheritable
+    // handle (a PipeWriter's is not), which a subprocess inherits as its stdio.
     let mut dup = HANDLE::default();
     let proc = unsafe { GetCurrentProcess() };
     unsafe {

@@ -188,6 +188,7 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_tee" => scenario_tee(),
         "redirect_multiline" => scenario_multiline(),
         "redirect_open_line" => scenario_open_line(),
+        "redirect_replaced_handle" => scenario_replaced_handle(),
         "redirect_slow_relay" => scenario_slow_relay(),
         "redirect_no_loop" => scenario_no_loop(),
         "lossy_backpressure" => scenario_lossy_backpressure(),
@@ -434,6 +435,33 @@ fn scenario_slow_relay() {
         ..ChildResult::default()
     };
     write_result(&result);
+}
+
+/// The process closes its standard output after the redirect. The drain's markers do not travel through that handle, so
+/// `flush` still returns and the line written before the close is relayed.
+fn scenario_replaced_handle() {
+    let mut harness = install_child_subscriber();
+    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    harness.relays = Some(relays);
+    let _ = writeln!(std::io::stdout(), "before-the-close");
+    let _ = std::io::stdout().flush();
+    close_stdout();
+    let result = finish(&mut harness);
+    write_result(&result);
+}
+
+#[cfg(unix)]
+fn close_stdout() {
+    // SAFETY: closes the child's own fd 1; nothing after this writes to it.
+    unsafe { libc::close(libc::STDOUT_FILENO) };
+}
+
+#[cfg(windows)]
+fn close_stdout() {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{SetStdHandle, STD_OUTPUT_HANDLE};
+    // SAFETY: points the child's own standard output at no handle; nothing after this writes to it.
+    unsafe { SetStdHandle(STD_OUTPUT_HANDLE, HANDLE::default()).expect("close the standard output") };
 }
 
 fn scenario_no_loop() {
