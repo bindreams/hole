@@ -51,6 +51,15 @@ impl Lane {
             Lane::Plugins => "plugin-e2e-tests",
         }
     }
+
+    /// The variable naming the installer this lane's tests ran on. The plugins lane stages no installer.
+    fn installer_env(self) -> Option<&'static str> {
+        match self {
+            Lane::Msi => Some(MSI_ENV),
+            Lane::Dmg => Some(DMG_ENV),
+            Lane::Plugins => None,
+        }
+    }
 }
 
 /// A command a shipped executable must survive: exit 0 and, when `prints` is set, print exactly that on stdout.
@@ -368,12 +377,15 @@ pub fn list(tag: &str) -> Result<()> {
 /// to this build's archive would ship two builds as one release.
 fn resolve_installer(lane: Lane, repo_root: &Path, installer_override: Option<OsString>) -> Result<PathBuf> {
     let release = repo_root.join("target").join("release");
-    let (env_var, built) = match lane {
-        Lane::Msi => (MSI_ENV, release.join("hole.msi")),
-        Lane::Dmg => (DMG_ENV, single_dmg(&release.join("bundle").join("dmg"))?),
+    let built = match lane {
+        Lane::Msi => release.join("hole.msi"),
+        Lane::Dmg => single_dmg(&release.join("bundle").join("dmg"))?,
         Lane::Plugins => bail!("the plugins lane stages no installer"),
     };
     if let Some(given) = installer_override.filter(|p| !p.is_empty()) {
+        let env_var = lane
+            .installer_env()
+            .expect("a lane that stages an installer names its override variable");
         check_installer_override(env_var, &repo_root.join(given), &built)?;
     }
     Ok(built)
@@ -557,11 +569,7 @@ pub fn stage(repo_root: &Path, tag: &str, lane: Lane, out: &Path) -> Result<()> 
     let (group, version) = parse_release_tag(tag)?;
     let platform = Platform::host().context("unknown host platform")?;
     let version = version.to_string();
-    let installer_override = match lane {
-        Lane::Msi => std::env::var_os(MSI_ENV),
-        Lane::Dmg => std::env::var_os(DMG_ENV),
-        Lane::Plugins => None,
-    };
+    let installer_override = lane.installer_env().and_then(std::env::var_os);
     let shipment = plan(group, lane, &version, platform, repo_root, || {
         resolve_installer(lane, repo_root, installer_override)
     })?;
