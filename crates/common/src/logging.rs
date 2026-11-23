@@ -254,6 +254,13 @@ impl StdioRelayHandles {
         let buffered = io::stdout().flush();
         let stderr = self.stderr.as_mut().map_or(Ok(()), |relay| relay.flush());
         let stdout = self.stdout.as_mut().map_or(Ok(()), |relay| relay.flush());
+        // A stdout that is not redirected is the caller's own: a flush error there is a closed stream, not a loss. A
+        // redirected one flushes into Hole's pipe, and its error repeats the relay's own.
+        let buffered = if self.stdout.is_some() && stdout.is_ok() {
+            buffered
+        } else {
+            Ok(())
+        };
         for result in [buffered, stderr, stdout] {
             if let Err(e) = result {
                 failed(e);

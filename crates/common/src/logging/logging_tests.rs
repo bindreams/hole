@@ -209,9 +209,9 @@ fn redirect_handles_multiline(#[fixture(temp_dir)] dir: &Path) {
     assert_eq!(count_c, 1, "expected 1 'multiline-c', got {count_c} in {relay_msgs:?}");
 }
 
-/// A drain that meets a line with no newline yet still delivers the text before the marker, and nothing of the marker.
-/// A complete line that looks like a marker is output too, and answers no drain request: the process cannot know a
-/// request's nonce. On each stream.
+/// On each stream: a drain that meets a line with no newline yet still delivers the text before the marker, and
+/// nothing of the marker. A complete line that looks like a marker is output too and answers no waiting request, since
+/// the process cannot know a request's nonce.
 #[skuld::test]
 fn redirect_delivers_an_open_line_at_a_drain(#[fixture(temp_dir)] dir: &Path) {
     for (scenario, target) in [
@@ -248,9 +248,9 @@ fn redirect_delivers_an_open_line_at_a_drain(#[fixture(temp_dir)] dir: &Path) {
 /// to that hook on the relay thread, which would write the panic into the pipe the thread alone reads; on any other
 /// thread it chains.
 ///
-/// Not reached: a drain that registers after the thread dropped the pipe's read end and before it called `end`
-/// (`BrokenPipe` mapped to the same error, `cancel`). That window is a few instructions wide, and no test reaches it without a
-/// hook.
+/// Not reached: a drain that registers after the thread dropped the pipe's read end and before it called `end`, where a
+/// broken pipe becomes the same error and the request is cancelled. That window is a few instructions wide, and no test
+/// reaches it without a hook.
 #[skuld::test]
 fn drain_after_the_relay_thread_ended_releases_and_completes(#[fixture(temp_dir)] dir: &Path) {
     let result = run_child("redirect_relay_thread_ended", dir);
