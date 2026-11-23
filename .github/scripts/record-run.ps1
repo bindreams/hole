@@ -5,9 +5,8 @@
 # is one command line and `socket` is the bridge's socket. This writes `result` as UTF-8 JSON and exits 0; any other
 # exit is this script's own failure, and there is then no result.
 #
-# After the command it connects to `socket` itself and records how that went. `hole` reports a refused connection
-# on stderr, through a relay that the process can exit ahead of, so the command's own output does not reliably say
-# why it failed; this token's own connect does.
+# After the command it connects to `socket` itself and records how that went: `hole` reports a refused connection as
+# "permission denied" on stderr, and this token's own connect names the socket error behind it.
 $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrEmpty($env:HOLE_RECORD_RUN_SPEC)) {
   throw "HOLE_RECORD_RUN_SPEC not set in the de-elevated child (env did not forward)"
