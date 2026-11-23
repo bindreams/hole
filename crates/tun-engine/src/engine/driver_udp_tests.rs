@@ -7,9 +7,10 @@
 //! `sim::recording_router` — no real socket, proxy or bypass mechanism is
 //! involved.
 
-use smoltcp::wire::{IpAddress, Ipv4Packet, Ipv6Packet, UdpPacket};
+use smoltcp::wire::{IpAddress, Ipv4Cidr, Ipv4Packet, Ipv6Packet, UdpPacket};
 
 use super::super::driver_sim_test_support::{start, v4, v6};
+use super::is_addressed_to_the_link;
 use crate::sim::{udp_packet, Dispatch};
 
 #[skuld::test]
@@ -217,4 +218,36 @@ async fn datagrams_addressed_to_a_group_or_to_the_link_open_no_flow() {
         rest.recv().await.is_none(),
         "a datagram to the link opened a further flow"
     );
+}
+
+/// The directed broadcast address follows the TUN's own prefix, and a /31, a /32 or an IPv6-only TUN has none.
+#[skuld::test]
+fn the_directed_broadcast_address_is_the_tuns_own() {
+    let cidr = |s: &str| Some(s.parse::<Ipv4Cidr>().unwrap());
+    let to = |tun: Option<Ipv4Cidr>, dst: &str| is_addressed_to_the_link(dst.parse().unwrap(), tun);
+
+    assert!(to(cidr("10.255.0.1/22"), "10.255.3.255"));
+    assert!(!to(cidr("10.255.0.1/22"), "10.255.0.255"));
+    assert!(!to(cidr("10.255.0.1/22"), "10.255.2.255"));
+    assert!(!to(cidr("10.255.0.1/24"), "10.255.0.0"));
+    assert!(to(cidr("192.168.7.9/16"), "192.168.255.255"));
+    assert!(!to(cidr("10.255.0.1/31"), "10.255.0.1"));
+    assert!(!to(cidr("10.255.0.1/32"), "10.255.0.1"));
+    assert!(!to(None, "10.255.0.255"));
+    // Unicast neighbours of the addresses above stay carried.
+    let tun = cidr("10.255.0.1/24");
+    for dst in [
+        "223.255.255.255",
+        "10.255.0.254",
+        "10.255.1.255",
+        "8.8.8.8",
+        "fe80::1",
+        "2001:db8::1",
+    ] {
+        assert!(!to(tun, dst), "{dst} is not addressed to the link");
+    }
+    // Not tied to the TUN: multicast and the limited broadcast are addressed to the link whatever the prefix.
+    assert!(to(None, "224.0.0.252"));
+    assert!(to(None, "255.255.255.255"));
+    assert!(to(None, "ff02::1:3"));
 }

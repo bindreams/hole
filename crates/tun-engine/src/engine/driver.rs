@@ -367,9 +367,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
     // UDP =============================================================================================================
 
     /// Handle a UDP packet before smoltcp sees it. Returns `true` if the
-    /// packet was consumed (dispatched to the Router, or handled by the
-    /// DNS interceptor), in which case the caller must NOT feed it to
-    /// smoltcp.
+    /// packet was consumed (dispatched to the Router, handled by the DNS
+    /// interceptor, or dropped for being addressed to the link), in which
+    /// case the caller must NOT feed it to smoltcp.
     async fn handle_udp_packet(&mut self, packet: &[u8]) -> bool {
         let parsed = match parse_ip_packet_full(packet) {
             Some(p) if p.proto == IpProto::Udp => p,
