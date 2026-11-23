@@ -81,8 +81,9 @@ Which writers a process gets depends on its kind (`ProcessKind`, passed to `init
 synchronously: its relay thread writes each line to the original handle itself, and the stderr and file layers write
 through a mutex. Nothing is lossy and no timer runs at exit, so a command's output, its errors and its `gui-cli.log`
 lines are delivered by the time its guard has dropped. A caller that reads late holds the command, as it holds any
-program. A write made from inside a sink's own write (a warning raised during a rotation, the panic hook after a writer
-panicked) is queued and written when the first returns, because the thread cannot take its own lock again.
+program. A write made from inside a sink's own write (a warning raised during a rotation) is queued and written when
+the first returns, because the thread cannot take its own lock again. If that write panics, the queued write is dropped
+with it; the panic hook's record reaches the other sink and the previous hook.
 
 The bridge and the GUI keep non-blocking writers, so that a wedged terminal cannot block them. What that costs at exit:
 the guards of those writers wait for their worker for at most a second (the bound is inside `tracing-appender`), so a

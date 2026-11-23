@@ -128,42 +128,44 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl SyncTarget {
-    /// Run `f` on the writer, holding its lock. `None` when this thread already holds the lock: a thread that
-    /// came back here would wait for itself. That happens when the writer logs (a warning raised during a rotation),
-    /// and when the panic hook logs after the writer panicked, before the unwinding releases the lock.
-    fn locked<R>(&self, f: impl FnOnce(&mut (dyn Write + Send)) -> R) -> Option<R> {
+    /// Run `f` on the writer, holding its lock, then write what the writer itself wrote to the sink meanwhile. A
+    /// thread that is already inside the writer would wait for itself if it took the lock again, so its write is
+    /// queued in `deferred` (when `queue` is given) and the call returns `Ok`. That happens when the writer logs, a
+    /// warning raised during a rotation. A writer that logs on every write keeps the second loop going, as it
+    /// would keep a non-blocking worker busy.
+    fn run(&self, queue: Option<&[u8]>, f: impl FnOnce(&mut (dyn Write + Send)) -> io::Result<()>) -> io::Result<()> {
         let me = std::thread::current().id();
         if *lock(&self.holder) == Some(me) {
-            return None;
+            if let Some(buf) = queue {
+                lock(&self.deferred).extend_from_slice(buf);
+            }
+            return Ok(());
         }
         let mut writer = lock(&self.writer);
         *lock(&self.holder) = Some(me);
-        struct Release<'a>(&'a Mutex<Option<ThreadId>>);
-        impl Drop for Release<'_> {
-            fn drop(&mut self) {
-                *lock(self.0) = None;
+        let _release = Release(self);
+        let mut result = f(&mut **writer);
+        loop {
+            let later = std::mem::take(&mut *lock(&self.deferred));
+            if later.is_empty() {
+                return result;
             }
+            result = result.and(writer.write_all(&later));
         }
-        let _release = Release(&self.holder);
-        Some(f(&mut **writer))
     }
+}
 
-    /// Write `buf`, then whatever the writer's own writes left in `deferred`.
-    fn write_all(&self, buf: &[u8]) -> io::Result<()> {
-        let written = self.locked(|writer| {
-            writer.write_all(buf)?;
-            loop {
-                let later = std::mem::take(&mut *lock(&self.deferred));
-                if later.is_empty() {
-                    return Ok(());
-                }
-                writer.write_all(&later)?;
-            }
-        });
-        written.unwrap_or_else(|| {
-            lock(&self.deferred).extend_from_slice(buf);
-            Ok(())
-        })
+/// Ends a thread's hold on a [`SyncTarget`], also when the writer panicked. The panic hook logs through the sinks
+/// before the unwinding gets here, so the record it queued for this sink is dropped with the writer's own: the
+/// writer is broken, and the record still reaches the other sink and the previous hook.
+struct Release<'a>(&'a SyncTarget);
+
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            lock(&self.0.deferred).clear();
+        }
+        *lock(&self.0.holder) = None;
     }
 }
 
@@ -175,14 +177,14 @@ impl Write for Sink {
     /// One lock for the whole buffer, so a line from one thread is not split by another's.
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         match self {
-            Sink::Synchronous(target) => target.write_all(buf),
+            Sink::Synchronous(target) => target.run(Some(buf), |writer| writer.write_all(buf)),
             Sink::NonBlocking(writer) => writer.write_all(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            Sink::Synchronous(target) => target.locked(|writer| writer.flush()).unwrap_or(Ok(())),
+            Sink::Synchronous(target) => target.run(None, |writer| writer.flush()),
             Sink::NonBlocking(writer) => writer.flush(),
         }
     }

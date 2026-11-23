@@ -293,9 +293,9 @@ fn drain_after_the_relay_thread_ended_releases_and_completes(#[fixture(temp_dir)
     assert_eq!(result.tee_stdout.lines().collect::<Vec<_>>(), expected);
 }
 
-/// A write made from inside the target's own write, on the same thread, is written after the write it interrupted: the
-/// sink's lock is not entered a second time (the thread would wait for itself), and the line is not lost. A warning
-/// raised during a log rotation, or the panic hook after a writer panicked, is such a write.
+/// A write made from inside the target's own write, on the same thread (a warning raised during a log rotation), is
+/// written after the call it interrupted, whether that call writes, fails or flushes: the sink's lock is not taken a
+/// second time, because the thread would wait for itself, and the line is not lost.
 #[skuld::test]
 fn a_write_made_from_inside_a_synchronous_write_is_written_after_it() {
     use std::io::Write;
@@ -304,6 +304,14 @@ fn a_write_made_from_inside_a_synchronous_write_is_written_after_it() {
     struct Reenter {
         sink: Arc<Mutex<Option<super::Sink>>>,
         seen: Arc<Mutex<Vec<u8>>>,
+        /// The outer write returns an error after the inner one.
+        fail: bool,
+    }
+    impl Reenter {
+        fn log(&self, line: &[u8]) {
+            let mut sink = self.sink.lock().unwrap().clone().expect("the sink is set");
+            sink.write_all(line).expect("a re-entrant write");
+        }
     }
     impl Write for Reenter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -312,43 +320,92 @@ fn a_write_made_from_inside_a_synchronous_write_is_written_after_it() {
                 == b"outer
 "
             {
-                let mut sink = self.sink.lock().unwrap().clone().expect("the sink is set");
-                sink.write_all(
+                self.log(
                     b"inner
 ",
-                )
-                .expect("a re-entrant write");
+                );
+                if self.fail {
+                    return Err(std::io::Error::other("the disk is full"));
+                }
             }
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
+            self.log(
+                b"from-flush
+",
+            );
             Ok(())
         }
     }
 
-    let slot = Arc::new(Mutex::new(None));
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let (mut sink, guard) = super::Delivery::Synchronous.sink(
-        false,
-        Box::new(Reenter {
-            sink: Arc::clone(&slot),
-            seen: Arc::clone(&seen),
-        }),
-    );
-    *slot.lock().unwrap() = Some(sink.clone());
-
-    sink.write_all(
-        b"outer
-",
-    )
-    .expect("the outer write");
-
-    assert!(guard.is_none(), "a synchronous sink has nothing queued");
-    assert_eq!(
-        String::from_utf8_lossy(&seen.lock().unwrap()),
-        "outer
+    // (what the sink is asked to do, whether the writer fails, what the writer must have seen, whether the call fails)
+    let cases: [(&str, bool, &str, bool); 3] = [
+        (
+            "write",
+            false,
+            "outer
 inner
-"
+",
+            false,
+        ),
+        (
+            "write",
+            true,
+            "outer
+inner
+",
+            true,
+        ),
+        (
+            "flush",
+            false,
+            "from-flush
+",
+            false,
+        ),
+    ];
+    for (action, fail, expected, fails) in cases {
+        let slot = Arc::new(Mutex::new(None));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (mut sink, guard) = super::Delivery::Synchronous.sink(
+            false,
+            Box::new(Reenter {
+                sink: Arc::clone(&slot),
+                seen: Arc::clone(&seen),
+                fail,
+            }),
+        );
+        *slot.lock().unwrap() = Some(sink.clone());
+
+        let result = match action {
+            "write" => sink.write_all(
+                b"outer
+",
+            ),
+            _ => sink.flush(),
+        };
+
+        assert!(guard.is_none(), "a synchronous sink has nothing queued");
+        assert_eq!(result.is_err(), fails, "{action}, fail {fail}: {result:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&seen.lock().unwrap()),
+            expected,
+            "{action}, fail {fail}"
+        );
+    }
+}
+
+/// A writer that panics after a write was made from inside it: that write is dropped with the call, and does not
+/// turn up after the next one.
+#[skuld::test]
+fn what_a_panicking_writer_wrote_to_its_own_sink_is_dropped(#[fixture(temp_dir)] dir: &Path) {
+    let result = run_child("sink_writer_panics", dir);
+    assert_eq!(
+        result.observed,
+        ["outer
+next
+"]
     );
 }
 

@@ -192,6 +192,7 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_tee_thread_bridge" => scenario_tee_thread(ProcessKind::Bridge),
         "redirect_tee_thread_gui" => scenario_tee_thread(ProcessKind::Gui),
         "redirect_relay_thread_ended" => scenario_relay_thread_ended(),
+        "sink_writer_panics" => scenario_sink_writer_panics(),
         "redirect_slow_stderr_relay" => scenario_slow_relay("hole::stderr_relay"),
         "redirect_slow_stdout_relay" => scenario_slow_relay("hole::stdout_relay"),
         "redirect_no_loop" => scenario_no_loop(),
@@ -531,6 +532,67 @@ fn scenario_relay_thread_ended() {
     write_result(&ChildResult {
         observed,
         tee_stdout: String::from_utf8_lossy(&stdout_tee.snapshot()).into_owned(),
+        ..ChildResult::default()
+    });
+}
+
+/// A synchronous sink whose writer logs through the sink and then panics, as the panic hook does on the thread that
+/// panicked. The sink's next write shows what the sink kept.
+fn scenario_sink_writer_panics() {
+    struct Panics {
+        sink: Arc<Mutex<Option<crate::logging::Sink>>>,
+        seen: VecWriter,
+    }
+    impl Write for Panics {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.seen.write_all(buf)?;
+            if buf
+                == b"outer
+"
+            {
+                let mut sink = self.sink.lock().unwrap().clone().expect("the sink is set");
+                sink.write_all(
+                    b"inner
+",
+                )
+                .expect("a re-entrant write");
+                panic!("the writer panics");
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // The default hook would print to the test's stderr; nothing here reads it.
+    std::panic::set_hook(Box::new(|_| {}));
+    let slot = Arc::new(Mutex::new(None));
+    let seen = VecWriter::new();
+    let (mut sink, _guard) = crate::logging::Delivery::Synchronous.sink(
+        false,
+        Box::new(Panics {
+            sink: Arc::clone(&slot),
+            seen: seen.clone(),
+        }),
+    );
+    *slot.lock().unwrap() = Some(sink.clone());
+
+    let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sink.write_all(
+            b"outer
+",
+        )
+    }));
+    assert!(outer.is_err(), "the writer panics on the outer write");
+    sink.write_all(
+        b"next
+",
+    )
+    .expect("the next write");
+
+    write_result(&ChildResult {
+        observed: vec![String::from_utf8_lossy(&seen.snapshot()).into_owned()],
         ..ChildResult::default()
     });
 }
