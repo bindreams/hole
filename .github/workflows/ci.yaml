@@ -705,9 +705,11 @@ jobs:
       # Installer lifecycle (Windows) ===================================================================================
       # The sequence (install, verify, de-elevated dashboard E2E, uninstall, verify; then install,
       # connect through the installed service, uninstall; then install, connect as the installing
-      # user without elevation across two service restarts, uninstall; then the upgrade) is the
+      # user without elevation across two service restarts, uninstall; then install, start a full tunnel
+      # as that user and fetch pages from outside the machine, uninstall; then the upgrade) is the
       # msi-installer harness (`msi-installer/tests/installed/`). It drives the INSTALLED binary
-      # through WebDriver and a SOCKS proxy over loopback, so it runs before the TUN lane.
+      # through WebDriver, a SOCKS proxy over loopback and, for the full-tunnel case, the runner's own
+      # routes and DNS, so it runs before the TUN lane.
       #
       # `installer-cleanup` runs `always()` after `installer-tests`: an idempotent uninstall that
       # verifies nothing is left. That step is the TUN lane's gate: the lane runs only once nothing
