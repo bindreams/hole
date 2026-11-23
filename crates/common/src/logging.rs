@@ -130,9 +130,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl SyncTarget {
     /// Run `f` on the writer, holding its lock, then write what the writer itself wrote to the sink meanwhile. A
     /// thread that is already inside the writer would wait for itself if it took the lock again, so its write is
-    /// queued in `deferred` (when `queue` is given) and the call returns `Ok`. That happens when the writer logs, a
-    /// warning raised during a rotation. A writer that logs on every write keeps the second loop going, as it
-    /// would keep a non-blocking worker busy.
+    /// queued in `deferred` (when `queue` is given) and the call returns `Ok` whatever becomes of the bytes later.
+    /// That happens when the writer logs, a warning raised during a rotation. The writer must be unbuffered, and
+    /// must not log on every write: that would keep the second loop going with the lock held.
     fn run(&self, queue: Option<&[u8]>, f: impl FnOnce(&mut (dyn Write + Send)) -> io::Result<()>) -> io::Result<()> {
         let me = std::thread::current().id();
         if *lock(&self.holder) == Some(me) {
