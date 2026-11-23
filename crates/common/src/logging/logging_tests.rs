@@ -50,9 +50,6 @@ pub struct ChildResult {
     /// preserved CLI script visibility).
     pub tee_stderr: String,
     pub tee_stdout: String,
-    /// The thread of every write to each tee target (`redirect_tee_thread`).
-    pub tee_threads_stderr: Vec<String>,
-    pub tee_threads_stdout: Vec<String>,
     /// What a scenario saw, one fact per line, in the order it saw them.
     pub observed: Vec<String>,
 }
@@ -160,9 +157,12 @@ fn redirect_captures_subprocess_stdout_via_inheritance(#[fixture(temp_dir)] dir:
     );
 }
 
-/// Load-bearing test for the tee of
-/// [`StdioRelayHandles::flush`](crate::logging::StdioRelayHandles): when `flush`
-/// returns, the saved-original tee target holds the bytes. Do not weaken the
+/// Load-bearing test for the **tee-drain phase** of
+/// [`StdioRelayHandles::flush`](crate::logging::StdioRelayHandles).
+/// The relay's `tee.write_all(buf)` goes through a
+/// `tracing_appender::NonBlocking` worker whose drain is asynchronous;
+/// without `flush` dropping the `WorkerGuard`s, the tee target can be
+/// empty when the test reads it. Do not weaken the
 /// `tee_stderr`/`tee_stdout` assertions — they are the canonical
 /// regression gate for the flush contract.
 #[skuld::test]
@@ -241,42 +241,15 @@ fn redirect_delivers_an_open_line_at_a_drain(#[fixture(temp_dir)] dir: &Path) {
     }
 }
 
-/// A command's relay thread writes each line to the stream's original handle itself: a hand-off to another thread
-/// would leave the last lines to a timer at exit. The bridge and the GUI hand the line to a worker.
-#[skuld::test]
-fn redirect_writes_the_original_handle_on_the_thread_the_process_kind_decides(#[fixture(temp_dir)] dir: &Path) {
-    for (scenario, on_relay_thread) in [
-        ("redirect_tee_thread_command", true),
-        ("redirect_tee_thread_bridge", false),
-        ("redirect_tee_thread_gui", false),
-    ] {
-        let result = run_child(scenario, dir);
-        for (stream, threads) in [
-            (super::Stream::Stderr, &result.tee_threads_stderr),
-            (super::Stream::Stdout, &result.tee_threads_stdout),
-        ] {
-            let relay = stream.thread_name();
-            assert_eq!(
-                threads.len(),
-                1,
-                "{scenario}: one write to the {stream:?} handle: {threads:?}"
-            );
-            assert_eq!(
-                threads[0] == relay,
-                on_relay_thread,
-                "{scenario}: the {stream:?} handle was written on {:?}, the relay thread is {relay:?}",
-                threads[0]
-            );
-        }
-    }
-}
-
 /// The drain after a relay thread has ended, which only a panic in a tracing writer, the redaction writer or a
 /// formatter brings about. After the join: a request registered earlier is released, a new request finds the drain
-/// ended, `flush` returns without error, and the other stream's lines all reached their tee.
+/// ended, `flush` reports that later output to the stream was lost, and the other stream's lines all reached their
+/// tee. The production panic hook, installed over a recording previous hook, still logs the panic but does not chain
+/// to that hook on the relay thread, which would write the panic into the pipe the thread alone reads; on any other
+/// thread it chains.
 ///
 /// Not reached: a drain that registers after the thread dropped the pipe's read end and before it called `end`
-/// (`BrokenPipe` mapped to done, `cancel`). That window is a few instructions wide, and no test reaches it without a
+/// (`BrokenPipe` mapped to the same error, `cancel`). That window is a few instructions wide, and no test reaches it without a
 /// hook.
 #[skuld::test]
 fn drain_after_the_relay_thread_ended_releases_and_completes(#[fixture(temp_dir)] dir: &Path) {
@@ -286,127 +259,13 @@ fn drain_after_the_relay_thread_ended_releases_and_completes(#[fixture(temp_dir)
         [
             "registered request: Err(Disconnected)",
             "new request: false",
-            "flush errors: []"
+            "flush errors: [\"the stderr relay thread has ended; later output to stderr was lost\"]",
+            "previous hook ran on: [\"not-a-relay\"]",
+            "panic records: [\"a tracing writer panics on the relay thread\", \"a panic off the relay thread\"]"
         ]
     );
     let expected: Vec<String> = (0..5).map(|i| format!("other-line-{i}")).collect();
     assert_eq!(result.tee_stdout.lines().collect::<Vec<_>>(), expected);
-}
-
-/// A write made from inside the target's own write, on the same thread (a warning raised during a log rotation), is
-/// written after the call it interrupted, whether that call writes, fails or flushes: the sink's lock is not taken a
-/// second time, because the thread would wait for itself, and the line is not lost.
-#[skuld::test]
-fn a_write_made_from_inside_a_synchronous_write_is_written_after_it() {
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
-
-    struct Reenter {
-        sink: Arc<Mutex<Option<super::Sink>>>,
-        seen: Arc<Mutex<Vec<u8>>>,
-        /// The outer write returns an error after the inner one.
-        fail: bool,
-    }
-    impl Reenter {
-        fn log(&self, line: &[u8]) {
-            let mut sink = self.sink.lock().unwrap().clone().expect("the sink is set");
-            sink.write_all(line).expect("a re-entrant write");
-        }
-    }
-    impl Write for Reenter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.seen.lock().unwrap().extend_from_slice(buf);
-            if buf
-                == b"outer
-"
-            {
-                self.log(
-                    b"inner
-",
-                );
-                if self.fail {
-                    return Err(std::io::Error::other("the disk is full"));
-                }
-            }
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.log(
-                b"from-flush
-",
-            );
-            Ok(())
-        }
-    }
-
-    // (what the sink is asked to do, whether the writer fails, what the writer must have seen, whether the call fails)
-    let cases: [(&str, bool, &str, bool); 3] = [
-        (
-            "write",
-            false,
-            "outer
-inner
-",
-            false,
-        ),
-        (
-            "write",
-            true,
-            "outer
-inner
-",
-            true,
-        ),
-        (
-            "flush",
-            false,
-            "from-flush
-",
-            false,
-        ),
-    ];
-    for (action, fail, expected, fails) in cases {
-        let slot = Arc::new(Mutex::new(None));
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let (mut sink, guard) = super::Delivery::Synchronous.sink(
-            false,
-            Box::new(Reenter {
-                sink: Arc::clone(&slot),
-                seen: Arc::clone(&seen),
-                fail,
-            }),
-        );
-        *slot.lock().unwrap() = Some(sink.clone());
-
-        let result = match action {
-            "write" => sink.write_all(
-                b"outer
-",
-            ),
-            _ => sink.flush(),
-        };
-
-        assert!(guard.is_none(), "a synchronous sink has nothing queued");
-        assert_eq!(result.is_err(), fails, "{action}, fail {fail}: {result:?}");
-        assert_eq!(
-            String::from_utf8_lossy(&seen.lock().unwrap()),
-            expected,
-            "{action}, fail {fail}"
-        );
-    }
-}
-
-/// A writer that panics after a write was made from inside it: that write is dropped with the call, and does not
-/// turn up after the next one.
-#[skuld::test]
-fn what_a_panicking_writer_wrote_to_its_own_sink_is_dropped(#[fixture(temp_dir)] dir: &Path) {
-    let result = run_child("sink_writer_panics", dir);
-    assert_eq!(
-        result.observed,
-        ["outer
-next
-"]
-    );
 }
 
 /// `flush` waits for relays that are behind: every line written to either stream before it has gone through that
