@@ -62,8 +62,9 @@ A fourth install starts a full tunnel, the default of `hole proxy start`, as tha
 server with no plugin. The server runs on the test machine, so it dials out of the machine's default interface instead of
 the routing table, which the tunnel now owns; that is the one thing the example is told. `curl`, run by the de-elevated
 child, requests `http://1.1.1.1/` and, over IPv4, `http://one.one.one.one/`, and each must answer `301` with a
-`Location` for the host the request named. The case then asks the operating system for the IPv4 DNS servers of each adapter (`Get-DnsClientServerAddress`)
-and fails when none is new while the tunnel is up. After `hole proxy stop` the machine's routes, adapters, addresses and
+`Location` for the host the request named. The case then asks the operating system for the IPv4 DNS servers of each adapter
+(`Get-DnsClientServerAddress`) and fails unless an adapter that did not exist before the start lists one, as the tunnel's own
+adapter does. After `hole proxy stop` the machine's routes, adapters, addresses and
 DNS settings must equal those taken before the start. The case needs the internet, and the machine's routes and DNS
 belong to the tunnel for a few seconds.
 
@@ -149,7 +150,7 @@ cargo xtask run hole-dmg-install-e2e
 
 installs the built app's bridge as root, connects with `hole proxy start` to a server behind each bundled plugin and to
 one with no plugin, fetches a page through each, and uninstalls. It then starts a full tunnel for each of the three and
-fetches pages from outside the machine by address and by name, as the Windows lane does; that case runs as root, not as the
-installing user. The connections are the same code the Windows lane runs ({src}`tests/installed/connect_journey.py`).
+fetches pages from outside the machine by address and by name, as the Windows lane does; in that case `hole` runs as root,
+as in the cases above, and `curl` runs as the user of the test. The connections are the same code the Windows lane runs ({src}`tests/installed/connect_journey.py`).
 It is meant for CI: it needs passwordless `sudo`, refuses to run over an existing install, and expects `hole-dmg` to
 have built the app and `cargo build -p plugin-e2e --example ss_plugin_server` to have built the test's server.

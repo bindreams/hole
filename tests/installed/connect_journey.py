@@ -277,7 +277,8 @@ class MachineView(Protocol):
         ...
 
     def dns_servers(self) -> Mapping[str, frozenset[str]]:
-        """The DNS servers the operating system itself reports, by the scope it reports them under."""
+        """The DNS servers the operating system itself reports, by the scope it reports them under (an adapter, a
+        resolver): a name that stays the same for the same scope from one call to the next."""
         ...
 
     def run_curl(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -310,8 +311,9 @@ def fetch(machine: MachineView, url: str, folder: Path, *, ipv4_only: bool) -> P
 def dns_servers_gained(
     before: Mapping[str, frozenset[str]], during: Mapping[str, frozenset[str]]
 ) -> dict[str, frozenset[str]]:
-    """The DNS servers the system reports now under a scope that did not report them before."""
-    return {scope: new for scope, servers in during.items() if (new := servers - before.get(scope, frozenset()))}
+    """The DNS servers of the scopes that exist now and did not exist before: what a tunnel adds, not what a lease
+    renewal or a reconfiguration of the machine's own adapters changes."""
+    return {scope: servers for scope, servers in during.items() if scope not in before and servers}
 
 
 def full_tunnel_journey(
@@ -359,8 +361,8 @@ def full_tunnel_journey(
         if not dns_servers_gained(dns_before, machine.dns_servers()):
             pytest.fail(
                 hole.report(
-                    f"the full tunnel of {case} is up, but the operating system reports no DNS server it did not "
-                    f"report before the start: nothing points the machine's lookups at the tunnel "
+                    f"the full tunnel of {case} is up, but the operating system reports no DNS server under "
+                    f"a scope it did not report before the start: nothing points the machine's lookups at the tunnel "
                     f"(before the start: {dict(dns_before)})",
                     started,
                 ),
