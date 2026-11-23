@@ -334,9 +334,10 @@ jobs:
       #   SKULD_LABELS=windows_console cargo nextest run -p dev-console \
       #     -E 'test(null_stdin_child_cannot_corrupt_console_mode)'
       #
-      # Budget: windows/arm64 took 828 to 1,018 s over nine runs from 2026-11-22 to
-      # 2026-11-23, and 1,233 s at its worst (a killed run's 1,200 s plus the 33 s
-      # of tests it had left), from the step's start and end times in the job logs.
+      # Budget: passing windows/arm64 runs reach 1,162 s. Runs cut at 1,200 s were
+      # still passing tests, so their full length is not known. The step is as long
+      # as `a_chain_with_a_gap_does_not_compile` (util) plus the tests that wait for
+      # it: the `env`-fixture tests in xtask start only when no other test runs.
       - id: test-tooling
         name: Test tooling
         if: ${{ !cancelled() && steps.archive.outcome == 'success' }}
