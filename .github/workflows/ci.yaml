@@ -335,8 +335,8 @@ jobs:
       #     -E 'test(null_stdin_child_cannot_corrupt_console_mode)'
       #
       # Budget: passing windows/arm64 runs reach 1,162 s. Runs cut at 1,200 s were
-      # still passing tests, so their full length is not known. The longest test in
-      # it there is `a_chain_with_a_gap_does_not_compile` (util), 4 to 18 minutes.
+      # still passing tests, so their full length is not known. The longest test
+      # there is `a_chain_with_a_gap_does_not_compile` (util), 4 to 18 minutes.
       - id: test-tooling
         name: Test tooling
         if: ${{ !cancelled() && steps.archive.outcome == 'success' }}
