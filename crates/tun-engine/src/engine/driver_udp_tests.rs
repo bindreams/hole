@@ -159,11 +159,11 @@ async fn an_ipv6_udp_datagram_round_trips() {
 
 // Datagrams addressed to the link =====================================================================================
 
-/// The operating system sends LLMNR, mDNS and NetBIOS lookups out of the TUN as it does out
-/// of every adapter. Each is addressed to a group or to the link, which no
-/// proxy can deliver to, so none may become a flow. The datagrams that must
-/// still be carried sit next to the ones that must not. The harness's TUN is
-/// `10.255.0.1/24`, so its directed broadcast is `10.255.0.255`.
+/// The operating system sends LLMNR, mDNS and NetBIOS lookups out of the TUN as
+/// it does out of every adapter. Each is addressed to a group or to the link,
+/// which no proxy can deliver to, so none may become a flow. The datagrams that
+/// must still be carried sit next to the ones that must not. The harness's TUN
+/// is `10.255.0.1/24`, so its directed broadcast is `10.255.0.255`.
 ///
 /// The read error queued behind the datagrams ends the engine without cancelling
 /// any task, and the receiver closes when the last router clone is dropped, so
@@ -203,9 +203,10 @@ async fn datagrams_addressed_to_a_group_or_to_the_link_open_no_flow() {
     let mut dispatched = Vec::new();
     while let Some(dispatch) = rx.recv().await {
         // Dropping the `Dispatch` releases the router task that sent it.
-        if let Dispatch::Udp { meta, .. } = dispatch {
-            dispatched.push(meta.dst);
-        }
+        let Dispatch::Udp { meta, .. } = dispatch else {
+            panic!("expected a UDP dispatch");
+        };
+        dispatched.push(meta.dst);
     }
     dispatched.sort();
     let mut expected = carried.to_vec();
