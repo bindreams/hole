@@ -57,6 +57,16 @@ or is not the user the installer added. The child cannot read pytest's own tempo
 `member-access\` under the log folder. A failure also says how the child's own connect to the bridge's socket went:
 `hole` can exit before its own error text reaches a pipe.
 
+A fourth install starts a full tunnel, the default of `hole proxy start`, as that same user
+({src}`msi-installer/tests/installed/test_full_tunnel.py`), once for a server behind each bundled plugin and once for a
+server with no plugin. The server runs on the test machine, so it dials out of the machine's default interface instead of
+the routing table, which the tunnel now owns; that is the one thing the example is told. `curl`, run by the de-elevated
+child, requests `http://1.1.1.1/` and, over IPv4, `http://one.one.one.one/`, and each must answer `301` with a
+`Location` for the host the request named. The case then asks the operating system for the IPv4 DNS servers of each adapter (`Get-DnsClientServerAddress`)
+and fails when none is new while the tunnel is up. After `hole proxy stop` the machine's routes, adapters, addresses and
+DNS settings must equal those taken before the start. The case needs the internet, and the machine's routes and DNS
+belong to the tunnel for a few seconds.
+
 ```{warning}
 This installs Hole system-wide on the machine you run it on. Use a throwaway machine or virtual machine, not the one you
 work on.
@@ -69,7 +79,7 @@ cargo xtask run hole-msi-cleanup          # after an interrupted run
 ```
 
 It needs the MSI built beforehand (`cargo xtask build hole-msi`, or the one `MSI_UNDER_TEST` names), the repo's
-`node_modules`, and for the connect and member-access cases `cargo build -p plugin-e2e --example ss_plugin_server` plus
+`node_modules`, and for the connect, member-access and full-tunnel cases `cargo build -p plugin-e2e --example ss_plugin_server` plus
 the `galoshes` and `ex-ray` builds `hole-msi` leaves (`cargo xtask build galoshes` alone builds both). The target builds none of these, so
 run `cargo xtask build frontend-build` once if `hole-msi` has not left `node_modules`. The run refuses to start, before
 it changes anything, when:
@@ -86,9 +96,9 @@ records both of its ProductCodes, so the cleanup removes whichever of the two an
 
 The tools the E2E needs (`tauri-driver`, `msedgedriver`, `gsudo`) download into `.cache/installer-e2e/`; nothing is added
 to `PATH` outside the test's child processes. Each phase that starts child processes has a failure bound
-(`GSUDO_SELFTEST_TIMEOUT_SECONDS`, `DASHBOARD_E2E_TIMEOUT_SECONDS` and, for each `hole` command of the connect and
-member-access cases, `HOLE_CLI_TIMEOUT_SECONDS` in {src}`msi-installer/tests/installed/support.py`), so a wedged phase
-fails by name and the uninstall still runs. The server of those two cases has none: it is the tree's code, and one that never reports
+(`GSUDO_SELFTEST_TIMEOUT_SECONDS`, `DASHBOARD_E2E_TIMEOUT_SECONDS` and, for each `hole` command of the connect,
+member-access and full-tunnel cases, `HOLE_CLI_TIMEOUT_SECONDS` in {src}`msi-installer/tests/installed/support.py`), so a wedged phase
+fails by name and the uninstall still runs. The server of those cases has none: it is the tree's code, and one that never reports
 ready ends at the CI step's limit. Install
 and uninstall logs go to `target\msi-test-logs\`, or to `MSI_TEST_LOG_DIR`. Nothing asserts what remains in
 `C:\ProgramData\hole` after the uninstall.
@@ -138,7 +148,8 @@ cargo xtask run hole-dmg-install-e2e
 ```
 
 installs the built app's bridge as root, connects with `hole proxy start` to a server behind each bundled plugin and to
-one with no plugin, fetches a page through each, and uninstalls. The connection is the same code the Windows lane runs
-({src}`tests/installed/connect_journey.py`).
+one with no plugin, fetches a page through each, and uninstalls. It then starts a full tunnel for each of the three and
+fetches pages from outside the machine by address and by name, as the Windows lane does; that case runs as root, not as the
+installing user. The connections are the same code the Windows lane runs ({src}`tests/installed/connect_journey.py`).
 It is meant for CI: it needs passwordless `sudo`, refuses to run over an existing install, and expects `hole-dmg` to
 have built the app and `cargo build -p plugin-e2e --example ss_plugin_server` to have built the test's server.
