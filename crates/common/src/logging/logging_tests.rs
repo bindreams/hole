@@ -216,7 +216,11 @@ fn redirect_delivers_an_open_line_at_a_drain(#[fixture(temp_dir)] dir: &Path) {
         .filter(|e| e.target == "hole::stderr_relay")
         .map(|e| e.message.as_str())
         .collect();
-    assert_eq!(relayed, ["open-line-no-newline"], "relayed lines: {relayed:?}");
+    assert_eq!(
+        relayed,
+        ["open-line__hole_relay_flush__abc"],
+        "relayed lines: {relayed:?}"
+    );
 }
 
 /// `flush` waits for a relay that is behind: every line written before it has gone through the tee when it returns.

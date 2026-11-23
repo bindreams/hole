@@ -373,13 +373,13 @@ fn scenario_multiline() {
     write_result(&result);
 }
 
-/// A line still open when the drain marker is written: the marker lands at its end, and the text before it must still be
-/// relayed.
+/// A line still open when the drain marker is written, and holding marker-like text of its own: the real marker lands at
+/// its end, and the text before it must still be relayed whole.
 fn scenario_open_line() {
     let mut harness = install_child_subscriber();
     let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
     harness.relays = Some(relays);
-    let _ = std::io::stderr().write_all(b"open-line-no-newline");
+    let _ = std::io::stderr().write_all(b"open-line__hole_relay_flush__abc");
     let _ = std::io::stderr().flush();
     let result = finish(&mut harness);
     write_result(&result);

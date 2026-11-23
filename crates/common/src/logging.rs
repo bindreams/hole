@@ -39,9 +39,9 @@ use util::dir::Dir;
 // Draining the relays =================================================================================================
 //
 // A line written to stdout or stderr reaches the caller through a relay thread and a non-blocking tee, and
-// `process::exit` ends both without waiting. `LogGuard::drop` therefore drains: it writes a marker line to each
-// redirected stream and waits until that stream's relay thread has read it, which means the thread has handed every
-// earlier line to its tee and to the tracing layers. Dropping the tee guard then writes the tee's queue out.
+// `process::exit` ends both without waiting. `LogGuard::drop` therefore drains: it writes a marker line into each
+// redirected stream's pipe, through a write end the relay keeps for it, and waits until that stream's relay thread has read
+// it, which means the thread has handed every earlier line to its tee and to the tracing layers. Dropping the tee guard then writes the tee's queue out.
 
 /// The text that starts a drain marker line; the line is this and a request number.
 const DRAIN_MARKER: &str = "__hole_relay_flush__";
@@ -104,12 +104,16 @@ struct Relay {
     _thread: JoinHandle<()>,
     tee_guard: Option<WorkerGuard>,
     drain: std::sync::Arc<Drain>,
+    /// A second write end of the stream's pipe, for the markers: they reach the relay whatever the process later does to
+    /// its standard handle.
+    marker_writer: os_pipe::PipeWriter,
 }
 
 impl Relay {
     fn spawn(
         stream: Stream,
         read_end: os_pipe::PipeReader,
+        marker_writer: os_pipe::PipeWriter,
         tee: tracing_appender::non_blocking::NonBlocking,
         tee_guard: WorkerGuard,
     ) -> io::Result<Relay> {
@@ -127,30 +131,31 @@ impl Relay {
             _thread: thread,
             tee_guard: Some(tee_guard),
             drain,
+            marker_writer,
         })
     }
 
-    /// Return once the relay thread has consumed everything this process wrote to `stream` before the call, then
+    /// Return once the relay thread has consumed everything this process wrote to the stream before the call, then
     /// write out the tee's queue. Later writes to the tee are lost: the tee's worker is gone.
-    fn flush(&mut self, stream: Stream) -> io::Result<()> {
-        if let Some((id, answered)) = self.drain.request() {
-            let marker = format!("{DRAIN_MARKER}{id}\n");
-            let written = match stream {
-                Stream::Stderr => io::stderr().write_all(marker.as_bytes()),
-                Stream::Stdout => {
-                    let mut stdout = io::stdout();
-                    stdout.write_all(marker.as_bytes()).and_then(|()| stdout.flush())
-                }
-            };
-            if let Err(e) = written {
-                self.drain.cancel(id);
-                return Err(e);
-            }
-            // An answer, or the end of the relay thread (which drops the sender): either way the thread holds nothing
-            // that was written before the marker.
-            let _ = answered.recv();
-        }
+    fn flush(&mut self) -> io::Result<()> {
+        let drained = self.drain();
+        // The tee's queue is written out whatever became of the marker.
         drop(self.tee_guard.take());
+        drained
+    }
+
+    fn drain(&mut self) -> io::Result<()> {
+        let Some((id, answered)) = self.drain.request() else {
+            return Ok(());
+        };
+        let marker = format!("{DRAIN_MARKER}{id}\n");
+        if let Err(e) = self.marker_writer.write_all(marker.as_bytes()) {
+            self.drain.cancel(id);
+            return Err(e);
+        }
+        // An answer, or the end of the relay thread (which drops the sender): either way the thread holds nothing that
+        // was written before the marker.
+        let _ = answered.recv();
         Ok(())
     }
 }
@@ -191,8 +196,8 @@ impl StdioRelayHandles {
     pub fn flush(&mut self) -> io::Result<()> {
         // Rust's stdout holds a line that has no newline yet; it must reach the pipe ahead of the markers.
         let buffered = io::stdout().flush();
-        let stderr = self.stderr.as_mut().map_or(Ok(()), |relay| relay.flush(Stream::Stderr));
-        let stdout = self.stdout.as_mut().map_or(Ok(()), |relay| relay.flush(Stream::Stdout));
+        let stderr = self.stderr.as_mut().map_or(Ok(()), |relay| relay.flush());
+        let stdout = self.stdout.as_mut().map_or(Ok(()), |relay| relay.flush());
         buffered.and(stderr).and(stdout)
     }
 }
@@ -366,11 +371,12 @@ fn redirect_one(stream: Stream) -> io::Result<(Relay, Box<dyn Write + Send>)> {
 
     redirect_fd(stream, &write_end)?;
     // After redirect_fd, the standard stream points at its own copy of the pipe
-    // write end (`dup2` on Unix, a duplicated handle on Windows), so dropping
-    // `write_end` closes only the original.
-    drop(write_end);
-
-    Ok((Relay::spawn(stream, read_end, tee_nb, tee_guard)?, layer_writer))
+    // write end (`dup2` on Unix, a duplicated handle on Windows); the relay
+    // keeps `write_end` itself for its drain markers.
+    Ok((
+        Relay::spawn(stream, read_end, write_end, tee_nb, tee_guard)?,
+        layer_writer,
+    ))
 }
 
 #[cfg(unix)]
@@ -469,7 +475,8 @@ fn relay_loop(
 /// looks like a marker but is not a waiting request's stays ordinary output.
 fn find_drain_marker(line: &[u8], drain: &Drain) -> Option<(usize, std::sync::mpsc::SyncSender<()>)> {
     let marker = DRAIN_MARKER.as_bytes();
-    let at = line.windows(marker.len()).position(|window| window == marker)?;
+    // The marker is written last, so it is the last one on the line; an earlier one is the process's own text.
+    let at = line.windows(marker.len()).rposition(|window| window == marker)?;
     let id = std::str::from_utf8(&line[at + marker.len()..])
         .ok()?
         .trim_end_matches(['\r', '\n'])
@@ -529,9 +536,8 @@ fn redirect_one_with_writer(stream: Stream, tee_target: Box<dyn Write + Send>) -
 
     let (read_end, write_end) = os_pipe::pipe()?;
     redirect_fd(stream, &write_end)?;
-    drop(write_end);
 
-    Relay::spawn(stream, read_end, tee_nb, tee_guard)
+    Relay::spawn(stream, read_end, write_end, tee_nb, tee_guard)
 }
 
 // Test-only escape hatch ==============================================================================================
