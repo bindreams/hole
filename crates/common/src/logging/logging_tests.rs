@@ -206,6 +206,19 @@ fn redirect_handles_multiline(#[fixture(temp_dir)] dir: &Path) {
     assert_eq!(count_c, 1, "expected 1 'multiline-c', got {count_c} in {relay_msgs:?}");
 }
 
+/// A drain that meets a line with no newline yet still delivers the text before the marker, and nothing of the marker.
+#[skuld::test]
+fn redirect_delivers_an_open_line_at_a_drain(#[fixture(temp_dir)] dir: &Path) {
+    let result = run_child("redirect_open_line", dir);
+    let relayed: Vec<&str> = result
+        .events
+        .iter()
+        .filter(|e| e.target == "hole::stderr_relay")
+        .map(|e| e.message.as_str())
+        .collect();
+    assert_eq!(relayed, ["open-line-no-newline"], "relayed lines: {relayed:?}");
+}
+
 #[skuld::test]
 fn redirect_does_not_loop(#[fixture(temp_dir)] dir: &Path) {
     let result = run_child("redirect_no_loop", dir);

@@ -541,17 +541,21 @@ pub(crate) fn dispatch(command: Command) -> ! {
     };
     #[cfg(not(target_os = "macos"))]
     let cli_owner: Option<(u32, u32)> = None;
-    let _cli_log_guard = resolve_cli_log_dir(&command)
-        .map(|d| hole_common::logging::init(&d, "gui-cli", "gui-cli.log", "hole=info", cli_owner));
-    let code = match command {
-        Command::Version => {
-            println!("hole {}", hole::version::VERSION);
-            0
+    // `process::exit` skips destructors and ends the log guard's relay threads and writers mid-delivery, so the guard
+    // lives only inside this block: its drop delivers the command's output and log lines before the exit below.
+    let code = {
+        let _cli_log_guard = resolve_cli_log_dir(&command)
+            .map(|d| hole_common::logging::init(&d, "gui-cli", "gui-cli.log", "hole=info", cli_owner));
+        match command {
+            Command::Version => {
+                println!("hole {}", hole::version::VERSION);
+                0
+            }
+            Command::Upgrade { yes } => handle_upgrade(yes),
+            Command::Bridge { action } => handle_bridge(action),
+            Command::Proxy { action } => handle_proxy(action),
+            Command::Path { action } => handle_path(action),
         }
-        Command::Upgrade { yes } => handle_upgrade(yes),
-        Command::Bridge { action } => handle_bridge(action),
-        Command::Proxy { action } => handle_proxy(action),
-        Command::Path { action } => handle_path(action),
     };
 
     std::process::exit(code)

@@ -73,6 +73,12 @@ would write each line twice. The net catches whatever bypasses `tracing`: the Go
 default panic printer. A panic hook emits an error event with a backtrace under `hole::panic` and then calls the previous
 hook.
 
+The relay and the writers are asynchronous, so whatever ends the process before they finish loses the last lines.
+Dropping the `LogGuard` waits for them: it writes a marker line to each redirected stream, blocks until that stream's
+reader thread has read it, and then flushes the tees and the writers. `process::exit` skips destructors, so `dispatch`
+drops the CLI's guard before it exits; a command's output, its errors and its `gui-cli.log` lines are delivered before
+the process ends. The GUI leaves through the event loop's own `process::exit` and does not drain.
+
 The most visible case is WebView2 on Windows, which writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
 straight to the inherited stderr. They land in `gui.log` through the relay. **A Chromium line is a real log record:
 investigate its cause rather than filtering it.**

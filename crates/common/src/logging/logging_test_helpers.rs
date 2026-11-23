@@ -187,6 +187,7 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_grandchild_stdout" => scenario_grandchild_stdout(),
         "redirect_tee" => scenario_tee(),
         "redirect_multiline" => scenario_multiline(),
+        "redirect_open_line" => scenario_open_line(),
         "redirect_no_loop" => scenario_no_loop(),
         "lossy_backpressure" => scenario_lossy_backpressure(),
         "echo_stderr" => scenario_echo_stderr(),
@@ -366,6 +367,18 @@ fn scenario_multiline() {
     let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
     harness.relays = Some(relays);
     let _ = std::io::stderr().write_all(b"multiline-a\nmultiline-b\nmultiline-c\n");
+    let _ = std::io::stderr().flush();
+    let result = finish(&mut harness);
+    write_result(&result);
+}
+
+/// A line still open when the drain marker is written: the marker lands at its end, and the text before it must still be
+/// relayed.
+fn scenario_open_line() {
+    let mut harness = install_child_subscriber();
+    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    harness.relays = Some(relays);
+    let _ = std::io::stderr().write_all(b"open-line-no-newline");
     let _ = std::io::stderr().flush();
     let result = finish(&mut harness);
     write_result(&result);
