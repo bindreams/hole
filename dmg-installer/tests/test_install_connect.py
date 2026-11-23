@@ -6,7 +6,8 @@ a user's machine does: `hole bridge install` copies the `hole` binary to
 /Library/PrivilegedHelperTools and launchd runs that copy as root. A start that
 names a bundled plugin must still find it.
 
-The connection itself is `connect_journey`, shared with the Windows installer suite.
+The connection itself is `connect_journey`, shared with the Windows installer suite: a SOCKS-only start that fetches
+a local page, and a full tunnel that fetches pages from outside the machine.
 
 Elevation is `sudo -n`, where the GUI uses osascript; both run the same
 `hole bridge install` as root with SUDO_USER set. IPC goes through the `hole
@@ -23,7 +24,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from connect_journey import SERVER_IDS, SERVERS, connect_and_fetch, report_teardown_failure
+from connect_journey import (
+    SERVER_IDS,
+    SERVERS,
+    connect_and_fetch,
+    full_tunnel_journey,
+    report_teardown_failure,
+    run_ss_server,
+)
 from connect_journey import ss_server, target  # noqa: F401 (fixtures)
 
 from dmg_installer.installed_bridge import (
@@ -38,6 +46,7 @@ from dmg_installer.installed_bridge import (
     sudo,
     tear_down,
 )
+from dmg_installer.macos_machine import MacMachine
 
 pytestmark = pytest.mark.install_e2e
 
@@ -166,3 +175,15 @@ def test_installed_bridge_connects(
     bridge: Bridge, ss_server: dict, target: tuple[int, str], plugin: str | None, tmp_path: Path
 ) -> None:
     connect_and_fetch(bridge, ss_server, plugin, target, tmp_path)
+
+
+@pytest.mark.parametrize(("plugin", "kind"), SERVERS, ids=SERVER_IDS)
+def test_installed_bridge_carries_a_full_tunnel(bridge: Bridge, plugin: str | None, kind: str, tmp_path: Path) -> None:
+    """The default of `hole proxy start`: every route in the tunnel, DNS pointed at Hole, pages from outside the machine.
+
+    The far side runs on this machine, so its own dials leave through the default interface, not the routing table the
+    tunnel now owns. It needs the internet, as the Windows case does.
+    """
+    machine = MacMachine()
+    with run_ss_server(kind, tmp_path, machine.default_interface()) as server:
+        full_tunnel_journey(bridge, server, plugin, machine, tmp_path)
