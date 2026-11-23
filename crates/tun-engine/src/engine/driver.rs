@@ -8,11 +8,13 @@
 //! [`DnsInterceptor`].
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant as StdInstant;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::time::Instant as SmoltcpInstant;
+use smoltcp::wire::Ipv4Cidr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -62,6 +64,8 @@ pub(crate) struct Driver<T = tun::AsyncDevice> {
     /// Reference time for converting `std::time::Instant` to
     /// `smoltcp::time::Instant`.
     epoch: StdInstant,
+    /// The TUN's IPv4 address and prefix, which fix its directed broadcast address.
+    tun_ipv4: Option<Ipv4Cidr>,
 
     // UDP flow dispatching --------------------------------------------------------------------------------------------
     flow_table: FlowTable,
@@ -97,6 +101,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
             router,
             config,
             epoch,
+            tun_ipv4: device_config.ipv4,
             flow_table: FlowTable::new(),
             reply_tx,
             reply_rx,
@@ -371,6 +376,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
             _ => return false,
         };
 
+        // A datagram addressed to a group or to the link has no recipient behind a proxy.
+        if is_addressed_to_the_link(parsed.dst.ip(), self.tun_ipv4) {
+            return true;
+        }
+
         let payload = parsed.payload;
 
         // Port-53 DNS interception.
@@ -447,6 +457,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
         let tx_queue = self.stack.dequeue_tx();
         let replies = std::mem::take(&mut self.pending_tun_writes);
         egress::flush_all(&mut self.tun, tx_queue, replies, &self.cancel).await
+    }
+}
+
+/// Whether `dst` is a multicast group, the limited broadcast address or the TUN subnet's directed broadcast
+/// address: a destination on the TUN's own link, which no flow to a server can reach.
+fn is_addressed_to_the_link(dst: IpAddr, tun_ipv4: Option<Ipv4Cidr>) -> bool {
+    match dst {
+        IpAddr::V4(v4) => {
+            v4.is_multicast() || v4.is_broadcast() || tun_ipv4.and_then(|cidr| cidr.broadcast()) == Some(v4)
+        }
+        IpAddr::V6(v6) => v6.is_multicast(),
     }
 }
 

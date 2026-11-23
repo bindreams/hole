@@ -153,3 +153,68 @@ async fn an_ipv6_udp_datagram_round_trips() {
 
     h.shutdown().await;
 }
+
+// Datagrams addressed to the link =====================================================================================
+
+/// Windows sends LLMNR, mDNS and NetBIOS lookups out of the TUN as it does out
+/// of every adapter. Each is addressed to a group or to the link, which no
+/// proxy can deliver to, so none may become a flow. The datagrams that must
+/// still be carried sit next to the ones that must not, and the carried ones
+/// are the sign that the dispatch path ran. The harness's TUN is
+/// `10.255.0.1/24`, so its directed broadcast is `10.255.0.255`.
+#[skuld::test]
+async fn datagrams_addressed_to_a_group_or_to_the_link_open_no_flow() {
+    let mut h = start(|_| {});
+    let src4 = v4("10.255.0.2", 51000);
+    let src6 = v6("fd00::ff00:2", 51000);
+
+    let dropped = [
+        v4("224.0.0.252", 5355),
+        v4("224.0.0.251", 5353),
+        v4("239.255.255.250", 1900),
+        v4("255.255.255.255", 67),
+        v4("10.255.0.255", 137),
+        v6("ff02::1:3", 5355),
+        v6("ff02::fb", 5353),
+        v6("ff0e::1", 9),
+    ];
+    let carried = [
+        v4("223.255.255.255", 53000),
+        v4("10.255.0.254", 137),
+        v4("10.255.1.255", 137),
+        v4("8.8.8.8", 443),
+        v6("fe80::1", 5355),
+        v6("2001:db8::1", 443),
+    ];
+
+    for dst in dropped {
+        let src = if dst.is_ipv4() { src4 } else { src6 };
+        h.wire.inject(udp_packet(src, dst, b"x")).await;
+    }
+    for dst in carried {
+        let src = if dst.is_ipv4() { src4 } else { src6 };
+        h.wire.inject(udp_packet(src, dst, b"x")).await;
+    }
+
+    let mut dispatched = Vec::new();
+    for _ in carried {
+        let Dispatch::Udp { meta, .. } = h.dispatch.recv().await.expect("router never dispatched") else {
+            panic!("expected a UDP dispatch");
+        };
+        dispatched.push(meta.dst);
+    }
+    dispatched.sort();
+    let mut expected = carried.to_vec();
+    expected.sort();
+    assert_eq!(
+        dispatched, expected,
+        "the flows opened are not exactly the unicast ones"
+    );
+
+    // Joining the cancelled engine is what orders this negative (see `Harness::shutdown`).
+    let mut rest = h.shutdown().await;
+    assert!(
+        rest.recv().await.is_none(),
+        "a datagram to the link opened a further flow"
+    );
+}

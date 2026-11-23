@@ -72,6 +72,11 @@ when the plugin on the connection to the server carries only TCP. The cascade dr
 failing UDP application by cascading to `InterfaceEndpoint`: the drop is the product's behaviour, and the user-facing
 escape (a Bypass rule the user writes) is in [the how-it-works page](../../how-it-works/udp.md#what-stops-working).
 
+A datagram addressed to a multicast group, to `255.255.255.255` or to the TUN subnet's directed broadcast address (the
+LLMNR, mDNS and NetBIOS lookups Windows sends out of every adapter) is dropped by `Driver::handle_udp_packet` before any
+flow exists, whatever the filter says. It is addressed to the link, so a server has nobody to deliver it to, and a Bypass
+flow would put the lookup on the real network.
+
 Where `supports_udp` comes from for the proxy endpoint:
 
 - `udp_available_from_chain` in {src}`crates/bridge/src/proxy_manager.rs` reads the transports the running plugin chain

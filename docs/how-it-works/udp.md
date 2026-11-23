@@ -14,10 +14,14 @@ fails to one that leaks.
 
 | The UDP flow                                          | What happens to it                                                                                             |
 | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Goes to a multicast group or to the link              | Dropped, whatever the rules say                                                                                |
 | Goes to port 53 while the {term}`DNS forwarder` is on | Answered by the DNS forwarder, whatever the rules say                                                          |
 | A rule says **Block**                                 | Dropped                                                                                                        |
 | A rule says **Bypass**                                | Sent directly, outside the tunnel. Dropped if the destination is IPv6 and the real network has no working IPv6 |
 | **Proxy**, by a rule or because no rule matches       | Relayed through the tunnel if the connection to the server can carry UDP. Dropped if it cannot                 |
+
+Windows sends LLMNR, mDNS and NetBIOS name lookups to a multicast group or to the link's broadcast address. No server
+can deliver them, so Hole drops them without a log entry.
 
 Only the last drop is the UDP rule. The others are a **Block** rule doing what it says, and a **Bypass** flow that has no
 usable route. Drops are logged by the {term}`bridge`, once per rule and destination for a stretch of time rather than per packet.
