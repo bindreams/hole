@@ -579,6 +579,43 @@ def hole_command_report(what: str, result: subprocess.CompletedProcess[str], bri
     )
 
 
+@dataclass(frozen=True)
+class InstalledCli:
+    """The installed `hole.exe`, run from this elevated process: the bridge's socket admits Administrators."""
+
+    # The service's log as the test found it: a failure shows what the log gained since.
+    bridge_log: LogBaseline
+    # The environment of each command; `None` is this process's.
+    environment: Mapping[str, str] | None = None
+
+    def run(self, *args: str) -> subprocess.CompletedProcess[str]:
+        command = [str(BIN_DIR / "hole.exe"), *args]
+        try:
+            # `hole` writes UTF-8; the default decoding is the ANSI code page.
+            return subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=HOLE_CLI_TIMEOUT_SECONDS,
+                env=None if self.environment is None else dict(self.environment),
+            )
+        except subprocess.TimeoutExpired as e:
+            # Returned as a failed command, not raised: the journey reports those, and a stop that hangs after a
+            # failed start must not replace that failure.
+            return subprocess.CompletedProcess(
+                command,
+                returncode=-1,
+                stdout=e.stdout if isinstance(e.stdout, str) else "",
+                stderr=(e.stderr if isinstance(e.stderr, str) else "")
+                + f"\n(killed: no exit within {HOLE_CLI_TIMEOUT_SECONDS}s)",
+            )
+
+    def report(self, what: str, result: subprocess.CompletedProcess[str]) -> str:
+        return hole_command_report(what, result, self.bridge_log)
+
+
 def _log_records(text: str) -> list[list[str]]:
     """The records of `text`: a first line and the indented lines of its fields."""
     records: list[list[str]] = []
