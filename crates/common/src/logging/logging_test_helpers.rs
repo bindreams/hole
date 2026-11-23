@@ -512,12 +512,18 @@ fn scenario_relay_thread_ended(ended: Stream) {
     thread.join().expect("the relay thread catches the panic");
 
     // Rust's stdout holds a line that is not complete; `flush` writes it into the pipe that nobody reads any more. The
-    // buffer keeps what it could not write, so `flush` meets the same failure again.
-    if let Stream::Stdout = ended {
-        write!(std::io::stdout(), "a line that is not complete").expect("buffered");
-        let failure = std::io::stdout().flush().expect_err("the pipe has no reader");
-        assert_eq!(failure.kind(), std::io::ErrorKind::BrokenPipe, "{failure}");
-    }
+    // result lists what two flushes of it do, since the exit report must meet the same failure after them.
+    let unfinished = match ended {
+        Stream::Stdout => {
+            write!(std::io::stdout(), "a line that is not complete").expect("buffered");
+            let flushes = [std::io::stdout().flush(), std::io::stdout().flush()];
+            Some(format!(
+                "unfinished line flushes: {:?}",
+                flushes.map(|r| r.err().map(|e| e.kind()))
+            ))
+        }
+        Stream::Stderr => None,
+    };
 
     // The same hook on a thread that is not a relay: the previous hook must run there, or the check above proves nothing.
     std::thread::Builder::new()
@@ -544,6 +550,7 @@ fn scenario_relay_thread_ended(ended: Stream) {
         .map(|(_, rest)| rest.split(" location=").next().unwrap_or(rest))
         .collect();
     observed.push(format!("panic records: {messages:?}"));
+    observed.extend(unfinished);
     let other_tee = match ended {
         Stream::Stderr => &stdout_tee,
         Stream::Stdout => &stderr_tee,

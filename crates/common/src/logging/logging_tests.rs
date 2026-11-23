@@ -255,23 +255,23 @@ fn redirect_delivers_an_open_line_at_a_drain(#[fixture(temp_dir)] dir: &Path) {
 fn drain_after_the_relay_thread_ended_releases_and_completes(#[fixture(temp_dir)] dir: &Path) {
     for ended in ["stderr", "stdout"] {
         let result = run_child(&format!("redirect_relay_thread_ended_{ended}"), dir);
-        assert_eq!(
-            result.observed,
-            [
-                "registered request: Err(Disconnected)".to_string(),
-                "new request: false".to_string(),
-                format!("flush errors: [\"the {ended} relay thread has ended; later output to {ended} was lost\"]"),
-                "previous hook ran on: [\"not-a-relay\"]".to_string(),
-                "panic records: [\"a tracing writer panics on the relay thread\", \"a panic off the relay thread\"]"
-                    .to_string(),
-            ],
-            "{ended} relay ended"
-        );
+        let mut expected = vec![
+            "registered request: Err(Disconnected)".to_string(),
+            "new request: false".to_string(),
+            format!("flush errors: [\"the {ended} relay thread has ended; later output to {ended} was lost\"]"),
+            "previous hook ran on: [\"not-a-relay\"]".to_string(),
+            "panic records: [\"a tracing writer panics on the relay thread\", \"a panic off the relay thread\"]"
+                .to_string(),
+        ];
+        if ended == "stdout" {
+            expected.push("unfinished line flushes: [Some(BrokenPipe), Some(BrokenPipe)]".to_string());
+        }
+        assert_eq!(result.observed, expected, "{ended} relay ended");
         // `tee_stdout` holds the tee of the stream that kept its relay.
-        let expected: Vec<String> = (0..5).map(|i| format!("other-line-{i}")).collect();
+        let other_lines: Vec<String> = (0..5).map(|i| format!("other-line-{i}")).collect();
         assert_eq!(
             result.tee_stdout.lines().collect::<Vec<_>>(),
-            expected,
+            other_lines,
             "{ended} relay ended"
         );
     }
