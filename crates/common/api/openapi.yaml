@@ -204,6 +204,36 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /v1/refresh-access:
+    post:
+      summary: Rebuild the socket's access list from the `hole` group
+      description: |
+        Reads the members of the `hole` group as the account database holds
+        them now and sets the bridge socket's access list to match, the same
+        way the bridge does when it binds the socket. The bridge is the only
+        process that writes its socket's access list; `hole bridge
+        grant-access` adds a user to the group and then sends this request,
+        so the user is admitted without a bridge restart. Takes no body, and
+        any client the socket admits may send it: it sets what the account
+        database says, so there is nothing to gain by sending it.
+        Returns 200 once the access list is set.
+      operationId: refreshAccess
+      responses:
+        "200":
+          description: The access list was set from the group
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmptyResponse"
+        "500":
+          description: >-
+            The access list could not be set from the group. The bridge's log
+            says what the socket was left with.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /v1/update-apply:
     post:
       summary: Apply a verified update (service-manager cutover)

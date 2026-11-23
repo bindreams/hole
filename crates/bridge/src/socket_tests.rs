@@ -150,7 +150,7 @@ fn remove_removes_a_symlink_at_the_name_and_not_what_it_points_at() {
 
 /// Verify that `bind_restricted` applies mode 0600 to the socket file.
 /// The final permissions (0660/root:hole) are applied later by
-/// `apply_socket_permissions()`, which is disabled in tests.
+/// `apply_socket_permissions()`, which `IpcServer` calls and this bare listener does not.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn socket_created_with_restrictive_permissions() {
@@ -177,57 +177,10 @@ fn socket_created_with_restrictive_permissions() {
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn socket_created_with_restrictive_dacl() {
-    use windows::core::HSTRING;
-    use windows::Win32::Security::Authorization::{
-        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    };
-    use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
-
     let path = test_socket_path("dacl");
     let _listener = LocalListener::bind_restricted(&path).unwrap();
 
-    let path_wide = HSTRING::from(path.as_os_str());
-    let mut sd = PSECURITY_DESCRIPTOR::default();
-
-    let err = unsafe {
-        GetNamedSecurityInfoW(
-            &path_wide,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            None,
-            None,
-            &mut sd,
-        )
-    };
-    assert!(err.is_ok(), "GetNamedSecurityInfoW failed: {err:?}");
-
-    let mut sddl_ptr = windows::core::PWSTR::null();
-    unsafe {
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            sd,
-            1, // SDDL_REVISION_1
-            DACL_SECURITY_INFORMATION,
-            &mut sddl_ptr,
-            None,
-        )
-    }
-    .expect("ConvertSecurityDescriptorToStringSecurityDescriptorW failed");
-
-    // SAFETY: sddl_ptr is a valid wide string allocated by the Win32 API.
-    let sddl = unsafe { sddl_ptr.to_string() }.unwrap();
-    unsafe {
-        let _ = windows::Win32::Foundation::LocalFree(Some(std::mem::transmute::<
-            *mut u16,
-            windows::Win32::Foundation::HLOCAL,
-        >(sddl_ptr.0)));
-        // Free the security descriptor allocated by GetNamedSecurityInfoW.
-        let _ = windows::Win32::Foundation::LocalFree(Some(std::mem::transmute::<
-            *mut std::ffi::c_void,
-            windows::Win32::Foundation::HLOCAL,
-        >(sd.0)));
-    }
+    let sddl = crate::test_support::dacl::dacl_sddl(&path);
 
     // The DACL should be protected (P flag) with only SYSTEM and BA ACEs.
     assert!(

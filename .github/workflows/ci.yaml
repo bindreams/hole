@@ -699,9 +699,10 @@ jobs:
 
       # Installer lifecycle (Windows) ===================================================================================
       # The sequence (install, verify, de-elevated dashboard E2E, uninstall, verify; then install,
-      # connect through the installed service, uninstall; then the upgrade) is the msi-installer
-      # harness (`msi-installer/tests/installed/`). It drives the INSTALLED binary through WebDriver
-      # and a SOCKS proxy over loopback, so it runs before the TUN lane.
+      # connect through the installed service, uninstall; then install, connect as the installing
+      # user without elevation across two service restarts, uninstall; then the upgrade) is the
+      # msi-installer harness (`msi-installer/tests/installed/`). It drives the INSTALLED binary
+      # through WebDriver and a SOCKS proxy over loopback, so it runs before the TUN lane.
       #
       # `installer-cleanup` runs `always()` after `installer-tests`: an idempotent uninstall that
       # verifies nothing is left. That step is the TUN lane's gate: the lane runs only once nothing
@@ -710,10 +711,10 @@ jobs:
       # verdicts. A failed lifecycle with a clean cleanup does not hide the TUN lane.
       #
       # Last-resort kill: the harness bounds each phase itself (msiexec 3 min; gsudo self-test,
-      # dashboard E2E and each diagnostics dump 5 min; each `hole` command of the connect case
-      # 2 min), so a wedged phase fails by name and the fixture still uninstalls first. The step's
-      # 75 leaves margin over those bounds for the unbounded phases (tool provisioning, the build,
-      # process listing, the connect case's own server).
+      # dashboard E2E and each diagnostics dump 5 min; each `hole` command of the connect and
+      # member-access cases 2 min), so a wedged phase fails by name and the fixture still
+      # uninstalls first. The step's 75 leaves margin over those bounds for the unbounded phases
+      # (tool provisioning, the build, process listing, the connect cases' own server).
       - id: installer-tests
         name: Install, E2E and uninstall the MSI
         if: ${{ !cancelled() && steps.installer-build-msi.outcome == 'success' }}

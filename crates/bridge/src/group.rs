@@ -25,25 +25,51 @@ pub fn add_user_to_group(username: &str) -> io::Result<()> {
 
 /// Returns `true` if a local group with the given name exists.
 ///
-/// macOS: wraps POSIX `getgrnam(3)` (locale-independent; queries the same
-/// `opendirectoryd` backend `dseditgroup` writes to). A name containing a
-/// NUL byte is, by definition, not a valid POSIX group name and returns
-/// `false` rather than panicking.
-///
 /// Used internally by `create_group` and `delete_group` for EAFP-style
-/// idempotency. `pub(crate)` for the test module.
+/// idempotency. `pub(crate)` for the test module. A lookup that fails is
+/// `false`, as a group that is not there.
 #[cfg(target_os = "macos")]
 pub(crate) fn group_exists(name: &str) -> bool {
-    // A name with an embedded NUL is not a valid POSIX group name; libc
-    // would see only the prefix. Return `false` rather than panic.
+    matches!(group_gid(name), Ok(Some(_)))
+}
+
+/// The gid of the local group `name`; `None` when there is no such group.
+///
+/// macOS: POSIX `getgrnam_r(3)` (locale-independent; queries the same
+/// `opendirectoryd` backend `dseditgroup` writes to). Not `getgrnam(3)`, which
+/// answers through a buffer the whole process shares: this runs wherever a
+/// socket is bound, and two threads of one process may bind. A name containing
+/// a NUL byte is, by definition, not a valid POSIX group name and is `None`.
+#[cfg(target_os = "macos")]
+pub(crate) fn group_gid(name: &str) -> io::Result<Option<libc::gid_t>> {
     let Ok(cname) = std::ffi::CString::new(name) else {
-        return false;
+        return Ok(None);
     };
-    // SAFETY: getgrnam returns a pointer into a libc-owned process-wide
-    // static buffer (or NULL). We only `is_null`-check, never dereference
-    // — so concurrent callers racing the static buffer cannot corrupt our
-    // observation. The CString outlives the call.
-    unsafe { !libc::getgrnam(cname.as_ptr()).is_null() }
+    let mut buf = vec![0u8; 1024];
+    loop {
+        // SAFETY: `group` is plain data; the all-zero value is valid and getgrnam_r overwrites it.
+        let mut grp: libc::group = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        // SAFETY: cname is NUL-terminated; grp/buf/result outlive the call.
+        let rc = unsafe {
+            libc::getgrnam_r(
+                cname.as_ptr(),
+                &mut grp,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        // A null result with rc 0 is "no such group". `gr_gid` is read from `grp`, which this call owns.
+        return Ok((!result.is_null()).then_some(grp.gr_gid));
+    }
 }
 
 /// Detect the real interactive user behind an elevated session.
@@ -52,7 +78,7 @@ pub(crate) fn group_exists(name: &str) -> bool {
 /// On Windows: queries the physical console session via WTS APIs.
 ///
 /// Returns `Err` if the user cannot be determined (e.g. headless install).
-pub fn installing_username() -> io::Result<String> {
+pub(crate) fn installing_username() -> io::Result<String> {
     os::installing_username()
 }
 
@@ -77,16 +103,25 @@ pub fn resolve_real_user() -> io::Result<RealUser> {
     os::resolve_real_user()
 }
 
-/// Look up the SID of any account (user or group) as a string (e.g. `S-1-5-21-...`).
+/// Look up the SID of any account (user or group) as a string (e.g. `S-1-5-21-...`). `None` when there is no such
+/// account; an error when the lookup could not be made.
 #[cfg(target_os = "windows")]
-pub fn lookup_sid(name: &str) -> io::Result<String> {
+pub(crate) fn lookup_sid(name: &str) -> io::Result<Option<String>> {
     os::lookup_sid(name)
 }
 
-/// Look up the SID of the `hole` group as a string (e.g. `S-1-5-21-...`).
+/// The SID of the `hole` group as a string (e.g. `S-1-5-21-...`). `None` when there is no such group; an error when
+/// the lookup could not be made.
 #[cfg(target_os = "windows")]
-pub fn group_sid() -> io::Result<String> {
+pub(crate) fn group_sid() -> io::Result<Option<String>> {
     lookup_sid(GROUP_NAME)
+}
+
+/// The SID of every member of the `hole` group, as the account database holds them now: users, groups and well-known
+/// SIDs alike, unresolved. A running process's token is not consulted, so a member added a moment ago is listed.
+#[cfg(target_os = "windows")]
+pub(crate) fn member_sids() -> io::Result<Vec<String>> {
+    os::member_sids(GROUP_NAME)
 }
 
 // macOS implementation ================================================================================================
@@ -105,7 +140,7 @@ mod os {
         // "Create called on existing record - do you want to overwrite, y or
         // n :", depending on whether stdin is a tty) and exits non-zero. We
         // can't tell that case apart from a real failure by parsing stderr
-        // (the messages are localized). Instead, on failure we ask `getgrnam`
+        // (the messages are localized). Instead, on failure we ask `group_exists`
         // whether the group exists; if it does, our caller's intent is met
         // and we return success — broadening the success condition from
         // "create succeeded" to "the group exists at end of attempt", which
@@ -128,7 +163,7 @@ mod os {
     pub fn delete_group() -> io::Result<()> {
         // EAFP, mirror of `create_group`: macOS `dseditgroup -o delete` on a
         // missing group exits non-zero with a localized "not found" stderr.
-        // Use `getgrnam` to verify post-failure and avoid stderr-substring
+        // Use `group_exists` to verify post-failure and avoid stderr-substring
         // matching that breaks under non-English locales.
         let output = SystemTool::Dseditgroup
             .command()?
@@ -372,10 +407,11 @@ mod os {
         Ok(username)
     }
 
-    /// Look up any account name (user or group) and return its SID as a string.
-    pub fn lookup_sid(name: &str) -> io::Result<String> {
+    /// Look up any account name (user or group) and return its SID as a string. `ERROR_NONE_MAPPED` is the answer
+    /// "no such account" and is `None`; any other failure is an error.
+    pub fn lookup_sid(name: &str) -> io::Result<Option<String>> {
         use windows::core::PWSTR;
-        use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED};
         use windows::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
 
         let account_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
@@ -390,7 +426,7 @@ mod os {
         // pointers are None (size query only). `sid_size` and `domain_size` are
         // out-parameters filled with required sizes. Expected to fail with
         // ERROR_INSUFFICIENT_BUFFER.
-        let _ = unsafe {
+        let first = unsafe {
             LookupAccountNameW(
                 None,
                 windows::core::PCWSTR(account_name.as_ptr()),
@@ -401,9 +437,11 @@ mod os {
                 &mut sid_type,
             )
         };
-
-        if sid_size == 0 {
-            return Err(io::Error::other(format!("account '{name}' not found")));
+        match first {
+            Ok(()) => {}
+            Err(e) if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() => {}
+            Err(e) if e.code() == ERROR_NONE_MAPPED.to_hresult() => return Ok(None),
+            Err(e) => return Err(io::Error::other(format!("LookupAccountNameW failed for '{name}': {e}"))),
         }
 
         // Second call: fill buffers
@@ -435,12 +473,84 @@ mod os {
         }
         .map_err(|e| io::Error::other(format!("LookupAccountNameW failed: {e}")))?;
 
-        // Convert SID to string
         // SAFETY: `sid_ptr` contains a valid SID written by the successful
-        // LookupAccountNameW call. `string_sid` is an out-parameter that Windows
+        // LookupAccountNameW call, and `sid_buf` outlives this call.
+        unsafe { sid_to_string(sid_ptr) }.map(Some)
+    }
+
+    /// The members of the local group `group`, each as a SID string, read at level 0: the SID alone. A member whose
+    /// account no longer resolves to a name (a deleted domain account) is listed all the same; resolving each SID to
+    /// a name would fail on it. A deleted local account is no longer a member: Windows takes it out of its groups.
+    /// Every page is read; there is no cap.
+    pub fn member_sids(group: &str) -> io::Result<Vec<String>> {
+        use windows::core::{HSTRING, PCWSTR};
+        use windows::Win32::Foundation::ERROR_MORE_DATA;
+        use windows::Win32::NetworkManagement::NetManagement::{
+            NERR_Success, NetApiBufferFree, NetLocalGroupGetMembers, LOCALGROUP_MEMBERS_INFO_0, MAX_PREFERRED_LENGTH,
+        };
+
+        let group_wide = HSTRING::from(group);
+        let mut sids = Vec::new();
+        // Zero on the first call; the API advances it and it is passed back unchanged.
+        let mut resume: usize = 0;
+        loop {
+            let mut buffer: *mut u8 = std::ptr::null_mut();
+            let mut read: u32 = 0;
+            let mut total: u32 = 0;
+            // SAFETY: `group_wide` is a valid null-terminated string kept alive for the call; the server name is
+            // null (this machine). The out-parameters are stack locals. On success and on ERROR_MORE_DATA the API
+            // allocates `buffer`, which is freed below with NetApiBufferFree on every path.
+            let status = unsafe {
+                NetLocalGroupGetMembers(
+                    PCWSTR::null(),
+                    &group_wide,
+                    0,
+                    &mut buffer,
+                    MAX_PREFERRED_LENGTH,
+                    &mut read,
+                    &mut total,
+                    Some(&mut resume),
+                )
+            };
+            let page = if buffer.is_null() {
+                Ok(())
+            } else {
+                // SAFETY: a non-null `buffer` holds `read` LOCALGROUP_MEMBERS_INFO_0 entries, each pointing at a
+                // valid SID inside the same allocation, which stays alive until the free below.
+                let page = unsafe {
+                    std::slice::from_raw_parts(buffer.cast::<LOCALGROUP_MEMBERS_INFO_0>(), read as usize)
+                        .iter()
+                        .try_for_each(|member| sid_to_string(member.lgrmi0_sid).map(|sid| sids.push(sid)))
+                };
+                // SAFETY: `buffer` was allocated by NetLocalGroupGetMembers and is freed exactly once.
+                unsafe { NetApiBufferFree(Some(buffer.cast())) };
+                page
+            };
+            page?;
+            if status == NERR_Success {
+                return Ok(sids);
+            }
+            if status != ERROR_MORE_DATA.0 {
+                return Err(io::Error::other(format!(
+                    "NetLocalGroupGetMembers failed for '{group}': error {status}"
+                )));
+            }
+        }
+    }
+
+    /// `sid` as a string (`S-1-...`).
+    ///
+    /// # Safety
+    ///
+    /// `sid` points at a valid SID that stays alive for the call.
+    unsafe fn sid_to_string(sid: windows::Win32::Security::PSID) -> io::Result<String> {
+        use windows::core::PWSTR;
+        use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+        // SAFETY: the caller vouches for `sid`. `string_sid` is an out-parameter that Windows
         // allocates via LocalAlloc; we free it with LocalFree below.
         let mut string_sid = PWSTR::null();
-        unsafe { ConvertSidToStringSidW(sid_ptr, &mut string_sid) }
+        unsafe { ConvertSidToStringSidW(sid, &mut string_sid) }
             .map_err(|e| io::Error::other(format!("ConvertSidToStringSidW failed: {e}")))?;
 
         // SAFETY: `string_sid.0` is a valid null-terminated UTF-16 string allocated

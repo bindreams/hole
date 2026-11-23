@@ -45,6 +45,18 @@ against any MSI too, a published release included. The server is the `ss_plugin_
 {src}`crates/plugin-e2e/`, with the working tree's `galoshes` and `ex-ray` builds on its side, so the plugins of the
 MSI under test must still speak to the tree's.
 
+A third install connects as the user the installer granted
+({src}`msi-installer/tests/installed/test_member_access.py`). Every other case reaches the bridge from the elevated
+test process, which the socket's Administrators entry admits whatever the bridge granted anyone else. This one runs the
+installed `hole.exe` from a child that `gsudo` de-elevated, whose token was made before the install and so carries no
+`hole` group. It connects to the server with no plugin, restarts the `HoleBridge` service, connects again, and does
+both once more. A second test takes the user out of the group, restarts the service, checks that the user is now
+refused, runs an elevated `hole bridge grant-access` and connects with no further restart. Each fails before its first
+connect when the child still holds Administrators, already carries the group,
+or is not the user the installer added. The child cannot read pytest's own temporary folder, so its files are in
+`member-access\` under the log folder. A failure also says how the child's own connect to the bridge's socket went:
+`hole` can exit before its own error text reaches a pipe.
+
 ```{warning}
 This installs Hole system-wide on the machine you run it on. Use a throwaway machine or virtual machine, not the one you
 work on.
@@ -57,8 +69,8 @@ cargo xtask run hole-msi-cleanup          # after an interrupted run
 ```
 
 It needs the MSI built beforehand (`cargo xtask build hole-msi`, or the one `MSI_UNDER_TEST` names), the repo's
-`node_modules`, and for the connect case `cargo build -p plugin-e2e --example ss_plugin_server` plus the `galoshes` and
-`ex-ray` builds `hole-msi` leaves (`cargo xtask build galoshes` alone builds both). The target builds none of these, so
+`node_modules`, and for the connect and member-access cases `cargo build -p plugin-e2e --example ss_plugin_server` plus
+the `galoshes` and `ex-ray` builds `hole-msi` leaves (`cargo xtask build galoshes` alone builds both). The target builds none of these, so
 run `cargo xtask build frontend-build` once if `hole-msi` has not left `node_modules`. The run refuses to start, before
 it changes anything, when:
 
@@ -74,9 +86,9 @@ records both of its ProductCodes, so the cleanup removes whichever of the two an
 
 The tools the E2E needs (`tauri-driver`, `msedgedriver`, `gsudo`) download into `.cache/installer-e2e/`; nothing is added
 to `PATH` outside the test's child processes. Each phase that starts child processes has a failure bound
-(`GSUDO_SELFTEST_TIMEOUT_SECONDS`, `DASHBOARD_E2E_TIMEOUT_SECONDS` and, for each `hole` command of the connect case,
-`HOLE_CLI_TIMEOUT_SECONDS` in {src}`msi-installer/tests/installed/support.py`), so a wedged phase fails by name and
-the uninstall still runs. The connect case's own server has none: it is the tree's code, and one that never reports
+(`GSUDO_SELFTEST_TIMEOUT_SECONDS`, `DASHBOARD_E2E_TIMEOUT_SECONDS` and, for each `hole` command of the connect and
+member-access cases, `HOLE_CLI_TIMEOUT_SECONDS` in {src}`msi-installer/tests/installed/support.py`), so a wedged phase
+fails by name and the uninstall still runs. The server of those two cases has none: it is the tree's code, and one that never reports
 ready ends at the CI step's limit. Install
 and uninstall logs go to `target\msi-test-logs\`, or to `MSI_TEST_LOG_DIR`. Nothing asserts what remains in
 `C:\ProgramData\hole` after the uninstall.

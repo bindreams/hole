@@ -7,17 +7,17 @@ command below; the definitions are in {src}`crates/hole/src/cli.rs`.
 
 ## `hole bridge`
 
-| Command                                                      | What it does                                                                                                                |
-| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `hole bridge run`                                            | Runs the bridge in the foreground, elevated. It serves IPC only; `hole proxy start` in full mode brings the TUN and routes. |
-| `hole bridge run --service`                                  | Runs the bridge as a service. The service installer passes this; the SCM or launchd starts it.                              |
-| `hole bridge install`                                        | Installs and starts the bridge service.                                                                                     |
-| `hole bridge enable`                                         | Sets the service to start automatically and starts it. Needs elevation.                                                     |
-| `hole bridge uninstall`                                      | Stops and removes the service.                                                                                              |
-| `hole bridge status`                                         | Prints whether the bridge is installed and running.                                                                         |
-| `hole bridge log [path \| watch [--tail N]]`                 | With no argument, prints the bridge log; `path` prints where it is; `watch` streams it, after `N` lines.                    |
-| `hole bridge grant-access`                                   | Creates the `hole` group and adds the current user to it. Needs elevation.                                                  |
-| `hole bridge ipc-send (--base64 B64 \| --request-file PATH)` | Sends one IPC request to the installed bridge. Needs elevation.                                                             |
+| Command                                                      | What it does                                                                                                                   |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `hole bridge run`                                            | Runs the bridge in the foreground, elevated. It serves IPC only; `hole proxy start` in full mode brings the TUN and routes.    |
+| `hole bridge run --service`                                  | Runs the bridge as a service. The service installer passes this; the SCM or launchd starts it.                                 |
+| `hole bridge install`                                        | Installs and starts the bridge service.                                                                                        |
+| `hole bridge enable`                                         | Sets the service to start automatically and starts it. Needs elevation.                                                        |
+| `hole bridge uninstall`                                      | Stops and removes the service.                                                                                                 |
+| `hole bridge status`                                         | Prints whether the bridge is installed and running.                                                                            |
+| `hole bridge log [path \| watch [--tail N]]`                 | With no argument, prints the bridge log; `path` prints where it is; `watch` streams it, after `N` lines.                       |
+| `hole bridge grant-access`                                   | Creates the `hole` group and adds the current user to it, then asks a running bridge to read the group again. Needs elevation. |
+| `hole bridge ipc-send (--base64 B64 \| --request-file PATH)` | Sends one IPC request to the installed bridge. Needs elevation.                                                                |
 
 Options of `bridge run`:
 
@@ -34,6 +34,10 @@ Options of `bridge run`:
 `bridge install`, `enable` and `uninstall` take `--log-dir`, and so does `bridge log`. `bridge grant-access` can send an
 IPC request afterwards (`--then-send`, `--then-send-file`). The GUI's elevated paths run these commands, and pass
 `--result-file` to `grant-access` and `ipc-send` to read the outcome back across stripped stdio.
+
+`bridge grant-access` exits 0 once the user is in the group and the running bridge, if there is one, has read the group
+again; with a send, it exits with the send's code. If a running bridge did not read the group, it exits 1, or the
+send's code when that is not 0, and it still runs the send first.
 
 `ipc-send` and the `hole proxy` commands below connect to the installed bridge's default socket. Only the GUI reads
 `HOLE_BRIDGE_SOCKET` to find another, which is how a dev app finds a dev bridge ([Development](development.md)), so a

@@ -16,8 +16,8 @@ use hole_common::config::StartupBehavior;
 use hole_common::protocol::{
     DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig, StartError,
     StatusResponse, TestServerRequest, TestServerResponse, UpdateApplyRequest, VersionResponse, ROUTE_CANCEL,
-    ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
-    ROUTE_TEST_SERVER, ROUTE_UNBLOCK, ROUTE_UPDATE_APPLY, ROUTE_VERSION,
+    ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_REFRESH_ACCESS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS,
+    ROUTE_STOP, ROUTE_TEST_SERVER, ROUTE_UNBLOCK, ROUTE_UPDATE_APPLY, ROUTE_VERSION,
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -124,6 +124,12 @@ pub(crate) struct IpcState<P: Proxy, R: Routing> {
     pub(crate) version: String,
     /// Service log dir — where the cutover marker is written (GUI-readable).
     pub(crate) log_dir: PathBuf,
+    /// The socket this server listens on: the file whose access list a refresh request rebuilds.
+    pub(crate) socket_path: PathBuf,
+    /// Held across a refresh request's read of the group and its write of the list, so two requests in flight cannot
+    /// interleave them and leave the list of the one that read first. The guard is owned by the blocking task that
+    /// does the work, not by the handler: a client that disconnects drops the handler, and the task still runs.
+    pub(crate) access_refresh: Arc<Mutex<()>>,
     /// Test-only rendezvous, mirroring `MockProxy`'s `start_gate`/
     /// `start_entered`: if set, `persist_after_start` fires `persist_entered`
     /// on entry, then awaits `persist_gate`, before doing any write. Lets a
@@ -143,7 +149,12 @@ impl<P: Proxy, R: Routing> IpcState<P, R> {
     ///
     /// `try_lock` is safe here: `proxy` is freshly constructed and not yet shared with any other task at this call
     /// site, in every production and test caller, so it is uncontended by construction.
-    pub(crate) fn new(proxy: Arc<Mutex<ProxyManager<P, R>>>, version: &str, log_dir: PathBuf) -> Self {
+    pub(crate) fn new(
+        proxy: Arc<Mutex<ProxyManager<P, R>>>,
+        version: &str,
+        log_dir: PathBuf,
+        socket_path: PathBuf,
+    ) -> Self {
         let (routing, unblock_generation, plugin_source) = {
             let pm = proxy.try_lock().expect("proxy mutex must be uncontended at bind time");
             (
@@ -159,6 +170,8 @@ impl<P: Proxy, R: Routing> IpcState<P, R> {
             start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
             version: version.to_owned(),
             log_dir,
+            socket_path,
+            access_refresh: Arc::new(Mutex::new(())),
             #[cfg(test)]
             persist_gate: None,
             #[cfg(test)]
@@ -184,23 +197,26 @@ impl IpcServer {
     /// Bind to the given Unix domain socket path.
     ///
     /// Removes any stale socket file, creates parent directories, binds with
-    /// restrictive initial permissions (umask on macOS, DACL on Windows), and
+    /// restrictive initial permissions (mode 0600 on macOS, DACL on Windows), and
     /// then applies the final OS-level access control (adding the `hole` group).
+    ///
+    /// The order is a contract. The socket listens with the restrictive permissions already set; only then is the
+    /// `hole` group read and the final permissions written; and nothing is served before this returns. So a
+    /// `hole bridge grant-access` that adds a user to the group and then fails to connect ran before the listen, and
+    /// the read here sees the user; one that connects is served after the write here. That is why the bridge is the
+    /// only writer of its socket's permissions and no lock between processes is needed.
     pub fn bind_with_log_dir<P: Proxy + 'static, R: Routing + 'static>(
         path: &Path,
         proxy: Arc<Mutex<ProxyManager<P, R>>>,
         version: &str,
         log_dir: PathBuf,
     ) -> std::io::Result<Self> {
-        #[cfg(not(test))]
         let listener = LocalListener::bind_restricted(path)?;
-        #[cfg(test)]
-        let listener = LocalListener::bind(path)?;
+        if let Err(e) = apply_socket_permissions(path) {
+            warn!(error = &e as &dyn std::error::Error, "failed to set socket permissions");
+        }
 
-        #[cfg(not(test))]
-        apply_socket_permissions(path);
-
-        let state = Arc::new(IpcState::new(proxy, version, log_dir));
+        let state = Arc::new(IpcState::new(proxy, version, log_dir, path.to_owned()));
         let router = build_router(state, version);
         Ok(Self {
             listener,
@@ -342,6 +358,7 @@ fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P,
         .route(ROUTE_VERSION, axum::routing::get(handle_version::<P, R>))
         .route(ROUTE_LOCKDOWN, axum::routing::post(handle_lockdown::<P, R>))
         .route(ROUTE_UNBLOCK, axum::routing::post(handle_unblock::<P, R>))
+        .route(ROUTE_REFRESH_ACCESS, axum::routing::post(handle_refresh_access::<P, R>))
         .route(ROUTE_UPDATE_APPLY, axum::routing::post(handle_update_apply::<P, R>))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer(axum::middleware::map_response(
@@ -897,6 +914,56 @@ fn extraction_failure(detail: &(dyn std::error::Error + 'static)) -> (StatusCode
     )
 }
 
+/// The 500 body of a refresh that did not set the socket's access list. The error's chain goes to bridge.log.
+const ACCESS_NOT_REFRESHED: &str = "the bridge could not set its socket's access list from the hole group";
+
+/// Rebuild the socket's access list from the `hole` group as the account database holds it now: what the bind did,
+/// done again. Sent by `hole bridge grant-access` after it adds a user to the group, and answered only once the list
+/// is set. Takes nothing from the client, so any client the socket admits may send it.
+///
+/// Blocking OS calls (the group's members, the list), so they run on the blocking pool. The read and the write are
+/// one section under [`IpcState::access_refresh`], whose guard moves into the blocking task.
+async fn handle_refresh_access<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
+) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let one_at_a_time = Arc::clone(&state.access_refresh).lock_owned().await;
+    let path = state.socket_path.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let _one_at_a_time = one_at_a_time;
+        apply_socket_permissions(&path)
+    });
+    match task.await {
+        Ok(Ok(())) => {
+            info!("socket access list set again");
+            Ok(Json(EmptyResponse {}))
+        }
+        Ok(Err(e)) => {
+            error!(
+                error = &e as &dyn std::error::Error,
+                "failed to refresh the socket's access list"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: ACCESS_NOT_REFRESHED.into(),
+                }),
+            ))
+        }
+        Err(e) => {
+            error!(
+                error = &e as &dyn std::error::Error,
+                "the access-list refresh task panicked"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: ACCESS_NOT_REFRESHED.into(),
+                }),
+            ))
+        }
+    }
+}
+
 async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
     Json(req): Json<UpdateApplyRequest>,
@@ -1349,7 +1416,7 @@ async fn handle_version<P: Proxy + 'static, R: Routing + 'static>(
 
 /// Base SDDL for socket access control: SYSTEM + Administrators only.
 /// Used as the restrictive initial DACL (with `P` flag) in `socket.rs`,
-/// and as the base for the final DACL (with `hole` group appended) here.
+/// and as the base for the final DACL (the `hole` group and its members appended) here.
 #[cfg(target_os = "windows")]
 pub(crate) const SDDL_BASE: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 
@@ -1360,9 +1427,9 @@ pub(crate) const SDDL_BASE: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 /// DACL in `socket.rs` (SYSTEM + Administrators only, before `listen()`).
 ///
 /// When `protect` is false, inherited ACEs are preserved. This is used for
-/// the final DACL in `apply_socket_permissions` (adding the `hole` group).
+/// the final DACL in [`apply_socket_permissions`] (adding the `hole` group).
 #[cfg(target_os = "windows")]
-pub fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Result<()> {
+pub(crate) fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Result<()> {
     use windows::core::HSTRING;
     use windows::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
 
@@ -1489,137 +1556,90 @@ fn with_sddl_dacl(
         .map_err(|e| std::io::Error::other(format!("failed to set ACL: {e}")))
 }
 
-/// Apply OS-level access control to the socket file.
+/// Sets the access list of the bridge's socket at `path`: SYSTEM, Administrators, the `hole` group, and each member of
+/// the group by its own SID, as the account database holds them now.
 ///
-/// This is the second phase of socket permission setup. The first phase
-/// (in `socket.rs`) applies a restrictive DACL/umask during socket creation
-/// to prevent a TOCTOU race. This function then sets the final permissions,
-/// adding the `hole` group on both platforms.
+/// This is the second phase of socket permission setup. The first phase (in `socket.rs`) applies a restrictive DACL
+/// during socket creation to prevent a TOCTOU race. Only the bridge calls this, on its own socket: at each bind, and
+/// when a client asks it to refresh ([`handle_refresh_access`]; `hole bridge grant-access` does, after it adds a user
+/// to the group). A member added or removed while a bridge runs is therefore picked up by its next start or by a
+/// refresh, not at once.
 ///
-/// On Windows: sets a DACL restricting access to SYSTEM, Administrators, and the `hole` group.
-/// If an `installer-user-sid` file exists (written by `install_bridge` in `setup.rs`),
-/// the SID it contains is also added to the DACL, then the file is deleted. This is a
-/// workaround for the Windows token snapshot limitation: process tokens are immutable
-/// snapshots of group memberships captured at logon time, so a newly-added group
-/// membership is not reflected in any running process's token until the user logs out
-/// and back in. Adding the user's own SID directly to the DACL provides immediate
-/// access without requiring re-login. The per-user SID is cleaned up on the next
-/// bridge restart (when the group membership will have taken effect after re-login).
+/// A member's own entry is what admits a user who has not signed in since joining the group. Windows fixes a token's
+/// groups at sign-in, so such a user's processes do not carry the group, but a token always carries its user's SID.
 ///
-/// On macOS: sets ownership to root:hole with mode 0660.
-#[cfg(all(target_os = "windows", not(test)))]
-fn apply_socket_permissions(path: &Path) {
-    let mut extra_sids = Vec::new();
-    if let Some(sid) = take_installer_user_sid(&installer_user_sid_dir()) {
-        info!(sid = %sid, "including installer user SID in socket DACL");
-        extra_sids.push(sid);
-    }
-    let extra_refs: Vec<&str> = extra_sids.iter().map(|s| s.as_str()).collect();
-    let sddl = build_sddl(&extra_refs);
-    if let Err(e) = set_dacl_from_sddl(path, &sddl, false) {
-        warn!(error = &e as &dyn std::error::Error, "failed to set socket permissions");
-    }
-}
-
-/// Name of the file where the installing user's SID is stored temporarily.
-///
-/// Written by [`prepare_ipc_access`], read and deleted by
-/// `apply_socket_permissions()` on bridge startup.
+/// Without a `hole` group the socket admits SYSTEM and Administrators only, and that is `Ok`. A group that cannot be
+/// looked up is an error and the socket is left as it was. If the group's members cannot be read, or the list with
+/// them cannot be set, the group's own entry is set alone ([`set_access_list`]) and the error is returned.
 #[cfg(target_os = "windows")]
-pub(crate) const INSTALLER_USER_SID_FILE: &str = "installer-user-sid";
-
-/// The folder of [`INSTALLER_USER_SID_FILE`]: the `hole` folder of `%ProgramData%`, which the system owns but to which
-/// a standard user can add names (it inherits `BUILTIN\Users:(CI)(WD,AD,WEA,WA)` from `%ProgramData%`, and nothing in
-/// the installer narrows it). The file is read and written as a state file: through a handle on the folder, and a
-/// read refuses a file the folder's owner cannot vouch for, so a name a user planted does not grant its SID access.
-#[cfg(target_os = "windows")]
-pub fn installer_user_sid_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into())).join("hole")
-}
-
-/// The SID the installer left in `dir`, as text. `NotFound` for a missing file or folder.
-#[cfg(target_os = "windows")]
-pub(crate) fn read_installer_user_sid(dir: &Path) -> std::io::Result<String> {
-    let bytes = util::dir::ReadDir::open(dir)?.read_vouched(INSTALLER_USER_SID_FILE.as_ref())?;
-    String::from_utf8(bytes)
-        .map(|sid| sid.trim().to_owned())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "the installer SID file is not text"))
-}
-
-/// Reads and removes the installer's SID in `dir`; `None` when there is no usable one. The file is removed after a
-/// read, because the per-user SID is a temporary bridge that is no longer needed after the bridge restarts (group
-/// membership will be in the token after re-login). A file that could not be read (a name a user planted, or a read
-/// error) is left, and reported. Text that is not a SID is removed and reported without the text: the folder is one a
-/// user can add names to, and `bridge.log` is one the user can read.
-#[cfg(target_os = "windows")]
-pub(crate) fn take_installer_user_sid(dir: &Path) -> Option<String> {
-    let sid = match read_installer_user_sid(dir) {
-        Ok(sid) => sid,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            warn!(
-                error = &e as &dyn std::error::Error,
-                "could not read the installer user SID file; ignoring it"
-            );
-            return None;
-        }
+fn apply_socket_permissions(path: &Path) -> std::io::Result<()> {
+    let Some(group_sid) = crate::group::group_sid()? else {
+        warn!("'hole' group not found, IPC restricted to admin-only");
+        return set_dacl_from_sddl(path, SDDL_BASE, false);
     };
-    if let Err(e) = crate::socket::remove_name(dir, INSTALLER_USER_SID_FILE.as_ref()) {
-        warn!(
-            error = &e as &dyn std::error::Error,
-            "could not remove the installer user SID file"
-        );
-    }
-    if !is_valid_sid_string(&sid) {
-        warn!("the installer user SID file does not hold a SID; ignoring it");
-        return None;
-    }
-    Some(sid)
+    let (member_sids, unread) = match crate::group::member_sids() {
+        Ok(sids) => (sids, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    set_access_list(path, &group_sid, &member_sids)?;
+    info!(
+        group = %group_sid,
+        members = ?member_sids,
+        "IPC restricted to SYSTEM + Administrators + the hole group and its members"
+    );
+    unread.map_or(Ok(()), Err)
 }
 
-/// Writes `sid` as the installer's SID in `dir`, making the folder if it is missing. The file is replaced as a whole,
-/// by name through a handle: a link a user planted at the name is replaced and what it leads to is left alone.
+/// Sets the access list of the socket at `path` for a group with these members ([`build_sddl`]).
+///
+/// If that list cannot be set, the group's own entry is set without the members, and the error says so. An access list
+/// holds 64 KB, about 1800 members, and a group with more must not lose the entry that admits the members whose
+/// tokens carry it.
 #[cfg(target_os = "windows")]
-pub(crate) fn write_installer_user_sid(dir: &Path, sid: &str) -> std::io::Result<()> {
-    util::dir::Dir::open(dir, true, None)?
-        .write_atomic(INSTALLER_USER_SID_FILE.as_ref(), sid.as_bytes(), None, |_| Ok(()))
+pub(crate) fn set_access_list(path: &Path, group_sid: &str, member_sids: &[String]) -> std::io::Result<()> {
+    let Err(with_members) = set_dacl_from_sddl(path, &build_sddl(group_sid, member_sids), false) else {
+        return Ok(());
+    };
+    if member_sids.is_empty() {
+        return Err(with_members);
+    }
+    let members = member_sids.len();
+    Err(std::io::Error::other(
+        match set_dacl_from_sddl(path, &build_sddl(group_sid, &[]), false) {
+            Ok(()) => format!(
+                "the access list could not be set with the group's {members} members ({with_members}); the group \
+                 alone is admitted, so a member who has not signed in since joining is refused"
+            ),
+            Err(group_alone) => format!(
+                "the access list could not be set with the group's {members} members ({with_members}), nor for the \
+                 group alone ({group_alone})"
+            ),
+        },
+    ))
 }
 
 /// Set up IPC access control so that the current interactive user can
 /// talk to the bridge once it's running. Idempotent.
 ///
-/// Specifically: creates the `hole` group if missing, adds the current
-/// interactive user to it, and on Windows writes that user's SID to the
-/// `installer-user-sid` file so the next `apply_socket_permissions` call
-/// includes it in the socket DACL (working around the Windows token-snapshot
-/// limitation).
-///
-/// Used by both `install_bridge` (where it's called once before service
-/// registration) and by `bridge grant-access` (where it's called by the
-/// dev workflow before starting the foreground bridge).
+/// Creates the `hole` group if missing and adds the current interactive user
+/// to it. The bridge reads the group when it binds its socket, so this must run
+/// before the bridge starts; a bridge already running is told to read it again
+/// (`handle_refresh_access`).
 ///
 /// # Testing
 ///
 /// This function is not covered by a unit test. Its idempotence is a
 /// property of the primitives it composes: `group::create_group` is
-/// idempotent (macOS: verifies post-failure with `getgrnam(3)`;
+/// idempotent (macOS: verifies post-failure with `group_exists`;
 /// Windows: detects error code 1379) and `group::add_user_to_group`
 /// is idempotent (macOS: `dseditgroup -o edit -a` is naturally
-/// idempotent; Windows: detects error code 1378). The SID file write
-/// unconditionally replaces the file. No unit test asserts its effects; it runs
-/// only end to end in the installer lanes.
+/// idempotent; Windows: detects error code 1378). It runs end to end in the
+/// installer lanes, where the Windows member-access test asserts its effect.
 pub fn prepare_ipc_access() -> std::io::Result<()> {
     crate::group::create_group()?;
     let user = crate::group::installing_username()?;
     crate::group::add_user_to_group(&user)?;
     info!(user = %user, group = %crate::group::GROUP_NAME, "prepared IPC access");
-
-    #[cfg(target_os = "windows")]
-    {
-        let sid = crate::group::lookup_sid(&user)?;
-        write_installer_user_sid(&installer_user_sid_dir(), &sid)?;
-        info!(sid = %sid, "wrote installer user SID");
-    }
     Ok(())
 }
 
@@ -1632,119 +1652,85 @@ pub(crate) fn is_valid_sid_string(s: &str) -> bool {
     s.starts_with("S-") && s.len() > 3 && s[2..].bytes().all(|b| b.is_ascii_digit() || b == b'-')
 }
 
-/// Build the SDDL string for the socket file DACL.
-///
-/// Always includes SYSTEM + Administrators + the `hole` group (if it exists).
-/// Additional per-user SIDs can be appended via `extra_sids` — this is used
-/// as a temporary workaround for the Windows token snapshot limitation (see
-/// [`apply_socket_permissions`] and the doc comment on `handle_grant_access`
-/// in `cli.rs`).
+/// The socket's access list as SDDL: SYSTEM and Administrators ([`SDDL_BASE`]), then full control for the group and
+/// for each of its members, in the order given. A string that is not a SID is left out and reported without its
+/// text, so nothing passed here can add an entry of its own.
 #[cfg(target_os = "windows")]
-pub fn build_sddl(extra_sids: &[&str]) -> String {
-    let base = SDDL_BASE;
-
-    let mut sddl = match crate::group::group_sid() {
-        Ok(sid) => {
-            info!(sid = %sid, "restricting IPC to SYSTEM + Administrators + hole group");
-            format!("{base}(A;;GA;;;{sid})")
-        }
-        Err(e) => {
-            warn!(
-                error = &e as &dyn std::error::Error,
-                "'hole' group not found, IPC restricted to admin-only"
-            );
-            base.to_string()
-        }
-    };
-
-    for sid in extra_sids {
+pub(crate) fn build_sddl(group_sid: &str, member_sids: &[String]) -> String {
+    let mut sddl = SDDL_BASE.to_owned();
+    for sid in std::iter::once(group_sid).chain(member_sids.iter().map(String::as_str)) {
         if is_valid_sid_string(sid) {
             sddl.push_str(&format!("(A;;GA;;;{sid})"));
         } else {
             warn!("ignoring malformed SID string in DACL");
         }
     }
-
     sddl
 }
 
 /// Set socket file ownership to root:hole and mode 0660 on macOS.
 ///
 /// This is the second phase of socket permission setup. The first phase
-/// (umask guard in `socket.rs`) creates the socket with mode 0600. This
-/// function then sets ownership to root:hole and widens the mode to 0660.
-#[cfg(all(target_os = "macos", not(test)))]
-fn apply_socket_permissions(path: &Path) {
+/// (`bind_restricted` in `socket.rs`) leaves the socket with mode 0600. This
+/// function then sets ownership to root:hole and widens the mode to 0660. Only
+/// the bridge calls it, on its own socket: at each bind, and when a client asks
+/// it to refresh ([`handle_refresh_access`]). A socket left root-only is an error, except where there is no `hole` group:
+/// then it is set to mode 0600 and that is `Ok`. A group that cannot be looked up is an error and the socket is left as
+/// it was.
+#[cfg(target_os = "macos")]
+fn apply_socket_permissions(path: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
 
-    let path_str = match path.to_str() {
-        Some(s) => s,
-        None => {
-            warn!("socket path is not valid UTF-8");
-            return;
-        }
-    };
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "socket path is not valid UTF-8"))?;
+    let c_path = CString::new(path_str).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid socket path for permissions: {e}"),
+        )
+    })?;
 
-    let c_path = match CString::new(path_str) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                error = &e as &dyn std::error::Error,
-                "invalid socket path for permissions"
-            );
-            return;
-        }
-    };
-
-    // Compile-time check: GROUP_NAME must not contain interior null bytes.
-    const _: () = {
-        let bytes = crate::group::GROUP_NAME.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            assert!(bytes[i] != 0, "GROUP_NAME must not contain null bytes");
-            i += 1;
-        }
-    };
-
-    // Look up the 'hole' group GID
-    let group_name = CString::new(crate::group::GROUP_NAME).expect("GROUP_NAME verified at compile time");
-    // SAFETY: `group_name` is a valid null-terminated CString kept alive for the
-    // call. getgrnam returns a pointer into a libc-owned process-wide static
-    // buffer; per POSIX it is not thread-safe (see also `group::os::group_exists`).
-    // We read `gr_gid` below before any other libc call could overwrite that
-    // buffer, and the bridge's apply-socket-permissions path is single-threaded
-    // at this point.
-    let grp = unsafe { libc::getgrnam(group_name.as_ptr()) };
-
-    if grp.is_null() {
+    let Some(gid) = crate::group::group_gid(crate::group::GROUP_NAME)? else {
         warn!("'hole' group not found, restricting socket to root-only");
         // SAFETY: `c_path` is a valid null-terminated CString. chmod on a valid
         // path is always safe to call.
-        unsafe {
-            libc::chmod(c_path.as_ptr(), 0o600);
+        if unsafe { libc::chmod(c_path.as_ptr(), 0o600) } != 0 {
+            return Err(std::io::Error::other(format!(
+                "chmod 0600 failed ({}); the socket may have incorrect permissions",
+                std::io::Error::last_os_error()
+            )));
         }
-        return;
-    }
-
-    // SAFETY: `grp` was checked non-null above and points to valid static storage
-    // from getgrnam. We read `gr_gid` immediately before any call that could
-    // invalidate the static buffer.
-    let gid = unsafe { (*grp).gr_gid };
+        return Ok(());
+    };
     info!(gid = gid, "setting socket ownership to root:hole, mode 0660");
 
     // SAFETY: `c_path` is a valid null-terminated CString for the path argument.
-    // `gid` is a valid group ID obtained from getgrnam. chown/chmod return 0 on
+    // `gid` is a valid group ID obtained from `group_gid`. chown/chmod return 0 on
     // success and -1 on failure; we check the return value.
     unsafe {
         if libc::chown(c_path.as_ptr(), 0, gid) != 0 {
-            warn!("chown failed, falling back to root-only socket");
-            libc::chmod(c_path.as_ptr(), 0o600);
-            return;
+            let chown = std::io::Error::last_os_error();
+            let left = if libc::chmod(c_path.as_ptr(), 0o600) == 0 {
+                "the socket is left root-only".to_owned()
+            } else {
+                format!(
+                    "chmod 0600 failed too ({}); the socket may have incorrect permissions",
+                    std::io::Error::last_os_error()
+                )
+            };
+            return Err(std::io::Error::other(format!(
+                "chown to root:hole failed ({chown}); {left}"
+            )));
         }
         if libc::chmod(c_path.as_ptr(), 0o660) != 0 {
-            warn!("chmod failed, socket may have incorrect permissions");
+            return Err(std::io::Error::other(format!(
+                "chmod 0660 failed ({}); the socket may have incorrect permissions",
+                std::io::Error::last_os_error()
+            )));
         }
     }
+    Ok(())
 }
 
 /// Build the cutover marker; extracted so the driver-identity mapping is

@@ -37,10 +37,11 @@ on Windows).
    reads holds a `ReadDir`, which has no method that writes, renames or removes.
 1. **Remove and move aside through the handle.** A state file is removed by `VersionedFile::update` with
    `Change::Remove` and moved aside by `Change::MoveAside` or `Dir::rename_noreplace`, never by `std::fs::remove_file` or
-   `rename` on a path. The same holds for the stale socket (`socket::remove`, `util::dir::make_dir_and_free_name`) and the
-   installer's SID file in the `hole` folder of `%ProgramData%`, to which a standard user can add names. A socket's bind,
+   `rename` on a path. The same holds for the stale socket (`socket::remove`, `util::dir::make_dir_and_free_name`), whose
+   folder on Windows is the `hole` folder of `%ProgramData%`, to which a standard user can add names. A socket's bind,
    and the mode or ACL set on it afterwards, still name it by path, because no platform binds relative to a directory
-   handle.
+   handle. The bridge is the only process that sets them, on its own socket: `hole bridge grant-access` asks the
+   running bridge to set them again and never touches the socket itself.
 1. **Set mode and owner through the open file.** `fchown`, `fchmod` and the Windows ACL go to the handle of a temp file,
    before it is renamed into place (`Dir::write_atomic`, `Dir::stage`).
 1. **Never touch a path after a rename.** Once the temp file has its final name the writer does nothing to that name, so a
@@ -111,8 +112,7 @@ The readers have the same kind of table (`no_reader_reads_through_a_symlink_plan
 `no_reader_waits_on_a_fifo_planted_at_its_name`, and `state_symlink_tests.rs` in `tun-engine`). A hard link is the file's own
 inode, so only `read_vouched`'s ownership and link-count rule tells it from the file: `no_reader_reads_a_hard_link_the_system_would_not_have_made`.
 A test cannot make a file the system owns without being the system, so the planted name is refused when the runner is root or an
-elevated token and read when it is a user. Logging has its own two: `no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse`
-and, for the installer's SID file, `text_that_is_not_a_sid_is_refused_and_never_logged`.
+elevated token and read when it is a user. Logging has its own: `no_state_reader_logs_a_fragment_of_a_file_it_cannot_parse`.
 
 Five source scans close the class. Each reads every use of a function through the file's own `use` and `type` declarations
 (`dir_writers_tests/scan.rs`), so a name imported, aliased, globbed or reached through a `type` alias is seen as the function it

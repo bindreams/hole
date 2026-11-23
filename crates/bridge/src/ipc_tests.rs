@@ -633,6 +633,16 @@ async fn post_unblock(client: &mut TestClient) -> http::Response<hyper::body::In
     client.send(req).await
 }
 
+async fn post_refresh_access(client: &mut TestClient) -> http::Response<hyper::body::Incoming> {
+    let req = http::Request::builder()
+        .method("POST")
+        .uri(hole_common::protocol::ROUTE_REFRESH_ACCESS)
+        .header("host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    client.send(req).await
+}
+
 async fn post_reload(client: &mut TestClient, config: &ProxyConfig) -> http::Response<hyper::body::Incoming> {
     let body_bytes = serde_json::to_vec(config).unwrap();
     let req = http::Request::builder()
@@ -1691,7 +1701,7 @@ fn ipc_state_with_persist_gate(
     )));
     let gate = Arc::new(tokio::sync::Notify::new());
     let (entered_tx, entered_rx) = oneshot::channel();
-    let mut state = IpcState::new(proxy, "test", dir);
+    let mut state = IpcState::new(proxy, "test", dir, PathBuf::new());
     state.persist_gate = Some(gate.clone());
     state.persist_entered = std::sync::Mutex::new(Some(entered_tx));
     (Arc::new(state), gate, entered_rx)
@@ -2975,62 +2985,50 @@ fn concurrent_double_cancel_during_start_both_succeed() {
     });
 }
 
-// SDDL tests (Windows only) ===========================================================================================
+// The socket's access list (Windows only) =============================================================================
+
+#[cfg(target_os = "windows")]
+const GROUP_SID: &str = "S-1-5-21-1234567890-1234567890-1234567890-1093";
+#[cfg(target_os = "windows")]
+const MEMBER_SID: &str = "S-1-5-21-1234567890-1234567890-1234567890-1001";
+/// A member that is not a user: Windows lists a well-known SID the same way.
+#[cfg(target_os = "windows")]
+const WELL_KNOWN_MEMBER_SID: &str = "S-1-5-4";
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn build_sddl_without_extra_sids() {
-    let sddl = crate::ipc::build_sddl(&[]);
-    // Must start with the base SDDL (SYSTEM + Administrators)
-    assert!(
-        sddl.starts_with(crate::ipc::SDDL_BASE),
-        "SDDL should start with base: {sddl}"
-    );
-    // The hole group SID ACE may or may not be present depending on whether
-    // the group exists on this machine. Either way, no extra user SIDs.
-    // Count ACE entries: each starts with "(A;;"
-    let ace_count = sddl.matches("(A;;").count();
-    // Base has 2 (SYSTEM + BA), group adds 0 or 1
-    assert!(
-        ace_count == 2 || ace_count == 3,
-        "expected 2 or 3 ACEs (base + optional group), got {ace_count} in: {sddl}"
+fn the_access_list_names_the_group_then_each_member() {
+    let sddl = crate::ipc::build_sddl(GROUP_SID, &[MEMBER_SID.to_owned(), WELL_KNOWN_MEMBER_SID.to_owned()]);
+
+    assert_eq!(
+        sddl,
+        format!(
+            "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{GROUP_SID})(A;;GA;;;{MEMBER_SID})(A;;GA;;;{WELL_KNOWN_MEMBER_SID})"
+        )
     );
 }
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn build_sddl_with_extra_sids() {
-    let fake_sid = "S-1-5-21-1234567890-1234567890-1234567890-1001";
-    let sddl = crate::ipc::build_sddl(&[fake_sid]);
-    assert!(
-        sddl.contains(&format!("(A;;GA;;;{fake_sid})")),
-        "SDDL should contain extra SID ACE: {sddl}"
+fn the_access_list_of_a_group_without_members_is_the_group_alone() {
+    assert_eq!(
+        crate::ipc::build_sddl(GROUP_SID, &[]),
+        format!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{GROUP_SID})")
     );
 }
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn build_sddl_with_multiple_extra_sids() {
-    let sid1 = "S-1-5-21-1111111111-1111111111-1111111111-1001";
-    let sid2 = "S-1-5-21-2222222222-2222222222-2222222222-1002";
-    let sddl = crate::ipc::build_sddl(&[sid1, sid2]);
-    assert!(
-        sddl.contains(&format!("(A;;GA;;;{sid1})")),
-        "SDDL should contain first extra SID: {sddl}"
-    );
-    assert!(
-        sddl.contains(&format!("(A;;GA;;;{sid2})")),
-        "SDDL should contain second extra SID: {sddl}"
-    );
-}
+fn the_access_list_leaves_out_a_member_that_is_not_a_sid() {
+    // Text that would close the entry and open one for Everyone.
+    let injection = "S-1-1-0)(A;;GA;;;S-1-1-0";
 
-#[cfg(target_os = "windows")]
-#[skuld::test]
-fn build_sddl_rejects_malformed_sid() {
-    // A malformed SID with SDDL metacharacters should be ignored
-    let malformed = "S-1-1-0)(A;;GA;;;S-1-1-0";
-    let sddl = crate::ipc::build_sddl(&[malformed]);
-    assert!(!sddl.contains(malformed), "malformed SID should be rejected: {sddl}");
+    let sddl = crate::ipc::build_sddl(GROUP_SID, &[injection.to_owned(), MEMBER_SID.to_owned()]);
+
+    assert_eq!(
+        sddl,
+        format!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{GROUP_SID})(A;;GA;;;{MEMBER_SID})")
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -3049,97 +3047,7 @@ fn is_valid_sid_string_rejects_invalid() {
     assert!(!crate::ipc::is_valid_sid_string("S-1-1-0 "));
 }
 
-// The installer's SID file (Windows only) =============================================================================
-//
-// The `hole` folder of `%ProgramData%` is the system's, but a standard user can add names to it, so the SID file is
-// read and written as a state file: through a handle, never through a link a user planted at the name.
-
-#[cfg(target_os = "windows")]
-const INSTALLER_SID: &str = "S-1-5-21-1234567890-1234567890-1234567890-1001";
-
-#[cfg(target_os = "windows")]
-#[skuld::test]
-fn the_installer_sid_written_is_the_installer_sid_taken_and_taking_removes_it() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("hole");
-
-    crate::ipc::write_installer_user_sid(&dir, INSTALLER_SID).unwrap();
-    assert_eq!(
-        crate::ipc::take_installer_user_sid(&dir).as_deref(),
-        Some(INSTALLER_SID)
-    );
-
-    assert_eq!(
-        crate::ipc::take_installer_user_sid(&dir),
-        None,
-        "the file outlived its take"
-    );
-    assert!(
-        std::fs::read_dir(&dir).unwrap().next().is_none(),
-        "the take left a name behind"
-    );
-}
-
-#[cfg(target_os = "windows")]
-#[skuld::test]
-fn no_installer_sid_is_taken_from_a_missing_file_or_folder() {
-    let tmp = tempfile::tempdir().unwrap();
-
-    assert_eq!(crate::ipc::take_installer_user_sid(tmp.path()), None);
-    assert_eq!(
-        crate::ipc::take_installer_user_sid(&tmp.path().join("no-such-folder")),
-        None
-    );
-}
-
-#[cfg(target_os = "windows")]
-#[skuld::test]
-fn the_installer_sid_is_not_read_through_a_symlink_planted_at_its_name() {
-    let tmp = tempfile::tempdir().unwrap();
-    let reader = util::dir::testing::Reader {
-        file: crate::ipc::INSTALLER_USER_SID_FILE,
-        write_valid: &|dir| crate::ipc::write_installer_user_sid(dir, INSTALLER_SID).unwrap(),
-        reads_it: &|dir| crate::ipc::read_installer_user_sid(dir).is_ok_and(|sid| sid == INSTALLER_SID),
-    };
-
-    let result = util::dir::testing::planted_name_is_not_read(
-        tmp.path(),
-        util::dir::testing::PlantedName::SymlinkToFile,
-        &reader,
-    );
-
-    assert_eq!(result, Ok(()));
-}
-
-#[cfg(target_os = "windows")]
-#[skuld::test]
-fn writing_the_installer_sid_replaces_a_symlink_at_its_name_and_not_what_it_points_at() {
-    let tmp = tempfile::tempdir().unwrap();
-    let victim = tmp.path().join("victim");
-    std::fs::write(&victim, b"keep").unwrap();
-    let dir = tmp.path().join("hole");
-    std::fs::create_dir(&dir).unwrap();
-    std::os::windows::fs::symlink_file(&victim, dir.join(crate::ipc::INSTALLER_USER_SID_FILE)).unwrap();
-
-    crate::ipc::write_installer_user_sid(&dir, INSTALLER_SID).unwrap();
-
-    assert_eq!(std::fs::read(&victim).unwrap(), b"keep", "written through the link");
-    assert_eq!(crate::ipc::read_installer_user_sid(&dir).unwrap(), INSTALLER_SID);
-}
-
-#[cfg(target_os = "windows")]
-#[skuld::test]
-fn the_installer_sid_folder_is_not_walked_through_a_users_link_to_a_system_folder() {
-    let tmp = tempfile::tempdir().unwrap();
-    let link = util::dir::testing::state_dir_linked_to_a_system_folder(tmp.path());
-
-    let err = crate::ipc::write_installer_user_sid(&link, INSTALLER_SID).unwrap_err();
-
-    assert_eq!(util::dir::Refusal::from_error(&err), Some(&util::dir::Refusal::Symlink));
-    assert_eq!(crate::ipc::take_installer_user_sid(&link), None);
-}
-
-/// Text a user could plant at the installer's SID name, with a piece of it on a second line.
+/// Text that is not a SID, with a piece of it on a second line.
 #[cfg(target_os = "windows")]
 const PLANTED_SID_TEXT: &str = "hunter2-SECRET
 second-line-SECRET";
@@ -3164,56 +3072,9 @@ fn logs_of(body: impl FnOnce()) -> String {
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn text_that_is_not_a_sid_is_refused_and_never_logged() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("hole");
-    crate::ipc::write_installer_user_sid(&dir, PLANTED_SID_TEXT).unwrap();
-
-    let mut taken = Some(String::new());
-    let logs = logs_of(|| taken = crate::ipc::take_installer_user_sid(&dir));
-
-    assert_eq!(taken, None, "text that is not a SID was taken as one");
-    assert!(
-        logs.contains("installer user SID"),
-        "the refusal was not reported: {logs}"
-    );
-    assert!(!logs.contains("SECRET"), "the file's text reached the log: {logs}");
-    assert!(!logs.contains("hunter2"), "the file's text reached the log: {logs}");
-}
-
-#[cfg(target_os = "windows")]
-#[skuld::test]
-fn an_sddl_injection_in_the_installer_sid_file_is_refused_and_never_logged() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("hole");
-    crate::ipc::write_installer_user_sid(&dir, "S-1-1-0)(A;;GA;;;hunter2").unwrap();
-
-    let mut taken = Some(String::new());
-    let logs = logs_of(|| taken = crate::ipc::take_installer_user_sid(&dir));
-
-    assert_eq!(taken, None);
-    assert!(!logs.contains("hunter2"), "the file's text reached the log: {logs}");
-}
-
-#[cfg(target_os = "windows")]
-#[skuld::test]
-fn an_empty_installer_sid_file_is_no_sid() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("hole");
-    crate::ipc::write_installer_user_sid(
-        &dir, " 
-",
-    )
-    .unwrap();
-
-    assert_eq!(crate::ipc::take_installer_user_sid(&dir), None);
-}
-
-#[cfg(target_os = "windows")]
-#[skuld::test]
 fn the_dacl_builder_logs_no_text_of_a_sid_it_rejects() {
     let mut sddl = String::new();
-    let logs = logs_of(|| sddl = crate::ipc::build_sddl(&[PLANTED_SID_TEXT]));
+    let logs = logs_of(|| sddl = crate::ipc::build_sddl(GROUP_SID, &[PLANTED_SID_TEXT.to_owned()]));
 
     assert!(!sddl.contains("SECRET"), "a rejected SID reached the SDDL: {sddl}");
     assert!(logs.contains("malformed SID"), "the rejection was not reported: {logs}");
@@ -3221,8 +3082,201 @@ fn the_dacl_builder_logs_no_text_of_a_sid_it_rejects() {
     assert!(!logs.contains("hunter2"), "the rejected text reached the log: {logs}");
 }
 
-// bind() smoke tests — the production-path bind, which in cfg(test) uses
-// the unrestricted LocalListener::bind and skips apply_socket_permissions.
+// The access list a bind sets (Windows only) ==========================================================================
+
+/// The trustees `sddl` names in entries of its own, in order: the entries a folder passed down are left out.
+#[cfg(target_os = "windows")]
+fn own_trustees(sddl: &str) -> Vec<String> {
+    crate::test_support::dacl::aces(sddl)
+        .into_iter()
+        .filter(|ace| !ace.is_inherited())
+        .map(|ace| ace.trustee)
+        .collect()
+}
+
+/// The trustees a socket must name of its own for `group_sid` and `member_sids`, as Windows prints them. Written out
+/// here, not built by the code under test.
+#[cfg(target_os = "windows")]
+fn printed_trustees(group_sid: &str, member_sids: &[&str]) -> Vec<String> {
+    let mut sddl = format!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{group_sid})");
+    for member in member_sids {
+        sddl.push_str(&format!("(A;;GA;;;{member})"));
+    }
+    own_trustees(&crate::test_support::dacl::printed_sddl(&sddl))
+}
+
+/// The group and members are stated here, so this does not depend on whether the machine has a `hole` group.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn the_access_list_set_on_a_socket_names_the_group_and_each_member() {
+    let path = test_socket_path("set-access-list");
+    let _listener = crate::socket::LocalListener::bind_restricted(&path).unwrap();
+
+    crate::ipc::set_access_list(
+        &path,
+        GROUP_SID,
+        &[MEMBER_SID.to_owned(), WELL_KNOWN_MEMBER_SID.to_owned()],
+    )
+    .unwrap();
+
+    assert_eq!(
+        own_trustees(&crate::test_support::dacl::dacl_sddl(&path)),
+        printed_trustees(GROUP_SID, &[MEMBER_SID, WELL_KNOWN_MEMBER_SID])
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An access list holds 64 KB. A group with more members than fit must still be admitted as a group: its members who
+/// have signed in since they joined carry it in their tokens.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn a_member_list_too_long_for_an_access_list_still_admits_the_group() {
+    let path = test_socket_path("long-access-list");
+    let _listener = crate::socket::LocalListener::bind_restricted(&path).unwrap();
+    let members: Vec<String> = (0..3000)
+        .map(|n| format!("S-1-5-21-1234567890-1234567890-1234567890-{}", 2000 + n))
+        .collect();
+
+    let result = crate::ipc::set_access_list(&path, GROUP_SID, &members);
+
+    let error = result
+        .expect_err("3000 members fitted into one access list")
+        .to_string();
+    assert!(
+        error.contains("3000 members") && error.contains("the group alone is admitted"),
+        "the error does not say what the socket was left with: {error}"
+    );
+    assert_eq!(
+        own_trustees(&crate::test_support::dacl::dacl_sddl(&path)),
+        printed_trustees(GROUP_SID, &[])
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The trustees a socket's own entries must name for the `hole` group as the account database holds it now, as
+/// Windows prints them. Without a `hole` group that is SYSTEM and Administrators.
+#[cfg(target_os = "windows")]
+fn trustees_of_the_group_now() -> Vec<String> {
+    let sddl = match crate::group::group_sid().expect("the lookup of the `hole` group") {
+        Some(group) => {
+            let members = crate::group::member_sids().expect("the members of a `hole` group that exists");
+            crate::ipc::build_sddl(&group, &members)
+        }
+        None => crate::ipc::SDDL_BASE.to_owned(),
+    };
+    // Windows prints some SIDs as aliases, so both sides go through its printer.
+    own_trustees(&crate::test_support::dacl::printed_sddl(&sddl))
+}
+
+/// `IpcServer::bind` is the bind every bridge makes, and each one sets the socket's access list from the account
+/// database as it is at that moment. A second bind of the same path is a bridge restart.
+///
+/// What this shows depends on the machine. Without a `hole` group it shows the two base entries; with one, the group
+/// and each member. That a member's own entry admits a user whose token has no group is the installed test's to show
+/// (`msi-installer/tests/installed/test_member_access.py`): it needs a second token.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn every_bind_sets_the_access_list_the_account_database_gives() {
+    use crate::test_support::dacl::{aces, dacl_sddl};
+
+    let expected = trustees_of_the_group_now();
+    let path = test_socket_path("access-list");
+
+    for bind in ["first", "second"] {
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
+
+        let sddl = dacl_sddl(&path);
+        assert_eq!(
+            own_trustees(&sddl),
+            expected,
+            "the {bind} bind did not set the access list the group gives: {sddl}"
+        );
+        assert!(
+            aces(&sddl)
+                .iter()
+                .filter(|ace| !ace.is_inherited())
+                .all(|ace| ace.kind == "A" && ace.rights == "FA"),
+            "the {bind} bind set an entry that is not full control: {sddl}"
+        );
+
+        drop(server);
+    }
+}
+
+/// A request to a running bridge to refresh its socket's access list sets what the account database says. The list
+/// is replaced beforehand by one naming a group and a member stated here (no machine has them), so the two lists
+/// differ whether or not the machine has a `hole` group. That the user the request admits is one the socket refused
+/// before is the installed test's to show (`test_grant_access_admits_a_user_while_the_bridge_runs`): it needs a second
+/// token.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn a_refresh_request_sets_the_access_list_the_account_database_gives() {
+    use crate::test_support::dacl::dacl_sddl;
+
+    rt().block_on(async {
+        let path = test_socket_path("refresh-access");
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
+        let expected = trustees_of_the_group_now();
+        crate::ipc::set_access_list(&path, GROUP_SID, &[MEMBER_SID.to_owned()]).unwrap();
+        assert_ne!(
+            own_trustees(&dacl_sddl(&path)),
+            expected,
+            "the list set beforehand is the one the account database gives, so the request could change nothing"
+        );
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let status = post_refresh_access(&mut client).await.status();
+        let sddl = dacl_sddl(&path);
+
+        assert_eq!(status, 200, "the request was not served");
+        assert_eq!(
+            own_trustees(&sddl),
+            expected,
+            "the request did not set the access list the group gives: {sddl}"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+/// A bridge whose socket's name is gone cannot set its list, for real on both platforms: the set names the socket by
+/// path. The refresh must say so, with a written sentence and not the error's text, which names a path.
+#[skuld::test]
+fn a_refresh_that_cannot_set_the_access_list_answers_500() {
+    rt().block_on(async {
+        let path = test_socket_path("refresh-access-unset");
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+        let mut client = TestClient::connect(&path).await;
+        std::fs::remove_file(&path).expect("the socket's name, removed after the client connected");
+
+        let resp = post_refresh_access(&mut client).await;
+
+        assert_eq!(
+            resp.status(),
+            500,
+            "a refresh that set nothing must error, not answer success"
+        );
+        let body = parse_error_body(resp).await;
+        assert_eq!(
+            body.message, "the bridge could not set its socket's access list from the hole group",
+            "the body is a written sentence, not the internal error's text"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+// bind() smoke tests: the bind every bridge makes.
 
 #[skuld::test]
 fn bind_accepts_connection() {
@@ -3384,7 +3438,7 @@ fn redacting_capture() -> (
 
 fn ipc_state(proxy: Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>) -> Arc<IpcState<MockProxy, MockRouting>> {
     let log_dir = tempfile::tempdir().unwrap().keep();
-    Arc::new(IpcState::new(proxy, "test", log_dir))
+    Arc::new(IpcState::new(proxy, "test", log_dir, PathBuf::new()))
 }
 
 fn redaction_config() -> ProxyConfig {
@@ -3456,7 +3510,12 @@ async fn test_server_request_arms_the_configured_and_the_resolved_address() {
         },
         host_as_rendered: Default::default(),
     });
-    let mut state = IpcState::new(mock_proxy(), "test", tempfile::tempdir().unwrap().keep());
+    let mut state = IpcState::new(
+        mock_proxy(),
+        "test",
+        tempfile::tempdir().unwrap().keep(),
+        PathBuf::new(),
+    );
     state.test_server_config = crate::server_test::TestConfig {
         bootstrap: crate::dns::bootstrap::BootstrapResolver::with_querier(probe.clone()),
         preflight_timeout: std::time::Duration::from_millis(500),

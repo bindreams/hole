@@ -711,67 +711,8 @@ fn the_startup_preference_over_a_corrupt_file_is_backed_up() {
 
 // Windows DACL ========================================================================================================
 
-/// Read `path`'s DACL back as an SDDL string. Round-tripping through SDDL
-/// rather than walking ACEs with `GetAce` keeps the unsafe surface to two
-/// calls and makes the assertion readable: the protected flag shows up as
-/// `D:P` and each ACE as a `(A;;...;SID)` clause.
 #[cfg(target_os = "windows")]
-fn dacl_sddl(path: &std::path::Path) -> String {
-    use windows::core::{HSTRING, PWSTR};
-    use windows::Win32::Foundation::LocalFree;
-    use windows::Win32::Security::Authorization::{
-        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
-    };
-    use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
-
-    let wide = HSTRING::from(path.as_os_str());
-    let mut psd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: `wide` outlives the call; `psd` is an out-param Windows fills
-    // with a LocalAlloc'd descriptor that we free below. The two None
-    // out-params are documented as optional.
-    unsafe {
-        GetNamedSecurityInfoW(
-            &wide,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            None,
-            None,
-            &mut psd,
-        )
-        // Returns WIN32_ERROR, not Result — `.ok()` converts it.
-        .ok()
-        .expect("GetNamedSecurityInfoW failed");
-    }
-
-    let mut out = PWSTR::null();
-    // SAFETY: `psd` is a valid descriptor from the call above; `out` receives
-    // a LocalAlloc'd string freed below.
-    unsafe {
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            psd,
-            SDDL_REVISION_1,
-            DACL_SECURITY_INFORMATION,
-            &mut out,
-            None,
-        )
-        .expect("ConvertSecurityDescriptorToStringSecurityDescriptorW failed");
-    }
-    // SAFETY: `out` is a NUL-terminated wide string owned by us until LocalFree.
-    let sddl = unsafe { out.to_string().expect("SDDL string was not valid UTF-16") };
-    // SAFETY: both pointers came from LocalAlloc inside the calls above.
-    unsafe {
-        let _ = LocalFree(Some(std::mem::transmute::<PWSTR, windows::Win32::Foundation::HLOCAL>(
-            out,
-        )));
-        let _ = LocalFree(Some(std::mem::transmute::<
-            PSECURITY_DESCRIPTOR,
-            windows::Win32::Foundation::HLOCAL,
-        >(psd)));
-    }
-    sddl
-}
+use crate::test_support::dacl::dacl_sddl;
 
 /// The state directory and the target file hold a `ProxyConfig`, i.e. the
 /// shadowsocks password. Under `C:\ProgramData` the inherited ACL grants

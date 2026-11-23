@@ -13,11 +13,11 @@
 //
 // When the user is first added to the `hole` group (either at install time or
 // via `grant-access`), no running process will reflect that membership until
-// the user logs out and back in. To provide immediate access, the elevated
-// `grant-access` command adds the user's own SID directly to the bridge
-// socket's DACL (a user's own SID is always present in their token). The
-// per-user SID is cleaned up on bridge restart, when the group membership
-// will have taken effect after re-login.
+// the user logs out and back in. So the bridge socket's DACL names each member
+// of the group by its own SID as well (a user's own SID is always present in
+// their token). The bridge writes that list at every start, and the elevated
+// `grant-access` command asks the running bridge to write it again, which gives
+// the user it has just added immediate access.
 
 use crate::setup;
 use crate::state::AppState;
@@ -201,9 +201,11 @@ pub enum ElevationResult {
 }
 
 /// Map the elevated run into a result. The result file (when the child wrote one)
-/// is authoritative over the exit code: the child exits 1 on any bridge error,
-/// but the file says why. A missing/unreadable file falls back to the SetupError
-/// axis — never to "denied".
+/// is authoritative over the exit code. The child exits 1 on any bridge error,
+/// and also when a running bridge did not set its access list in `grant-access`;
+/// in that case the file still holds the send's outcome, and why the refresh
+/// failed is in `gui-cli.log`. A missing/unreadable file falls back to the
+/// SetupError axis — never to "denied".
 pub fn elevation_result_from(
     run: Result<(), &crate::setup::SetupError>,
     file: Option<ElevatedOutcome>,

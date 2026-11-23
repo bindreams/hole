@@ -950,6 +950,43 @@ fn unblock_500_maps_to_error() {
     });
 }
 
+/// Drive POST /v1/refresh-access against a mock. Like `Unblock` it has no bespoke error mapping.
+async fn refresh_access_against_status(
+    path: &std::path::Path,
+    status: axum::http::StatusCode,
+    message: &'static str,
+) -> Result<BridgeResponse, ClientError> {
+    let _mock = spawn_route_error_bridge(path, hole_common::protocol::ROUTE_REFRESH_ACCESS, status, message).await;
+    let mut client = BridgeClient::connect(path).await.unwrap();
+    client.send(BridgeRequest::RefreshAccess).await
+}
+
+#[skuld::test]
+fn refresh_access_200_maps_to_ack() {
+    rt().block_on(async {
+        let result =
+            refresh_access_against_status(&test_socket_path("refresh200"), axum::http::StatusCode::OK, "").await;
+        assert!(matches!(result, Ok(BridgeResponse::Ack)), "got {result:?}");
+    });
+}
+
+#[skuld::test]
+fn refresh_access_500_maps_to_error() {
+    rt().block_on(async {
+        let result = refresh_access_against_status(
+            &test_socket_path("refresh500"),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "refresh boom",
+        )
+        .await
+        .unwrap();
+        match result {
+            BridgeResponse::Error { message } => assert!(message.contains("refresh boom"), "got {message}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    });
+}
+
 // Typed Start error path ==============================================================================================
 
 /// Mock serving POST /start with a raw (status, body) pair.

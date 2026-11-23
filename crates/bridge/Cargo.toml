@@ -145,6 +145,8 @@ windows = { version = "0.62", features = [
     "Wdk_System_SystemInformation",
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
+    # NetLocalGroupGetMembers, for the members of the `hole` group (`group::member_sids`).
+    "Win32_NetworkManagement_NetManagement",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
