@@ -270,12 +270,12 @@ impl StdioRelayHandles {
 }
 
 /// Whether a failed flush of Rust's stdout buffer is a loss to report. Redirected, the buffer flushes into Hole's own
-/// pipe and a failure means the relay thread is gone, which the relay's own failed drain reports (`relay_failed`) and
-/// otherwise is unexplained. Not redirected (the debug switch), the stream is the caller's, and a closed one is not a
-/// loss.
+/// pipe and a broken pipe means the relay thread is gone, which the relay's own failed drain reports (`relay_failed`);
+/// any other failure is a loss of its own. Not redirected (the debug switch), the stream is the caller's, and a closed
+/// one is not a loss.
 fn buffer_flush_failure_is_loss(error: &io::Error, redirected: bool, relay_failed: bool) -> bool {
     if redirected {
-        !relay_failed
+        !(relay_failed && error.kind() == io::ErrorKind::BrokenPipe)
     } else {
         error.kind() != io::ErrorKind::BrokenPipe
     }
@@ -633,8 +633,8 @@ static PANIC_HOOK_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::
 // Set on the stdio relay threads. The previous hook (the default printer) writes to stderr, which on a relay thread is
 // the pipe that thread alone reads: a panic text longer than the pipe holds would make the thread wait for itself, and
 // the drain at exit with it. The panic hook therefore does not chain on such a thread. Its own record goes through the
-// layers, which write the original stderr and the file, unless the writer or formatter that ended the thread panics on
-// that record too.
+// layers, which write the original stderr and the file. If the writer or formatter that ended the thread panics on that
+// record too, that is a panic inside the hook, and std aborts the process.
 std::thread_local! {
     static ON_RELAY_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

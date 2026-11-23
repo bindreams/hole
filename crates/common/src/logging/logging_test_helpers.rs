@@ -188,7 +188,8 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_multiline" => scenario_multiline(),
         "redirect_open_line_stderr" => scenario_open_line(Stream::Stderr),
         "redirect_open_line_stdout" => scenario_open_line(Stream::Stdout),
-        "redirect_relay_thread_ended" => scenario_relay_thread_ended(),
+        "redirect_relay_thread_ended_stderr" => scenario_relay_thread_ended(Stream::Stderr),
+        "redirect_relay_thread_ended_stdout" => scenario_relay_thread_ended(Stream::Stdout),
         "redirect_slow_stderr_relay" => scenario_slow_relay("hole::stderr_relay"),
         "redirect_slow_stdout_relay" => scenario_slow_relay("hole::stdout_relay"),
         "redirect_no_loop" => scenario_no_loop(),
@@ -408,11 +409,11 @@ fn scenario_open_line(stream: Stream) {
     write_result(&result);
 }
 
-/// The stderr relay thread ends, by a panic in a tracing writer, while a drain request is registered, with the
+/// The relay thread of `ended` ends, by a panic in a tracing writer, while a drain request is registered, with the
 /// production panic hook installed over a previous hook that records the threads it runs on. The result lists what the
 /// hook and each drain branch did once the thread has been joined; nothing here blocks, so a branch that is wrong shows
 /// as a different line, not as a hang.
-fn scenario_relay_thread_ended() {
+fn scenario_relay_thread_ended(ended: Stream) {
     struct PanicWriter;
     impl Write for PanicWriter {
         fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
@@ -423,18 +424,20 @@ fn scenario_relay_thread_ended() {
         }
     }
 
-    /// The stderr relay's events go to a writer that panics, the panic hook's records to `records`, the rest nowhere.
-    struct PanicOnStderrRelay {
+    /// The events of the relay with `target` go to a writer that panics, the panic hook's records to `records`, the
+    /// rest nowhere.
+    struct PanicOnRelay {
+        target: &'static str,
         records: VecWriter,
     }
-    impl<'a> MakeWriter<'a> for PanicOnStderrRelay {
+    impl<'a> MakeWriter<'a> for PanicOnRelay {
         type Writer = Box<dyn Write>;
         fn make_writer(&'a self) -> Self::Writer {
             Box::new(std::io::sink())
         }
         fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
             match meta.target() {
-                "hole::stderr_relay" => Box::new(PanicWriter),
+                target if target == self.target => Box::new(PanicWriter),
                 "hole::panic" => Box::new(self.records.clone()),
                 _ => Box::new(std::io::sink()),
             }
@@ -460,32 +463,58 @@ fn scenario_relay_thread_ended() {
     let records = VecWriter::new();
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
-            .with_writer(PanicOnStderrRelay {
+            .with_writer(PanicOnRelay {
+                target: match ended {
+                    Stream::Stderr => "hole::stderr_relay",
+                    Stream::Stdout => "hole::stdout_relay",
+                },
                 records: records.clone(),
             })
             .with_ansi(false),
     );
     tracing::subscriber::set_global_default(subscriber).expect("set_global_default in child");
 
-    let stdout_tee = VecWriter::new();
+    let (stderr_tee, stdout_tee) = (VecWriter::new(), VecWriter::new());
     let mut relays = crate::logging::redirect_stdio_to_tracing_with_writers_for_tests(
-        Box::new(VecWriter::new()),
+        Box::new(stderr_tee.clone()),
         Box::new(stdout_tee.clone()),
     )
     .expect("redirect with custom writers");
+    fn relay(relays: &mut StdioRelayHandles, ended: Stream) -> &mut crate::logging::Relay {
+        match ended {
+            Stream::Stderr => relays.stderr.as_mut().expect("the stderr relay"),
+            Stream::Stdout => relays.stdout.as_mut().expect("the stdout relay"),
+        }
+    }
 
     // A request registered while the thread is alive: the thread ends before it answers.
-    let stderr = relays.stderr.as_mut().expect("the stderr relay");
-    let (_nonce, answered) = stderr.drain.request().expect("the stderr relay thread is alive");
+    let (_nonce, answered) = relay(&mut relays, ended)
+        .drain
+        .request()
+        .expect("the relay thread is alive");
 
+    // The other stream keeps its relay: its lines must all reach its tee.
     for i in 0..5 {
-        let _ = writeln!(std::io::stdout(), "other-line-{i}");
+        match ended {
+            Stream::Stderr => writeln!(std::io::stdout(), "other-line-{i}"),
+            Stream::Stdout => writeln!(std::io::stderr(), "other-line-{i}"),
+        }
+        .expect("a line to the other stream");
     }
-    let _ = writeln!(std::io::stderr(), "boom");
+    match ended {
+        Stream::Stderr => writeln!(std::io::stderr(), "boom"),
+        Stream::Stdout => writeln!(std::io::stdout(), "boom"),
+    }
+    .expect("the line that ends the relay thread");
 
     // The thread has ended once it is joined: after this the drain's state does not change.
-    let ended = std::mem::replace(&mut stderr._thread, std::thread::spawn(|| {}));
-    ended.join().expect("the relay thread catches the panic");
+    let thread = std::mem::replace(&mut relay(&mut relays, ended)._thread, std::thread::spawn(|| {}));
+    thread.join().expect("the relay thread catches the panic");
+
+    // Rust's stdout holds a line that is not complete; `flush` writes it into the pipe that nobody reads any more.
+    if let Stream::Stdout = ended {
+        write!(std::io::stdout(), "a line that is not complete").expect("buffered");
+    }
 
     // The same hook on a thread that is not a relay: the previous hook must run there, or the check above proves nothing.
     std::thread::Builder::new()
@@ -499,7 +528,7 @@ fn scenario_relay_thread_ended() {
     observed.push(format!("registered request: {:?}", answered.try_recv()));
     observed.push(format!(
         "new request: {}",
-        relays.stderr.as_ref().unwrap().drain.request().is_some()
+        relay(&mut relays, ended).drain.request().is_some()
     ));
     let mut errors = Vec::new();
     relays.flush(|e| errors.push(e.to_string()));
@@ -512,9 +541,13 @@ fn scenario_relay_thread_ended() {
         .map(|(_, rest)| rest.split(" location=").next().unwrap_or(rest))
         .collect();
     observed.push(format!("panic records: {messages:?}"));
+    let other_tee = match ended {
+        Stream::Stderr => &stdout_tee,
+        Stream::Stdout => &stderr_tee,
+    };
     write_result(&ChildResult {
         observed,
-        tee_stdout: String::from_utf8_lossy(&stdout_tee.snapshot()).into_owned(),
+        tee_stdout: String::from_utf8_lossy(&other_tee.snapshot()).into_owned(),
         ..ChildResult::default()
     });
 }

@@ -241,31 +241,40 @@ fn redirect_delivers_an_open_line_at_a_drain(#[fixture(temp_dir)] dir: &Path) {
     }
 }
 
-/// The drain after a relay thread has ended, which only a panic in a tracing writer, the redaction writer or a
-/// formatter brings about. After the join: a request registered earlier is released, a new request finds the drain
-/// ended, `flush` reports that later output to the stream was lost, and the other stream's lines all reached their
-/// tee. The production panic hook, installed over a recording previous hook, still logs the panic but does not chain
-/// to that hook on the relay thread, which would write the panic into the pipe the thread alone reads; on any other
-/// thread it chains.
+/// The drain after a relay thread has ended, on each stream, which only a panic in a tracing writer, the redaction
+/// writer or a formatter brings about. After the join: a request registered earlier is released, a new request finds
+/// the drain ended, `flush` reports once that later output to the stream was lost (though Rust's stdout also holds an
+/// unfinished line that can no longer be written), and the other stream's lines all reached their tee. The production
+/// panic hook, installed over a recording previous hook, still logs the panic but does not chain to that hook on the
+/// relay thread, which would write the panic into the pipe the thread alone reads; on any other thread it chains.
 ///
 /// Not reached: a drain that registers after the thread dropped the pipe's read end and before it called `end`, where a
 /// broken pipe becomes the same error and the request is cancelled. That window is a few instructions wide, and no test
 /// reaches it without a hook.
 #[skuld::test]
 fn drain_after_the_relay_thread_ended_releases_and_completes(#[fixture(temp_dir)] dir: &Path) {
-    let result = run_child("redirect_relay_thread_ended", dir);
-    assert_eq!(
-        result.observed,
-        [
-            "registered request: Err(Disconnected)",
-            "new request: false",
-            "flush errors: [\"the stderr relay thread has ended; later output to stderr was lost\"]",
-            "previous hook ran on: [\"not-a-relay\"]",
-            "panic records: [\"a tracing writer panics on the relay thread\", \"a panic off the relay thread\"]"
-        ]
-    );
-    let expected: Vec<String> = (0..5).map(|i| format!("other-line-{i}")).collect();
-    assert_eq!(result.tee_stdout.lines().collect::<Vec<_>>(), expected);
+    for ended in ["stderr", "stdout"] {
+        let result = run_child(&format!("redirect_relay_thread_ended_{ended}"), dir);
+        assert_eq!(
+            result.observed,
+            [
+                "registered request: Err(Disconnected)".to_string(),
+                "new request: false".to_string(),
+                format!("flush errors: [\"the {ended} relay thread has ended; later output to {ended} was lost\"]"),
+                "previous hook ran on: [\"not-a-relay\"]".to_string(),
+                "panic records: [\"a tracing writer panics on the relay thread\", \"a panic off the relay thread\"]"
+                    .to_string(),
+            ],
+            "{ended} relay ended"
+        );
+        // `tee_stdout` holds the tee of the stream that kept its relay.
+        let expected: Vec<String> = (0..5).map(|i| format!("other-line-{i}")).collect();
+        assert_eq!(
+            result.tee_stdout.lines().collect::<Vec<_>>(),
+            expected,
+            "{ended} relay ended"
+        );
+    }
 }
 
 /// `flush` waits for relays that are behind: every line written to either stream before it has gone through that
@@ -969,6 +978,7 @@ fn a_stdout_buffer_flush_failure_is_a_loss_unless_it_is_reported_elsewhere() {
     // (redirected, the relay's own flush failed, the error's kind, is a loss)
     let table = [
         (true, true, BrokenPipe, false),
+        (true, true, StorageFull, true),
         (true, false, BrokenPipe, true),
         (true, false, StorageFull, true),
         (false, false, BrokenPipe, false),
