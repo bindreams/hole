@@ -21,10 +21,10 @@ fails to one that leaks.
 | **Proxy**, by a rule or because no rule matches       | Relayed through the tunnel if the connection to the server can carry UDP. Dropped if it cannot                 |
 
 Only the last drop is the UDP rule. The others are a **Block** rule doing what it says, a **Bypass** flow that has no
-usable route, and a datagram to a multicast group or to the link. Windows sends its LLMNR, mDNS and NetBIOS name lookups
-there, and no server can deliver them, so Hole drops them without a log entry. The {term}`bridge` logs the other drops, once per
-rule and destination for a stretch of time rather than per packet. The UDP rule's entry is a warning that names the plugin
-that cannot carry the flow.
+usable route, and a datagram to a multicast group or to the link. The operating system sends its LLMNR, mDNS and
+NetBIOS name lookups there, and no server can deliver them, so Hole drops them without a log entry. The {term}`bridge`
+logs the other drops, once per rule and destination for a stretch of time rather than per packet. The UDP rule's entry
+is a warning that names the plugin that cannot carry the flow.
 
 ## Who can carry UDP
 

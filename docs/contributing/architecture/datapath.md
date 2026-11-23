@@ -73,9 +73,9 @@ failing UDP application by cascading to `InterfaceEndpoint`: the drop is the pro
 escape (a Bypass rule the user writes) is in [the how-it-works page](../../how-it-works/udp.md#what-stops-working).
 
 A datagram addressed to a multicast group, to `255.255.255.255` or to the TUN subnet's directed broadcast address (the
-LLMNR, mDNS and NetBIOS lookups Windows sends out of every adapter) is dropped by `Driver::handle_udp_packet` before any
-flow exists, whatever the filter says. It is addressed to the link, so a server has nobody to deliver it to, and a Bypass
-flow would put the lookup on the real network.
+LLMNR, mDNS and NetBIOS lookups the operating system sends out of every adapter) is dropped by
+`Driver::handle_udp_packet` before any flow exists, whatever the filter says. It is addressed to the link, so a server
+has nobody to deliver it to.
 
 Where `supports_udp` comes from for the proxy endpoint:
 

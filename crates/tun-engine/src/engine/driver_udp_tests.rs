@@ -7,6 +7,8 @@
 //! `sim::recording_router` — no real socket, proxy or bypass mechanism is
 //! involved.
 
+use std::io;
+
 use smoltcp::wire::{IpAddress, Ipv4Cidr, Ipv4Packet, Ipv6Packet, UdpPacket};
 
 use super::super::driver_sim_test_support::{start, v4, v6};
@@ -157,15 +159,18 @@ async fn an_ipv6_udp_datagram_round_trips() {
 
 // Datagrams addressed to the link =====================================================================================
 
-/// Windows sends LLMNR, mDNS and NetBIOS lookups out of the TUN as it does out
+/// The operating system sends LLMNR, mDNS and NetBIOS lookups out of the TUN as it does out
 /// of every adapter. Each is addressed to a group or to the link, which no
 /// proxy can deliver to, so none may become a flow. The datagrams that must
-/// still be carried sit next to the ones that must not, and the carried ones
-/// are the sign that the dispatch path ran. The harness's TUN is
+/// still be carried sit next to the ones that must not. The harness's TUN is
 /// `10.255.0.1/24`, so its directed broadcast is `10.255.0.255`.
+///
+/// The read error queued behind the datagrams ends the engine without cancelling
+/// any task, and the receiver closes when the last router clone is dropped, so
+/// draining it to the end sees every flow the engine opened.
 #[skuld::test]
 async fn datagrams_addressed_to_a_group_or_to_the_link_open_no_flow() {
-    let mut h = start(|_| {});
+    let h = start(|_| {});
     let src4 = v4("10.255.0.2", 51000);
     let src6 = v6("fd00::ff00:2", 51000);
 
@@ -188,21 +193,19 @@ async fn datagrams_addressed_to_a_group_or_to_the_link_open_no_flow() {
         v6("2001:db8::1", 443),
     ];
 
-    for dst in dropped {
+    for dst in dropped.into_iter().chain(carried) {
         let src = if dst.is_ipv4() { src4 } else { src6 };
         h.wire.inject(udp_packet(src, dst, b"x")).await;
     }
-    for dst in carried {
-        let src = if dst.is_ipv4() { src4 } else { src6 };
-        h.wire.inject(udp_packet(src, dst, b"x")).await;
-    }
+    h.wire.fail_next_read(io::ErrorKind::Other);
 
+    let mut rx = h.join().await;
     let mut dispatched = Vec::new();
-    for _ in carried {
-        let Dispatch::Udp { meta, .. } = h.dispatch.recv().await.expect("router never dispatched") else {
-            panic!("expected a UDP dispatch");
-        };
-        dispatched.push(meta.dst);
+    while let Some(dispatch) = rx.recv().await {
+        // Dropping the `Dispatch` releases the router task that sent it.
+        if let Dispatch::Udp { meta, .. } = dispatch {
+            dispatched.push(meta.dst);
+        }
     }
     dispatched.sort();
     let mut expected = carried.to_vec();
@@ -210,13 +213,6 @@ async fn datagrams_addressed_to_a_group_or_to_the_link_open_no_flow() {
     assert_eq!(
         dispatched, expected,
         "the flows opened are not exactly the unicast ones"
-    );
-
-    // Joining the cancelled engine is what orders this negative (see `Harness::shutdown`).
-    let mut rest = h.shutdown().await;
-    assert!(
-        rest.recv().await.is_none(),
-        "a datagram to the link opened a further flow"
     );
 }
 
