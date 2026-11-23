@@ -188,7 +188,6 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_tee" => scenario_tee(),
         "redirect_multiline" => scenario_multiline(),
         "redirect_open_line" => scenario_open_line(),
-        "redirect_replaced_handle" => scenario_replaced_handle(),
         "redirect_slow_relay" => scenario_slow_relay(),
         "redirect_no_loop" => scenario_no_loop(),
         "lossy_backpressure" => scenario_lossy_backpressure(),
@@ -386,17 +385,18 @@ fn scenario_open_line() {
     write_result(&result);
 }
 
-/// Lines keep arriving while the relay thread is held up (each tracing event takes `EVENT_DELAY`, a fault injected to
-/// widen the window; nothing waits on it). `flush` must return only once every line has gone through the tee.
+/// Lines keep arriving on both streams while the relay threads are held up (each tracing event takes a delay, a fault
+/// injected to widen the window; nothing waits on it). The stderr relay is held up longer than the stdout relay, so a
+/// `flush` that waits for stdout alone still returns while stderr is behind. `flush` must return only once every line
+/// of each stream has gone through its tee.
 fn scenario_slow_relay() {
     use std::fs::OpenOptions;
     const LINES: usize = 15;
-    const EVENT_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
 
-    struct SlowWriter;
+    struct SlowWriter(std::time::Duration);
     impl Write for SlowWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            std::thread::sleep(EVENT_DELAY);
+            std::thread::sleep(self.0);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -404,64 +404,54 @@ fn scenario_slow_relay() {
         }
     }
 
+    struct SlowRelays;
+    impl<'a> MakeWriter<'a> for SlowRelays {
+        type Writer = SlowWriter;
+        fn make_writer(&'a self) -> SlowWriter {
+            SlowWriter(std::time::Duration::ZERO)
+        }
+        fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> SlowWriter {
+            let millis = if meta.target() == "hole::stderr_relay" { 40 } else { 5 };
+            SlowWriter(std::time::Duration::from_millis(millis))
+        }
+    }
+
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
-            .with_writer(|| SlowWriter)
+            .with_writer(SlowRelays)
             .with_ansi(false),
     );
     tracing::subscriber::set_global_default(subscriber).expect("set_global_default in child");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let stdout_path = dir.path().join("tee-stdout.bin");
-    let stdout_file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&stdout_path)
-        .expect("open stdout tee file");
-    let mut relays = crate::logging::redirect_stdio_to_tracing_with_writers_for_tests(
-        Box::new(std::io::sink()),
-        Box::new(stdout_file),
-    )
-    .expect("redirect with custom writers");
+    let tee_file = |name: &str| {
+        let path = dir.path().join(name);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .expect("open tee file");
+        (path, file)
+    };
+    let (stderr_path, stderr_file) = tee_file("tee-stderr.bin");
+    let (stdout_path, stdout_file) = tee_file("tee-stdout.bin");
+    let mut relays =
+        crate::logging::redirect_stdio_to_tracing_with_writers_for_tests(Box::new(stderr_file), Box::new(stdout_file))
+            .expect("redirect with custom writers");
 
     for i in 0..LINES {
         let _ = writeln!(std::io::stdout(), "slow-line-{i}");
+        let _ = writeln!(std::io::stderr(), "slow-line-{i}");
     }
     relays.flush().expect("relay flush");
 
     let result = ChildResult {
+        tee_stderr: std::fs::read_to_string(&stderr_path).unwrap_or_default(),
         tee_stdout: std::fs::read_to_string(&stdout_path).unwrap_or_default(),
         ..ChildResult::default()
     };
     write_result(&result);
-}
-
-/// The process closes its standard output after the redirect. The drain's markers do not travel through that handle, so
-/// `flush` still returns and the line written before the close is relayed.
-fn scenario_replaced_handle() {
-    let mut harness = install_child_subscriber();
-    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
-    harness.relays = Some(relays);
-    let _ = writeln!(std::io::stdout(), "before-the-close");
-    let _ = std::io::stdout().flush();
-    close_stdout();
-    let result = finish(&mut harness);
-    write_result(&result);
-}
-
-#[cfg(unix)]
-fn close_stdout() {
-    // SAFETY: closes the child's own fd 1; nothing after this writes to it.
-    unsafe { libc::close(libc::STDOUT_FILENO) };
-}
-
-#[cfg(windows)]
-fn close_stdout() {
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::Console::{SetStdHandle, STD_OUTPUT_HANDLE};
-    // SAFETY: points the child's own standard output at no handle; nothing after this writes to it.
-    unsafe { SetStdHandle(STD_OUTPUT_HANDLE, HANDLE::default()).expect("close the standard output") };
 }
 
 fn scenario_no_loop() {

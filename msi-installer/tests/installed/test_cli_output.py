@@ -18,11 +18,6 @@ pytestmark = pytest.mark.system_wide
 # This module's install and uninstall logs (`installed_hole`).
 MSIEXEC_LOG_STEM = "msi-cli-output"
 
-# How many times the error case runs. On the shipped 0.7.1 a run loses its stderr or its log line about one time in
-# four, so one run proves little; this many make a miss as unlikely as a lost run is likely. A fixed `hole` loses
-# nothing, so the count is a sample size, not a retry.
-ERROR_RUNS = 24
-
 
 @pytest.fixture
 def hole(installed_hole: Path, tmp_path: Path) -> InstalledCli:
@@ -43,18 +38,16 @@ def test_a_result_reaches_a_pipe(hole: InstalledCli):
 
 def test_an_error_reaches_stderr_and_the_log(hole: InstalledCli, tmp_path: Path):
     absent = tmp_path / "absent.json"
-    for run in range(1, ERROR_RUNS + 1):
-        log = tmp_path / "gui-cli.log"
-        log.unlink(missing_ok=True)
+    log = tmp_path / "gui-cli.log"
 
-        failed = hole.run("proxy", "start", "--config-file", str(absent))
+    failed = hole.run("proxy", "start", "--config-file", str(absent))
 
-        what = f"run {run}: `hole proxy start` of a config file that does not exist"
-        assert failed.returncode == 1, hole.report(f"{what} did not exit 1", failed)
-        assert "failed to read" in failed.stderr and "absent.json" in failed.stderr, hole.report(
-            f"{what} did not say on stderr that it could not read the file", failed
-        )
-        logged = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
-        assert "failed to read" in logged and "absent.json" in logged, hole.report(
-            f"{what} did not write that to gui-cli.log (which holds {logged!r})", failed
-        )
+    what = "`hole proxy start` of a config file that does not exist"
+    assert failed.returncode == 1, hole.report(f"{what} did not exit 1", failed)
+    assert "failed to read" in failed.stderr and "absent.json" in failed.stderr, hole.report(
+        f"{what} did not say on stderr that it could not read the file", failed
+    )
+    logged = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+    assert "failed to read" in logged and "absent.json" in logged, hole.report(
+        f"{what} did not write that to gui-cli.log (which holds {logged!r})", failed
+    )

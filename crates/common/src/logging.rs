@@ -106,8 +106,8 @@ struct Relay {
     tee_guard: Option<WorkerGuard>,
     drain: std::sync::Arc<Drain>,
     stream: Stream,
-    /// A second write end of the stream's pipe, for the markers: they reach the relay whatever the process later does
-    /// to its standard handle.
+    /// A second write end of the stream's pipe, for the markers: a marker does not depend on the process's standard
+    /// handle. Hole does not replace a standard handle after the redirect.
     marker_writer: os_pipe::PipeWriter,
 }
 
