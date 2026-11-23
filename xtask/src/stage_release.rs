@@ -8,6 +8,7 @@
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -362,16 +363,17 @@ pub fn list(tag: &str) -> Result<()> {
 /// The installer a lane stages: the single `.dmg` in the release bundle dir / the release MSI, the build this
 /// checkout's update archive and payload probe are taken from.
 ///
-/// `MSI_UNDER_TEST` / `DMG_UNDER_TEST` may be set (a relative path is from the repo root) but only to that same
-/// file: staging another installer next to this build's archive would ship two builds as one release.
-fn resolve_installer(lane: Lane, repo_root: &Path) -> Result<PathBuf> {
+/// `installer_override` is the value of the lane's `MSI_UNDER_TEST` / `DMG_UNDER_TEST`, if set (empty counts as
+/// unset; a relative path is from the repo root). It may name only that same file: staging another installer next
+/// to this build's archive would ship two builds as one release.
+fn resolve_installer(lane: Lane, repo_root: &Path, installer_override: Option<OsString>) -> Result<PathBuf> {
     let release = repo_root.join("target").join("release");
     let (env_var, built) = match lane {
         Lane::Msi => (MSI_ENV, release.join("hole.msi")),
         Lane::Dmg => (DMG_ENV, single_dmg(&release.join("bundle").join("dmg"))?),
         Lane::Plugins => bail!("the plugins lane stages no installer"),
     };
-    if let Some(given) = std::env::var_os(env_var).filter(|p| !p.is_empty()) {
+    if let Some(given) = installer_override.filter(|p| !p.is_empty()) {
         check_installer_override(env_var, &repo_root.join(given), &built)?;
     }
     Ok(built)
@@ -555,8 +557,13 @@ pub fn stage(repo_root: &Path, tag: &str, lane: Lane, out: &Path) -> Result<()> 
     let (group, version) = parse_release_tag(tag)?;
     let platform = Platform::host().context("unknown host platform")?;
     let version = version.to_string();
+    let installer_override = match lane {
+        Lane::Msi => std::env::var_os(MSI_ENV),
+        Lane::Dmg => std::env::var_os(DMG_ENV),
+        Lane::Plugins => None,
+    };
     let shipment = plan(group, lane, &version, platform, repo_root, || {
-        resolve_installer(lane, repo_root)
+        resolve_installer(lane, repo_root, installer_override)
     })?;
     if shipment.files.is_empty() {
         println!("xtask: {group} ships nothing from the {lane:?} lane on {platform}");

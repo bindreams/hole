@@ -1,4 +1,4 @@
-use skuld::env;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use xtask_lib::version::Group;
@@ -525,47 +525,47 @@ fn repo_with_msi() -> (tempfile::TempDir, PathBuf) {
 }
 
 #[skuld::test]
-fn a_relative_installer_override_is_from_the_repo_root(#[fixture] env: &skuld::EnvGuard) {
+fn a_relative_installer_override_is_from_the_repo_root() {
     let (repo, msi) = repo_with_msi();
     std::fs::write(repo.path().join("target/release/other.msi"), b"other").unwrap();
 
-    env.set("MSI_UNDER_TEST", "target/release/hole.msi");
-    assert_eq!(resolve_installer(Lane::Msi, repo.path()).unwrap(), msi);
+    let given = Some(OsString::from("target/release/hole.msi"));
+    assert_eq!(resolve_installer(Lane::Msi, repo.path(), given).unwrap(), msi);
 
-    env.set("MSI_UNDER_TEST", "target/release/other.msi");
-    let err = resolve_installer(Lane::Msi, repo.path()).unwrap_err();
+    let given = Some(OsString::from("target/release/other.msi"));
+    let err = resolve_installer(Lane::Msi, repo.path(), given).unwrap_err();
     assert!(err.to_string().contains("MSI_UNDER_TEST"), "{err}");
 }
 
 #[skuld::test]
-fn an_empty_installer_override_is_unset(#[fixture] env: &skuld::EnvGuard) {
+fn an_empty_installer_override_is_unset() {
     let (repo, msi) = repo_with_msi();
-    env.set("MSI_UNDER_TEST", "");
-    assert_eq!(resolve_installer(Lane::Msi, repo.path()).unwrap(), msi);
-    env.remove("MSI_UNDER_TEST");
-    assert_eq!(resolve_installer(Lane::Msi, repo.path()).unwrap(), msi);
+    assert_eq!(
+        resolve_installer(Lane::Msi, repo.path(), Some(OsString::new())).unwrap(),
+        msi
+    );
+    assert_eq!(resolve_installer(Lane::Msi, repo.path(), None).unwrap(), msi);
 }
 
 #[skuld::test]
-fn the_dmg_lane_resolves_the_one_built_dmg_and_checks_its_override(#[fixture] env: &skuld::EnvGuard) {
+fn the_dmg_lane_resolves_the_one_built_dmg_and_checks_its_override() {
     let repo = tempfile::tempdir().unwrap();
     let dmg_dir = repo.path().join("target/release/bundle/dmg");
     std::fs::create_dir_all(&dmg_dir).unwrap();
     let dmg = dmg_dir.join("Hole_1.2.3_aarch64.dmg");
     std::fs::write(&dmg, b"built").unwrap();
 
-    env.remove("DMG_UNDER_TEST");
-    assert_eq!(resolve_installer(Lane::Dmg, repo.path()).unwrap(), dmg);
-    env.set("DMG_UNDER_TEST", "target/release/bundle/dmg/Hole_1.2.3_aarch64.dmg");
-    assert_eq!(resolve_installer(Lane::Dmg, repo.path()).unwrap(), dmg);
-    env.set("DMG_UNDER_TEST", "target/release/bundle/dmg/missing.dmg");
-    assert!(resolve_installer(Lane::Dmg, repo.path()).is_err());
+    assert_eq!(resolve_installer(Lane::Dmg, repo.path(), None).unwrap(), dmg);
+    let given = Some(OsString::from("target/release/bundle/dmg/Hole_1.2.3_aarch64.dmg"));
+    assert_eq!(resolve_installer(Lane::Dmg, repo.path(), given).unwrap(), dmg);
+    let given = Some(OsString::from("target/release/bundle/dmg/missing.dmg"));
+    assert!(resolve_installer(Lane::Dmg, repo.path(), given).is_err());
 }
 
 #[skuld::test]
 fn the_plugins_lane_has_no_installer() {
     let (repo, _) = repo_with_msi();
-    assert!(resolve_installer(Lane::Plugins, repo.path()).is_err());
+    assert!(resolve_installer(Lane::Plugins, repo.path(), None).is_err());
 }
 
 #[skuld::test]
