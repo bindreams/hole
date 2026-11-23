@@ -43,6 +43,10 @@ must reach the disk, at the price that a stalled disk blocks the threads that lo
 emits an event, the panic hook's included, waits with no limit until the disk drains. The stderr writer and the two stdio tees are lossy, so a wedged terminal can never block the
 bridge or the panic hook.
 
+That describes the bridge and the GUI. A one-shot command writes synchronously (see [the stdio safety
+net](#the-stdio-safety-net)): nothing is lossy, and a stalled disk or terminal holds the thread that writes until it
+drains.
+
 ## Turning the volume up
 
 Each sink builds its own filter: a global default of `info`, then `RUST_LOG`, then the sink's directives, then a pin of
@@ -73,12 +77,19 @@ would write each line twice. The net catches whatever bypasses `tracing`: the Go
 default panic printer. A panic hook emits an error event with a backtrace under `hole::panic` and then calls the previous
 hook.
 
-The relay and the writers are asynchronous, so whatever ends the process before they finish loses the last lines.
-Dropping the `LogGuard` waits for them: it writes a marker line to each redirected stream, blocks until that stream's
-reader thread has read it, and then flushes the tees and the writers. `process::exit` skips destructors, so `dispatch`
-drops the CLI's guard before it exits; a command's output, its errors and its `gui-cli.log` lines are delivered before
-the process ends. The wait has no limit, like the file writer's: a stalled disk that blocks the relay thread holds the
-exit too. The GUI leaves through the event loop's own `process::exit` and does not drain.
+Which writers a process gets depends on its kind (`ProcessKind`, passed to `init`). A one-shot command writes
+synchronously: its relay thread writes each line to the original handle itself, and the stderr and file layers write
+through a mutex. Nothing is lossy and no timer runs at exit, so a command's output, its errors and its `gui-cli.log`
+lines are delivered by the time its guard has dropped; a caller that reads late holds the command, as it holds any program.
+The bridge and the GUI keep non-blocking writers, so that a wedged terminal cannot block them. What that costs at exit:
+the guards of those writers wait for their worker for at most a second (the bound is inside `tracing-appender`), so a
+reader that stalls past it loses the lines still queued.
+
+Whatever ends the process before the relay threads have caught up loses the last lines. Dropping the `LogGuard` waits for
+them: it writes a marker line, carrying a random nonce, to each redirected stream, and blocks until that stream's reader
+thread has read it. `process::exit` skips destructors, so `dispatch` drops the CLI's guard before it exits. The wait has
+no limit, like the file writer's: a stalled disk that blocks the relay thread holds the exit too. The GUI leaves through
+the event loop's own `process::exit` and does not drain.
 
 The most visible case is WebView2 on Windows, which writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
 straight to the inherited stderr. They land in `gui.log` through the relay. **A Chromium line is a real log record:
