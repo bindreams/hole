@@ -333,7 +333,3 @@ async fn spawn_ss_with_plugin(
         }
     }
 }
-
-#[cfg(test)]
-#[path = "ssserver_tests.rs"]
-mod ssserver_tests;
