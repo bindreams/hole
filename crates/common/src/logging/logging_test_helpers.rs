@@ -188,7 +188,8 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_tee" => scenario_tee(),
         "redirect_multiline" => scenario_multiline(),
         "redirect_open_line" => scenario_open_line(),
-        "redirect_slow_relay" => scenario_slow_relay(),
+        "redirect_slow_stderr_relay" => scenario_slow_relay("hole::stderr_relay"),
+        "redirect_slow_stdout_relay" => scenario_slow_relay("hole::stdout_relay"),
         "redirect_no_loop" => scenario_no_loop(),
         "lossy_backpressure" => scenario_lossy_backpressure(),
         "echo_stderr" => scenario_echo_stderr(),
@@ -386,10 +387,10 @@ fn scenario_open_line() {
 }
 
 /// Lines keep arriving on both streams while the relay threads are held up (each tracing event takes a delay, a fault
-/// injected to widen the window; nothing waits on it). The stderr relay is held up longer than the stdout relay, so a
-/// `flush` that waits for stdout alone still returns while stderr is behind. `flush` must return only once every line
-/// of each stream has gone through its tee.
-fn scenario_slow_relay() {
+/// injected to widen the window; nothing waits on it). The relay of `slow_target` is held up longer than the other, so a
+/// `flush` that waits for the other stream alone still returns while this one is behind. `flush` must return only once
+/// every line of each stream has gone through its tee.
+fn scenario_slow_relay(slow_target: &'static str) {
     use std::fs::OpenOptions;
     const LINES: usize = 15;
 
@@ -404,21 +405,21 @@ fn scenario_slow_relay() {
         }
     }
 
-    struct SlowRelays;
+    struct SlowRelays(&'static str);
     impl<'a> MakeWriter<'a> for SlowRelays {
         type Writer = SlowWriter;
         fn make_writer(&'a self) -> SlowWriter {
             SlowWriter(std::time::Duration::ZERO)
         }
         fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> SlowWriter {
-            let millis = if meta.target() == "hole::stderr_relay" { 40 } else { 5 };
+            let millis = if meta.target() == self.0 { 40 } else { 5 };
             SlowWriter(std::time::Duration::from_millis(millis))
         }
     }
 
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
-            .with_writer(SlowRelays)
+            .with_writer(SlowRelays(slow_target))
             .with_ansi(false),
     );
     tracing::subscriber::set_global_default(subscriber).expect("set_global_default in child");

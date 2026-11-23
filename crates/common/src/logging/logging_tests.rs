@@ -224,15 +224,28 @@ fn redirect_delivers_an_open_line_at_a_drain(#[fixture(temp_dir)] dir: &Path) {
 }
 
 /// `flush` waits for relays that are behind: every line written to either stream before it has gone through that
-/// stream's tee when it returns.
+/// stream's tee when it returns. Each stream is the slower one in turn, so a drain of one stream that is missing is
+/// not hidden by the time the other's takes.
 #[skuld::test]
 fn redirect_flush_waits_for_a_slow_relay(#[fixture(temp_dir)] dir: &Path) {
-    let result = run_child("redirect_slow_relay", dir);
     let expected: Vec<String> = (0..15).map(|i| format!("slow-line-{i}")).collect();
-    let stdout: Vec<&str> = result.tee_stdout.lines().collect();
-    let stderr: Vec<&str> = result.tee_stderr.lines().collect();
-    assert_eq!(stdout, expected, "the stdout tee holds {} of 15 lines", stdout.len());
-    assert_eq!(stderr, expected, "the stderr tee holds {} of 15 lines", stderr.len());
+    for slow in ["redirect_slow_stderr_relay", "redirect_slow_stdout_relay"] {
+        let result = run_child(slow, dir);
+        let stdout: Vec<&str> = result.tee_stdout.lines().collect();
+        let stderr: Vec<&str> = result.tee_stderr.lines().collect();
+        assert_eq!(
+            stdout,
+            expected,
+            "{slow}: the stdout tee holds {} of 15 lines",
+            stdout.len()
+        );
+        assert_eq!(
+            stderr,
+            expected,
+            "{slow}: the stderr tee holds {} of 15 lines",
+            stderr.len()
+        );
+    }
 }
 
 #[skuld::test]
