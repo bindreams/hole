@@ -15,5 +15,12 @@ use std::path::Path;
 /// and its log dir back to the user; `None` off-macOS / for the unprivileged GUI.
 pub fn init(log_dir: &Path, owner: Option<(u32, u32)>) -> LogGuard {
     let (file, stderr) = hole_common::logging::resolve_sink_directives("hole_bridge=info", Some("HOLE_BRIDGE_LOG"));
-    hole_common::logging::init_dual(log_dir, "bridge", "bridge.log", &file, &stderr, owner)
+    hole_common::logging::init_dual(
+        log_dir,
+        hole_common::logging::ProcessKind::Bridge,
+        "bridge.log",
+        &file,
+        &stderr,
+        owner,
+    )
 }

@@ -19,11 +19,12 @@ use util::dir::Dir;
 
 /// Exact type of [`crate::logging::init`]. A regression to a different arity
 /// (e.g. dropping `kind` or the trailing `owner`) fails the assertion below.
-type InitFn = fn(&std::path::Path, &'static str, &str, &str, Option<(u32, u32)>) -> crate::logging::LogGuard;
+type InitFn =
+    fn(&std::path::Path, crate::logging::ProcessKind, &str, &str, Option<(u32, u32)>) -> crate::logging::LogGuard;
 
 #[skuld::test]
 fn init_signature_takes_kind() {
-    // Compile-time guard: init's signature includes a &'static str kind
+    // Compile-time guard: init's signature includes a process kind
     // between log_dir and log_filename, and a trailing owner. A regression to
     // the old form fails to compile here.
     let _f: InitFn = crate::logging::init;
@@ -49,6 +50,11 @@ pub struct ChildResult {
     /// preserved CLI script visibility).
     pub tee_stderr: String,
     pub tee_stdout: String,
+    /// The thread of every write to each tee target (`redirect_tee_thread`).
+    pub tee_threads_stderr: Vec<String>,
+    pub tee_threads_stdout: Vec<String>,
+    /// What a scenario saw, one fact per line, in the order it saw them.
+    pub observed: Vec<String>,
 }
 
 // Parent-side helpers =================================================================================================
@@ -154,12 +160,9 @@ fn redirect_captures_subprocess_stdout_via_inheritance(#[fixture(temp_dir)] dir:
     );
 }
 
-/// Load-bearing test for the **tee-drain phase** of
-/// [`StdioRelayHandles::flush`](crate::logging::StdioRelayHandles).
-/// The relay's `tee.write_all(buf)` goes through a
-/// `tracing_appender::NonBlocking` worker whose drain is asynchronous;
-/// without `flush` dropping the `WorkerGuard`s, the tee target can be
-/// empty when the test reads it. Do not weaken the
+/// Load-bearing test for the tee of
+/// [`StdioRelayHandles::flush`](crate::logging::StdioRelayHandles): when `flush`
+/// returns, the saved-original tee target holds the bytes. Do not weaken the
 /// `tee_stderr`/`tee_stdout` assertions — they are the canonical
 /// regression gate for the flush contract.
 #[skuld::test]
@@ -207,20 +210,86 @@ fn redirect_handles_multiline(#[fixture(temp_dir)] dir: &Path) {
 }
 
 /// A drain that meets a line with no newline yet still delivers the text before the marker, and nothing of the marker.
+/// A complete line that looks like a marker is output too: no drain is waiting for its nonce. On each stream.
 #[skuld::test]
 fn redirect_delivers_an_open_line_at_a_drain(#[fixture(temp_dir)] dir: &Path) {
-    let result = run_child("redirect_open_line", dir);
-    let relayed: Vec<&str> = result
-        .events
-        .iter()
-        .filter(|e| e.target == "hole::stderr_relay")
-        .map(|e| e.message.as_str())
-        .collect();
+    for (scenario, target) in [
+        ("redirect_open_line_stderr", "hole::stderr_relay"),
+        ("redirect_open_line_stdout", "hole::stdout_relay"),
+    ] {
+        let result = run_child(scenario, dir);
+        let relayed: Vec<&str> = result
+            .events
+            .iter()
+            .filter(|e| e.target == target)
+            .map(|e| e.message.as_str())
+            .collect();
+        assert_eq!(
+            relayed,
+            [
+                "__hole_relay_flush__00000000000000000000000000000000",
+                "open-line__hole_relay_flush__abc"
+            ],
+            "{scenario}: relayed lines: {relayed:?}"
+        );
+        assert_eq!(
+            result.observed,
+            ["answered by the line: Err(Empty)"],
+            "{scenario}: a waiting drain request must not be answered by a line of the process's own"
+        );
+    }
+}
+
+/// A command's relay thread writes each line to the stream's original handle itself: a hand-off to another thread
+/// would leave the last lines to a timer at exit. The bridge and the GUI hand the line to a worker.
+#[skuld::test]
+fn redirect_writes_the_original_handle_on_the_thread_the_process_kind_decides(#[fixture(temp_dir)] dir: &Path) {
+    for (scenario, on_relay_thread) in [
+        ("redirect_tee_thread_command", true),
+        ("redirect_tee_thread_bridge", false),
+        ("redirect_tee_thread_gui", false),
+    ] {
+        let result = run_child(scenario, dir);
+        for (stream, threads) in [
+            (super::Stream::Stderr, &result.tee_threads_stderr),
+            (super::Stream::Stdout, &result.tee_threads_stdout),
+        ] {
+            let relay = stream.thread_name();
+            assert_eq!(
+                threads.len(),
+                1,
+                "{scenario}: one write to the {stream:?} handle: {threads:?}"
+            );
+            assert_eq!(
+                threads[0] == relay,
+                on_relay_thread,
+                "{scenario}: the {stream:?} handle was written on {:?}, the relay thread is {relay:?}",
+                threads[0]
+            );
+        }
+    }
+}
+
+/// The drain after a relay thread has ended, which only a panic in a tracing writer, the redaction writer or a
+/// formatter brings about. After the join: a request registered earlier is released, a new request finds the drain
+/// ended, `flush` returns without error, and the other stream's lines all reached their tee.
+///
+/// Not reached: a drain that registers after the thread dropped the pipe's read end and before it called `end`
+/// (`BrokenPipe` mapped to done, `cancel`). That window is a few instructions wide, and no test reaches it without a
+/// hook.
+#[skuld::test]
+fn drain_after_the_relay_thread_ended_releases_and_completes(#[fixture(temp_dir)] dir: &Path) {
+    let result = run_child("redirect_relay_thread_ended", dir);
     assert_eq!(
-        relayed,
-        ["open-line__hole_relay_flush__abc"],
-        "relayed lines: {relayed:?}"
+        result.observed,
+        [
+            "registered request: Err(Disconnected)",
+            "new request: false",
+            "flush errors: []"
+        ]
     );
+    let expected: Vec<String> = (0..5).map(|i| format!("other-line-{i}")).collect();
+    assert_eq!(result.tee_stdout.lines().collect::<Vec<_>>(), expected);
 }
 
 /// `flush` waits for relays that are behind: every line written to either stream before it has gone through that

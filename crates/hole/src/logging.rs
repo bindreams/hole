@@ -8,7 +8,14 @@ pub fn init(log_dir: &Path) -> LogGuard {
     // The GUI runs unprivileged, so `gui.log` is already user-owned: `owner` is
     // `None` (no chown).
     let (file, stderr) = hole_common::logging::resolve_sink_directives("hole=info", None);
-    hole_common::logging::init_dual(log_dir, "gui", "gui.log", &file, &stderr, None)
+    hole_common::logging::init_dual(
+        log_dir,
+        hole_common::logging::ProcessKind::Gui,
+        "gui.log",
+        &file,
+        &stderr,
+        None,
+    )
 }
 
 #[cfg(test)]

@@ -541,11 +541,17 @@ pub(crate) fn dispatch(command: Command) -> ! {
     };
     #[cfg(not(target_os = "macos"))]
     let cli_owner: Option<(u32, u32)> = None;
-    // `process::exit` skips destructors and ends the log guard's relay threads and writers mid-delivery, so the guard
-    // lives only inside this block: its drop delivers the command's output and log lines before the exit below.
+    // `process::exit` skips destructors: the guard is dropped at the end of this block so its drain runs first.
     let code = {
-        let _cli_log_guard = resolve_cli_log_dir(&command)
-            .map(|d| hole_common::logging::init(&d, "gui-cli", "gui-cli.log", "hole=info", cli_owner));
+        let _cli_log_guard = resolve_cli_log_dir(&command).map(|d| {
+            hole_common::logging::init(
+                &d,
+                hole_common::logging::ProcessKind::Command,
+                "gui-cli.log",
+                "hole=info",
+                cli_owner,
+            )
+        });
         match command {
             Command::Version => {
                 println!("hole {}", hole::version::VERSION);

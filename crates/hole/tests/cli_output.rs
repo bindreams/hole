@@ -1,8 +1,8 @@
 //! A `hole` command run with its output piped hands the caller its result on stdout and its error on stderr, and writes
 //! the error to `gui-cli.log`, before the process exits.
 //!
-//! The real `hole` executable runs, so the test crosses the same exit path a script does: `dispatch` ends in
-//! `process::exit`, with the log guard's stdio relay behind stdout and stderr.
+//! The real `hole` executable runs because `dispatch` ends in `process::exit`, with the log guard's stdio relay behind
+//! stdout and stderr.
 
 #![allow(clippy::disallowed_methods)] // attended test: runs the workspace's own `hole`
 
@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 
 hole_test_observability::register!();
 
-/// What `hole bridge status` prints, one line per state of the bridge service (`status_report`, `crates/hole/src/cli.rs`).
+/// What `hole bridge status` prints, one line per state of the bridge service (`status_report`).
 const STATUS_LINES: [&str; 5] = [
     "installed (running)",
     "installed (stopped)",

@@ -20,31 +20,128 @@
 //    target `hole::panic`, then chains the previous hook so the default printer
 //    still runs in dev mode.
 //
-// Non-blocking writers split into two categories:
-// - **Stderr + stdio-relay tees** keep `.lossy(true)` — a wedged terminal
-//   (Ctrl+S, pipe consumer hung) MUST NOT block the bridge or the panic
-//   hook.
-// - **File appender** is `.lossy(false)` — the teardown burst MUST land
-//   on disk for diagnostics. A wedged disk blocks every thread that logs,
-//   with no limit, once the writer's default `buffered_lines_limit` is full;
-//   the buffer only delays that.
+// How the writers deliver depends on the kind of process (`ProcessKind::delivery`):
+// - **A one-shot command** writes synchronously. The relay thread writes the original handle itself, and the stderr and
+//   file layers write through a mutex. Nothing is lossy and no timer runs at exit; a caller that reads late holds the
+//   command, as it holds any program.
+// - **The bridge and the GUI** write through non-blocking writers. The stderr and stdio-relay tees are `.lossy(true)`:
+//   a wedged terminal (Ctrl+S, pipe consumer hung) MUST NOT block the bridge or the panic hook. The file appender is
+//   `.lossy(false)`: the teardown burst MUST land on disk for diagnostics. A wedged disk blocks every thread that logs,
+//   with no limit, once the writer's default `buffered_lines_limit` is full; the buffer only delays that.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
+use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 use util::dir::Dir;
+use uuid::Uuid;
+
+// Process kinds and how their writers deliver =========================================================================
+
+/// The kind of process that initializes logging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessKind {
+    /// A one-shot `hole` command.
+    Command,
+    /// The privileged bridge.
+    Bridge,
+    /// The unprivileged GUI.
+    Gui,
+}
+
+impl ProcessKind {
+    /// The label of this kind's native-crash marker.
+    fn label(self) -> &'static str {
+        match self {
+            ProcessKind::Command => "gui-cli",
+            ProcessKind::Bridge => "bridge",
+            ProcessKind::Gui => "gui",
+        }
+    }
+
+    /// How this kind's writers deliver.
+    pub(crate) fn delivery(self) -> Delivery {
+        match self {
+            ProcessKind::Command => Delivery::Synchronous,
+            ProcessKind::Bridge => Delivery::NonBlocking,
+            ProcessKind::Gui => Delivery::NonBlocking,
+        }
+    }
+}
+
+/// How a writer gets its bytes to its target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// The thread that writes is the thread that delivers: when `write` returns, the target has the bytes.
+    Synchronous,
+    /// A worker thread delivers. `write` returns at once, and what is queued is written out when the writer's
+    /// `WorkerGuard` is dropped, which waits for the worker for a bounded time.
+    NonBlocking,
+}
+
+impl Delivery {
+    /// A writer onto `target`, behind the redaction wrap, and the guard to drop to write out what the writer has
+    /// queued (`None` for a synchronous writer, which queues nothing). `lossy` says whether a non-blocking writer
+    /// drops lines when its queue is full; a synchronous writer blocks instead.
+    fn sink(self, lossy: bool, target: Box<dyn Write + Send>) -> (Sink, Option<WorkerGuard>) {
+        let target = util::redact::RedactingWriter::new(target);
+        match self {
+            Delivery::Synchronous => (Sink::Synchronous(Arc::new(Mutex::new(Box::new(target)))), None),
+            Delivery::NonBlocking => {
+                let (writer, guard) = NonBlockingBuilder::default().lossy(lossy).finish(target);
+                (Sink::NonBlocking(writer), Some(guard))
+            }
+        }
+    }
+}
+
+/// A writer built by [`Delivery::sink`]: one handle for a tracing layer (it is a `MakeWriter`) or for a relay's tee.
+#[derive(Clone)]
+pub(crate) enum Sink {
+    Synchronous(Arc<Mutex<Box<dyn Write + Send>>>),
+    NonBlocking(NonBlocking),
+}
+
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Sink::Synchronous(target) => target.lock().unwrap_or_else(PoisonError::into_inner).write(buf),
+            Sink::NonBlocking(writer) => writer.write(buf),
+        }
+    }
+
+    /// One lock for the whole buffer, so a line from one thread is not split by another's.
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        match self {
+            Sink::Synchronous(target) => target.lock().unwrap_or_else(PoisonError::into_inner).write_all(buf),
+            Sink::NonBlocking(writer) => writer.write_all(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Sink::Synchronous(target) => target.lock().unwrap_or_else(PoisonError::into_inner).flush(),
+            Sink::NonBlocking(writer) => writer.flush(),
+        }
+    }
+}
+
+impl<'a> MakeWriter<'a> for Sink {
+    type Writer = Sink;
+
+    fn make_writer(&'a self) -> Sink {
+        self.clone()
+    }
+}
 
 // Draining the relays =================================================================================================
 //
-// A line written to stdout or stderr reaches the caller through a relay thread and a non-blocking tee, and
-// `process::exit` ends both without waiting. `LogGuard::drop` therefore drains: it writes a marker line into each
-// redirected stream's pipe, through a write end the relay keeps, and waits until the relay thread has read it. The
-// thread has then handed every earlier line to its tee and to the tracing layers; dropping the tee guard writes the
-// tee's queue out.
+// The protocol is described in docs/contributing/architecture/logging.md.
 
-/// The text that starts a drain marker line; the line is this and a request number.
+/// The text that starts a drain marker line; the line is this and the request's nonce.
 const DRAIN_MARKER: &str = "__hole_relay_flush__";
 
 /// What one relay thread shares with whoever waits for it to catch up.
@@ -57,9 +154,8 @@ struct Drain {
 struct DrainState {
     /// The relay thread has returned: nobody will be answered any more.
     ended: bool,
-    next_id: u64,
-    /// The requests the thread has not yet answered, by marker number.
-    waiting: Vec<(u64, std::sync::mpsc::SyncSender<()>)>,
+    /// The requests the thread has not yet answered, by nonce.
+    waiting: Vec<(Uuid, std::sync::mpsc::SyncSender<()>)>,
 }
 
 impl Drain {
@@ -68,27 +164,27 @@ impl Drain {
     }
 
     /// Register a request. `None` when the relay thread has ended: there is nothing left to wait for. Otherwise
-    /// the marker number and a receiver that returns once the thread answers or ends.
-    fn request(&self) -> Option<(u64, std::sync::mpsc::Receiver<()>)> {
+    /// the marker's nonce, random per request so that no other writer on the stream can guess it, and a receiver
+    /// that returns once the thread answers or ends.
+    fn request(&self) -> Option<(Uuid, std::sync::mpsc::Receiver<()>)> {
         let mut state = self.lock();
         if state.ended {
             return None;
         }
-        let id = state.next_id;
-        state.next_id += 1;
+        let nonce = Uuid::new_v4();
         let (answer, answered) = std::sync::mpsc::sync_channel(1);
-        state.waiting.push((id, answer));
-        Some((id, answered))
+        state.waiting.push((nonce, answer));
+        Some((nonce, answered))
     }
 
-    fn cancel(&self, id: u64) {
-        self.lock().waiting.retain(|(waiting, _)| *waiting != id);
+    fn cancel(&self, nonce: Uuid) {
+        self.lock().waiting.retain(|(waiting, _)| *waiting != nonce);
     }
 
-    /// Take request `id` out of the waiting list, if it is there.
-    fn take(&self, id: u64) -> Option<std::sync::mpsc::SyncSender<()>> {
+    /// Take the request with `nonce` out of the waiting list, if it is there.
+    fn take(&self, nonce: Uuid) -> Option<std::sync::mpsc::SyncSender<()>> {
         let mut state = self.lock();
-        let at = state.waiting.iter().position(|(waiting, _)| *waiting == id)?;
+        let at = state.waiting.iter().position(|(waiting, _)| *waiting == nonce)?;
         Some(state.waiting.swap_remove(at).1)
     }
 
@@ -100,7 +196,8 @@ impl Drain {
     }
 }
 
-/// One redirected stream: its relay thread, the guard of the lossy tee behind it, and the drain they share.
+/// One redirected stream: its relay thread, the guard of the tee behind it (a non-blocking tee has one), and the drain
+/// they share.
 struct Relay {
     _thread: JoinHandle<()>,
     tee_guard: Option<WorkerGuard>,
@@ -116,13 +213,14 @@ impl Relay {
         stream: Stream,
         read_end: os_pipe::PipeReader,
         marker_writer: os_pipe::PipeWriter,
-        tee: tracing_appender::non_blocking::NonBlocking,
-        tee_guard: WorkerGuard,
+        tee: Sink,
+        tee_guard: Option<WorkerGuard>,
     ) -> io::Result<Relay> {
         let drain = std::sync::Arc::new(Drain::default());
         let thread = std::thread::Builder::new().name(stream.thread_name().into()).spawn({
             let drain = std::sync::Arc::clone(&drain);
             move || {
+                // A panic in a tracing writer must not skip `end`: a drain would wait for a thread that is gone.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     relay_loop(read_end, tee, stream, &drain);
                 }));
@@ -131,15 +229,17 @@ impl Relay {
         })?;
         Ok(Relay {
             _thread: thread,
-            tee_guard: Some(tee_guard),
+            tee_guard,
             drain,
             stream,
             marker_writer,
         })
     }
 
-    /// Return once the relay thread has consumed everything this process wrote to the stream before the call, then
-    /// write out the tee's queue. Later writes to the tee are lost: the tee's worker is gone.
+    /// Return once the relay thread has consumed everything this process wrote to the stream before the call. A
+    /// non-blocking tee (the bridge and the GUI) is then written out by dropping its guard, which waits for the tee's
+    /// worker for at most a second; later writes to such a tee are lost. A synchronous tee (a command) has written
+    /// each line before the thread read the marker, so it has nothing left to write.
     fn flush(&mut self) -> io::Result<()> {
         let drained = self.drain();
         // The tee's queue is written out whatever became of the marker.
@@ -148,10 +248,10 @@ impl Relay {
     }
 
     fn drain(&mut self) -> io::Result<()> {
-        let Some((id, answered)) = self.drain.request() else {
+        let Some((nonce, answered)) = self.drain.request() else {
             return Ok(());
         };
-        let marker = format!("{DRAIN_MARKER}{id}\n");
+        let marker = format!("{DRAIN_MARKER}{}\n", nonce.simple());
         // Under the stream's own lock, so the marker cannot land between the pieces of one `eprintln!`.
         let written = match self.stream {
             Stream::Stderr => {
@@ -164,7 +264,7 @@ impl Relay {
             }
         };
         if let Err(e) = written {
-            self.drain.cancel(id);
+            self.drain.cancel(nonce);
             // No reader is left on the pipe: the relay thread has ended and holds nothing.
             return if e.kind() == io::ErrorKind::BrokenPipe {
                 Ok(())
@@ -181,26 +281,36 @@ impl Relay {
 
 // LogGuard ============================================================================================================
 
-/// Guards for the non-blocking writers and the stdio relay reader threads.
+/// Guards for the writers and the stdio relay reader threads.
 ///
-/// Held for the process lifetime. Dropping it drains the relays and the writers, so the output and the log lines of
-/// a command that ends by dropping it are all delivered; `process::exit` skips the drop, so a command that exits
-/// that way drops the guard first.
+/// Held for the process lifetime. Dropping it waits until the relay threads have handled everything the process wrote
+/// to stdout and stderr. A command's writers are synchronous, so after that everything is delivered. A bridge's or a
+/// GUI's non-blocking writers are then written out by their guards, each waiting for its worker for at most a second
+/// (tracing-appender's bound); a reader that stalls past it loses what is queued. `process::exit` skips the drop, so a
+/// command that exits that way must drop the guard first.
 pub struct LogGuard {
-    _file: WorkerGuard,
-    _stderr: WorkerGuard,
+    _file: Option<WorkerGuard>,
+    _stderr: Option<WorkerGuard>,
     _relays: StdioRelayHandles,
+    /// A writer onto the original stderr, for what the drain cannot deliver.
+    report: Sink,
 }
 
 impl Drop for LogGuard {
     fn drop(&mut self) {
-        // The stream is closed or full of an error the caller already has: there is nothing more to deliver.
-        let _ = self._relays.flush();
+        let report = &mut self.report;
+        self._relays.flush(|e| {
+            // A broken pipe means the caller closed the stream: nobody is left to deliver to. Anything else is a fault
+            // that lost output, and the caller has no other way to hear of it.
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                let _ = writeln!(report, "hole: the output could not be fully delivered: {e}");
+            }
+        });
     }
 }
 
-/// The relays of the redirected streams, and the guards of their lossy non-blocking tees. A stream that is not
-/// redirected (the debug switch) has none. Held inside `LogGuard`.
+/// The relays of the redirected streams, and the guards of their non-blocking tees. A stream that is not redirected
+/// (the debug switch) has none. Held inside `LogGuard`.
 pub(crate) struct StdioRelayHandles {
     stderr: Option<Relay>,
     stdout: Option<Relay>,
@@ -208,16 +318,20 @@ pub(crate) struct StdioRelayHandles {
 
 impl StdioRelayHandles {
     /// Return once every byte written to stdout and stderr before the call has been consumed by its relay thread,
-    /// emitted as a tracing event and written through the tee to the stream's original handle.
+    /// emitted as a tracing event and written through the tee to the stream's original handle. Each error of a
+    /// step is passed to `failed`; a failed step does not skip the next.
     ///
-    /// Synchronous (a channel, not a runtime) so it works outside a tokio runtime. No sleep: it waits for the relay
-    /// threads' own answers.
-    pub fn flush(&mut self) -> io::Result<()> {
+    /// Synchronous (a channel, not a runtime) so it works outside a tokio runtime.
+    pub fn flush(&mut self, mut failed: impl FnMut(io::Error)) {
         // Rust's stdout holds a line that has no newline yet; it must reach the pipe ahead of the markers.
         let buffered = io::stdout().flush();
         let stderr = self.stderr.as_mut().map_or(Ok(()), |relay| relay.flush());
         let stdout = self.stdout.as_mut().map_or(Ok(()), |relay| relay.flush());
-        buffered.and(stderr).and(stdout)
+        for result in [buffered, stderr, stdout] {
+            if let Err(e) = result {
+                failed(e);
+            }
+        }
     }
 }
 
@@ -375,16 +489,18 @@ fn save_original_pair(stream: Stream) -> (Box<dyn Write + Send>, Box<dyn Write +
 /// tees each line to (a) a tracing event and (b) the saved-original handle.
 /// Returns the relay and the second saved-original copy intended for the
 /// tracing stderr layer (caller can drop it for stdout where there's no layer).
-fn redirect_one(stream: Stream) -> io::Result<(Relay, Box<dyn Write + Send>)> {
+fn redirect_one(stream: Stream, delivery: Delivery) -> io::Result<(Relay, Box<dyn Write + Send>)> {
     // Save the original BEFORE the redirect — once dup2/SetStdHandle runs,
     // io::stdout/stderr point at the pipe.
     let (tee_target, layer_writer) = save_original_pair(stream);
+    Ok((redirect_one_with(stream, tee_target, delivery)?, layer_writer))
+}
 
-    // Wrap the tee writer in a lossy non-blocking writer so a slow downstream
-    // consumer of the saved-original cannot back up the relay reader thread.
-    let (tee_nb, tee_guard) = NonBlockingBuilder::default()
-        .lossy(true)
-        .finish(util::redact::RedactingWriter::new(tee_target));
+/// [`redirect_one`] for a caller-chosen tee target. The relay thread writes the tee itself when `delivery` is
+/// synchronous. When it is not, a lossy non-blocking writer stands between them, so a slow consumer of the original
+/// handle cannot back up the relay reader thread.
+fn redirect_one_with(stream: Stream, tee_target: Box<dyn Write + Send>, delivery: Delivery) -> io::Result<Relay> {
+    let (tee, tee_guard) = delivery.sink(true, tee_target);
 
     let (read_end, write_end) = os_pipe::pipe()?;
 
@@ -392,10 +508,7 @@ fn redirect_one(stream: Stream) -> io::Result<(Relay, Box<dyn Write + Send>)> {
     // After redirect_fd, the standard stream points at its own copy of the pipe
     // write end (`dup2` on Unix, a duplicated handle on Windows); the relay
     // keeps `write_end` itself for its drain markers.
-    Ok((
-        Relay::spawn(stream, read_end, write_end, tee_nb, tee_guard)?,
-        layer_writer,
-    ))
+    Relay::spawn(stream, read_end, write_end, tee, tee_guard)
 }
 
 #[cfg(unix)]
@@ -441,16 +554,11 @@ fn redirect_fd(stream: Stream, write_end: &os_pipe::PipeWriter) -> io::Result<()
 /// Reader loop: read raw bytes line-by-line from the pipe, tee them to the
 /// saved-original handle, and emit a tracing event for each non-empty line.
 /// A drain marker (see `Relay::flush`) is answered after the text before it is
-/// handled, and is not teed or emitted.
+/// handled, and is not teed or emitted. The tee is written on this thread.
 ///
 /// Tracing's `event!` macro takes a literal target string, so we dispatch on
 /// the `Stream` enum to one of the two known emit_* helpers.
-fn relay_loop(
-    reader: os_pipe::PipeReader,
-    mut tee: tracing_appender::non_blocking::NonBlocking,
-    stream: Stream,
-    drain: &Drain,
-) {
+fn relay_loop(reader: os_pipe::PipeReader, mut tee: impl Write, stream: Stream, drain: &Drain) {
     use std::io::{BufRead, BufReader};
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::with_capacity(4096);
@@ -494,12 +602,10 @@ fn find_drain_marker(line: &[u8], drain: &Drain) -> Option<(usize, std::sync::mp
     let marker = DRAIN_MARKER.as_bytes();
     // The marker is written last, so it is the last one on the line; an earlier one is the process's own text.
     let at = line.windows(marker.len()).rposition(|window| window == marker)?;
-    let id = std::str::from_utf8(&line[at + marker.len()..])
+    let nonce = std::str::from_utf8(&line[at + marker.len()..])
         .ok()?
-        .trim_end_matches(['\r', '\n'])
-        .parse::<u64>()
-        .ok()?;
-    Some((at, drain.take(id)?))
+        .trim_end_matches(['\r', '\n']);
+    Some((at, drain.take(Uuid::try_parse(nonce).ok()?)?))
 }
 
 fn emit_stderr_relay(msg: &str) {
@@ -514,9 +620,9 @@ fn emit_stdout_relay(msg: &str) {
 /// thread handles + the saved-original-stderr writer for the tracing stderr
 /// layer. The saved-original-stdout writer is dropped (no stdout tracing
 /// layer) — the relay's tee already preserves CLI script visibility.
-fn redirect_stdio_to_tracing() -> io::Result<(StdioRelayHandles, Box<dyn Write + Send>)> {
-    let (stderr, stderr_layer_writer) = redirect_one(Stream::Stderr)?;
-    let (stdout, _stdout_layer_writer) = redirect_one(Stream::Stdout)?;
+fn redirect_stdio_to_tracing(delivery: Delivery) -> io::Result<(StdioRelayHandles, Box<dyn Write + Send>)> {
+    let (stderr, stderr_layer_writer) = redirect_one(Stream::Stderr, delivery)?;
+    let (stdout, _stdout_layer_writer) = redirect_one(Stream::Stdout, delivery)?;
     let relays = StdioRelayHandles {
         stderr: Some(stderr),
         stdout: Some(stdout),
@@ -527,8 +633,10 @@ fn redirect_stdio_to_tracing() -> io::Result<(StdioRelayHandles, Box<dyn Write +
 /// Test-only re-export of `redirect_stdio_to_tracing` so child-side test
 /// scenarios can drive the redirect without going through `init()`.
 #[cfg(test)]
-pub(crate) fn redirect_stdio_to_tracing_for_tests() -> io::Result<(StdioRelayHandles, Box<dyn Write + Send>)> {
-    redirect_stdio_to_tracing()
+pub(crate) fn redirect_stdio_to_tracing_for_tests(
+    kind: ProcessKind,
+) -> io::Result<(StdioRelayHandles, Box<dyn Write + Send>)> {
+    redirect_stdio_to_tracing(kind.delivery())
 }
 
 /// Test-only variant that lets the caller supply explicit tee target writers
@@ -536,25 +644,15 @@ pub(crate) fn redirect_stdio_to_tracing_for_tests() -> io::Result<(StdioRelayHan
 /// by the `redirect_tee` scenario to verify the tee path receives bytes.
 #[cfg(test)]
 pub(crate) fn redirect_stdio_to_tracing_with_writers_for_tests(
+    kind: ProcessKind,
     stderr_tee: Box<dyn Write + Send>,
     stdout_tee: Box<dyn Write + Send>,
 ) -> io::Result<StdioRelayHandles> {
+    let delivery = kind.delivery();
     Ok(StdioRelayHandles {
-        stderr: Some(redirect_one_with_writer(Stream::Stderr, stderr_tee)?),
-        stdout: Some(redirect_one_with_writer(Stream::Stdout, stdout_tee)?),
+        stderr: Some(redirect_one_with(Stream::Stderr, stderr_tee, delivery)?),
+        stdout: Some(redirect_one_with(Stream::Stdout, stdout_tee, delivery)?),
     })
-}
-
-#[cfg(test)]
-fn redirect_one_with_writer(stream: Stream, tee_target: Box<dyn Write + Send>) -> io::Result<Relay> {
-    let (tee_nb, tee_guard) = NonBlockingBuilder::default()
-        .lossy(true)
-        .finish(util::redact::RedactingWriter::new(tee_target));
-
-    let (read_end, write_end) = os_pipe::pipe()?;
-    redirect_fd(stream, &write_end)?;
-
-    Relay::spawn(stream, read_end, write_end, tee_nb, tee_guard)
 }
 
 // Test-only escape hatch ==============================================================================================
@@ -711,7 +809,7 @@ where
 /// stay alive.
 pub fn init(
     log_dir: &Path,
-    kind: &'static str,
+    kind: ProcessKind,
     log_filename: &str,
     default_directive: &str,
     owner: Option<(u32, u32)>,
@@ -733,7 +831,7 @@ pub fn init(
 /// production diagnostics.
 pub fn init_multi<I>(
     log_dir: &Path,
-    kind: &'static str,
+    kind: ProcessKind,
     log_filename: &str,
     directives: I,
     owner: Option<(u32, u32)>,
@@ -758,12 +856,12 @@ where
 /// `hole::logging=debug` is pinned so the logging subsystem itself emits
 /// lifecycle events.
 ///
-/// `kind` labels the native-crash marker. `owner` is the `(uid, gid)` the log
+/// `kind` labels the native-crash marker and decides how the writers deliver. `owner` is the `(uid, gid)` the log
 /// directory and each rotated file are handed to; `None` (the unprivileged GUI)
 /// leaves ownership alone.
 pub fn init_dual(
     log_dir: &Path,
-    kind: &'static str,
+    kind: ProcessKind,
     log_filename: &str,
     file_directives: &[String],
     stderr_directives: &[String],
@@ -794,6 +892,7 @@ pub fn init_dual(
     // writer so the writer targets the saved-original handle, not the pipe.
     // `HOLE_LOGGING_DISABLE_REDIRECT` is honored only in dev/test builds; in
     // release the FD safety net is non-negotiable (the env var is a no-op).
+    let delivery = kind.delivery();
     let (relays, original_stderr) = if disable_redirect_for_tests() {
         (
             StdioRelayHandles {
@@ -803,7 +902,7 @@ pub fn init_dual(
             Box::new(io::stderr()) as Box<dyn Write + Send>,
         )
     } else {
-        redirect_stdio_to_tracing().expect("stdio redirect failed")
+        redirect_stdio_to_tracing(delivery).expect("stdio redirect failed")
     };
 
     // Each rotation hands the fresh root-owned active file back to the real user
@@ -819,27 +918,24 @@ pub fn init_dual(
     // the leak, and it is the only redaction between any crate's `info!` and
     // the file.
     //
-    // The FILE appender is `lossy(false)`: the proxy-stop teardown burst
+    // A non-blocking FILE appender is `lossy(false)`: the proxy-stop teardown burst
     // (SystemRoutes::drop sequence: route commands, state-file clear,
     // Remove-NetAdapter) must never be silently truncated, or `bridge.log`
     // loses the diagnostic for a teardown that broke the user's network.
     // Trade-off: a wedged disk (full filesystem, OneDrive sync stall, AV scan)
     // blocks every thread that logs, with no limit, once the writer's default
     // `buffered_lines_limit` is full.
-    let (file_nb, file_guard) = NonBlockingBuilder::default()
-        .lossy(false)
-        .finish(util::redact::RedactingWriter::new(owned));
-    // The STDERR non-blocking writer keeps `lossy(true)`: a wedged terminal
+    let (file_sink, file_guard) = delivery.sink(false, owned);
+    // A non-blocking STDERR writer keeps `lossy(true)`: a wedged terminal
     // (Ctrl+S on a console session) MUST NOT block the bridge.
-    let (stderr_nb, stderr_guard) = NonBlockingBuilder::default()
-        .lossy(true)
-        .finish(util::redact::RedactingWriter::new(original_stderr));
+    let (stderr_sink, stderr_guard) = delivery.sink(true, original_stderr);
+    let report = stderr_sink.clone();
 
     use tracing_subscriber::util::SubscriberInitExt;
     // Sanctioned by clippy.toml `disallowed_methods`: the ONE
     // production `try_init` workspace-wide. Tests use `register!()`.
     #[allow(clippy::disallowed_methods)]
-    if let Err(e) = compose_subscriber(file_nb, stderr_nb, file_directives, stderr_directives).try_init() {
+    if let Err(e) = compose_subscriber(file_sink, stderr_sink, file_directives, stderr_directives).try_init() {
         // Subscriber not yet active; write directly to FD 2. Goes through the
         // redirect → relay → file layer once installed elsewhere.
         let _ = writeln!(io::stderr(), "hole: tracing subscriber init failed: {e}");
@@ -857,12 +953,13 @@ pub fn init_dual(
     // (signal-safe context — no chown). It is transient, lives in the
     // user-owned log dir, and is swept on next start, so it is left
     // root-owned on purpose rather than chowned from an unsafe context.
-    tombstone::attach(kind, log_dir);
+    tombstone::attach(kind.label(), log_dir);
 
     LogGuard {
         _file: file_guard,
         _stderr: stderr_guard,
         _relays: relays,
+        report,
     }
 }
 
