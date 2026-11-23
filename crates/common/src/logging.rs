@@ -254,18 +254,30 @@ impl StdioRelayHandles {
         let buffered = io::stdout().flush();
         let stderr = self.stderr.as_mut().map_or(Ok(()), |relay| relay.flush());
         let stdout = self.stdout.as_mut().map_or(Ok(()), |relay| relay.flush());
-        // A stdout that is not redirected is the caller's own: a flush error there is a closed stream, not a loss. A
-        // redirected one flushes into Hole's pipe, and its error repeats the relay's own.
-        let buffered = if self.stdout.is_some() && stdout.is_ok() {
-            buffered
-        } else {
-            Ok(())
-        };
+        let buffered = buffered.or_else(|e| {
+            if buffer_flush_failure_is_loss(&e, self.stdout.is_some(), stdout.is_err()) {
+                Err(e)
+            } else {
+                Ok(())
+            }
+        });
         for result in [buffered, stderr, stdout] {
             if let Err(e) = result {
                 failed(e);
             }
         }
+    }
+}
+
+/// Whether a failed flush of Rust's stdout buffer is a loss to report. Redirected, the buffer flushes into Hole's own
+/// pipe and a failure means the relay thread is gone, which the relay's own failed drain reports (`relay_failed`) and
+/// otherwise is unexplained. Not redirected (the debug switch), the stream is the caller's, and a closed one is not a
+/// loss.
+fn buffer_flush_failure_is_loss(error: &io::Error, redirected: bool, relay_failed: bool) -> bool {
+    if redirected {
+        !relay_failed
+    } else {
+        error.kind() != io::ErrorKind::BrokenPipe
     }
 }
 
@@ -621,7 +633,8 @@ static PANIC_HOOK_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::
 // Set on the stdio relay threads. The previous hook (the default printer) writes to stderr, which on a relay thread is
 // the pipe that thread alone reads: a panic text longer than the pipe holds would make the thread wait for itself, and
 // the drain at exit with it. The panic hook therefore does not chain on such a thread. Its own record goes through the
-// layers, which write the original stderr and the file.
+// layers, which write the original stderr and the file, unless the writer or formatter that ended the thread panics on
+// that record too.
 std::thread_local! {
     static ON_RELAY_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

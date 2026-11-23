@@ -960,3 +960,26 @@ fn init_dual_hands_the_log_dir_and_file_to_the_owner_when_the_os_allows(#[fixtur
         "the file"
     );
 }
+
+/// A failed flush of Rust's stdout buffer is reported as a loss unless the relay already reports it (redirected) or the
+/// caller closed the stream (not redirected).
+#[skuld::test]
+fn a_stdout_buffer_flush_failure_is_a_loss_unless_it_is_reported_elsewhere() {
+    use std::io::ErrorKind::{BrokenPipe, StorageFull};
+    // (redirected, the relay's own flush failed, the error's kind, is a loss)
+    let table = [
+        (true, true, BrokenPipe, false),
+        (true, false, BrokenPipe, true),
+        (true, false, StorageFull, true),
+        (false, false, BrokenPipe, false),
+        (false, false, StorageFull, true),
+    ];
+    for (redirected, relay_failed, kind, expected) in table {
+        let error = std::io::Error::from(kind);
+        assert_eq!(
+            super::buffer_flush_failure_is_loss(&error, redirected, relay_failed),
+            expected,
+            "redirected {redirected}, relay failed {relay_failed}, {kind:?}"
+        );
+    }
+}

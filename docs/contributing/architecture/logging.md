@@ -87,7 +87,8 @@ A relay thread that has ended, by a panic in a tracing writer or formatter, take
 reports that later output to that stream was lost, and `LogGuard` writes the report to the original stderr. The relay
 thread never writes the stream it reads, since that stream is the pipe it alone empties. For that reason the panic hook
 skips the previous hook, the default printer that writes to stderr, on a relay thread; the hook's own record is logged
-as on any other thread, to the sinks whose directives let it through.
+as on any other thread, to the sinks whose directives let it through. When the writer or formatter that ended the thread
+panics on that record too, the record is lost and the exit report is the only trace.
 
 The most visible case is WebView2 on Windows, which writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
 straight to the inherited stderr. They land in `gui.log` through the relay. **A Chromium line is a real log record:
