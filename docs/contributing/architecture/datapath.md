@@ -72,6 +72,12 @@ when the plugin on the connection to the server carries only TCP. The cascade dr
 failing UDP application by cascading to `InterfaceEndpoint`: the drop is the product's behaviour, and the user-facing
 escape (a Bypass rule the user writes) is in [the how-it-works page](../../how-it-works/udp.md#what-stops-working).
 
+A datagram addressed to a multicast group, to `255.255.255.255`, to the TUN subnet's directed broadcast address or to a
+link-local unicast address (`169.254.0.0/16`, `fe80::/10`) is dropped by `Driver::handle_udp_packet` before any flow
+exists, whatever the filter says. The operating system sends LLMNR, mDNS and NetBIOS lookups to the groups and broadcast
+addresses out of every adapter. A link-local address is valid only on the link the datagram leaves from, which here is
+the TUN, and no server sits on it.
+
 Where `supports_udp` comes from for the proxy endpoint:
 
 - `udp_available_from_chain` in {src}`crates/bridge/src/proxy_manager.rs` reads the transports the running plugin chain

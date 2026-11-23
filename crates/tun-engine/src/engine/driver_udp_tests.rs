@@ -7,9 +7,12 @@
 //! `sim::recording_router` — no real socket, proxy or bypass mechanism is
 //! involved.
 
-use smoltcp::wire::{IpAddress, Ipv4Packet, Ipv6Packet, UdpPacket};
+use std::io;
+
+use smoltcp::wire::{IpAddress, Ipv4Cidr, Ipv4Packet, Ipv6Packet, UdpPacket};
 
 use super::super::driver_sim_test_support::{start, v4, v6};
+use super::is_addressed_to_the_link;
 use crate::sim::{udp_packet, Dispatch};
 
 #[skuld::test]
@@ -152,4 +155,117 @@ async fn an_ipv6_udp_datagram_round_trips() {
     assert!(udp.verify_checksum(&IpAddress::Ipv6(ip.src_addr()), &IpAddress::Ipv6(ip.dst_addr())));
 
     h.shutdown().await;
+}
+
+// Datagrams addressed to the link =====================================================================================
+
+/// Datagrams addressed to a group or to the link (LLMNR, mDNS, NetBIOS) must open
+/// no flow; unicast neighbours must still open one. The harness's TUN is
+/// `10.255.0.1/24`, so its directed broadcast is `10.255.0.255`.
+///
+/// The read error queued behind the datagrams ends the engine without cancelling
+/// any task, and the receiver closes when the last router clone is dropped, so
+/// draining it to the end sees every flow the engine opened.
+#[skuld::test]
+async fn datagrams_addressed_to_a_group_or_to_the_link_open_no_flow() {
+    let h = start(|_| {});
+    let src4 = v4("10.255.0.2", 51000);
+    let src6 = v6("fd00::ff00:2", 51000);
+
+    let dropped = [
+        v4("224.0.0.252", 5355),
+        v4("224.0.0.251", 5353),
+        v4("239.255.255.250", 1900),
+        v4("255.255.255.255", 67),
+        v4("10.255.0.255", 137),
+        v6("ff02::1:3", 5355),
+        v6("ff02::fb", 5353),
+        v6("ff0e::1", 9),
+        v4("224.0.0.251", 53),
+        v6("ff02::fb", 53),
+        v4("169.254.0.0", 137),
+        v4("169.254.169.254", 80),
+        v4("169.254.255.255", 5355),
+        v6("fe80::1", 5355),
+        v6("febf:ffff::1", 5355),
+    ];
+    let carried = [
+        v4("223.255.255.255", 53000),
+        v4("10.255.0.254", 137),
+        v4("10.255.1.255", 137),
+        v4("8.8.8.8", 443),
+        v4("8.8.8.8", 53),
+        v4("169.253.255.255", 80),
+        v4("169.255.0.0", 80),
+        v6("2001:db8::1", 443),
+        v6("fe7f:ffff::1", 5355),
+        v6("fec0::1", 5355),
+    ];
+
+    for dst in dropped.into_iter().chain(carried) {
+        let src = if dst.is_ipv4() { src4 } else { src6 };
+        h.wire.inject(udp_packet(src, dst, b"x")).await;
+    }
+    h.wire.fail_next_read(io::ErrorKind::Other);
+
+    let mut rx = h.join().await;
+    let mut dispatched = Vec::new();
+    while let Some(dispatch) = rx.recv().await {
+        // Dropping the `Dispatch` releases the router task that sent it.
+        let Dispatch::Udp { meta, .. } = dispatch else {
+            panic!("expected a UDP dispatch");
+        };
+        dispatched.push(meta.dst);
+    }
+    dispatched.sort();
+    let mut expected = carried.to_vec();
+    expected.sort();
+    assert_eq!(
+        dispatched, expected,
+        "the flows opened are not exactly the unicast ones"
+    );
+}
+
+/// The directed broadcast address follows the TUN's own prefix, and a /31, a /32 or an IPv6-only TUN has none.
+#[skuld::test]
+fn the_directed_broadcast_address_is_the_tuns_own() {
+    let cidr = |s: &str| Some(s.parse::<Ipv4Cidr>().unwrap());
+    let to = |tun: Option<Ipv4Cidr>, dst: &str| is_addressed_to_the_link(dst.parse().unwrap(), tun);
+
+    assert!(to(cidr("10.255.0.1/22"), "10.255.3.255"));
+    assert!(!to(cidr("10.255.0.1/22"), "10.255.0.255"));
+    assert!(!to(cidr("10.255.0.1/22"), "10.255.2.255"));
+    assert!(!to(cidr("10.255.0.1/24"), "10.255.0.0"));
+    assert!(to(cidr("192.168.7.9/16"), "192.168.255.255"));
+    assert!(!to(cidr("10.255.0.1/31"), "10.255.0.1"));
+    assert!(!to(cidr("10.255.0.1/32"), "10.255.0.1"));
+    assert!(!to(None, "10.255.0.255"));
+    let tun = cidr("10.255.0.1/24");
+    for dst in [
+        "223.255.255.255",
+        "10.255.0.254",
+        "10.255.1.255",
+        "8.8.8.8",
+        "169.253.255.255",
+        "169.255.0.0",
+        "fe7f:ffff::1",
+        "fec0::1",
+        "2001:db8::1",
+    ] {
+        assert!(!to(tun, dst), "{dst} is not addressed to the link");
+    }
+    // Not tied to the TUN: multicast, the limited broadcast and link-local addresses are addressed to the link
+    // whatever the prefix.
+    for dst in [
+        "224.0.0.252",
+        "255.255.255.255",
+        "169.254.0.0",
+        "169.254.255.255",
+        "ff02::1:3",
+        "fe80::1",
+        "febf:ffff::1",
+    ] {
+        assert!(to(None, dst), "{dst} is addressed to the link");
+        assert!(to(tun, dst), "{dst} is addressed to the link");
+    }
 }
