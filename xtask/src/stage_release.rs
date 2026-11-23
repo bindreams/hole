@@ -52,14 +52,27 @@ impl Lane {
         }
     }
 
-    /// The variable naming the installer this lane's tests ran on. The plugins lane stages no installer.
-    fn installer_env(self) -> Option<&'static str> {
+    /// The installer this lane stages. The plugins lane stages none.
+    fn installer(self) -> Option<Installer> {
         match self {
-            Lane::Msi => Some(MSI_ENV),
-            Lane::Dmg => Some(DMG_ENV),
+            Lane::Msi => Some(Installer {
+                env: MSI_ENV,
+                built: |release| Ok(release.join("hole.msi")),
+            }),
+            Lane::Dmg => Some(Installer {
+                env: DMG_ENV,
+                built: |release| single_dmg(&release.join("bundle").join("dmg")),
+            }),
             Lane::Plugins => None,
         }
     }
+}
+
+/// A lane's installer: the variable naming the one its tests ran on, and where the build under `target/release`
+/// puts it.
+struct Installer {
+    env: &'static str,
+    built: fn(&Path) -> Result<PathBuf>,
 }
 
 /// A command a shipped executable must survive: exit 0 and, when `prints` is set, print exactly that on stdout.
@@ -377,16 +390,12 @@ pub fn list(tag: &str) -> Result<()> {
 /// to this build's archive would ship two builds as one release.
 fn resolve_installer(lane: Lane, repo_root: &Path, installer_override: Option<OsString>) -> Result<PathBuf> {
     let release = repo_root.join("target").join("release");
-    let built = match lane {
-        Lane::Msi => release.join("hole.msi"),
-        Lane::Dmg => single_dmg(&release.join("bundle").join("dmg"))?,
-        Lane::Plugins => bail!("the plugins lane stages no installer"),
+    let Some(installer) = lane.installer() else {
+        bail!("the plugins lane stages no installer");
     };
+    let built = (installer.built)(&release)?;
     if let Some(given) = installer_override.filter(|p| !p.is_empty()) {
-        let env_var = lane
-            .installer_env()
-            .expect("a lane that stages an installer names its override variable");
-        check_installer_override(env_var, &repo_root.join(given), &built)?;
+        check_installer_override(installer.env, &repo_root.join(given), &built)?;
     }
     Ok(built)
 }
@@ -569,7 +578,7 @@ pub fn stage(repo_root: &Path, tag: &str, lane: Lane, out: &Path) -> Result<()> 
     let (group, version) = parse_release_tag(tag)?;
     let platform = Platform::host().context("unknown host platform")?;
     let version = version.to_string();
-    let installer_override = lane.installer_env().and_then(std::env::var_os);
+    let installer_override = lane.installer().and_then(|installer| std::env::var_os(installer.env));
     let shipment = plan(group, lane, &version, platform, repo_root, || {
         resolve_installer(lane, repo_root, installer_override)
     })?;
