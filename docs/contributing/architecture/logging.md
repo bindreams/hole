@@ -43,10 +43,6 @@ must reach the disk, at the price that a stalled disk blocks the threads that lo
 emits an event, the panic hook's included, waits with no limit until the disk drains. The stderr writer and the two stdio tees are lossy, so a wedged terminal can never block the
 bridge or the panic hook.
 
-That describes the bridge and the GUI. A one-shot command writes synchronously (see [the stdio safety
-net](#the-stdio-safety-net)): nothing is lossy, and a stalled disk or terminal holds the thread that writes until it
-drains.
-
 ## Turning the volume up
 
 Each sink builds its own filter: a global default of `info`, then `RUST_LOG`, then the sink's directives, then a pin of
@@ -75,25 +71,23 @@ pipe tees every line to the original handle, so a terminal still sees it, and em
 `hole::stdout_relay` or `hole::stderr_relay`, so the file sees it too. The stderr layer drops those two targets, or it
 would write each line twice. The net catches whatever bypasses `tracing`: the Go runtime of a plugin, a native library, the
 default panic printer. A panic hook emits an error event with a backtrace under `hole::panic` and then calls the previous
-hook.
+hook, except on a relay thread (below).
 
-Which writers a process gets depends on its kind (`ProcessKind`, passed to `init`). A one-shot command writes
-synchronously: its relay thread writes each line to the original handle itself, and the stderr and file layers write
-through a mutex. Nothing is lossy and no timer runs at exit, so a command's output, its errors and its `gui-cli.log`
-lines are delivered by the time its guard has dropped. A caller that reads late holds the command, as it holds any
-program. A write made from inside a sink's own write (a warning raised during a rotation) is queued and written when
-the first returns, because the thread cannot take its own lock again. If that write panics, the queued write is dropped
-with it; the panic hook's record reaches the other sink and the previous hook.
+The relay and the writers are asynchronous, so whatever ends the process before they finish loses the last lines.
+Dropping the `LogGuard` waits for them: it writes a marker line, carrying a random nonce, to each redirected stream,
+blocks until that stream's reader thread has read it, and then drops the guards of the tees and the writers. This first
+wait has no limit, like the file writer's: a stalled disk that blocks the relay thread holds the exit too. Each guard
+then waits up to 100 ms to send its worker the shutdown message and up to 1000 ms for the worker to finish (the bounds are
+inside `tracing-appender`), and the four guards, two tees, the stderr writer and the file writer, drop one after another.
+Output that its reader or disk has not taken by then is lost, and the exit goes on. `process::exit` skips destructors, so
+`dispatch` drops the CLI's guard before it exits. The GUI leaves through the event loop's own `process::exit` and does
+not drain.
 
-The bridge and the GUI keep non-blocking writers, so that a wedged terminal cannot block them. What that costs at exit:
-the guards of those writers wait for their worker for at most a second (the bound is inside `tracing-appender`), so a
-reader that stalls past it loses the lines still queued.
-
-Whatever ends the process before the relay threads have caught up loses the last lines. Dropping the `LogGuard` waits
-for them: it writes a marker line, carrying a random nonce, to each redirected stream, and blocks until that stream's
-reader thread has read it. `process::exit` skips destructors, so `dispatch` drops the CLI's guard before it exits. The
-wait has no limit, like the file writer's: a stalled disk that blocks the relay thread holds the exit too. The GUI
-leaves through the event loop's own `process::exit` and does not drain.
+A relay thread that has ended, by a panic in a tracing writer or formatter, takes no more output: the drain at exit
+reports that later output to that stream was lost, and `LogGuard` writes the report to the original stderr. The relay
+thread never writes the stream it reads, since that stream is the pipe it alone empties. For that reason the panic hook
+skips the previous hook, the default printer that writes to stderr, on a relay thread; the hook's own record still goes
+to the file and the original stderr.
 
 The most visible case is WebView2 on Windows, which writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
 straight to the inherited stderr. They land in `gui.log` through the relay. **A Chromium line is a real log record:
