@@ -18,6 +18,7 @@ use base64::Engine as _;
 use garter::{BinaryPlugin, ChainRunner, Mode, PluginEnv, ReadinessMode, StartError};
 use shadowsocks::config::{Mode as SsMode, ServerConfig};
 use shadowsocks::crypto::CipherKind;
+use shadowsocks::net::ConnectOpts;
 use shadowsocks_service::server::ServerBuilder as SsServerBuilder;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::sync::oneshot;
@@ -63,15 +64,37 @@ pub fn random_password_for(method: CipherKind) -> String {
 /// passing port 0 would hand the two sockets distinct kernel-allocated
 /// ports — the explicit allocation here keeps them on the same port.
 pub async fn start_real_ss_server(method: CipherKind, password: &str) -> (SocketAddr, JoinHandle<()>) {
+    start_real_ss_server_via(method, password, None).await
+}
+
+/// [`start_real_ss_server`] whose own dials to its targets leave through the network interface named
+/// `outbound_interface` (its friendly name on Windows, its device name elsewhere), not through the routing table.
+/// `None` is [`start_real_ss_server`].
+///
+/// A server on the machine a full tunnel runs on needs this: dialing through the routing table sends its dials back
+/// into the tunnel, which hands them to the server again.
+pub async fn start_real_ss_server_via(
+    method: CipherKind,
+    password: &str,
+    outbound_interface: Option<&str>,
+) -> (SocketAddr, JoinHandle<()>) {
     let (port, server) = port_alloc::bind_ephemeral(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         Protocols::TCP | Protocols::UDP,
         |port| {
             let password = password.to_string();
+            let outbound_interface = outbound_interface.map(str::to_string);
             async move {
                 let mut svr_cfg = ServerConfig::new(("127.0.0.1", port), password, method).unwrap();
                 svr_cfg.set_mode(SsMode::TcpAndUdp);
-                SsServerBuilder::new(svr_cfg).build().await
+                let mut builder = SsServerBuilder::new(svr_cfg);
+                if let Some(interface) = outbound_interface {
+                    builder.set_connect_opts(ConnectOpts {
+                        bind_interface: Some(interface),
+                        ..ConnectOpts::default()
+                    });
+                }
+                builder.build().await
             }
         },
     )
@@ -101,7 +124,26 @@ pub async fn start_real_ss_server_with_plugin_ws(
     password: &str,
     plugin_path: &str,
 ) -> (SocketAddr, PluginServer) {
-    start_real_ss_server_with_plugin_ws_opts(method, password, plugin_path, WS_SERVER_OPTS).await
+    start_real_ss_server_with_plugin_ws_via(method, password, plugin_path, None).await
+}
+
+/// [`start_real_ss_server_with_plugin_ws`] whose ss-server dials its targets out of `outbound_interface`, as
+/// [`start_real_ss_server_via`] does. `None` is [`start_real_ss_server_with_plugin_ws`].
+pub async fn start_real_ss_server_with_plugin_ws_via(
+    method: CipherKind,
+    password: &str,
+    plugin_path: &str,
+    outbound_interface: Option<&str>,
+) -> (SocketAddr, PluginServer) {
+    spawn_ss_with_plugin(
+        method,
+        password,
+        Protocols::TCP,
+        plugin_path,
+        WS_SERVER_OPTS,
+        outbound_interface,
+    )
+    .await
 }
 
 /// [`start_real_ss_server_with_plugin_ws`] with the server-mode options string
@@ -112,7 +154,7 @@ pub async fn start_real_ss_server_with_plugin_ws_opts(
     plugin_path: &str,
     opts: &str,
 ) -> (SocketAddr, PluginServer) {
-    spawn_ss_with_plugin(method, password, Protocols::TCP, plugin_path, opts).await
+    spawn_ss_with_plugin(method, password, Protocols::TCP, plugin_path, opts, None).await
 }
 
 /// Front a held ss-server with a SERVER-mode plugin (websocket + TLS). Same
@@ -126,7 +168,7 @@ pub async fn start_real_ss_server_with_plugin_ws_tls(
     certs: &TestCerts,
 ) -> (SocketAddr, PluginServer) {
     let opts = format!("server;host=cloudfront.com;path=/;tls;{}", certs.plugin_opts_fragment());
-    spawn_ss_with_plugin(method, password, Protocols::TCP, plugin_path, &opts).await
+    spawn_ss_with_plugin(method, password, Protocols::TCP, plugin_path, &opts, None).await
 }
 
 /// Front a held ss-server with a QUIC-transport SERVER-mode plugin. QUIC
@@ -146,7 +188,7 @@ pub async fn start_real_ss_server_with_plugin_quic(
     certs: &TestCerts,
 ) -> (SocketAddr, PluginServer) {
     let opts = format!("server;host=cloudfront.com;mode=quic;{}", certs.plugin_opts_fragment());
-    spawn_ss_with_plugin(method, password, Protocols::UDP, plugin_path, &opts).await
+    spawn_ss_with_plugin(method, password, Protocols::UDP, plugin_path, &opts, None).await
 }
 
 /// Keeps a plugin-fronted ss-server alive for a test's duration. Hold it for as
@@ -198,11 +240,12 @@ async fn spawn_ss_with_plugin(
     public_bind_protocols: Protocols,
     plugin_path: &str,
     plugin_opts: &str,
+    outbound_interface: Option<&str>,
 ) -> (SocketAddr, PluginServer) {
     // Plain ss-server on a HELD loopback port (no plugin). The plugin chain
     // forwards decapsulated traffic here; the port is held for the server's
     // lifetime, so there is no bind-and-drop rendezvous race.
-    let (ss_addr, ss_handle) = start_real_ss_server(method, password).await;
+    let (ss_addr, ss_handle) = start_real_ss_server_via(method, password, outbound_interface).await;
 
     let mut attempt: u32 = 0;
     loop {
@@ -290,3 +333,7 @@ async fn spawn_ss_with_plugin(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ssserver_tests.rs"]
+mod ssserver_tests;
