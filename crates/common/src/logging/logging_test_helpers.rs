@@ -511,8 +511,9 @@ fn scenario_relay_thread_ended(ended: Stream) {
     let thread = std::mem::replace(&mut relay(&mut relays, ended)._thread, std::thread::spawn(|| {}));
     thread.join().expect("the relay thread catches the panic");
 
-    // Rust's stdout holds a line that is not complete; `flush` writes it into the pipe that nobody reads any more. The
-    // result lists what two flushes of it do, since the exit report must meet the same failure after them.
+    // Rust's stdout holds a line that is not complete. A flush writes it into the pipe that nobody reads any more and
+    // fails, and the line stays buffered, so the flush in `StdioRelayHandles::flush` below meets the same failure. The
+    // result lists what two flushes here do, to show that the buffer still holds the line.
     let unfinished = match ended {
         Stream::Stdout => {
             write!(std::io::stdout(), "a line that is not complete").expect("buffered");
