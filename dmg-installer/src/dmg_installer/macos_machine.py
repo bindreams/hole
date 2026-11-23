@@ -28,13 +28,22 @@ def _is_network_route(columns: list[str]) -> bool:
 
 
 def _resolvers() -> dict[str, frozenset[str]]:
-    """The resolvers of `scutil --dns` by their own text (flags, order, reachability) without the `resolver #N` heading:
-    the numbers follow the order, which changes when a resolver is added, and the rest of a resolver does not."""
+    """The resolvers of `scutil --dns`: what identifies one (its flags, order, domains and interface, as `scutil` prints
+    them) mapped to its nameservers.
+
+    The `resolver #N` heading is left out because the numbers follow the order, which changes when a resolver is added,
+    and so are the nameservers and the `reach` line, which change under a resolver that stays: a lease renewal, a
+    reachability flag.
+    """
     section = _output("scutil", "--dns").split(_SCOPED_SECTION)[0]
     resolvers = {}
     for block in re.split(r"^resolver #\d+\s*$", section, flags=re.MULTILINE)[1:]:
-        text = "\n".join(line.strip() for line in block.strip().splitlines())
-        resolvers[text] = frozenset(re.findall(r"nameserver\[\d+\]\s*:\s*(\S+)", block))
+        identity = "\n".join(
+            line.strip()
+            for line in block.strip().splitlines()
+            if not re.match(r"\s*(nameserver\[\d+\]|reach)\s*:", line)
+        )
+        resolvers[identity] = frozenset(re.findall(r"nameserver\[\d+\]\s*:\s*(\S+)", block))
     return resolvers
 
 
@@ -59,10 +68,11 @@ class MacMachine:
             "== interfaces",
             _output("ifconfig", "-l").strip(),
             "== resolvers",
-            *_resolvers(),
+            *(f"{identity}\n{sorted(servers)}" for identity, servers in sorted(_resolvers().items())),
         ])
 
     def dns_servers(self) -> dict[str, frozenset[str]]:
+        """The nameservers of each resolver, by what identifies the resolver (`_resolvers`)."""
         return _resolvers()
 
     def run_curl(self, *args: str) -> subprocess.CompletedProcess[str]:

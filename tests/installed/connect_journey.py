@@ -312,7 +312,8 @@ def dns_servers_gained(
     before: Mapping[str, frozenset[str]], during: Mapping[str, frozenset[str]]
 ) -> dict[str, frozenset[str]]:
     """The DNS servers of the scopes that exist now and did not exist before: what a tunnel adds, not what a lease
-    renewal or a reconfiguration of the machine's own adapters changes."""
+    renewal or a reconfiguration of the machine's own adapters changes. Any new scope with a server counts, the
+    tunnel's own or one that comes up beside it."""
     return {scope: servers for scope, servers in during.items() if scope not in before and servers}
 
 
