@@ -182,9 +182,8 @@ fn a_command_whose_log_file_refuses_writes_says_so_on_stderr() {
     let out = hole(log_dir.path(), &["bridge", "status"]);
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // One status line was printed and relayed to the log, so one write was refused.
-    let report = "hole: the output could not be fully delivered: the log file was not fully written: \
-                  writes refused: 1, messages dropped: 0";
+    // How many writes the file refused is every event it was given, which depends on `RUST_LOG` and on the machine.
+    let report = "hole: the output could not be fully delivered: the log file was not fully written: writes refused: ";
     assert_eq!(
         log.metadata().expect("the log file's size").len(),
         0,

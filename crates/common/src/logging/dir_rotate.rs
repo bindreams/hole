@@ -37,7 +37,7 @@ pub struct DirRotate {
 impl DirRotate {
     /// `owner` is given the active file each time it is created, so the user can read it without elevating, and is
     /// the only owner an existing active file may have. `notices` is told, once, that the file could not be opened.
-    /// Behind a queue this runs on the queue's writer thread, where `notices` must not be the process's stderr, a
+    /// Behind a queue this runs on the queue's writer thread, where `notices` must not be the process's stderr or a
     /// redirected stream (see `Queued`).
     pub fn new(
         dir: Dir,

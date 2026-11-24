@@ -198,8 +198,22 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_tee_overflows" => scenario_tee_overflows(),
         "redirect_writer_thread_panics" => scenario_writer_thread_panics(),
         "writer_thread_write_to_a_queue_with_room" => scenario_writer_thread_write(OtherQueue::HasRoom),
-        "writer_thread_write_to_an_ended_queue" => scenario_writer_thread_write(OtherQueue::Ended),
-        "writer_thread_write_to_a_full_queue" => scenario_writer_thread_write(OtherQueue::Full),
+        "writer_thread_write_to_a_closed_waiting_queue" => {
+            scenario_writer_thread_write(OtherQueue::Closed(Overflow::Wait))
+        }
+        "writer_thread_write_to_a_closed_dropping_queue" => {
+            scenario_writer_thread_write(OtherQueue::Closed(Overflow::Drop))
+        }
+        "writer_thread_write_to_a_panicked_waiting_queue" => {
+            scenario_writer_thread_write(OtherQueue::Panicked(Overflow::Wait))
+        }
+        "writer_thread_write_to_a_panicked_dropping_queue" => {
+            scenario_writer_thread_write(OtherQueue::Panicked(Overflow::Drop))
+        }
+        "writer_thread_write_to_a_full_waiting_queue" => scenario_writer_thread_write(OtherQueue::Full(Overflow::Wait)),
+        "writer_thread_write_to_a_full_dropping_queue" => {
+            scenario_writer_thread_write(OtherQueue::Full(Overflow::Drop))
+        }
         "layer_writers_fail" => scenario_layer_writers_fail(),
         "redirect_no_loop" => scenario_no_loop(),
         "echo_stderr" => scenario_echo_stderr(),
@@ -851,15 +865,133 @@ pub(crate) fn writer_thread_text(server: &str) -> String {
 enum OtherQueue {
     /// Empty, with a destination that takes what it is given.
     HasRoom,
-    /// Finished: its writer thread has ended.
-    Ended,
+    /// Closed by `finish`: its writer thread has ended.
+    Closed(Overflow),
+    /// Its destination panicked and its writer thread has ended; `finish` has not been called.
+    Panicked(Overflow),
     /// Full, behind a destination that is held inside its first write until the destination that writes to it is done.
-    Full,
+    Full(Overflow),
+}
+
+/// A queue in one of the states of [`OtherQueue`], and what the scenario reads afterwards.
+struct Other {
+    queue: crate::logging::queued::Queued,
+    /// `None` once finished.
+    guard: Option<crate::logging::queued::QueuedGuard>,
+    /// Lets the held destination of a full queue go.
+    release: Option<mpsc::Sender<()>>,
+    /// What the queue's destination took.
+    took: Box<dyn Fn() -> String>,
+    /// What `finish` returned, once it has.
+    finished: String,
+}
+
+/// What `finish` returned, as text.
+fn describe(result: Result<(), crate::logging::queued::QueueError>) -> String {
+    match result {
+        Ok(()) => "ok".to_string(),
+        Err(error) => error.to_string(),
+    }
+}
+
+/// A destination that panics on its first write. It says when it is dropped, which is after its queue's receiver:
+/// from then on the queue's senders are refused.
+struct PanicsOnFirstWrite(mpsc::Sender<()>);
+
+impl Write for PanicsOnFirstWrite {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        panic!("the other destination panics");
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for PanicsOnFirstWrite {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+impl OtherQueue {
+    fn build(self) -> Other {
+        let taken = VecWriter::new();
+        let bytes_took: Box<dyn Fn() -> String> = {
+            let taken = taken.clone();
+            Box::new(move || format!("{:?}", String::from_utf8_lossy(&taken.snapshot())))
+        };
+        match self {
+            OtherQueue::HasRoom => {
+                let (queue, guard) = queued(taken, Overflow::Wait);
+                Other {
+                    queue,
+                    guard: Some(guard),
+                    release: None,
+                    took: bytes_took,
+                    finished: String::new(),
+                }
+            }
+            OtherQueue::Closed(overflow) => {
+                let (queue, guard) = queued(taken, overflow);
+                Other {
+                    queue,
+                    guard: None,
+                    release: None,
+                    took: bytes_took,
+                    finished: describe(guard.finish()),
+                }
+            }
+            OtherQueue::Panicked(overflow) => {
+                // The panic is this scenario's subject; its message would reach the redirected stderr.
+                std::panic::set_hook(Box::new(|_| {}));
+                let (gone_tx, gone) = mpsc::channel();
+                let (mut queue, guard) = queued(PanicsOnFirstWrite(gone_tx), overflow);
+                queue.write_all(b"held").expect("the other queue has room");
+                gone.recv()
+                    .expect("the other destination is dropped when its writer thread ends");
+                Other {
+                    queue,
+                    guard: Some(guard),
+                    release: None,
+                    took: bytes_took,
+                    finished: String::new(),
+                }
+            }
+            OtherQueue::Full(overflow) => {
+                let writes = Arc::new(AtomicUsize::new(0));
+                let (entered, has_entered) = mpsc::channel();
+                let (release, released) = mpsc::channel();
+                let (mut queue, guard) = queued(
+                    Held {
+                        entered: Some(entered),
+                        release: released,
+                        writes: Arc::clone(&writes),
+                    },
+                    overflow,
+                );
+                // The destination holds the first message, so the queue behind it is empty and takes exactly its
+                // capacity.
+                queue.write_all(b"held").expect("the other queue has room");
+                has_entered.recv().expect("the other destination's first write");
+                for _ in 0..CAPACITY {
+                    queue.write_all(b"x").expect("the other queue has room");
+                }
+                Other {
+                    queue,
+                    guard: Some(guard),
+                    release: Some(release),
+                    took: Box::new(move || format!("{} messages", writes.load(Ordering::SeqCst))),
+                    finished: String::new(),
+                }
+            }
+        }
+    }
 }
 
 /// A destination writes a line that names the armed server address to another queue from its writer thread, with
 /// stderr redirected and teed to a buffer. The result holds what the other queue's destination took (a full queue's
-/// destination: how many messages) and what the tee took; the parent reads this process's real stderr.
+/// destination: how many messages), what `finish` returned for the other queue and what the tee took; the parent reads
+/// this process's real stderr.
 fn scenario_writer_thread_write(state: OtherQueue) {
     struct WritesAQueue(crate::logging::queued::Queued);
     impl Write for WritesAQueue {
@@ -876,58 +1008,25 @@ fn scenario_writer_thread_write(state: OtherQueue) {
     let tee = VecWriter::new();
     let mut relays = redirect_stdio_with(Box::new(tee.clone()), Box::new(std::io::sink()), Overflow::Wait)
         .expect("redirect with custom writers");
-    let other_took = VecWriter::new();
-    let other_writes = Arc::new(AtomicUsize::new(0));
-    let (entered, has_entered) = mpsc::channel();
-    let (release, released) = mpsc::channel();
-    let (mut other, other_guard) = match state {
-        OtherQueue::Full => queued(
-            Held {
-                entered: Some(entered),
-                release: released,
-                writes: Arc::clone(&other_writes),
-            },
-            Overflow::Wait,
-        ),
-        OtherQueue::HasRoom | OtherQueue::Ended => queued(other_took.clone(), Overflow::Wait),
-    };
-    let mut other_guard = Some(other_guard);
-    match state {
-        OtherQueue::HasRoom => {}
-        OtherQueue::Ended => other_guard
-            .take()
-            .expect("not finished yet")
-            .finish()
-            .expect("the other queue"),
-        OtherQueue::Full => {
-            // The destination holds the first message, so the queue behind it is empty and takes exactly its capacity.
-            other.write_all(b"held").expect("the other queue has room");
-            has_entered.recv().expect("the other destination's first write");
-            for _ in 0..CAPACITY {
-                other.write_all(b"x").expect("the other queue has room");
-            }
-        }
-    }
-    let (mut queue, guard) = queued(WritesAQueue(other), Overflow::Wait);
+    let mut other = state.build();
+    let (mut queue, guard) = queued(WritesAQueue(other.queue), Overflow::Wait);
     queue.write_all(b"go").expect("the queue has room");
     // In this order every place the text could have gone is complete before it is read: the writer thread has
-    // written, the other queue is written out, and the relay has teed what reached the redirected stderr. A full
-    // queue is still held when the first `finish` returns: the write to it did not wait.
+    // written, the other queue is written out, and the relay has teed what reached the redirected stderr.
     guard.finish().expect("the queue whose destination writes");
-    if let OtherQueue::Full = state {
+    if let Some(release) = other.release {
         release.send(()).expect("the other destination is waiting");
     }
-    if let Some(other_guard) = other_guard {
-        other_guard.finish().expect("the other queue");
+    if let Some(other_guard) = other.guard.take() {
+        other.finished = describe(other_guard.finish());
     }
     relays.flush(|e| panic!("relay flush: {e}"));
 
-    let other_took = match state {
-        OtherQueue::Full => format!("{} messages", other_writes.load(Ordering::SeqCst)),
-        OtherQueue::HasRoom | OtherQueue::Ended => format!("{:?}", String::from_utf8_lossy(&other_took.snapshot())),
-    };
     write_result(&ChildResult {
-        observed: vec![format!("the other queue took: {other_took}")],
+        observed: vec![
+            format!("the other queue took: {}", (other.took)()),
+            format!("finishing the other queue returned: {}", other.finished),
+        ],
         tee_stderr: String::from_utf8_lossy(&tee.snapshot()).into_owned(),
         ..ChildResult::default()
     });

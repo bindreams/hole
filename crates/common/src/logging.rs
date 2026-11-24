@@ -511,9 +511,9 @@ enum SavedStream {
 }
 
 /// The process's stderr as its caller gave it: the saved handle once stderr is redirected, `io::stderr()` until then.
-/// Redacts what it is given. A write depends on no thread of this process, so a writer thread whose record found its
-/// queue full or ended, and the exit report, use it where a queue or `io::stderr()` could wait for the thread that is
-/// writing.
+/// Redacts what it is given. A write depends on no thread of this process, so the exit report, and a writer thread's
+/// record that a queue could not take or that found its queue closed, use it where a queue or `io::stderr()` could wait
+/// for the thread that is writing.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OriginalStderr;
 

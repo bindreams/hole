@@ -7,7 +7,7 @@
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 use super::{DeliveryThread, OriginalStderr, DELIVERY_THREAD};
@@ -42,13 +42,79 @@ impl Overflow {
     }
 }
 
+impl Overflow {
+    /// What becomes of `buf` when the queue cannot take it: the queue's own policy decides.
+    fn cannot_take(self, dropped: &AtomicU64, buf: &[u8]) -> io::Result<()> {
+        match self {
+            // Waiting is not possible here, and `Wait` promises that nothing is dropped.
+            Overflow::Wait => OriginalStderr.write_all(buf),
+            Overflow::Drop => {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+    }
+}
+
 /// How a write to a [`Queued`] is handed over, which depends on the thread that makes it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Handover {
     /// Into the queue; a full queue does what the queue's [`Overflow`] says.
     Queue,
-    /// Offered to the queue without waiting; to the original stderr when the queue is full or has ended.
+    /// Offered to the queue without waiting. A queue that cannot take it (full, or its writer panicked) does what its
+    /// [`Overflow`] says; a queue that `finish` has closed has the record go to the original stderr.
     Offer,
+}
+
+/// Why the queue did not take an offered message.
+enum Refusal {
+    /// The queue is full.
+    Full,
+    /// The writer thread panicked and dropped its receiver.
+    Panicked,
+    /// `finish` has closed the queue.
+    Closed,
+}
+
+impl Refusal {
+    /// What becomes of `buf`, which the queue refused. A queue that cannot take it decides by its `overflow`; a closed
+    /// queue has nobody to write it, so it goes to the original stderr.
+    fn handle(self, overflow: Overflow, dropped: &AtomicU64, buf: &[u8]) -> io::Result<()> {
+        match self {
+            Refusal::Full => overflow.cannot_take(dropped, buf),
+            Refusal::Panicked => overflow.cannot_take(dropped, buf),
+            Refusal::Closed => OriginalStderr.write_all(buf),
+        }
+    }
+}
+
+/// Whether `finish` has closed the queue to offers. Shared by the clones of a [`Queued`] and the [`QueuedGuard`].
+///
+/// An offer holds the lock only across its `try_send`, which does not wait. `finish` sets the flag under the lock and
+/// releases it before it sends `Finish`: an offer from the queue's own writer thread could be waiting for the lock
+/// while `finish` waits for that writer to make room. An offer either completes before the flag is set and is written
+/// ahead of `Finish`, or finds the flag set; so none reaches the receiver between the writer reading `Finish` and
+/// dropping it.
+#[derive(Clone, Default)]
+struct Closing(Arc<Mutex<bool>>);
+
+impl Closing {
+    fn offer(&self, sender: &SyncSender<Message>, message: Message) -> Result<(), Refusal> {
+        let closed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if *closed {
+            return Err(Refusal::Closed);
+        }
+        match sender.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(Refusal::Full),
+            // The flag is not set, so `Finish` has not been sent: only a panic ends the writer thread.
+            Err(TrySendError::Disconnected(_)) => Err(Refusal::Panicked),
+        }
+    }
+
+    fn close(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    }
 }
 
 /// The writer thread has ended: it was finished, or its destination panicked.
@@ -68,18 +134,22 @@ enum Message {
 
 /// Hands each write to a thread that owns the destination. Clone; a `MakeWriter`.
 ///
-/// Contract: on a writer thread a write never waits for a queue. It is offered to the queue, and goes to the original
-/// stderr when the queue is full or has ended. Code on a writer thread logs once per event it reports, never once per
-/// message it writes. It writes no redirected stream. A writer that waited for a queue or for a redirected stream
-/// could be waiting for itself, directly or through the relay thread that reads the stream.
+/// Contract: on a writer thread a write never waits for a queue. It is offered without waiting. When the queue cannot
+/// take it (it is full, or its writer panicked), a `Drop` queue drops and counts it, and a `Wait` queue's record goes
+/// to the original stderr. When `finish` has closed the queue, the record goes to the original stderr; an offer made
+/// before then is written ahead of `Finish`. The original stderr is a destination like any other: a reader that does
+/// not read it holds the writer thread. Code on a writer thread logs once per event it reports, never once per message
+/// it writes. It writes no redirected stream. The panic record of a writer whose own destination panicked is lost with
+/// that writer's queue.
 ///
-/// The panic record of a writer whose own destination panicked is lost with that writer's queue, and so is any record
-/// a writer offers to its own queue after `Finish` is queued.
+/// A writer that waited for a queue or for a redirected stream could be waiting for itself, directly or through the
+/// relay thread that reads the stream.
 #[derive(Clone)]
 pub(crate) struct Queued {
     sender: SyncSender<Message>,
     overflow: Overflow,
     dropped: Arc<AtomicU64>,
+    closing: Closing,
 }
 
 /// Owns the writer thread. Dropped without [`Self::finish`], the thread keeps writing until every [`Queued`] is gone.
@@ -87,6 +157,7 @@ pub(crate) struct Queued {
 pub(crate) struct QueuedGuard {
     sender: SyncSender<Message>,
     dropped: Arc<AtomicU64>,
+    closing: Closing,
     thread: JoinHandle<Written>,
 }
 
@@ -165,16 +236,19 @@ pub(crate) fn queued<W: Write + Send + 'static>(destination: W, overflow: Overfl
             written
         })
         .expect("failed to spawn a log writer thread");
+    let closing = Closing::default();
     let queued = Queued {
         sender: sender.clone(),
         overflow,
         dropped: Arc::clone(&dropped),
+        closing: closing.clone(),
     };
     (
         queued,
         QueuedGuard {
             sender,
             dropped,
+            closing,
             thread,
         },
     )
@@ -206,10 +280,11 @@ impl Write for Queued {
         let message = Message::Bytes(buf.to_vec());
         match DELIVERY_THREAD.get().map_or(Handover::Queue, DeliveryThread::handover) {
             Handover::Queue => self.overflow.send(&self.sender, message, &self.dropped)?,
-            Handover::Offer => match self.sender.try_send(message) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => OriginalStderr.write_all(buf)?,
-            },
+            Handover::Offer => {
+                if let Err(refusal) = self.closing.offer(&self.sender, message) {
+                    refusal.handle(self.overflow, &self.dropped, buf)?;
+                }
+            }
         }
         Ok(buf.len())
     }
@@ -230,8 +305,11 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Queued {
 
 impl QueuedGuard {
     /// Return once every message queued before the call is written and flushed. No time limit: a destination that
-    /// takes no bytes holds the call. Later writes to the queue fail.
+    /// takes no bytes holds the call. A later write from a writer thread goes to the original stderr; one from another
+    /// thread fails.
     pub(crate) fn finish(self) -> Result<(), QueueError> {
+        // Closed before `Finish` is sent, and the lock is released before the send: see [`Closing`].
+        self.closing.close();
         // Waits for room in a full queue; fails when the writer thread has already ended, which the join reports.
         let _ = self.sender.send(Message::Finish);
         // The thread catches its destination's panic, so a join error is a panic outside the destination.

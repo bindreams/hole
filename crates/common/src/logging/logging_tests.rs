@@ -379,39 +379,122 @@ fn a_write_to_a_queue_with_room_from_a_writer_thread_reaches_its_destination(#[f
     assert_eq!(stderr, "", "the child's real stderr");
     assert_eq!(
         result.observed,
-        [format!("the other queue took: {:?}", writer_thread_text(REDACT_ADDR))]
+        [
+            format!("the other queue took: {:?}", writer_thread_text(REDACT_ADDR)),
+            "finishing the other queue returned: ok".to_string(),
+        ]
     );
     assert_eq!(result.tee_stderr, "", "what reached the redirected stderr");
 }
 
-/// A write to a queue that has ended, made on a writer thread, lands on the original stderr. Not on `io::stderr()`:
-/// that is the redirected pipe, whose reader may be waiting for this thread. The line names the armed server address
-/// and passes no destination's redaction wrapper on this path; it arrives with the token in the address's place.
+/// A write to a queue that `finish` has closed, made on a writer thread, lands on the original stderr, whatever the
+/// queue does when it is full. Not on `io::stderr()`: that is the redirected pipe, whose reader may be waiting for this
+/// thread. The line names the armed server address and passes no destination's redaction wrapper on this path; it
+/// arrives with the token in the address's place.
 #[skuld::test]
-fn a_write_to_an_ended_queue_from_a_writer_thread_lands_on_the_original_stderr_redacted(
+fn a_write_to_a_closed_waiting_queue_from_a_writer_thread_lands_on_the_original_stderr_redacted(
     #[fixture(temp_dir)] dir: &Path,
 ) {
     use crate::logging::logging_test_helpers::writer_thread_text;
 
-    let (result, stderr) = run_child_reading_stderr("writer_thread_write_to_an_ended_queue", dir);
-    assert_eq!(stderr, writer_thread_text(REDACT_TOKEN), "the child's real stderr");
-    assert_eq!(result.observed, ["the other queue took: \"\""]);
-    assert_eq!(result.tee_stderr, "", "what reached the redirected stderr");
-}
-
-/// A write to a full queue, made on a writer thread, lands on the original stderr, redacted, and the queue takes no
-/// more than it held. The write does not wait for room: the child finishes the writing queue while the full queue's
-/// destination is still held.
-#[skuld::test]
-fn a_write_to_a_full_queue_from_a_writer_thread_lands_on_the_original_stderr_redacted(#[fixture(temp_dir)] dir: &Path) {
-    use crate::logging::logging_test_helpers::writer_thread_text;
-    use crate::logging::queued::CAPACITY;
-
-    let (result, stderr) = run_child_reading_stderr("writer_thread_write_to_a_full_queue", dir);
+    let (result, stderr) = run_child_reading_stderr("writer_thread_write_to_a_closed_waiting_queue", dir);
     assert_eq!(stderr, writer_thread_text(REDACT_TOKEN), "the child's real stderr");
     assert_eq!(
         result.observed,
-        [format!("the other queue took: {} messages", CAPACITY + 1)]
+        ["the other queue took: \"\"", "finishing the other queue returned: ok"]
+    );
+    assert_eq!(result.tee_stderr, "", "what reached the redirected stderr");
+}
+
+/// As [`a_write_to_a_closed_waiting_queue_from_a_writer_thread_lands_on_the_original_stderr_redacted`], for a queue
+/// that drops when it is full: closed is not full, and nothing is dropped.
+#[skuld::test]
+fn a_write_to_a_closed_dropping_queue_from_a_writer_thread_lands_on_the_original_stderr_redacted(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    use crate::logging::logging_test_helpers::writer_thread_text;
+
+    let (result, stderr) = run_child_reading_stderr("writer_thread_write_to_a_closed_dropping_queue", dir);
+    assert_eq!(stderr, writer_thread_text(REDACT_TOKEN), "the child's real stderr");
+    assert_eq!(
+        result.observed,
+        ["the other queue took: \"\"", "finishing the other queue returned: ok"]
+    );
+    assert_eq!(result.tee_stderr, "", "what reached the redirected stderr");
+}
+
+/// A queue whose writer thread panicked cannot take a record, as a full one cannot: a queue that waits when it is full
+/// has the record written to the original stderr, redacted. Nothing is counted as dropped.
+#[skuld::test]
+fn a_write_to_a_panicked_waiting_queue_from_a_writer_thread_lands_on_the_original_stderr_redacted(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    use crate::logging::logging_test_helpers::writer_thread_text;
+
+    let (result, stderr) = run_child_reading_stderr("writer_thread_write_to_a_panicked_waiting_queue", dir);
+    assert_eq!(stderr, writer_thread_text(REDACT_TOKEN), "the child's real stderr");
+    assert_eq!(
+        result.observed,
+        [
+            "the other queue took: \"\"",
+            "finishing the other queue returned: writes refused: 0, messages dropped: 0, the writer thread panicked",
+        ]
+    );
+    assert_eq!(result.tee_stderr, "", "what reached the redirected stderr");
+}
+
+/// A queue that drops when it is full drops the record of a writer thread when its own writer thread has panicked, and
+/// counts it; the original stderr gets nothing.
+#[skuld::test]
+fn a_write_to_a_panicked_dropping_queue_from_a_writer_thread_is_dropped_and_counted(#[fixture(temp_dir)] dir: &Path) {
+    let (result, stderr) = run_child_reading_stderr("writer_thread_write_to_a_panicked_dropping_queue", dir);
+    assert_eq!(stderr, "", "the child's real stderr");
+    assert_eq!(
+        result.observed,
+        [
+            "the other queue took: \"\"",
+            "finishing the other queue returned: writes refused: 0, messages dropped: 1, the writer thread panicked",
+        ]
+    );
+    assert_eq!(result.tee_stderr, "", "what reached the redirected stderr");
+}
+
+/// A write to a full queue that waits when it is full, made on a writer thread, lands on the original stderr, redacted,
+/// and the queue takes no more than it held: a writer thread must not wait for a queue, which could be its own.
+#[skuld::test]
+fn a_write_to_a_full_waiting_queue_from_a_writer_thread_lands_on_the_original_stderr_redacted(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    use crate::logging::logging_test_helpers::writer_thread_text;
+    use crate::logging::queued::CAPACITY;
+
+    let (result, stderr) = run_child_reading_stderr("writer_thread_write_to_a_full_waiting_queue", dir);
+    assert_eq!(stderr, writer_thread_text(REDACT_TOKEN), "the child's real stderr");
+    assert_eq!(
+        result.observed,
+        [
+            format!("the other queue took: {} messages", CAPACITY + 1),
+            "finishing the other queue returned: ok".to_string(),
+        ]
+    );
+    assert_eq!(result.tee_stderr, "", "what reached the redirected stderr");
+}
+
+/// A write to a full queue that drops when it is full, made on a writer thread, is dropped and counted, as on any
+/// other thread. The original stderr gets nothing: for a terminal sink it is the stream that filled the queue, and a
+/// writer thread blocked on it would hold every thread behind it.
+#[skuld::test]
+fn a_write_to_a_full_dropping_queue_from_a_writer_thread_is_dropped_and_counted(#[fixture(temp_dir)] dir: &Path) {
+    use crate::logging::queued::CAPACITY;
+
+    let (result, stderr) = run_child_reading_stderr("writer_thread_write_to_a_full_dropping_queue", dir);
+    assert_eq!(stderr, "", "the child's real stderr");
+    assert_eq!(
+        result.observed,
+        [
+            format!("the other queue took: {} messages", CAPACITY + 1),
+            "finishing the other queue returned: writes refused: 0, messages dropped: 1".to_string(),
+        ]
     );
     assert_eq!(result.tee_stderr, "", "what reached the redirected stderr");
 }
