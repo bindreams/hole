@@ -99,6 +99,40 @@ fn a_command_whose_stdout_the_caller_closed_reports_no_loss() {
     );
 }
 
+/// A command whose stdout takes no bytes says that its output was not delivered, on stderr and in the log. The stdout
+/// here is a file opened for reading only, which the operating system refuses to write.
+#[skuld::test]
+fn a_command_whose_stdout_refuses_writes_says_that_its_output_was_not_delivered() {
+    let work = tempfile::tempdir().expect("work dir");
+    let log_dir = tempfile::tempdir_in(work.path()).expect("log dir");
+    let target = work.path().join("stdout");
+    std::fs::write(&target, b"").expect("create the file");
+    let read_only = std::fs::File::open(&target).expect("open the file for reading");
+    let out = hole_command(log_dir.path(), &["bridge", "status"])
+        .stdout(read_only)
+        .output()
+        .expect("run hole");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let log = std::fs::read_to_string(log_dir.path().join("gui-cli.log")).unwrap_or_default();
+    // One status line was printed, so one write was refused.
+    let report = "hole: the output could not be fully delivered: stdout was not fully written: \
+                  writes refused: 1, messages dropped: 0";
+    assert_eq!(
+        std::fs::read(&target).expect("read the file back"),
+        b"",
+        "the file took bytes, so nothing was refused"
+    );
+    assert!(
+        stderr.contains(report),
+        "stderr is {stderr:?}, which does not say that stdout was not written"
+    );
+    assert!(
+        log.contains(report),
+        "gui-cli.log is {log:?}, which does not record that stdout was not written"
+    );
+}
+
 fn main() {
     skuld::run_all();
 }
