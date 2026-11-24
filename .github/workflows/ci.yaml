@@ -136,7 +136,7 @@ jobs:
 
       - id: setup-build
         uses: ./.github/actions/setup-build
-        # Sized for an empty compile cache; to be resized by the budget rule above from the cold run of this change.
+        # Sized for an empty compile cache; to be resized by the budget rule above.
         timeout-minutes: 60
         with:
           save-cache: ${{ matrix.cache-saver == true }}
@@ -557,8 +557,7 @@ jobs:
       - id: hole-build
         name: Build hole test binaries
         if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.hole == true }}
-        # Sized for an empty compile cache (a cold run on macOS amd64 started 701 crates in 70 minutes and was cut);
-        # to be resized by the budget rule above from the cold run of this change.
+        # Sized for an empty compile cache; to be resized by the budget rule above.
         timeout-minutes: 120
         shell: bash
         run: |
@@ -658,9 +657,7 @@ jobs:
       #
       # Slow runs are part of that spread, not outliers: darwin/amd64's 32.3m and
       # 21.2m are one run. Raised only, never tightened. Those runs had a warm
-      # compile cache, which a run cannot count on; `setup-build` (60) and
-      # `hole-build` (120) are set for an empty one, as values for a measuring
-      # run, and are resized by the rule above from its cold times.
+      # compile cache; `setup-build` and `hole-build` are sized for an empty one.
       #
       # NO COMPILING. Nothing after `hole-build` may compile or run a build script:
       # the steps only re-execute what it compiled, and one that compiles has a
@@ -977,8 +974,8 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      # The server's log: its statistics give counts of failed cache writes, this gives the cause. On a run that only
-      # reads the cache, every miss is logged and counted as a failed write ("storage is read-only").
+      # On a run that only reads the cache, every miss is logged and counted as a failed write ("Cannot write to
+      # read-only storage").
       - id: sccache-upload-error-log
         name: Upload the sccache error log
         if: ${{ always() }}

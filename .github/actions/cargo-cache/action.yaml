@@ -40,9 +40,8 @@ runs:
     # so every parallel job sharing a key pays the full tar and all but the
     # first to finish then fail with "Unable to reserve cache ... another job
     # may be creating this cache". On Windows that tar takes minutes. So a job
-    # saves only when it is the designated saver for its key. Whether the ref
-    # may write at all is `setup-build`'s rule, which sets `save`; PRs read
-    # `main`'s cache through `restore-keys`.
+    # saves only when it is the designated saver for its key. PRs read `main`'s
+    # cache through `restore-keys`.
     - uses: actions/cache/restore@v6
       if: inputs.save != 'true'
       with:

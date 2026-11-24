@@ -4,8 +4,7 @@ description: Set up a compilable Rust workspace (toolchains, cache, runtime deps
 # The cache-write rule, stated once here: a run writes caches (the cargo cache
 # and sccache) only for a push to `refs/heads/main` that is not a release
 # call. Every other run only reads: a PR-ref cache is visible to that PR alone
-# and would only fill the repo's 10 GB cache quota. `cargo-cache` and
-# sccache both take their decision from the `cache-writes` step below.
+# and would only fill the repo's 10 GB cache quota.
 
 inputs:
   save-cache:
@@ -32,8 +31,13 @@ runs:
         # One server for the whole job: with no idle exit it is never restarted
         # mid-job, so the statistics it prints at the end cover every compile.
         echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
+        # The server's startup makes no request to the cache service and takes
+        # the mode this action sets. A slow cache service then cannot make a
+        # start run out of its ten seconds, which fails the compile that
+        # started the server.
+        echo "SCCACHE_SKIP_CACHE_CHECK=true" >> "$GITHUB_ENV"
         # The server logs a failed cache write only at `debug` level, in its
-        # `server` module; the statistics give the count and not the cause.
+        # `server` module.
         echo "SCCACHE_LOG=warn,sccache::server=debug" >> "$GITHUB_ENV"
         echo "SCCACHE_ERROR_LOG=$RUNNER_TEMP/sccache-error.log" >> "$GITHUB_ENV"
 
@@ -76,9 +80,7 @@ runs:
 
     # Its setup downloads a release, outside this repo's retry helpers; when
     # that fails, build without it rather than fail on a lost network, and
-    # leave a warning. With it, a compile can also fail: a server that does not
-    # start in time (the cache service unreachable) fails the compile that
-    # started it, so the server is started below, under retry.
+    # leave a warning.
     - id: sccache
       uses: mozilla-actions/sccache-action@v0.0.11
       continue-on-error: true
@@ -88,24 +90,25 @@ runs:
         # renovate: datasource=github-releases depName=mozilla/sccache
         version: v0.20.0
 
-    - name: Build without sccache (its setup could not fetch it)
-      if: steps.sccache.outcome == 'failure'
-      shell: bash
-      run: |
-        echo "::warning::mozilla-actions/sccache-action failed; building without sccache"
-        echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-
-    # The server outlives this step and serves every compile of the job. A start
-    # that times out leaves its server coming up, and `--start-server` on a
-    # running one fails with "Address in use", so each attempt also accepts a
-    # server that is already answering: `--zero-stats` connects to one or tries
-    # to start one, and fails when it gets neither (`--show-stats` would print
-    # empty statistics and succeed). A start that keeps failing is retried until
-    # the step's limit.
-    - name: Start the sccache server
+    # The server outlives this step and serves every compile of the job. Its
+    # startup needs no network (`SCCACHE_SKIP_CACHE_CHECK`), so a failure here
+    # is not a lost network and is not retried: the job builds without sccache.
+    - id: sccache-server
+      name: Start the sccache server
       if: steps.sccache.outcome == 'success'
+      continue-on-error: true
       shell: bash
-      run: .github/scripts/retry.sh bash -c 'sccache --start-server || sccache --zero-stats'
+      run: sccache --start-server
+
+    - name: Build without sccache (it was not fetched, or its server did not start)
+      if: steps.sccache.outcome == 'failure' || steps.sccache-server.outcome == 'failure'
+      shell: bash
+      env:
+        SETUP: ${{ steps.sccache.outcome }}
+        SERVER: ${{ steps.sccache-server.outcome }}
+      run: |
+        echo "::warning::sccache is unavailable (setup: $SETUP, server: $SERVER); building without it"
+        echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
     # Compiling `xtask` below fetches crates, so a network loss would fail it
     # with no product defect behind it; `retry.sh` waits for the network.
@@ -113,10 +116,9 @@ runs:
       shell: bash
       run: .github/scripts/cargo-fetch.sh
 
-    # The `cargo xtask` alias (`.cargo/config.toml`) is `cargo run --package
-    # xtask --quiet`, so its first call compiles `xtask` with no output. This
-    # compiles the same bin with the same profile and features, with output, so
-    # the step's time is the compile and the later call finds it built.
+    # The `cargo xtask` alias runs `--quiet`, so its first call compiles `xtask`
+    # silently; building it here, same bin and profile, shows the compile in its
+    # own step.
     - name: Build xtask
       shell: bash
       run: cargo build --package xtask --bin xtask
