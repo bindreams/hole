@@ -789,6 +789,19 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # Journeys ========================================================================================================
+      # The installed lanes' JUnit files against tests/installed/journeys.yaml: every case the table names for this
+      # platform ran. In a release of `hole`, a journey with no test on this platform fails too, and `release-upload`
+      # below does not run after a failed step. The release tag is passed as the release steps pass it.
+      - id: journeys
+        name: Check that every journey's test ran
+        if: ${{ !cancelled() && (steps.installer-tests.outcome == 'success' || steps.dmg-install-e2e.outcome == 'success') }}
+        timeout-minutes: 5
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: cargo xtask verify-journeys --results target/journeys --tag "$RELEASE_TAG"
+
       # TUN lanes =======================================================================================================
       # Quoted: an unquoted ` #` opens a YAML comment and truncates the name.
       - id: hole-test-tun

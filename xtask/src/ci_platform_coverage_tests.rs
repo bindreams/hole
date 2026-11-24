@@ -728,6 +728,8 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
     ] {
         g.insert(id, HOLE_LEGS.to_vec());
     }
+    // The journey table is checked wherever an installed lane runs.
+    g.insert("journeys", vec!["windows/amd64", "darwin/amd64", "darwin/arm64"]);
     g.insert("hole-test-tun-macos", DARWIN.to_vec());
     // Darwin uploads bridge logs unconditionally; elsewhere only on failure.
     g.insert("hole-upload-bridge-logs", DARWIN.to_vec());

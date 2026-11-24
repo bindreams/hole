@@ -35,6 +35,7 @@ pub mod git_util;
 pub mod global_net_state_conformance;
 pub mod golangci_lint;
 pub mod interrupt;
+pub mod journeys;
 pub mod manifest;
 pub mod notices;
 pub mod orchestrate;
@@ -511,6 +512,19 @@ pub enum Command {
         #[arg(long = "junit", required = true)]
         junits: Vec<PathBuf>,
     },
+    /// Verify that every case the journey table (`tests/installed/journeys.yaml`) names for this host's platform
+    /// ran, as the installed lanes' JUnit files show — see `xtask::journeys`.
+    ///
+    /// A case that did not run fails the step. A journey with no test on this platform is printed, and fails the
+    /// step in a release of `hole`.
+    VerifyJourneys {
+        /// The folder of JUnit files (`*.xml`) the installed lanes wrote, relative to the repo root unless absolute.
+        #[arg(long)]
+        results: PathBuf,
+        /// The release being cut, `releases/<group>/vX.Y.Z`. Empty or absent for a run that releases nothing.
+        #[arg(long)]
+        tag: Option<String>,
+    },
     /// Verify that the startup strip covers every variable a real `cargo run`
     /// added to xtask's environment — see `xtask::run_injected_env`. Run it as
     /// `cargo run --package xtask -- verify-run-injected-env ...`, not through
@@ -624,6 +638,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         } => global_net_state_conformance::verify(&repo_root()?, &job, Some(&step_prefix), record.as_deref()),
         Command::VerifyGlobalNetStateExecuted { expected, junits } => {
             global_net_state_conformance::verify_executed(&repo_root()?, &expected, &junits)
+        }
+        Command::VerifyJourneys { results, tag } => {
+            journeys::verify(&repo_root()?, &results, tag.as_deref().filter(|tag| !tag.is_empty()))
         }
         Command::VerifyRunInjectedEnv { parent_env_names } => {
             run_injected_env::verify(&repo_root()?.join(parent_env_names))

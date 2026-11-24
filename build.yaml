@@ -204,6 +204,9 @@ targets:
     # Run in this order: each file installs for itself, and the upgrade refuses a
     # machine with Hole on it (see test_upgrade.py).
     #
+    # The JUnit file in target/journeys/ is what `cargo xtask verify-journeys` checks
+    # tests/installed/journeys.yaml against: a test file not named here has no result.
+    #
     # No `depends`: `frontend-build` would `npm ci` and rebuild ui/dist, which
     # CI's `hole-build` has already compiled in. The E2E needs the `node_modules`
     # a `hole-msi` or `frontend-build` run left.
@@ -213,7 +216,7 @@ targets:
       - uv lock --check --offline --directory msi-installer
       - .github/scripts/retry.sh uv sync --directory msi-installer --group dev
       - uv run --directory msi-installer --group dev provision-e2e-tools
-    run: uv run --directory msi-installer --group dev pytest -v -s -m system_wide tests/installed/test_lifecycle.py tests/installed/test_connect.py tests/installed/test_member_access.py tests/installed/test_full_tunnel.py tests/installed/test_upgrade.py
+    run: uv run --directory msi-installer --group dev pytest -v -s -m system_wide --junitxml=../target/journeys/hole-msi-install-tests.xml tests/installed/test_lifecycle.py tests/installed/test_connect.py tests/installed/test_member_access.py tests/installed/test_full_tunnel.py tests/installed/test_upgrade.py
 
   hole-msi-cleanup:
     # Uninstalls what an interrupted `hole-msi-install-tests` left (a step timeout
@@ -231,8 +234,11 @@ targets:
     # Run-only, no `depends:`: it consumes the app, `galoshes` and `ex-ray` that
     # `hole-dmg` built in the same job, so a second cascade here would roll the
     # flaky bundle_dmg.sh/hdiutil pipeline twice.
+    #
+    # The JUnit file in target/journeys/ is what `cargo xtask verify-journeys` checks
+    # tests/installed/journeys.yaml against.
     platforms: [darwin/amd64, darwin/arm64]
-    run: uv run --directory dmg-installer pytest -v -m install_e2e
+    run: uv run --directory dmg-installer pytest -v -m install_e2e --junitxml=../target/journeys/hole-dmg-install-e2e.xml
 
   npm-install:
     # `node_modules/` from `package-lock.json`, and nothing built. `frontend-build` (the Vite bundle) and

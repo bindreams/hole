@@ -1,0 +1,99 @@
+# The things a person does with the installed product that a `hole` release must have a test for, and the cases that
+# run each on each platform it ships for. `cargo xtask verify-journeys` reads it; docs/contributing/installers.md
+# says how to change it.
+#
+# A case is written as the installed lane's JUnit file names it: `<classname>::<name>`, the test's path from its
+# project as dotted words, then the test's name with its parameters. `none` is a journey no test runs on that
+# platform: a draft release of `hole` fails until the cell has a case.
+
+# How each platform's lane installs the product, where that is not how a person does.
+installs:
+  windows/amd64: With `msiexec` and a quiet UI from an elevated shell, not by double-click (bindreams/hole#1403)
+  darwin/amd64: The app copied from the DMG to a temporary folder and the helper installed with `sudo`, not by dragging the app to Applications (bindreams/hole#1404)
+  darwin/arm64: The app copied from the DMG to a temporary folder and the helper installed with `sudo`, not by dragging the app to Applications (bindreams/hole#1404)
+
+journeys:
+  - id: install
+    does: Install the released file the way its page says
+    cells:
+      windows/amd64:
+        cases:
+          - tests.installed.test_lifecycle::test_installed_files_match_canonical_bindir
+          - tests.installed.test_lifecycle::test_bridge_service_registered
+          - tests.installed.test_lifecycle::test_machine_path_has_bin_dir
+        differs: Checks the installed files, the service and the machine PATH, not what the installer shows (bindreams/hole#1403)
+      darwin/amd64: none
+      darwin/arm64: none
+
+  - id: connect-full-tunnel
+    does: Press Connect with the default settings and load a page by name, without a plugin and through each bundled one
+    cells:
+      windows/amd64:
+        cases:
+          - tests.installed.test_full_tunnel::test_installed_full_tunnel_carries_a_page[v2ray-plugin]
+          - tests.installed.test_full_tunnel::test_installed_full_tunnel_carries_a_page[galoshes]
+          - tests.installed.test_full_tunnel::test_installed_full_tunnel_carries_a_page[no-plugin]
+        differs: Starts the tunnel with `hole proxy start`, not with the Connect button (bindreams/hole#1384)
+      darwin/amd64:
+        cases:
+          - tests.test_install_connect::test_installed_bridge_carries_a_full_tunnel[v2ray-plugin]
+          - tests.test_install_connect::test_installed_bridge_carries_a_full_tunnel[galoshes]
+          - tests.test_install_connect::test_installed_bridge_carries_a_full_tunnel[no-plugin]
+        differs: Starts the tunnel with `hole proxy start` as root, not with the Connect button (bindreams/hole#1384)
+      darwin/arm64:
+        cases:
+          - tests.test_install_connect::test_installed_bridge_carries_a_full_tunnel[v2ray-plugin]
+          - tests.test_install_connect::test_installed_bridge_carries_a_full_tunnel[galoshes]
+          - tests.test_install_connect::test_installed_bridge_carries_a_full_tunnel[no-plugin]
+        differs: Starts the tunnel with `hole proxy start` as root, not with the Connect button (bindreams/hole#1384)
+
+  # The full-tunnel cases stop the tunnel and compare the machine's routes and DNS with those before it, but load no
+  # page afterwards.
+  - id: disconnect-and-load-directly
+    does: Disconnect, and load a page directly
+    cells:
+      windows/amd64: none
+      darwin/amd64: none
+      darwin/arm64: none
+
+  - id: connect-after-service-restart
+    does: Connect again after the service restarts
+    cells:
+      windows/amd64:
+        cases:
+          - tests.installed.test_member_access::test_the_installing_user_reaches_the_bridge_before_and_after_restarts[none]
+        differs: Connects in SOCKS-only mode and without a plugin, with `hole proxy start`, not with the Connect button (bindreams/hole#1384)
+      darwin/amd64: none
+      darwin/arm64: none
+
+  - id: second-account-admitted
+    does: A second account is admitted and connects
+    cells:
+      windows/amd64:
+        cases:
+          - tests.installed.test_member_access::test_grant_access_admits_a_user_while_the_bridge_runs[none]
+          - tests.installed.test_member_access::test_a_member_with_no_account_is_listed_and_does_not_lock_the_user_out[none]
+        differs: The installing user, taken out of the `hole` group, stands for the second account; connects in SOCKS-only mode and without a plugin, with `hole proxy start` (bindreams/hole#1405, bindreams/hole#1384)
+      darwin/amd64: none
+      darwin/arm64: none
+
+  - id: update-from-last-release
+    does: Update from the last published release, then connect
+    cells:
+      windows/amd64: none
+      darwin/amd64: none
+      darwin/arm64: none
+
+  - id: lift-lockdown
+    does: Lift a Lockdown block with the commands the troubleshooting page gives
+    cells:
+      windows/amd64: none
+      darwin/amd64: none
+      darwin/arm64: none
+
+  - id: uninstall-and-load-directly
+    does: Uninstall, and load a page directly
+    cells:
+      windows/amd64: none
+      darwin/amd64: none
+      darwin/arm64: none

@@ -36,37 +36,15 @@ expects Restart Manager to stop the service. The lifecycle runs against any MSI 
 also needs the working tree's staged files (`target\release\installer-stage`, from `cargo xtask build hole-msi`) and an MSI
 under test whose version is not lower than the tree's.
 
-Between the two, the lane installs once more and connects ({src}`msi-installer/tests/installed/test_connect.py`): the
-installed `hole.exe` asks the `HoleBridge` service the MSI registered to start a SOCKS-only proxy for a server behind
-`galoshes`, one behind `v2ray-plugin` and one with no plugin, and `curl` fetches a page through each. This is the
-only test in which the service the service manager started runs a plugin; the bridge's own end-to-end tests start it
-as a child of the test. A failure prints what `C:\ProgramData\hole\logs\bridge.log` gained during the case. It runs
-against any MSI too, a published release included. The server is the `ss_plugin_server` example of
-{src}`crates/plugin-e2e/`, with the working tree's `galoshes` and `ex-ray` builds on its side, so the plugins of the
-MSI under test must still speak to the tree's.
-
-A third install connects as the user the installer granted
-({src}`msi-installer/tests/installed/test_member_access.py`). Every other case reaches the bridge from the elevated
-test process, which the socket's Administrators entry admits whatever the bridge granted anyone else. This one runs the
-installed `hole.exe` from a child that `gsudo` de-elevated, whose token was made before the install and so carries no
-`hole` group. It connects to the server with no plugin, restarts the `HoleBridge` service, connects again, and does
-both once more. A second test takes the user out of the group, restarts the service, checks that the user is now
-refused, runs an elevated `hole bridge grant-access` and connects with no further restart. Each fails before its first
-connect when the child still holds Administrators, already carries the group,
-or is not the user the installer added. The child cannot read pytest's own temporary folder, so its files are in
-`member-access\` under the log folder. A failure also says how the child's own connect to the bridge's socket went:
-`hole` can exit before its own error text reaches a pipe.
-
-A fourth install starts a full tunnel, the default of `hole proxy start`, as that same user
-({src}`msi-installer/tests/installed/test_full_tunnel.py`), once for a server behind each bundled plugin and once for a
-server with no plugin. The server runs on the test machine, so it dials out of the machine's default interface instead of
-the routing table, which the tunnel now owns; that is the one thing the example is told. `curl`, run by the de-elevated
-child, requests `http://1.1.1.1/` and, over IPv4, `http://one.one.one.one/`, and each must answer `301` with a
-`Location` for the host the request named. The case then asks the operating system for the IPv4 DNS servers of each
-adapter (`Get-DnsClientServerAddress`) and fails unless an adapter that did not exist before the start lists one, as the
-tunnel's own adapter does. After `hole proxy stop` the machine's routes, adapters, addresses and DNS settings must equal
-those taken before the start. The case needs the internet, and the machine's routes and DNS belong to the tunnel for a
-few seconds.
+The lane's cases are listed by journey in {src}`tests/installed/journeys.yaml`. A row is something a person does with
+the installed product that a `hole` release must have a test for, and it has one cell for each platform a release ships
+for (Windows amd64, macOS amd64 and arm64): the test cases that run it there, or `none`. Each case is written as the
+lane's JUnit file names it, `<classname>::<name>`. `cargo xtask verify-journeys` runs in CI after the installed lanes, reads
+the JUnit files they write into `target/journeys/`, and fails when a case a cell names did not run. In a draft release of
+`hole` it also fails on a `none` cell, so the leg uploads nothing until the cell has a test. To add a journey, add a row
+with a cell for every platform; to fill a `none` cell, write the test, name it in the cell, and for a Windows test file
+add the file to the lane's command line in {src}`build.yaml`. The `installs` entry of each platform and the `differs` text
+of each cell say how the test differs from what a person does, and name the issue that tracks it.
 
 ```{warning}
 This installs Hole system-wide on the machine you run it on. Use a throwaway machine or virtual machine, not the one you

@@ -228,4 +228,4 @@ proxy through the installed service, once as the elevated test process and once 
 Its full-tunnel case starts the default `hole proxy start`, as that user, and fetches a page from outside the machine
 by address and by name, asks the operating system whether DNS points at the tunnel, and compares the machine's routes,
 adapters and DNS settings before the start and after the stop. [The installers](installers.md#the-install-e2e-and-uninstall-run)
-lists the cases.
+links the journey table, which names each case and the journeys no test runs yet.

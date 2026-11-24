@@ -439,7 +439,7 @@ pub(crate) struct Expectation {
 }
 
 /// `path` if absolute, else resolved against `repo_root`.
-fn absolutize(repo_root: &Path, path: &Path) -> PathBuf {
+pub(crate) fn absolutize(repo_root: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
