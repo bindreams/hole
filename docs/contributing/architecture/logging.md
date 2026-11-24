@@ -105,19 +105,33 @@ queue. Four rules follow:
 
 - The panic hook skips the previous hook, the default printer that writes to stderr, on both kinds of thread. The hook's
   own record is still logged.
-- A write to a queue made on a writer thread is offered to the queue without waiting, and goes to the original stderr
-  when the queue is full or has ended. A record that a writer thread logs, such as the warning of a failed `chown`
-  during a rotation, reaches the sinks that would have taken it. The panic record of a writer whose own destination
-  panicked is lost with that writer's queue.
+- A write to a queue made on a writer thread is offered to the queue without waiting. A record that a writer thread
+  logs, such as the warning of a failed `chown` during a rotation, reaches the sinks that would have taken it. The
+  panic record of a writer whose own destination panicked is lost with that writer's queue.
 - `DirRotate` writes its notice that the file could not be opened to the original stderr.
 - The two `tracing` layers are built with `log_internal_errors(false)`. A layer told to log its internal errors prints
   a failed write to stderr, the redirected stream, on the thread that logged the event; printed on a relay thread, the
   line would return as an event whose write fails again.
 
+What a write made on a writer thread does depends on the state of the queue it is offered to:
+
+| The queue                                       | A write made on a writer thread                 |
+| ----------------------------------------------- | ----------------------------------------------- |
+| Has room                                        | Is queued.                                      |
+| Is full, and drops when full                    | Is dropped and counted, as on any other thread. |
+| Is full, and waits when full                    | Goes to the original stderr.                    |
+| Has a writer that panicked, and drops when full | Is dropped and counted.                         |
+| Has a writer that panicked, and waits when full | Goes to the original stderr.                    |
+| Has been finished, whichever it does when full  | Goes to the original stderr.                    |
+
+A record offered before the queue was finished is written. The original stderr is a destination like any other: a
+bridge or app started in a terminal whose console is paused, while the log file's queue is full, waits until the console
+is read again, and nothing is lost.
+
 A relay thread that has ended, by a panic in a tracing writer or formatter, takes no more output: the drain at exit
 reports that later output to that stream was lost. A writer thread whose destination panics ends as well; later writes
-to its queue fail, and the report at exit says that it panicked. When the writer or formatter that ended a relay thread
-panics on the hook's record too, that is a panic inside the hook, and Rust aborts the process.
+to its queue from other threads fail, and the report at exit says that it panicked. When the writer or formatter that
+ended a relay thread panics on the hook's record too, that is a panic inside the hook, and Rust aborts the process.
 
 The most visible case is WebView2 on Windows, which writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
 straight to the inherited stderr. They land in `gui.log` through the relay. **A Chromium line is a real log record:
