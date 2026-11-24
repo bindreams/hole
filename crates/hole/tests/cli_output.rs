@@ -133,6 +133,69 @@ fn a_command_whose_stdout_refuses_writes_says_that_its_output_was_not_delivered(
     );
 }
 
+/// A command whose stderr takes no bytes records in the log what stderr did not receive: the line the command
+/// printed there, and the log event the stderr sink was given. Each record exists only because the exit waited for
+/// that sink's writer and read what it could not write. The stderr here is a file opened for reading only.
+#[skuld::test]
+fn a_command_whose_stderr_refuses_writes_records_in_the_log_what_was_not_delivered() {
+    let work = tempfile::tempdir().expect("work dir");
+    let log_dir = tempfile::tempdir_in(work.path()).expect("log dir");
+    let absent = work.path().join("absent.json");
+    let target = work.path().join("stderr");
+    std::fs::write(&target, b"").expect("create the file");
+    let read_only = std::fs::File::open(&target).expect("open the file for reading");
+    // The command prints its error to stderr and logs it as an event, so each of the two stderr sinks has a write.
+    let out = hole_command(
+        log_dir.path(),
+        &["proxy", "start", "--config-file", absent.to_str().expect("utf-8 path")],
+    )
+    .stderr(read_only)
+    .output()
+    .expect("run hole");
+
+    let log = std::fs::read_to_string(log_dir.path().join("gui-cli.log")).unwrap_or_default();
+    assert_eq!(out.status.code(), Some(1), "exit code (gui-cli.log {log:?})");
+    for sink in ["stderr", "the log on stderr"] {
+        let report =
+            format!("hole: the output could not be fully delivered: {sink} was not fully written: writes refused: ");
+        assert!(
+            log.contains(&report),
+            "gui-cli.log is {log:?}, which does not record that {sink} was not written"
+        );
+    }
+}
+
+/// A command whose log file takes no bytes says on stderr that the log was not fully written. The file is locked by
+/// this test; on Windows a lock is mandatory, and the operating system refuses a write into the locked range.
+#[cfg(windows)]
+#[skuld::test]
+fn a_command_whose_log_file_refuses_writes_says_so_on_stderr() {
+    let log_dir = tempfile::tempdir().expect("log dir");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(log_dir.path().join("gui-cli.log"))
+        .expect("create the log file");
+    log.lock().expect("lock the log file");
+    let out = hole(log_dir.path(), &["bridge", "status"]);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // One status line was printed and relayed to the log, so one write was refused.
+    let report = "hole: the output could not be fully delivered: the log file was not fully written: \
+                  writes refused: 1, messages dropped: 0";
+    assert_eq!(
+        log.metadata().expect("the log file's size").len(),
+        0,
+        "the file took bytes, so nothing was refused"
+    );
+    assert!(
+        stderr.contains(report),
+        "stderr is {stderr:?}, which does not say that the log file was not written"
+    );
+}
+
 fn main() {
     skuld::run_all();
 }
