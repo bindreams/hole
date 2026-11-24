@@ -368,18 +368,51 @@ fn a_panic_on_a_writer_thread_is_reported_and_does_not_chain_to_the_previous_hoo
     );
 }
 
-/// A write to a queue made on a writer thread lands on the original stderr. Not in the queue: the thread could be
-/// waiting for itself. Not on `io::stderr()`: that is the redirected pipe, whose reader may be waiting for this
-/// thread. The child's tee is a buffer, so its real stderr receives only what was written to the original handle. The
-/// line names the armed server address and passes no destination's redaction wrapper on this path; it arrives with the
-/// token in the address's place.
+/// A write to a queue that has room, made on a writer thread, reaches that queue's destination and nothing reaches the
+/// original stderr. The child's tee is a buffer, so its real stderr receives only what was written to the original
+/// handle.
 #[skuld::test]
-fn a_write_to_a_queue_from_a_writer_thread_lands_on_the_original_stderr_redacted(#[fixture(temp_dir)] dir: &Path) {
+fn a_write_to_a_queue_with_room_from_a_writer_thread_reaches_its_destination(#[fixture(temp_dir)] dir: &Path) {
     use crate::logging::logging_test_helpers::writer_thread_text;
 
-    let (result, stderr) = run_child_reading_stderr("writer_thread_write", dir);
+    let (result, stderr) = run_child_reading_stderr("writer_thread_write_to_a_queue_with_room", dir);
+    assert_eq!(stderr, "", "the child's real stderr");
+    assert_eq!(
+        result.observed,
+        [format!("the other queue took: {:?}", writer_thread_text(REDACT_ADDR))]
+    );
+    assert_eq!(result.tee_stderr, "", "what reached the redirected stderr");
+}
+
+/// A write to a queue that has ended, made on a writer thread, lands on the original stderr. Not on `io::stderr()`:
+/// that is the redirected pipe, whose reader may be waiting for this thread. The line names the armed server address
+/// and passes no destination's redaction wrapper on this path; it arrives with the token in the address's place.
+#[skuld::test]
+fn a_write_to_an_ended_queue_from_a_writer_thread_lands_on_the_original_stderr_redacted(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    use crate::logging::logging_test_helpers::writer_thread_text;
+
+    let (result, stderr) = run_child_reading_stderr("writer_thread_write_to_an_ended_queue", dir);
     assert_eq!(stderr, writer_thread_text(REDACT_TOKEN), "the child's real stderr");
     assert_eq!(result.observed, ["the other queue took: \"\""]);
+    assert_eq!(result.tee_stderr, "", "what reached the redirected stderr");
+}
+
+/// A write to a full queue, made on a writer thread, lands on the original stderr, redacted, and the queue takes no
+/// more than it held. The write does not wait for room: the child finishes the writing queue while the full queue's
+/// destination is still held.
+#[skuld::test]
+fn a_write_to_a_full_queue_from_a_writer_thread_lands_on_the_original_stderr_redacted(#[fixture(temp_dir)] dir: &Path) {
+    use crate::logging::logging_test_helpers::writer_thread_text;
+    use crate::logging::queued::CAPACITY;
+
+    let (result, stderr) = run_child_reading_stderr("writer_thread_write_to_a_full_queue", dir);
+    assert_eq!(stderr, writer_thread_text(REDACT_TOKEN), "the child's real stderr");
+    assert_eq!(
+        result.observed,
+        [format!("the other queue took: {} messages", CAPACITY + 1)]
+    );
     assert_eq!(result.tee_stderr, "", "what reached the redirected stderr");
 }
 

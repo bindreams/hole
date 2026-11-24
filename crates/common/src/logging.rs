@@ -27,7 +27,7 @@
 //   command waits for its reader; the bridge and the GUI drop and count, so a wedged terminal (Ctrl+S, a pipe
 //   consumer that hangs) never holds them.
 
-use queued::{queued, Overflow, QueueError, Queued, QueuedGuard};
+use queued::{queued, Handover, Overflow, QueueError, Queued, QueuedGuard};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
@@ -511,8 +511,9 @@ enum SavedStream {
 }
 
 /// The process's stderr as its caller gave it: the saved handle once stderr is redirected, `io::stderr()` until then.
-/// Redacts what it is given. A write depends on no thread of this process, so a writer thread and the exit report use
-/// it where a queue or `io::stderr()` could wait for the thread that is writing.
+/// Redacts what it is given. A write depends on no thread of this process, so a writer thread whose record found its
+/// queue full or ended, and the exit report, use it where a queue or `io::stderr()` could wait for the thread that is
+/// writing.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OriginalStderr;
 
@@ -721,13 +722,13 @@ pub(crate) enum DeliveryThread {
 }
 
 impl DeliveryThread {
-    /// Whether a write to a `Queued` made on this thread goes into the queue.
-    fn queues(self) -> bool {
+    /// How a write to a `Queued` made on this thread is handed over.
+    fn handover(self) -> Handover {
         match self {
             // Handing lines to the queues is this thread's work, and no writer waits for it.
-            DeliveryThread::Relay => true,
-            // The queue may be this thread's own, which it alone empties.
-            DeliveryThread::Writer => false,
+            DeliveryThread::Relay => Handover::Queue,
+            // The queue may be this thread's own, which it alone empties: a wait for room could be a wait for itself.
+            DeliveryThread::Writer => Handover::Offer,
         }
     }
 
@@ -744,9 +745,8 @@ impl DeliveryThread {
 }
 
 // What the current thread is to the delivery, if anything. On a delivery thread the panic hook's own record still goes
-// through the layers: from a relay thread into their queues, from a writer thread straight to the original stderr. If
-// the writer or formatter that ended a relay thread panics on that record too, that is a panic inside the hook, and std
-// aborts the process.
+// through the layers, into their queues from either kind of thread. If the writer or formatter that ended a relay
+// thread panics on that record too, that is a panic inside the hook, and std aborts the process.
 std::thread_local! {
     static DELIVERY_THREAD: std::cell::Cell<Option<DeliveryThread>> = const { std::cell::Cell::new(None) };
 }

@@ -42,6 +42,15 @@ impl Overflow {
     }
 }
 
+/// How a write to a [`Queued`] is handed over, which depends on the thread that makes it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Handover {
+    /// Into the queue; a full queue does what the queue's [`Overflow`] says.
+    Queue,
+    /// Offered to the queue without waiting; to the original stderr when the queue is full or has ended.
+    Offer,
+}
+
 /// The writer thread has ended: it was finished, or its destination panicked.
 struct Ended;
 
@@ -59,10 +68,13 @@ enum Message {
 
 /// Hands each write to a thread that owns the destination. Clone; a `MakeWriter`.
 ///
-/// Contract: nothing that runs on the writer thread (the destination's `write` and `flush` and what they call)
-/// reaches a `Queued` or one of the process's redirected streams. A writer that waited for a queue or for a
-/// redirected stream could be waiting for itself, directly or through the relay thread that reads the stream. A
-/// write to a `Queued` from a writer thread goes straight to the original stderr instead of a queue.
+/// Contract: on a writer thread a write never waits for a queue. It is offered to the queue, and goes to the original
+/// stderr when the queue is full or has ended. Code on a writer thread logs once per event it reports, never once per
+/// message it writes. It writes no redirected stream. A writer that waited for a queue or for a redirected stream
+/// could be waiting for itself, directly or through the relay thread that reads the stream.
+///
+/// The panic record of a writer whose own destination panicked is lost with that writer's queue, and so is any record
+/// a writer offers to its own queue after `Finish` is queued.
 #[derive(Clone)]
 pub(crate) struct Queued {
     sender: SyncSender<Message>,
@@ -189,14 +201,15 @@ fn write_all_messages(destination: &mut impl Write, receiver: &Receiver<Message>
 }
 
 impl Write for Queued {
-    /// Queues `buf` as one message. `Err` once the writer thread has ended.
+    /// Hands `buf` over as one message. Off a writer thread, `Err` once the writer thread has ended.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let queues = DELIVERY_THREAD.get().is_none_or(DeliveryThread::queues);
-        if queues {
-            self.overflow
-                .send(&self.sender, Message::Bytes(buf.to_vec()), &self.dropped)?;
-        } else {
-            OriginalStderr.write_all(buf)?;
+        let message = Message::Bytes(buf.to_vec());
+        match DELIVERY_THREAD.get().map_or(Handover::Queue, DeliveryThread::handover) {
+            Handover::Queue => self.overflow.send(&self.sender, message, &self.dropped)?,
+            Handover::Offer => match self.sender.try_send(message) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => OriginalStderr.write_all(buf)?,
+            },
         }
         Ok(buf.len())
     }
