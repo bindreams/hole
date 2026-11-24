@@ -26,6 +26,13 @@
     },
     {
       "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/actions/setup-build/action\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+version:\\s*(?<currentValue>v\\S+)"
+      ]
+    },
+    {
+      "customType": "regex",
       "managerFilePatterns": ["/^prek\\.toml$/"],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+additional_dependencies\\s*=\\s*\\[\"[^\"=]+==(?<currentValue>[^\"]+)\""
