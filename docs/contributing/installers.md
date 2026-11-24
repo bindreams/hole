@@ -26,8 +26,8 @@ the service anyway and the uninstall completes with the app left running.
 ### The install, E2E and uninstall run
 
 CI's installer lane installs the MSI, drives the installed app through WebDriver, uninstalls it and checks nothing is
-left. It also upgrades over a second MSI linked from the same staged files. Both uninstall paths meet a running
-`HoleBridge` service, so the harness passes `MSIRESTARTMANAGERCONTROL=Disable` (under `/quiet`, Restart Manager would
+left; the [journey table](#the-journey-table) says which of its cases prove which journey. It also upgrades over a
+second MSI linked from the same staged files. Both uninstall paths meet a running `HoleBridge` service, so the harness passes `MSIRESTARTMANAGERCONTROL=Disable` (under `/quiet`, Restart Manager would
 otherwise stop the service first); for the upgrade's nested removal it writes the property into the second MSI itself,
 because the removal ignores the outer command line. The proof is a `stop wait: sending Stop` record with a `Running`
 look in `C:\ProgramData\hole\logs\gui-cli.log`, gained during the `msiexec` call and, for the upgrade, written by
@@ -51,7 +51,9 @@ test process, which the socket's Administrators entry admits whatever the bridge
 installed `hole.exe` from a child that `gsudo` de-elevated, whose token was made before the install and so carries no
 `hole` group. It connects to the server with no plugin, restarts the `HoleBridge` service, connects again, and does
 both once more. A second test takes the user out of the group, restarts the service, checks that the user is now
-refused, runs an elevated `hole bridge grant-access` and connects with no further restart. Each fails before its first
+refused, runs an elevated `hole bridge grant-access` and connects with no further restart. A third puts a member into
+`hole` whose account does not exist, as a deleted domain account leaves one, restarts the service, and checks that the
+bridge's log lists that member and that the user still connects. Each fails before its first
 connect when the child still holds Administrators, already carries the group,
 or is not the user the installer added. The child cannot read pytest's own temporary folder, so its files are in
 `member-access\` under the log folder. A failure also says how the child's own connect to the bridge's socket went:
@@ -67,17 +69,6 @@ adapter (`Get-DnsClientServerAddress`) and fails unless an adapter that did not 
 tunnel's own adapter does. After `hole proxy stop` the machine's routes, adapters, addresses and DNS settings must equal
 those taken before the start. The case needs the internet, and the machine's routes and DNS belong to the tunnel for a
 few seconds.
-
-{src}`tests/installed/journeys.yaml` lists the cases behind each journey, not every case of the lane. A row is something
-a person does with the installed product that a `hole` release must have a test for, and it has one cell for each
-platform a release ships for (Windows amd64, macOS amd64 and arm64): the test cases that run it there, or `none`. Each
-case is written as the lane's JUnit file names it, `<classname>::<name>`. `cargo xtask verify-journeys` runs in CI after
-the installed lanes, reads the JUnit files they write into `target/journeys/`, and fails when a case a cell names did
-not run. In a draft release of `hole` it also fails on a `none` cell, so the leg uploads nothing until the cell has a
-test. To add a journey, add a row with a cell for every platform; to fill a `none` cell, write the test, name it in the
-cell, and for a Windows test file add the file to the lane's command line in {src}`build.yaml`. The `installs` entry of
-each platform and the `differs` text of each cell say how the test differs from what a person does, and name the issue
-that tracks it.
 
 ```{warning}
 This installs Hole system-wide on the machine you run it on. Use a throwaway machine or virtual machine, not the one you
@@ -165,4 +156,21 @@ fetches pages from outside the machine by address and by name, as the Windows la
 root, as in the cases above, and `curl` runs as the user of the test. The connections are the same code the Windows lane
 runs ({src}`tests/installed/connect_journey.py`).
 It is meant for CI: it needs passwordless `sudo`, refuses to run over an existing install, and expects `hole-dmg` to
-have built the app and `cargo build -p plugin-e2e --example ss_plugin_server` to have built the test's server.
+have built the app and `cargo build -p plugin-e2e --example ss_plugin_server` to have built the test's server. The
+[journey table](#the-journey-table) says which journeys this lane proves.
+
+## The journey table
+
+{src}`tests/installed/journeys.yaml` lists the cases behind each journey, not every case of the installed lanes. A row is
+something a person does with the installed product that a `hole` release must have a test for. It has one cell for each
+platform a release ships for (Windows amd64, macOS amd64 and arm64): the test cases that run it there, or `none`. Each
+case is written as the lane's JUnit file names it, `<classname>::<name>`.
+
+`cargo xtask verify-journeys` runs in CI after the installed lanes, reads the JUnit files they write into
+`target/journeys/`, and fails when a case a cell names did not run. In a draft release of `hole` it also fails on a
+`none` cell, so the leg uploads nothing until the cell has a test.
+
+To add a journey, add a row with a cell for every platform. To fill a `none` cell, write the test, name it in the cell,
+and for a Windows test file add the file to the lane's command line in {src}`build.yaml`. The `installs` entry of each
+platform and the `differs` text of each cell say how the test differs from what a person does, and name the issue that
+tracks it.
