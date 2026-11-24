@@ -62,7 +62,7 @@ journeys:
       windows/amd64:
         cases:
           - tests.installed.test_member_access::test_the_installing_user_reaches_the_bridge_before_and_after_restarts[none]
-        differs: Connects in SOCKS-only mode and without a plugin, with `hole proxy start`, not with the Connect button (bindreams/hole#1384)
+        differs: Connects in SOCKS-only mode and without a plugin, with `hole proxy start`, not with the Connect button (bindreams/hole#1384, bindreams/hole#1407)
       darwin/amd64: none
       darwin/arm64: none
 
@@ -73,7 +73,7 @@ journeys:
         cases:
           - tests.installed.test_member_access::test_grant_access_admits_a_user_while_the_bridge_runs[none]
           - tests.installed.test_member_access::test_a_member_with_no_account_is_listed_and_does_not_lock_the_user_out[none]
-        differs: The installing user, taken out of the `hole` group, stands for the second account; connects in SOCKS-only mode and without a plugin, with `hole proxy start` (bindreams/hole#1405, bindreams/hole#1384)
+        differs: The installing user, taken out of the `hole` group, stands for the second account; connects in SOCKS-only mode and without a plugin, with `hole proxy start` (bindreams/hole#1407, bindreams/hole#1384)
       darwin/amd64: none
       darwin/arm64: none
 
