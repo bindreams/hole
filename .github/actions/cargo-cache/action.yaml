@@ -12,9 +12,8 @@ inputs:
   save:
     description: >-
       Save the cache at job end. Set by exactly one job per cache key (runner
-      OS + rustc commit, no arch), and it saves only on `main`. Every other
-      job, and every other ref, restores only; the release workflows never set
-      it.
+      OS + rustc commit, no arch), and only where `setup-build`'s cache-write
+      rule allows a write. Every other job restores only.
     required: false
     default: "false"
 
@@ -41,19 +40,17 @@ runs:
     # so every parallel job sharing a key pays the full tar and all but the
     # first to finish then fail with "Unable to reserve cache ... another job
     # may be creating this cache". On Windows that tar takes minutes. So a job
-    # saves only when it is the designated saver for its key and the ref is
-    # `main`: a PR-ref cache is visible to that PR alone and would only fill
-    # the repo's 10 GB cache quota. PRs read `main`'s cache through
-    # `restore-keys`.
+    # saves only when it is the designated saver for its key. PRs read `main`'s
+    # cache through `restore-keys`.
     - uses: actions/cache/restore@v6
-      if: github.ref != 'refs/heads/main' || inputs.save != 'true'
+      if: inputs.save != 'true'
       with:
         path: ${{ steps.spec.outputs.path }}
         key: ${{ steps.spec.outputs.key }}
         restore-keys: ${{ steps.spec.outputs.restore-keys }}
 
     - uses: actions/cache@v6
-      if: github.ref == 'refs/heads/main' && inputs.save == 'true'
+      if: inputs.save == 'true'
       with:
         path: ${{ steps.spec.outputs.path }}
         key: ${{ steps.spec.outputs.key }}
