@@ -673,6 +673,7 @@ fn golden() -> BTreeMap<&'static str, Vec<&'static str>> {
         "test-galoshes",
         "test-tooling",
         "test-plugin-e2e",
+        "sccache-upload-error-log",
     ] {
         g.insert(id, ALL_LEGS.to_vec());
     }
@@ -1073,10 +1074,11 @@ fn a_failed_dmg_still_captures_diagnostics_and_runs_the_hole_lanes() {
 }
 
 /// Steps that are meant to run when something failed earlier: artifact uploads.
-const RUNS_AFTER_A_FAILURE: [&str; 3] = [
+const RUNS_AFTER_A_FAILURE: [&str; 4] = [
     "installer-upload-msi-logs",
     "installer-upload-bridge-logs",
     "hole-upload-bridge-logs",
+    "sccache-upload-error-log",
 ];
 
 /// Every later step requires `provision`, so a broken VM fails once instead of

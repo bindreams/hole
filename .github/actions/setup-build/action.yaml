@@ -1,13 +1,21 @@
 name: Setup Build
 description: Set up a compilable Rust workspace (toolchains, cache, runtime deps)
 
+# The cache-write rule, stated once here: a run writes caches (the cargo cache
+# and sccache) only for a push to `refs/heads/main` that is not a release
+# call. Every other run only reads: a PR-ref cache is visible to that PR alone
+# and would only fill the repo's 10 GB cache quota.
+
 inputs:
   save-cache:
     description: >-
-      Save the cargo cache at job end (see `cargo-cache`). Set by exactly one
-      job per cache key (runner OS + rustc commit, no arch), and it saves only
-      on `main`. Every other job, and every other ref, restores only; the
-      release workflows deliberately never set it.
+      Save the cargo cache at job end (see `cargo-cache`), if the run writes
+      caches at all. Set by exactly one job per cache key (runner OS + rustc
+      commit, no arch).
+    required: false
+    default: "false"
+  release-call:
+    description: Set by a release call, which never writes a cache.
     required: false
     default: "false"
 
@@ -20,6 +28,30 @@ runs:
         echo "CARGO_TERM_COLOR=always" >> "$GITHUB_ENV"
         echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        # One server for the whole job: with no idle exit it is never restarted
+        # mid-job, so the statistics it prints at the end cover every compile.
+        echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
+        # The server's startup makes no request to the cache service and takes
+        # the mode this action sets. A slow cache service then cannot make a
+        # start run out of its ten seconds, which fails the compile that
+        # started the server.
+        echo "SCCACHE_SKIP_CACHE_CHECK=true" >> "$GITHUB_ENV"
+        # The server logs a failed cache write only at `debug` level, in its
+        # `server` module.
+        echo "SCCACHE_LOG=warn,sccache::server=debug" >> "$GITHUB_ENV"
+        echo "SCCACHE_ERROR_LOG=$RUNNER_TEMP/sccache-error.log" >> "$GITHUB_ENV"
+
+    # Read by the server when it starts, so it is set before the server step.
+    - name: Decide whether this run writes caches
+      id: cache-writes
+      shell: bash
+      env:
+        WRITES: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.release-call != 'true' }}
+      run: |
+        echo "enabled=$WRITES" >> "$GITHUB_OUTPUT"
+        if [[ "$WRITES" != true ]]; then
+            echo "SCCACHE_GHA_RW_MODE=READ_ONLY" >> "$GITHUB_ENV"
+        fi
 
     - uses: ./.github/actions/setup-rust
       id: setup-rust
@@ -44,20 +76,38 @@ runs:
     - uses: ./.github/actions/cargo-cache
       with:
         cachekey: ${{ steps.setup-rust.outputs.cachekey }}
-        save: ${{ inputs.save-cache }}
+        save: ${{ inputs.save-cache == 'true' && steps.cache-writes.outputs.enabled == 'true' }}
 
-    # sccache only speeds compiles up. Its setup downloads a release, outside
-    # this repo's retry helpers; when that fails, build without it rather than
-    # fail on a lost network, and leave a warning.
+    # Its setup downloads a release, outside this repo's retry helpers; when
+    # that fails, build without it rather than fail on a lost network, and
+    # leave a warning.
     - id: sccache
       uses: mozilla-actions/sccache-action@v0.0.11
       continue-on-error: true
+      with:
+        # The cache namespace holds sccache's own version, so a release that
+        # floated in would empty the whole cache.
+        # renovate: datasource=github-releases depName=mozilla/sccache
+        version: v0.20.0
 
-    - name: Build without sccache (its setup could not fetch it)
-      if: steps.sccache.outcome == 'failure'
+    # The server outlives this step and serves every compile of the job. Its
+    # startup needs no network (`SCCACHE_SKIP_CACHE_CHECK`), so a failure here
+    # is not a lost network and is not retried: the job builds without sccache.
+    - id: sccache-server
+      name: Start the sccache server
+      if: steps.sccache.outcome == 'success'
+      continue-on-error: true
       shell: bash
+      run: sccache --start-server
+
+    - name: Build without sccache (it was not fetched, or its server did not start)
+      if: steps.sccache.outcome == 'failure' || steps.sccache-server.outcome == 'failure'
+      shell: bash
+      env:
+        SETUP: ${{ steps.sccache.outcome }}
+        SERVER: ${{ steps.sccache-server.outcome }}
       run: |
-        echo "::warning::mozilla-actions/sccache-action failed; building without sccache"
+        echo "::warning::sccache is unavailable (setup: $SETUP, server: $SERVER); building without it"
         echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
     # Compiling `xtask` below fetches crates, so a network loss would fail it
@@ -65,6 +115,13 @@ runs:
     - name: Fetch crate sources
       shell: bash
       run: .github/scripts/cargo-fetch.sh
+
+    # The `cargo xtask` alias runs `--quiet`, so its first call compiles `xtask`
+    # silently; building it here, same bin and profile, shows the compile in its
+    # own step.
+    - name: Build xtask
+      shell: bash
+      run: cargo build --package xtask --bin xtask
 
     - name: Fetch runtime deps (ex-ray, wintun)
       shell: bash
