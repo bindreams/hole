@@ -6,12 +6,10 @@
 //! decides which gaps stop the step.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::marker::PhantomData;
 use std::path::Path;
 
 use anyhow::{bail, ensure, Context, Result};
 use indexmap::IndexMap;
-use serde::de::{Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
 use xtask_lib::version::{display_version, parse_release_tag, Group};
 
@@ -95,38 +93,10 @@ impl std::fmt::Display for Case {
 
 // Loading =============================================================================================================
 
-/// A YAML mapping's entries in file order, a repeated key kept: a map type would keep the last one silently, and
-/// [`check_platforms`] refuses the repeat with the row's name.
-struct Entries<V>(Vec<(String, V)>);
-
-impl<'de, V: Deserialize<'de>> Deserialize<'de> for Entries<V> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct EntriesVisitor<V>(PhantomData<V>);
-
-        impl<'de, V: Deserialize<'de>> Visitor<'de> for EntriesVisitor<V> {
-            type Value = Entries<V>;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a mapping")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut entries = Vec::new();
-                while let Some(entry) = map.next_entry()? {
-                    entries.push(entry);
-                }
-                Ok(Entries(entries))
-            }
-        }
-
-        deserializer.deserialize_map(EntriesVisitor(PhantomData))
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTable {
-    installs: Entries<String>,
+    installs: IndexMap<String, String>,
     journeys: Vec<RawJourney>,
 }
 
@@ -135,7 +105,7 @@ struct RawTable {
 struct RawJourney {
     id: String,
     does: String,
-    cells: Entries<serde_yml::Value>,
+    cells: IndexMap<String, noyalib::Value>,
 }
 
 #[derive(Deserialize)]
@@ -145,11 +115,20 @@ struct RawCases {
     differs: Option<String>,
 }
 
+/// The reader's policy: a key written twice anywhere in the file is an error, and so are the YAML features the table
+/// has no use for (a tag, a merge key), which would take the reader down paths that resolve keys before it checks them.
+fn reader_config() -> noyalib::ParserConfig {
+    noyalib::ParserConfig::new()
+        .duplicate_key_policy(noyalib::DuplicateKeyPolicy::Error)
+        .merge_key_policy(noyalib::MergeKeyPolicy::Error)
+        .with_policy(noyalib::policy::DenyTags)
+}
+
 impl Journeys {
     /// Parse and validate `text` against `shipped`, the platforms a `hole` release ships for. An error names the row.
     pub(crate) fn load(text: &str, shipped: &[Platform]) -> Result<Self> {
-        let raw: RawTable = serde_yml::from_str(text).context("parsing the table")?;
-        check_platforms("`installs`", raw.installs.0.iter().map(|(key, _)| key), shipped)?;
+        let raw: RawTable = noyalib::from_str_with_config(text, &reader_config()).context("parsing the table")?;
+        check_platforms("`installs`", raw.installs.keys(), shipped)?;
 
         let mut ids = BTreeSet::new();
         let mut journeys = Vec::new();
@@ -157,14 +136,10 @@ impl Journeys {
             let id = row.id;
             ensure!(ids.insert(id.clone()), "journey `{id}`: the id is used twice");
             ensure!(!row.does.trim().is_empty(), "journey `{id}`: `does` is empty");
-            check_platforms(
-                &format!("journey `{id}`"),
-                row.cells.0.iter().map(|(key, _)| key),
-                shipped,
-            )?;
+            check_platforms(&format!("journey `{id}`"), row.cells.keys(), shipped)?;
 
             let mut cells = IndexMap::new();
-            for (platform, value) in row.cells.0 {
+            for (platform, value) in row.cells {
                 let context = format!("journey `{id}`, platform {platform}");
                 let cell = parse_cell(value).with_context(|| context)?;
                 cells.insert(
@@ -178,7 +153,7 @@ impl Journeys {
     }
 }
 
-/// `keys` are exactly the `shipped` platforms: no missing one, no extra, no repeat.
+/// `keys`, which the reader has made distinct, are exactly the `shipped` platforms: no missing one, no extra.
 fn check_platforms<'a>(what: &str, keys: impl Iterator<Item = &'a String>, shipped: &[Platform]) -> Result<()> {
     let mut seen = Vec::new();
     for key in keys {
@@ -190,10 +165,6 @@ fn check_platforms<'a>(what: &str, keys: impl Iterator<Item = &'a String>, shipp
             "{what}: {platform} is not a platform a `hole` release ships for ({})",
             join(shipped)
         );
-        ensure!(
-            !seen.contains(&platform),
-            "{what}: platform {platform} is written twice"
-        );
         seen.push(platform);
     }
     for platform in shipped {
@@ -202,12 +173,12 @@ fn check_platforms<'a>(what: &str, keys: impl Iterator<Item = &'a String>, shipp
     Ok(())
 }
 
-fn parse_cell(value: serde_yml::Value) -> Result<Cell> {
+fn parse_cell(value: noyalib::Value) -> Result<Cell> {
     if value.as_str() == Some("none") {
         return Ok(Cell::None);
     }
     let raw: RawCases =
-        serde_yml::from_value(value).context("the cell is neither `none` nor a mapping of `cases` and `differs`")?;
+        noyalib::from_value(&value).context("the cell is neither `none` nor a mapping of `cases` and `differs`")?;
     ensure!(
         !raw.cases.is_empty(),
         "`cases` is empty: write `none` for a journey no test runs"

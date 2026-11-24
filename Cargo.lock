@@ -10715,6 +10715,7 @@ dependencies = [
  "libc",
  "libsearch-guard",
  "minisign",
+ "noyalib",
  "payload-archive",
  "petgraph",
  "png 0.18.1",
