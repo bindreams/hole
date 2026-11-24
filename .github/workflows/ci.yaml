@@ -977,7 +977,8 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      # The server's log: its statistics give counts of failed cache writes, this gives the cause.
+      # The server's log: its statistics give counts of failed cache writes, this gives the cause. On a run that only
+      # reads the cache, every miss is logged and counted as a failed write ("storage is read-only").
       - id: sccache-upload-error-log
         name: Upload the sccache error log
         if: ${{ always() }}

@@ -42,7 +42,7 @@ runs:
       id: cache-writes
       shell: bash
       env:
-        WRITES: ${{ github.ref == 'refs/heads/main' && inputs.release-call != 'true' }}
+        WRITES: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.release-call != 'true' }}
       run: |
         echo "enabled=$WRITES" >> "$GITHUB_OUTPUT"
         if [[ "$WRITES" != true ]]; then
@@ -98,12 +98,14 @@ runs:
     # The server outlives this step and serves every compile of the job. A start
     # that times out leaves its server coming up, and `--start-server` on a
     # running one fails with "Address in use", so each attempt also accepts a
-    # server that is already answering (`--show-stats` connects to one, or starts
-    # one).
+    # server that is already answering: `--zero-stats` connects to one or tries
+    # to start one, and fails when it gets neither (`--show-stats` would print
+    # empty statistics and succeed). A start that keeps failing is retried until
+    # the step's limit.
     - name: Start the sccache server
       if: steps.sccache.outcome == 'success'
       shell: bash
-      run: .github/scripts/retry.sh bash -c 'sccache --start-server || sccache --show-stats > /dev/null'
+      run: .github/scripts/retry.sh bash -c 'sccache --start-server || sccache --zero-stats'
 
     # Compiling `xtask` below fetches crates, so a network loss would fail it
     # with no product defect behind it; `retry.sh` waits for the network.
