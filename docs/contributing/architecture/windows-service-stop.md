@@ -52,7 +52,7 @@ would not advance the checkpoint. A status report is the only thing done under i
 ## Logging
 
 Each phase entered is logged at info (`service stop phase`, with its checkpoint) to `bridge.log`. The control handler does no
-log I/O of its own: the SCM gives the handler a bounded time, and the file appender can apply back-pressure, so a log write
+log I/O of its own: the SCM gives the handler a bounded time, and the log file's queue waits when it is full, so a log write
 there could fail the caller's `ControlService`. The shutdown forwarder task logs the first phase's hand-off the moment it wakes
 from the shutdown signal, so a stop that wedges before the first entry still leaves a line. The handler also catches a
 panicking report, because it runs inside the service's `extern "system"` entry point and an unwinding panic there aborts the

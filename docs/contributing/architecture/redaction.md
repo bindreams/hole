@@ -21,11 +21,13 @@ an immutable snapshot), so no logging call can block behind a concurrent arm. Ma
 leftmost-longest and ASCII-case-insensitive: with `10.0.0.1` and `10.0.0.12` both armed, the longer one wins, so no
 trailing byte leaks and the line is not attributed to the wrong entry.
 
-`RedactingWriter` wraps a writer so that everything written through it is redacted. `init_dual` wraps four non-blocking
-writers, and **exactly one of them is a log file**: the `DirRotate` appender ([logging](logging.md#where-the-logs-go)).
-Wrapping it closes the file leak. The other three (the stderr layer and the two stdio relay tees) feed a developer's
-terminal, which the redaction cannot reopen either way. `RedactingWriter::write` returns the count of *input* bytes: a
-count of output bytes would panic `write_all`'s loop on the logging worker thread, since redaction changes the length.
+`RedactingWriter` wraps a writer so that everything written through it is redacted. `init_dual` wraps the destinations
+of its four queues, and **exactly one of them is a log file**: the `DirRotate` writer
+([logging](logging.md#where-the-logs-go)). Wrapping it closes the file leak. The other three (the stderr layer and the
+two stdio relay tees) feed a developer's terminal, which the redaction cannot reopen either way. What Hole writes
+straight to the original stderr (the report at exit, a record logged on a writer thread) passes through the same
+redaction. `RedactingWriter::write` returns the count of *input* bytes: a count of output bytes would panic
+`write_all`'s loop on the sink's writer thread, since redaction changes the length.
 
 ## What is armed
 

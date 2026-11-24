@@ -37,11 +37,20 @@ handle. A path-based rotator would follow
 whatever the user swapped in for a component of the path, as root. A directory the walk refuses disables the file sink,
 with one line on the real stderr that carries no path; the bridge keeps running.
 
-**Blocking behaviour.** The file writer is non-blocking and **not lossy**: the burst of lines at the end of a teardown
-must reach the disk, at the price that a stalled disk blocks the threads that log. The writer's buffer
-(`buffered_lines_limit`, tracing-appender's default) only delays when that starts: once it is full, every thread that
-emits an event, the panic hook's included, waits with no limit until the disk drains. The stderr writer and the two stdio tees are lossy, so a wedged terminal can never block the
-bridge or the panic hook.
+**Blocking behaviour.** Every sink is written by a thread of its own, behind a queue of 128,000 messages (`queued` in
+{src}`crates/common/src/logging/queued.rs`), so no write runs on the thread that logs. A message is one event, or one
+line of a redirected stream. The file's queue waits when it is full: the burst of lines at the end of a teardown must
+reach the disk, at the price that a stalled disk holds every thread that emits an event, the panic hook's included,
+with no limit, once the queue is full. The stderr layer and the two stdio tees write to the terminal, and what their
+full queue does depends on the kind of process (`ProcessKind::terminal`):
+
+| Process    | A terminal sink whose queue is full                                                                   |
+| ---------- | ----------------------------------------------------------------------------------------------------- |
+| A command  | Waits for room. The output is what the command is for, and a caller that reads slowly gets all of it. |
+| The bridge | Drops the message and counts it, so a paused console never stops the datapath.                        |
+| The app    | Drops the message and counts it, so a paused console never freezes the window.                        |
+
+A write that a destination refuses is counted as well, and the writer thread goes on with the next message.
 
 ## Turning the volume up
 
@@ -71,24 +80,43 @@ pipe tees every line to the original handle, so a terminal still sees it, and em
 `hole::stdout_relay` or `hole::stderr_relay`, so the file sees it too. The stderr layer drops those two targets, or it
 would write each line twice. The net catches whatever bypasses `tracing`: the Go runtime of a plugin, a native library, the
 default panic printer. A panic hook emits an error event with a backtrace under `hole::panic` and then calls the previous
-hook, except on a relay thread (below).
+hook, except on a relay thread or a writer thread (below).
 
 The relay and the writers are asynchronous, so whatever ends the process before they finish loses the last lines.
-Dropping the `LogGuard` waits for them: it writes a marker line, carrying a random nonce, to each redirected stream,
-blocks until that stream's reader thread has read it, and then drops the guards of the tees and the writers. This first
-wait has no limit, like the file writer's: a stalled disk that blocks the relay thread holds the exit too. Each guard
-then waits up to 100 ms to send its worker the shutdown message and up to 1000 ms for the worker to finish (the bounds are
-inside `tracing-appender`), and the four guards, two tees, the stderr writer and the file writer, drop one after another.
-Output that its reader or disk has not taken by then is lost, and the exit goes on. `process::exit` skips destructors, so
-`dispatch` drops the CLI's guard before it exits. The GUI leaves through the event loop's own `process::exit` and does
-not drain.
+Dropping the `LogGuard` waits for them, in this order:
+
+1. It writes a marker line, carrying a random nonce, to each redirected stream and blocks until that stream's relay
+   thread has read it.
+1. It finishes the queues of the two tees and of the stderr layer: each writer thread writes out what was queued before
+   the call and ends, and the guard joins it.
+1. It finishes the file's queue the same way.
+
+No step has a time limit. A caller that does not read a command's output, a console its user paused or a stalled disk
+holds the exit until it takes the bytes. The installed service has no console; its terminal sinks write nowhere and
+never wait. What a sink did not deliver (messages a full queue dropped, writes the destination refused, a writer thread
+that panicked) is reported in one line for that sink on the original stderr, and for the terminal sinks in the log file
+as well. A caller that closed the stream is not told of a loss. `process::exit` skips destructors, so `dispatch` drops
+the CLI's guard before it exits. The GUI leaves through the event loop's own `process::exit` and does not drain.
+
+A relay thread and a writer thread must not wait for the delivery themselves. A relay thread that wrote its own stream
+would be filling the pipe that it alone empties. A writer thread that waited for room in a queue could be waiting for
+itself, and one that wrote a redirected stream would wait for a relay thread that may be waiting for that writer's
+queue. Four rules follow:
+
+- The panic hook skips the previous hook, the default printer that writes to stderr, on both kinds of thread. The hook's
+  own record is still logged.
+- A write to a queue made on a writer thread goes straight to the original stderr instead of the queue. A record that a
+  writer thread logs lands there: the panic hook's record of a destination that panicked, or the warning of a failed
+  `chown` during a rotation. Each sink that would have taken the record writes it, so it appears there once per sink.
+- `DirRotate` writes its notice that the file could not be opened to the original stderr.
+- The two `tracing` layers are built with `log_internal_errors(false)`. A layer told to log its internal errors prints
+  a failed write to stderr, the redirected stream, on the thread that logged the event; printed on a relay thread, the
+  line would return as an event whose write fails again.
 
 A relay thread that has ended, by a panic in a tracing writer or formatter, takes no more output: the drain at exit
-reports that later output to that stream was lost, and `LogGuard` writes the report to the original stderr. The relay
-thread never writes the stream it reads, since that stream is the pipe it alone empties. For that reason the panic hook
-skips the previous hook, the default printer that writes to stderr, on a relay thread; the hook's own record is logged
-as on any other thread, to the sinks whose directives let it through. When the writer or formatter that ended the thread
-panics on that record too, that is a panic inside the hook, and Rust aborts the process.
+reports that later output to that stream was lost. A writer thread whose destination panics ends as well; later writes
+to its queue fail, and the report at exit says that it panicked. When the writer or formatter that ended a relay thread
+panics on the hook's record too, that is a panic inside the hook, and Rust aborts the process.
 
 The most visible case is WebView2 on Windows, which writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
 straight to the inherited stderr. They land in `gui.log` through the relay. **A Chromium line is a real log record:
