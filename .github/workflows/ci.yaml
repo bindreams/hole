@@ -337,9 +337,8 @@ jobs:
       #     -E 'test(null_stdin_child_cannot_corrupt_console_mode)'
       #
       # Budget: passing windows/arm64 runs reach 1,162 s. Runs cut at 1,200 s were
-      # still passing tests, so their full length is not known. The step is as long
-      # as `a_chain_with_a_gap_does_not_compile` (util) plus the tests that wait for
-      # it: the `env`-fixture tests in xtask start only when no other test runs.
+      # still passing tests, so their full length is not known. The longest test
+      # is `a_chain_with_a_gap_does_not_compile` (util), 4 to 18 minutes.
       - id: test-tooling
         name: Test tooling
         if: ${{ !cancelled() && steps.archive.outcome == 'success' }}
