@@ -7,7 +7,13 @@ use util::dir::testing::plant_link;
 use util::dir::Dir;
 
 fn writer(dir: &Path, limit: usize) -> DirRotate {
-    DirRotate::new(Dir::open(dir, false, None).unwrap(), "bridge.log".as_ref(), limit, None)
+    DirRotate::new(
+        Dir::open(dir, false, None).unwrap(),
+        "bridge.log".as_ref(),
+        limit,
+        None,
+        std::io::sink(),
+    )
 }
 
 /// A byte stream in which every position is told apart from its neighbours, so a lost or reordered span shows.
@@ -131,6 +137,7 @@ fn the_active_file_goes_to_the_owner_when_opened_and_after_each_rotation(#[fixtu
         "bridge.log".as_ref(),
         64,
         Some((foreign, foreign)),
+        std::io::sink(),
     );
     assert_eq!(owner_of("bridge.log") == foreign, allowed, "at open");
 
@@ -316,6 +323,42 @@ fn a_file_that_cannot_be_opened_is_said_once_and_without_a_path(#[fixture(temp_d
 
     assert_eq!(said.len(), 1, "{said:?}");
     assert!(!said[0].contains(dir.to_string_lossy().as_ref()), "{said:?}");
+}
+
+/// The notice is written to the writer the rotator was given. Behind a queue the rotator runs on a writer thread,
+/// where the process's own stderr is the redirected pipe and must not be written.
+#[skuld::test]
+fn a_file_that_cannot_be_opened_is_said_on_the_writer_the_rotator_was_given(#[fixture(temp_dir)] dir: &Path) {
+    #[derive(Clone, Default)]
+    struct Notices(Arc<Mutex<Vec<u8>>>);
+    impl Write for Notices {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    block(dir, "bridge.log");
+    let notices = Notices::default();
+    let mut w = DirRotate::new(
+        Dir::open(dir, false, None).unwrap(),
+        "bridge.log".as_ref(),
+        100,
+        None,
+        notices.clone(),
+    );
+    w.write_all(b"line\n").unwrap();
+    let said = String::from_utf8(notices.0.lock().unwrap().clone()).unwrap();
+
+    let (line, rest) = said.split_once('\n').unwrap_or((&said, "missing newline"));
+    assert!(
+        line.starts_with("hole: the log file is disabled, it was not opened: "),
+        "{said:?}"
+    );
+    assert_eq!(rest, "", "one line, once: {said:?}");
 }
 
 #[skuld::test]

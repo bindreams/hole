@@ -583,7 +583,7 @@ fn writers() -> Vec<Writer> {
             run: |dir, owner| {
                 let handle = Dir::open(dir, true, owner)?;
                 // More than the limit, so that the file is rotated and opened again.
-                DirRotate::new(handle, OsStr::new(LOG_NAME), 16, owner).write_all(&[b'x'; 40])
+                DirRotate::new(handle, OsStr::new(LOG_NAME), 16, owner, std::io::sink()).write_all(&[b'x'; 40])
             },
         },
     ];

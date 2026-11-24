@@ -242,7 +242,7 @@ fn capture_at(
 
 #[skuld::test]
 fn a_phase_is_reported_to_the_scm_before_it_is_logged() {
-    // A log writer that back-pressures (`lossy(false)` on a wedged disk) must not
+    // A log writer that back-pressures (the file's queue, full on a wedged disk) must not
     // stand between a phase and its StopPending report.
     let writer = VecWriter::new();
     let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
@@ -326,7 +326,7 @@ fn a_stop_control_does_not_wait_for_a_report_in_flight_on_another_thread() {
 #[skuld::test]
 fn a_stop_control_writes_no_log_line_on_the_control_handler_thread() {
     // The SCM fails a ControlService whose HandlerEx does not return promptly.
-    // The file appender is non-lossy, so a log write on the handler thread can
+    // The file's queue waits when it is full, so a log write on the handler thread can
     // block and fail it. The outcome is logged by the main task instead.
     let writer = VecWriter::new();
     let log = Log::default();

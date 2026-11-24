@@ -59,22 +59,33 @@ pub struct ChildResult {
 /// Spawn the test binary as a child with the given test kind, capture its
 /// result file, and return the parsed result. Panics on child failure.
 fn run_child(kind: &str, dir: &Path) -> ChildResult {
+    run_child_reading_stderr(kind, dir).0
+}
+
+/// [`run_child`], and what the child wrote to its real stderr (post-redirect: what a tee or a direct write put on
+/// the original handle).
+fn run_child_reading_stderr(kind: &str, dir: &Path) -> (ChildResult, String) {
     let exe = std::env::current_exe().expect("current_exe");
     let result_path = dir.join(format!("result-{kind}.json"));
-    let status = Command::new(&exe)
+    let output = Command::new(&exe)
         .env("HOLE_LOGGING_TEST_KIND", kind)
         .env("HOLE_LOGGING_TEST_OUTPUT", &result_path)
         .stdin(Stdio::null())
-        // Discard the child's actual stdio (post-redirect, post-tee) so it
+        // Discard the child's actual stdout (post-redirect, post-tee) so it
         // doesn't pollute the test runner output; the test's assertions read
-        // the JSON result file, not stdio.
+        // the JSON result file and, where they ask for it, stderr.
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .expect("spawn child");
-    assert!(status.success(), "child {kind} failed with status {status:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "child {kind} failed with status {:?}; its stderr: {stderr}",
+        output.status
+    );
     let bytes = std::fs::read(&result_path).expect("read child result");
-    serde_json::from_slice(&bytes).expect("parse child result")
+    (serde_json::from_slice(&bytes).expect("parse child result"), stderr)
 }
 
 // Tests: stdio redirect ===============================================================================================
@@ -157,14 +168,13 @@ fn redirect_captures_subprocess_stdout_via_inheritance(#[fixture(temp_dir)] dir:
     );
 }
 
-/// Load-bearing test for the **tee-drain phase** of
-/// [`StdioRelayHandles::flush`](crate::logging::StdioRelayHandles).
-/// The relay's `tee.write_all(buf)` goes through a
-/// `tracing_appender::NonBlocking` worker whose drain is asynchronous;
-/// without `flush` dropping the `WorkerGuard`s, the tee target can be
-/// empty when the test reads it. Do not weaken the
-/// `tee_stderr`/`tee_stdout` assertions — they are the canonical
-/// regression gate for the flush contract.
+/// What each stream is given reaches its tee target as well as the layers.
+/// The relay's `tee.write_all(buf)` goes through a queue to a writer thread,
+/// and [`StdioRelayHandles::flush`](crate::logging::StdioRelayHandles)
+/// finishes that queue before the scenario reads the target. A `flush` that
+/// did not would still pass here whenever the writer thread is quick; the
+/// test that fails on it every time is
+/// `redirect_reports_the_writes_a_tee_destination_refused`.
 #[skuld::test]
 fn redirect_tees_to_saved_original(#[fixture(temp_dir)] dir: &Path) {
     let result = run_child("redirect_tee", dir);
@@ -302,6 +312,129 @@ fn redirect_flush_waits_for_a_slow_relay(#[fixture(temp_dir)] dir: &Path) {
     }
 }
 
+/// A tee whose destination refuses some writes goes on writing the rest, and `flush` reports the first error and how
+/// many writes were refused: output that did not reach the caller is never lost in silence.
+#[skuld::test]
+fn redirect_reports_the_writes_a_tee_destination_refused(#[fixture(temp_dir)] dir: &Path) {
+    let result = run_child("redirect_tee_refuses", dir);
+    assert_eq!(
+        result.tee_stderr.lines().collect::<Vec<_>>(),
+        ["line-0", "line-2", "line-4"],
+        "the lines the destination did not refuse"
+    );
+    assert_eq!(
+        result.observed,
+        [format!(
+            "flush errors: [\"stderr was not fully written: writes refused: 2, messages dropped: 0: {}\"]",
+            std::io::Error::from(std::io::ErrorKind::StorageFull)
+        )]
+    );
+}
+
+/// A tee that drops when its queue is full (the bridge's and the GUI's) says at `flush` how many messages it dropped.
+/// The destination holds its first write until the relay has taken every line, so the count is exact: one line in the
+/// destination's hands, a full queue, and the rest dropped.
+#[skuld::test]
+fn redirect_reports_the_messages_a_full_tee_dropped(#[fixture(temp_dir)] dir: &Path) {
+    use crate::logging::logging_test_helpers::OVERFLOW_EXCESS;
+    use crate::logging::queued::CAPACITY;
+
+    let result = run_child("redirect_tee_overflows", dir);
+    assert_eq!(
+        result.observed,
+        [
+            format!("tee writes: {}", CAPACITY + 1),
+            format!(
+                "flush errors: [\"stderr was not fully written: writes refused: 0, messages dropped: {OVERFLOW_EXCESS}\"]"
+            ),
+        ]
+    );
+}
+
+/// A destination that panics on its writer thread: `flush` reports it, and the panic hook logs the panic but does not
+/// chain to the previous hook there. The default previous hook prints to stderr, the pipe whose reader may be waiting
+/// for this writer's queue. On a thread the delivery does not depend on, the hook chains.
+#[skuld::test]
+fn a_panic_on_a_writer_thread_is_reported_and_does_not_chain_to_the_previous_hook(#[fixture(temp_dir)] dir: &Path) {
+    let result = run_child("redirect_writer_thread_panics", dir);
+    assert_eq!(
+        result.observed,
+        [
+            "flush errors: [\"stderr was not fully written: writes refused: 0, messages dropped: 0, the writer thread \
+             panicked\"]",
+            "previous hook ran on: [\"not-a-delivery-thread\"]",
+            "panic records: [\"a destination panics on its writer thread\", \"a panic off the delivery threads\"]",
+        ]
+    );
+}
+
+/// A write to a queue made on a writer thread lands on the original stderr. Not in the queue: the thread could be
+/// waiting for itself. Not on `io::stderr()`: that is the redirected pipe, whose reader may be waiting for this
+/// thread. The child's tee is a buffer, so its real stderr receives only what was written to the original handle. The
+/// line names the armed server address and passes no destination's redaction wrapper on this path; it arrives with the
+/// token in the address's place.
+#[skuld::test]
+fn a_write_to_a_queue_from_a_writer_thread_lands_on_the_original_stderr_redacted(#[fixture(temp_dir)] dir: &Path) {
+    use crate::logging::logging_test_helpers::writer_thread_text;
+
+    let (result, stderr) = run_child_reading_stderr("writer_thread_write", dir);
+    assert_eq!(stderr, writer_thread_text(REDACT_TOKEN), "the child's real stderr");
+    assert_eq!(result.observed, ["the other queue took: \"\""]);
+    assert_eq!(result.tee_stderr, "", "what reached the redirected stderr");
+}
+
+/// A layer whose writer refuses an event prints nothing to stderr. A `tracing-subscriber` layer that logs its
+/// internal errors prints such a failure, and stderr is the redirected pipe: printed on a relay thread, the line would
+/// come back as an event that fails again, without end. `fmt::layer()` does not log them today, though its
+/// documentation says it does; `compose_subscriber` sets the flag itself, so a change of that default cannot bring the
+/// print back.
+#[skuld::test]
+fn a_layer_whose_writer_fails_prints_nothing_to_the_redirected_stderr(#[fixture(temp_dir)] dir: &Path) {
+    let result = run_child("layer_writers_fail", dir);
+    assert_eq!(
+        result.observed,
+        ["write attempts: 2"],
+        "one event, once to each of the two layers"
+    );
+    assert_eq!(result.tee_stderr, "", "what reached the redirected stderr");
+}
+
+/// What a full queue of a terminal sink does, for each kind of process.
+#[skuld::test]
+fn only_a_command_waits_for_the_reader_of_its_terminal_sinks() {
+    use crate::logging::queued::Overflow;
+    use crate::logging::ProcessKind;
+
+    assert!(matches!(ProcessKind::Command.terminal(), Overflow::Wait));
+    assert!(matches!(ProcessKind::Bridge.terminal(), Overflow::Drop));
+    assert!(matches!(ProcessKind::Gui.terminal(), Overflow::Drop));
+}
+
+/// What a terminal sink did not deliver is reported unless the caller closed the stream: then every refusal is a
+/// broken pipe, nothing was dropped and nothing panicked.
+#[skuld::test]
+fn a_terminal_sink_reports_a_loss_unless_its_caller_closed_the_stream() {
+    use std::io::ErrorKind::{BrokenPipe, StorageFull};
+    // (the first error's kind, messages dropped, the writer thread panicked, is a loss)
+    let table = [
+        (Some(BrokenPipe), 0, false, false),
+        (Some(StorageFull), 0, false, true),
+        (Some(BrokenPipe), 1, false, true),
+        (Some(BrokenPipe), 0, true, true),
+        (None, 1, false, true),
+        (None, 0, true, true),
+    ];
+    for (first, dropped, panicked, expected) in table {
+        let error = crate::logging::queued::QueueError {
+            first: first.map(std::io::Error::from),
+            refused: u64::from(first.is_some()),
+            dropped,
+            panicked,
+        };
+        assert_eq!(super::terminal_failure_is_loss(&error), expected, "{error:?}");
+    }
+}
+
 #[skuld::test]
 fn redirect_does_not_loop(#[fixture(temp_dir)] dir: &Path) {
     let result = run_child("redirect_no_loop", dir);
@@ -333,33 +466,6 @@ fn redirect_does_not_loop(#[fixture(temp_dir)] dir: &Path) {
             .iter()
             .any(|e| e.layer == "stderr" && e.target.starts_with("hole::stdout_relay")),
         "stderr layer should not receive stdout_relay events"
-    );
-}
-
-#[skuld::test]
-fn lossy_mode_drops_under_backpressure(#[fixture(temp_dir)] dir: &Path) {
-    // The child writes many lines to stderr while the file appender is
-    // throttled by a slow writer. Under non-lossy mode, this would block for
-    // far longer than the deadline below. Under lossy mode, the child completes
-    // promptly and MANY events are dropped: the SlowWriter should see far
-    // fewer writes than lines (proving the lossy channel is actually dropping,
-    // not just queuing).
-    let start = std::time::Instant::now();
-    let result = run_child("lossy_backpressure", dir);
-    let elapsed = start.elapsed();
-    // Generous deadline: the child loop is microseconds per iteration plus
-    // process spawn/cleanup, while the throttled sink would, without lossy mode,
-    // take lines * its per-write sleep.
-    assert!(
-        elapsed < std::time::Duration::from_secs(20),
-        "lossy backpressure test took {elapsed:?} — likely blocking on file writer"
-    );
-    // `tee_stderr` holds the observed SlowWriter write count (child reused
-    // this field — see scenario_lossy_backpressure).
-    let writes: usize = result.tee_stderr.parse().expect("observed write count from child");
-    assert!(
-        writes < 10_000,
-        "lossy mode should have dropped events under backpressure, but SlowWriter saw {writes} writes",
     );
 }
 
@@ -794,7 +900,7 @@ fn relay_events_go_to_file_not_stderr() {
 
 use crate::logging::logging_test_helpers::{REDACT_ADDR, REDACT_TOKEN};
 
-/// The leak test. `init_dual` builds four non-blocking writers and exactly
+/// The leak test. `init_dual` builds four queued writers and exactly
 /// one of them is a log file; this covers that one.
 #[skuld::test]
 fn init_dual_writes_a_redacted_file(#[fixture(temp_dir)] dir: &Path) {
@@ -831,7 +937,7 @@ fn init_dual_writes_a_redacted_file(#[fixture(temp_dir)] dir: &Path) {
 }
 
 /// Pinned to the console tee target, not the file. The file is a different
-/// writer, so a change that wrapped only the appender would still pass an
+/// writer, so a change that wrapped only the file's would still pass an
 /// assertion made against the file.
 #[skuld::test]
 fn the_console_tee_target_is_redacted(#[fixture(temp_dir)] dir: &Path) {

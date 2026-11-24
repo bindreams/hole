@@ -36,7 +36,6 @@ dirs = "7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 tracing-log = "0.2"
-tracing-appender = "0.2"
 os_pipe = "1"
 time = { version = "0.3", features = ["serde-well-known", "formatting", "macros"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "net"] }

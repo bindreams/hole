@@ -11,7 +11,8 @@
 #![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
 use crate::logging::logging_tests::{CapturedEvent, ChildResult};
-use crate::logging::{redirect_stdio_to_tracing_for_tests, ProcessKind, StdioRelayHandles, Stream};
+use crate::logging::queued::{queued, Overflow, CAPACITY};
+use crate::logging::{redirect_stdio_to_tracing, redirect_stdio_with, ProcessKind, StdioRelayHandles, Stream};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -163,8 +164,8 @@ fn write_result(result: &ChildResult) {
 
 fn finish(harness: &mut ChildHarness) -> ChildResult {
     // Flush the stdio relay deterministically: write a sentinel through
-    // stderr/stdout, block on the reader's ack, then drain the
-    // NonBlocking tee writers' WorkerGuards. No sleep.
+    // stderr/stdout, block on the reader's ack, then finish the tees'
+    // queues. No sleep.
     if let Some(relays) = harness.relays.as_mut() {
         relays.flush(|e| panic!("relay flush: {e}"));
     }
@@ -192,8 +193,12 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_relay_thread_ended_stdout" => scenario_relay_thread_ended(Stream::Stdout),
         "redirect_slow_stderr_relay" => scenario_slow_relay("hole::stderr_relay"),
         "redirect_slow_stdout_relay" => scenario_slow_relay("hole::stdout_relay"),
+        "redirect_tee_refuses" => scenario_tee_refuses(),
+        "redirect_tee_overflows" => scenario_tee_overflows(),
+        "redirect_writer_thread_panics" => scenario_writer_thread_panics(),
+        "writer_thread_write" => scenario_writer_thread_write(),
+        "layer_writers_fail" => scenario_layer_writers_fail(),
         "redirect_no_loop" => scenario_no_loop(),
-        "lossy_backpressure" => scenario_lossy_backpressure(),
         "echo_stderr" => scenario_echo_stderr(),
         "echo_stdout" => scenario_echo_stdout(),
         "log_bridge_to_file" => scenario_log_bridge_to_file(),
@@ -219,10 +224,8 @@ fn scenario_log_bridge_to_file() {
     unsafe { std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1") };
     let guard = super::init(log_dir, ProcessKind::Command, "test.log", "info", None);
     log::info!("from-log-crate-bridge-test");
-    // Drop the guard explicitly so the `tracing_appender::NonBlocking`
-    // worker thread flushes its in-flight events to disk before the
-    // child process exits. No sleep — the WorkerGuard's Drop joins
-    // the worker.
+    // Drop the guard explicitly: it returns once the file's writer thread
+    // has written every event to disk, and the child exits after it.
     drop(guard);
 }
 
@@ -241,7 +244,7 @@ fn scenario_echo_stdout() {
 
 fn scenario_basic_stderr() {
     let mut harness = install_child_subscriber();
-    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    let (relays, _layer_writer) = redirect_stdio_to_tracing(Overflow::Wait).expect("redirect");
     harness.relays = Some(relays);
     let _ = writeln!(std::io::stderr(), "hello-from-stderr");
     let _ = std::io::stderr().flush();
@@ -251,7 +254,7 @@ fn scenario_basic_stderr() {
 
 fn scenario_basic_stdout() {
     let mut harness = install_child_subscriber();
-    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    let (relays, _layer_writer) = redirect_stdio_to_tracing(Overflow::Wait).expect("redirect");
     harness.relays = Some(relays);
     let _ = writeln!(std::io::stdout(), "hello-from-stdout");
     let _ = std::io::stdout().flush();
@@ -261,7 +264,7 @@ fn scenario_basic_stdout() {
 
 fn scenario_grandchild_stderr() {
     let mut harness = install_child_subscriber();
-    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    let (relays, _layer_writer) = redirect_stdio_to_tracing(Overflow::Wait).expect("redirect");
     harness.relays = Some(relays);
 
     // Pass A: Rust grandchild via current_exe.
@@ -294,7 +297,7 @@ fn scenario_grandchild_stderr() {
 
 fn scenario_grandchild_stdout() {
     let mut harness = install_child_subscriber();
-    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    let (relays, _layer_writer) = redirect_stdio_to_tracing(Overflow::Wait).expect("redirect");
     harness.relays = Some(relays);
 
     let exe = std::env::current_exe().expect("current_exe");
@@ -348,9 +351,10 @@ fn scenario_tee() {
         .expect("open stdout tee file");
 
     let mut harness = install_child_subscriber();
-    let relays = crate::logging::redirect_stdio_to_tracing_with_writers_for_tests(
+    let relays = redirect_stdio_with(
         Box::new(stderr_file.try_clone().unwrap()),
         Box::new(stdout_file.try_clone().unwrap()),
+        Overflow::Wait,
     )
     .expect("redirect with custom writers");
     harness.relays = Some(relays);
@@ -368,7 +372,7 @@ fn scenario_tee() {
 
 fn scenario_multiline() {
     let mut harness = install_child_subscriber();
-    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    let (relays, _layer_writer) = redirect_stdio_to_tracing(Overflow::Wait).expect("redirect");
     harness.relays = Some(relays);
     let _ = std::io::stderr().write_all(b"multiline-a\nmultiline-b\nmultiline-c\n");
     let _ = std::io::stderr().flush();
@@ -382,7 +386,7 @@ fn scenario_multiline() {
 /// it must still be relayed whole.
 fn scenario_open_line(stream: Stream) {
     let mut harness = install_child_subscriber();
-    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    let (relays, _layer_writer) = redirect_stdio_to_tracing(Overflow::Wait).expect("redirect");
     let relay = match stream {
         Stream::Stderr => relays.stderr.as_ref(),
         Stream::Stdout => relays.stdout.as_ref(),
@@ -475,9 +479,10 @@ fn scenario_relay_thread_ended(ended: Stream) {
     tracing::subscriber::set_global_default(subscriber).expect("set_global_default in child");
 
     let (stderr_tee, stdout_tee) = (VecWriter::new(), VecWriter::new());
-    let mut relays = crate::logging::redirect_stdio_to_tracing_with_writers_for_tests(
+    let mut relays = redirect_stdio_with(
         Box::new(stderr_tee.clone()),
         Box::new(stdout_tee.clone()),
+        Overflow::Wait,
     )
     .expect("redirect with custom writers");
     fn relay(relays: &mut StdioRelayHandles, ended: Stream) -> &mut crate::logging::Relay {
@@ -614,9 +619,8 @@ fn scenario_slow_relay(slow_target: &'static str) {
     };
     let (stderr_path, stderr_file) = tee_file("tee-stderr.bin");
     let (stdout_path, stdout_file) = tee_file("tee-stdout.bin");
-    let mut relays =
-        crate::logging::redirect_stdio_to_tracing_with_writers_for_tests(Box::new(stderr_file), Box::new(stdout_file))
-            .expect("redirect with custom writers");
+    let mut relays = redirect_stdio_with(Box::new(stderr_file), Box::new(stdout_file), Overflow::Wait)
+        .expect("redirect with custom writers");
 
     for i in 0..LINES {
         let _ = writeln!(std::io::stdout(), "slow-line-{i}");
@@ -632,28 +636,79 @@ fn scenario_slow_relay(slow_target: &'static str) {
     write_result(&result);
 }
 
-fn scenario_no_loop() {
-    let mut harness = install_child_subscriber();
-    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
-    harness.relays = Some(relays);
-    tracing::info!("normal event");
-    let result = finish(&mut harness);
-    write_result(&result);
+/// An error and its causes as the exit report prints them.
+fn chain_text(error: &std::io::Error) -> String {
+    util::error::chain(error)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
-fn scenario_lossy_backpressure() {
-    // SlowWriter sleeps on every write and counts the number of successful
-    // writes — used in place of the file appender to verify the relay/file
-    // pipeline doesn't block AND that some events were actually dropped
-    // (not just queued).
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static WRITES: AtomicUsize = AtomicUsize::new(0);
-
-    struct SlowWriter;
-    impl Write for SlowWriter {
+/// The stderr tee's destination refuses its second and fourth write. The result holds what the destination took and
+/// what `flush` reported.
+fn scenario_tee_refuses() {
+    struct Refusing {
+        taken: VecWriter,
+        writes: usize,
+    }
+    impl Write for Refusing {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            WRITES.fetch_add(1, Ordering::SeqCst);
+            self.writes += 1;
+            if self.writes.is_multiple_of(2) {
+                return Err(std::io::ErrorKind::StorageFull.into());
+            }
+            self.taken.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let taken = VecWriter::new();
+    let mut relays = redirect_stdio_with(
+        Box::new(Refusing {
+            taken: taken.clone(),
+            writes: 0,
+        }),
+        Box::new(std::io::sink()),
+        Overflow::Wait,
+    )
+    .expect("redirect with custom writers");
+    for i in 0..5 {
+        writeln!(std::io::stderr(), "line-{i}").expect("a line to stderr");
+    }
+    let mut errors = Vec::new();
+    relays.flush(|e| errors.push(chain_text(&e)));
+    write_result(&ChildResult {
+        observed: vec![format!("flush errors: {errors:?}")],
+        tee_stderr: String::from_utf8_lossy(&taken.snapshot()).into_owned(),
+        ..ChildResult::default()
+    });
+}
+
+/// How many lines the overflow scenario writes past what its tee can hold: one in the destination's hands and a full
+/// queue.
+pub(crate) const OVERFLOW_EXCESS: usize = 7;
+
+/// The stderr tee, one that drops when it is full, has a destination that holds its first write until the relay has
+/// taken `OVERFLOW_EXCESS` more lines than the tee can hold. The result holds how many writes the destination took and
+/// what `flush` reported.
+fn scenario_tee_overflows() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    struct Held {
+        entered: Option<mpsc::Sender<()>>,
+        release: mpsc::Receiver<()>,
+        writes: Arc<AtomicUsize>,
+    }
+    impl Write for Held {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).expect("the scenario waits for the first write");
+                self.release.recv().expect("the scenario releases the first write");
+            }
+            self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -661,32 +716,226 @@ fn scenario_lossy_backpressure() {
         }
     }
 
-    let (slow_nb, _slow_guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
-        .lossy(true)
-        .finish(SlowWriter);
+    let (entered, has_entered) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut relays = redirect_stdio_with(
+        Box::new(Held {
+            entered: Some(entered),
+            release: released,
+            writes: Arc::clone(&writes),
+        }),
+        Box::new(std::io::sink()),
+        Overflow::Drop,
+    )
+    .expect("redirect with custom writers");
 
-    let file_layer = tracing_subscriber::fmt::layer().with_writer(slow_nb).with_ansi(false);
-
-    let subscriber = tracing_subscriber::registry().with(file_layer);
-    tracing::subscriber::set_global_default(subscriber).expect("set_global_default for lossy");
-
-    let (_relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
-
-    // Write 10000 stderr lines in a tight loop. Without lossy mode this
-    // would take the line count times SlowWriter's sleep. With lossy mode it
-    // completes promptly, and the SlowWriter counter lands well below 10000
-    // (proving events were dropped, not just queued).
-    for i in 0..10_000 {
-        let _ = writeln!(std::io::stderr(), "lossy-line-{i}");
+    // The destination holds the first line, so the queue behind it is empty and takes exactly its capacity.
+    writeln!(std::io::stderr(), "line-0").expect("a line to stderr");
+    has_entered.recv().expect("the destination's first write");
+    for i in 1..=CAPACITY + OVERFLOW_EXCESS {
+        writeln!(std::io::stderr(), "line-{i}").expect("a line to stderr");
     }
-    let _ = std::io::stderr().flush();
+    // The relay has handed every line to the tee once it answers a drain; a tee that drops never holds the relay.
+    relays
+        .stderr
+        .as_mut()
+        .expect("the stderr relay")
+        .drain()
+        .expect("the relay takes every line");
+    release.send(()).expect("the destination is waiting");
 
-    // Record the observed write count in the result so the parent test can
-    // assert on it. Reuse `tee_stderr` as a free-form channel for the value.
-    let result = ChildResult {
-        tee_stderr: WRITES.load(Ordering::SeqCst).to_string(),
+    let mut errors = Vec::new();
+    relays.flush(|e| errors.push(chain_text(&e)));
+    write_result(&ChildResult {
+        observed: vec![
+            format!("tee writes: {}", writes.load(Ordering::SeqCst)),
+            format!("flush errors: {errors:?}"),
+        ],
         ..ChildResult::default()
-    };
+    });
+}
+
+/// The stderr tee's destination panics on its writer thread, with the production panic hook installed over a previous
+/// hook that records the threads it runs on. The result lists where the previous hook ran, the panic records the hook
+/// logged, and what `flush` reported.
+fn scenario_writer_thread_panics() {
+    struct PanicWriter;
+    impl Write for PanicWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            panic!("a destination panics on its writer thread");
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The panic hook's records go to `records`, the rest nowhere.
+    struct PanicRecords(VecWriter);
+    impl<'a> MakeWriter<'a> for PanicRecords {
+        type Writer = Box<dyn Write>;
+        fn make_writer(&'a self) -> Self::Writer {
+            Box::new(std::io::sink())
+        }
+        fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+            match meta.target() {
+                "hole::panic" => Box::new(self.0.clone()),
+                _ => Box::new(std::io::sink()),
+            }
+        }
+    }
+
+    let chained = Arc::new(Mutex::new(Vec::<String>::new()));
+    std::panic::set_hook(Box::new({
+        let chained = Arc::clone(&chained);
+        move |_| {
+            let thread = std::thread::current();
+            chained
+                .lock()
+                .unwrap()
+                .push(thread.name().unwrap_or("<unnamed>").to_string());
+        }
+    }));
+    crate::logging::install_panic_hook_for_tests();
+
+    let records = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(PanicRecords(records.clone()))
+            .with_ansi(false),
+    );
+    tracing::subscriber::set_global_default(subscriber).expect("set_global_default in child");
+
+    let mut relays = redirect_stdio_with(Box::new(PanicWriter), Box::new(std::io::sink()), Overflow::Wait)
+        .expect("redirect with custom writers");
+    writeln!(std::io::stderr(), "boom").expect("the line that ends the writer thread");
+
+    // `flush` finishes the tee, which joins its writer thread: the hook has run there by the time it returns.
+    let mut errors = Vec::new();
+    relays.flush(|e| errors.push(chain_text(&e)));
+
+    // The same hook on a thread the delivery does not depend on: the previous hook must run there, or the check proves
+    // nothing.
+    std::thread::Builder::new()
+        .name("not-a-delivery-thread".into())
+        .spawn(|| panic!("a panic off the delivery threads"))
+        .expect("spawn")
+        .join()
+        .expect_err("the thread panics");
+
+    let records = String::from_utf8_lossy(&records.snapshot()).into_owned();
+    let messages: Vec<&str> = records
+        .lines()
+        .filter_map(|line| line.split_once("hole::panic: panic: "))
+        .map(|(_, rest)| rest.split(" location=").next().unwrap_or(rest))
+        .collect();
+    write_result(&ChildResult {
+        observed: vec![
+            format!("flush errors: {errors:?}"),
+            format!("previous hook ran on: {:?}", chained.lock().unwrap()),
+            format!("panic records: {messages:?}"),
+        ],
+        ..ChildResult::default()
+    });
+}
+
+/// What the destination of [`scenario_writer_thread_write`] writes from its writer thread, naming `server`.
+pub(crate) fn writer_thread_text(server: &str) -> String {
+    format!("written on a writer thread for {server}\n")
+}
+
+/// A destination writes a line that names the armed server address to another queue from its writer thread, with
+/// stderr redirected and teed to a buffer. The result holds what the other queue's destination took and what the tee
+/// took; the parent reads this process's real stderr.
+fn scenario_writer_thread_write() {
+    struct WritesAQueue(crate::logging::queued::Queued);
+    impl Write for WritesAQueue {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write_all(writer_thread_text(REDACT_ADDR).as_bytes())?;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    util::redact::arm(REDACT_TOKEN, [REDACT_ADDR.to_string()]);
+    let tee = VecWriter::new();
+    let mut relays = redirect_stdio_with(Box::new(tee.clone()), Box::new(std::io::sink()), Overflow::Wait)
+        .expect("redirect with custom writers");
+    let other_took = VecWriter::new();
+    let (other, other_guard) = queued(other_took.clone(), Overflow::Wait);
+    let (mut queue, guard) = queued(WritesAQueue(other), Overflow::Wait);
+    queue.write_all(b"go").expect("the queue has room");
+    // In this order every place the text could have gone is complete before it is read: the writer thread has
+    // written, the other queue is written out, and the relay has teed what reached the redirected stderr.
+    guard.finish().expect("the queue whose destination writes");
+    other_guard.finish().expect("the other queue");
+    relays.flush(|e| panic!("relay flush: {e}"));
+
+    write_result(&ChildResult {
+        observed: vec![format!(
+            "the other queue took: {:?}",
+            String::from_utf8_lossy(&other_took.snapshot())
+        )],
+        tee_stderr: String::from_utf8_lossy(&tee.snapshot()).into_owned(),
+        ..ChildResult::default()
+    });
+}
+
+/// The production subscriber over two writers that refuse every write, with stderr redirected and teed to a buffer.
+/// One event is logged. The result holds how many writes the layers attempted and what reached the redirected stderr.
+fn scenario_layer_writers_fail() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct Refusing(Arc<AtomicUsize>);
+    impl Write for Refusing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::ErrorKind::StorageFull.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for Refusing {
+        type Writer = Refusing;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let directives = ["info".to_string()];
+    let subscriber = crate::logging::compose_subscriber(
+        Refusing(Arc::clone(&attempts)),
+        Refusing(Arc::clone(&attempts)),
+        &directives,
+        &directives,
+    );
+    tracing::subscriber::set_global_default(subscriber).expect("set_global_default in child");
+
+    let tee = VecWriter::new();
+    let mut relays = redirect_stdio_with(Box::new(tee.clone()), Box::new(std::io::sink()), Overflow::Wait)
+        .expect("redirect with custom writers");
+    tracing::info!(target: "some_dependency", "an event both writers refuse");
+    // The relay has teed whatever reached the redirected stderr once this returns.
+    relays.flush(|e| panic!("relay flush: {e}"));
+
+    write_result(&ChildResult {
+        observed: vec![format!("write attempts: {}", attempts.load(Ordering::SeqCst))],
+        tee_stderr: String::from_utf8_lossy(&tee.snapshot()).into_owned(),
+        ..ChildResult::default()
+    });
+}
+
+fn scenario_no_loop() {
+    let mut harness = install_child_subscriber();
+    let (relays, _layer_writer) = redirect_stdio_to_tracing(Overflow::Wait).expect("redirect");
+    harness.relays = Some(relays);
+    tracing::info!("normal event");
+    let result = finish(&mut harness);
     write_result(&result);
 }
 
@@ -709,9 +958,8 @@ fn scenario_redact_file() {
     // A third-party-shaped line: no Hole site authored it, nothing about it
     // is `ServerAddress`-typed, and it still must not reach the file.
     tracing::info!(target: "some_dependency::dialer", "creating connection to {REDACT_ADDR}:8388");
-    // Drop the guard explicitly so the `tracing_appender::NonBlocking`
-    // worker thread flushes to disk before the child exits. No sleep — the
-    // WorkerGuard's Drop joins the worker.
+    // Drop the guard explicitly: it returns once the file's writer thread
+    // has written every event to disk, and the child exits after it.
     drop(guard);
 }
 
@@ -739,9 +987,10 @@ fn scenario_redact_tee() {
 
     let mut harness = install_child_subscriber();
     util::redact::arm(REDACT_TOKEN, [REDACT_ADDR.to_string()]);
-    let relays = crate::logging::redirect_stdio_to_tracing_with_writers_for_tests(
+    let relays = redirect_stdio_with(
         Box::new(stderr_file.try_clone().unwrap()),
         Box::new(stdout_file.try_clone().unwrap()),
+        Overflow::Wait,
     )
     .expect("redirect with custom writers");
     harness.relays = Some(relays);

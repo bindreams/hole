@@ -284,8 +284,8 @@ fn destroy_windows_before_exit(app: &tauri::AppHandle) {
         // On Windows, tao's `runner.handling_events()` guard defers the
         // `ControlFlow::Exit` until the destroy has been processed.
         if let Err(e) = window.destroy() {
-            // stderr, not `tracing`: the async appender is not flushed before
-            // `process::exit`. Only dev builds have a console to show it.
+            // Best effort: nothing waits for the log's queues or the stderr relay
+            // before `process::exit`. Only dev builds have a console to show it.
             eprintln!(
                 "warning: failed to destroy webview window {:?} on exit: {e}",
                 window.label(),

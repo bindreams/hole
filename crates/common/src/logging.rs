@@ -20,19 +20,17 @@
 //    target `hole::panic`, then chains the previous hook so the default printer
 //    still runs in dev mode.
 //
-// Non-blocking writers split into two categories:
-// - **Stderr + stdio-relay tees** keep `.lossy(true)` — a wedged terminal
-//   (Ctrl+S, pipe consumer hung) MUST NOT block the bridge or the panic
-//   hook.
-// - **File appender** is `.lossy(false)` — the teardown burst MUST land
-//   on disk for diagnostics. A wedged disk blocks every thread that logs,
-//   with no limit, once the writer's default `buffered_lines_limit` is full;
-//   the buffer only delays that.
+// Every sink is written by a thread of its own, behind a queue (`queued`):
+// - **The file** waits when its queue is full: the teardown burst MUST land on disk for diagnostics. A wedged disk
+//   holds every thread that logs, with no limit, once the queue is full; the queue only delays that.
+// - **The stderr layer and the two stdio tees** do what `ProcessKind::terminal` says for the kind of process: a
+//   command waits for its reader; the bridge and the GUI drop and count, so a wedged terminal (Ctrl+S, a pipe
+//   consumer that hangs) never holds them.
 
+use queued::{queued, Overflow, QueueError, Queued, QueuedGuard};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
-use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use util::dir::Dir;
 use uuid::Uuid;
@@ -55,6 +53,18 @@ impl ProcessKind {
             ProcessKind::Command => "gui-cli",
             ProcessKind::Bridge => "bridge",
             ProcessKind::Gui => "gui",
+        }
+    }
+
+    /// What this kind's terminal sinks (the two tees and the stderr layer) do when their reader falls behind.
+    fn terminal(self) -> Overflow {
+        match self {
+            // The output is the product, and the caller owns the reader.
+            ProcessKind::Command => Overflow::Wait,
+            // A paused console must not stop the datapath.
+            ProcessKind::Bridge => Overflow::Drop,
+            // A paused console must not freeze the window.
+            ProcessKind::Gui => Overflow::Drop,
         }
     }
 }
@@ -118,10 +128,10 @@ impl Drain {
     }
 }
 
-/// One redirected stream: its relay thread, the guard of the lossy tee behind it, and the drain they share.
+/// One redirected stream: its relay thread, the guard of the tee behind it, and the drain they share.
 struct Relay {
     _thread: JoinHandle<()>,
-    tee_guard: Option<WorkerGuard>,
+    tee_guard: Option<QueuedGuard>,
     drain: std::sync::Arc<Drain>,
     stream: Stream,
     /// A second write end of the stream's pipe, for the markers: a marker does not depend on the process's standard
@@ -134,14 +144,14 @@ impl Relay {
         stream: Stream,
         read_end: os_pipe::PipeReader,
         marker_writer: os_pipe::PipeWriter,
-        tee: NonBlocking,
-        tee_guard: WorkerGuard,
+        tee: Queued,
+        tee_guard: QueuedGuard,
     ) -> io::Result<Relay> {
         let drain = std::sync::Arc::new(Drain::default());
         let thread = std::thread::Builder::new().name(stream.thread_name().into()).spawn({
             let drain = std::sync::Arc::clone(&drain);
             move || {
-                ON_RELAY_THREAD.with(|on| on.set(true));
+                DELIVERY_THREAD.set(Some(DeliveryThread::Relay));
                 // A panic in a tracing writer must not skip `end`: a drain would wait for a thread that is gone.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     relay_loop(read_end, tee, stream, &drain);
@@ -158,13 +168,20 @@ impl Relay {
         })
     }
 
-    /// Return once the relay thread has consumed everything this process wrote to the stream before the call, then
-    /// write out the tee's queue: dropping its guard waits up to 100 ms to send the shutdown and up to 1000 ms for the
-    /// tee's worker, and what is still queued then is lost, as is every later write to the tee.
-    fn flush(&mut self) -> io::Result<()> {
-        let drained = self.drain();
+    /// Return once the relay thread has consumed everything this process wrote to the stream before the call and the
+    /// tee has written it to the stream's original handle, with no time limit. Each failure goes to `failed`. Returns
+    /// whether the relay thread took everything. A relay is flushed once: what the stream is given later reaches the
+    /// log file only.
+    fn flush(&mut self, failed: &mut impl FnMut(io::Error)) -> bool {
+        let drained = self.drain().map_err(&mut *failed).is_ok();
         // The tee's queue is written out whatever became of the marker.
-        drop(self.tee_guard.take());
+        let guard = self.tee_guard.take();
+        debug_assert!(guard.is_some(), "a relay is flushed once");
+        if let Some(Err(error)) = guard.map(QueuedGuard::finish) {
+            if terminal_failure_is_loss(&error) {
+                failed(undelivered(self.stream.name(), error));
+            }
+        }
         drained
     }
 
@@ -210,34 +227,76 @@ impl Relay {
 
 // LogGuard ============================================================================================================
 
-/// Guards for the non-blocking writers and the stdio relay reader threads.
+/// Guards for the writer threads of the sinks and the stdio relay reader threads.
 ///
-/// Held for the process lifetime. Dropping it waits until the relay threads have handed everything the process wrote to
-/// stdout and stderr to their tees and layers, with no limit, and then drops the guards of the non-blocking writers one
-/// after another. Each waits up to 100 ms to send its shutdown and up to 1000 ms for its worker (`tracing-appender`'s
-/// bounds); output a reader has not taken by then is lost. `process::exit` skips the drop, so a command that exits that
-/// way must drop the guard first.
+/// Held for the process lifetime. Dropping it returns once everything the process wrote to stdout and stderr, and
+/// every event logged before the drop, has been written to the original handles and the log file. There is no time
+/// limit: a reader or a disk that takes no bytes holds the exit. What a sink did not deliver is said on the original
+/// stderr and, for the terminal sinks, in the file. `process::exit` skips the drop, so a command that exits that way
+/// must drop the guard first.
 pub struct LogGuard {
-    _file: WorkerGuard,
-    _stderr: WorkerGuard,
-    _relays: StdioRelayHandles,
-    /// A writer onto the original stderr, for what the drain cannot deliver.
-    report: NonBlocking,
+    relays: StdioRelayHandles,
+    stderr: Option<QueuedGuard>,
+    /// The file's queue, for the report of what the terminal sinks did not deliver.
+    file: Queued,
+    file_guard: Option<QueuedGuard>,
 }
 
 impl Drop for LogGuard {
     fn drop(&mut self) {
-        let report = &mut self.report;
-        // Every error is from the process's own pipes, whose only reader is a relay thread: it means output was lost,
-        // and the caller has no other way to hear of it.
-        self._relays.flush(|e| {
-            let _ = writeln!(report, "hole: the output could not be fully delivered: {e}");
-        });
+        let mut failures = Vec::new();
+        self.relays.flush(|e| failures.push(e));
+        if let Some(Err(error)) = self.stderr.take().map(QueuedGuard::finish) {
+            if terminal_failure_is_loss(&error) {
+                failures.push(undelivered("the log on stderr", error));
+            }
+        }
+        // The caller has no other way to hear of a loss. This thread writes the report itself: the file's queue is not
+        // finished yet, and the original stderr depends on no thread of this process.
+        for failure in &failures {
+            let line = undelivered_line(failure);
+            let _ = self.file.write_all(line.as_bytes());
+            let _ = OriginalStderr.write_all(line.as_bytes());
+        }
+        if let Some(Err(error)) = self.file_guard.take().map(QueuedGuard::finish) {
+            let line = undelivered_line(&undelivered("the log file", error));
+            let _ = OriginalStderr.write_all(line.as_bytes());
+        }
     }
 }
 
-/// The relays of the redirected streams, and the guards of their lossy tees. A stream that is not redirected (the
-/// debug switch) has none. Held inside `LogGuard`.
+/// A sink that did not take everything it was given.
+#[derive(Debug, thiserror::Error)]
+#[error("{sink} was not fully written")]
+struct Undelivered {
+    sink: &'static str,
+    #[source]
+    error: QueueError,
+}
+
+/// `error` as the `io::Error` that `StdioRelayHandles::flush` passes on.
+fn undelivered(sink: &'static str, error: QueueError) -> io::Error {
+    io::Error::other(Undelivered { sink, error })
+}
+
+/// The line of the exit report for one failure: the error and its causes.
+fn undelivered_line(failure: &io::Error) -> String {
+    let causes: Vec<String> = util::error::chain(failure).map(ToString::to_string).collect();
+    format!("hole: the output could not be fully delivered: {}\n", causes.join(": "))
+}
+
+/// Whether what a terminal sink (a tee or the stderr layer) did not deliver is a loss to report. Its destination is
+/// the caller's stream; a caller that closed it has asked for no more, and its refusals are broken pipes.
+fn terminal_failure_is_loss(error: &QueueError) -> bool {
+    let closed_by_caller = error
+        .first
+        .as_ref()
+        .is_some_and(|first| first.kind() == io::ErrorKind::BrokenPipe);
+    error.dropped > 0 || error.panicked || !closed_by_caller
+}
+
+/// The relays of the redirected streams, and the guards of their tees. A stream that is not redirected (the debug
+/// switch) has none. Held inside `LogGuard`.
 pub(crate) struct StdioRelayHandles {
     stderr: Option<Relay>,
     stdout: Option<Relay>,
@@ -245,24 +304,19 @@ pub(crate) struct StdioRelayHandles {
 
 impl StdioRelayHandles {
     /// Return once every byte written to stdout and stderr before the call has been consumed by its relay thread,
-    /// emitted as a tracing event and written through the tee to the stream's original handle. Each error of a
-    /// step is passed to `failed`; a failed step does not skip the next.
+    /// emitted as a tracing event and written by the tee to the stream's original handle. Each failure of a step is
+    /// passed to `failed`; a failed step does not skip the next.
     ///
-    /// Synchronous (a channel, not a runtime) so it works outside a tokio runtime.
+    /// Synchronous (channels and a join, not a runtime) so it works outside a tokio runtime.
     pub fn flush(&mut self, mut failed: impl FnMut(io::Error)) {
         // Rust's stdout holds a line that has no newline yet; it must reach the pipe ahead of the markers.
         let buffered = io::stdout().flush();
-        let stderr = self.stderr.as_mut().map_or(Ok(()), |relay| relay.flush());
-        let stdout = self.stdout.as_mut().map_or(Ok(()), |relay| relay.flush());
-        let buffered = buffered.or_else(|e| {
-            if buffer_flush_failure_is_loss(&e, self.stdout.is_some(), stdout.is_err()) {
-                Err(e)
-            } else {
-                Ok(())
-            }
-        });
-        for result in [buffered, stderr, stdout] {
-            if let Err(e) = result {
+        if let Some(relay) = self.stderr.as_mut() {
+            relay.flush(&mut failed);
+        }
+        let stdout_failed = self.stdout.as_mut().is_some_and(|relay| !relay.flush(&mut failed));
+        if let Err(e) = buffered {
+            if buffer_flush_failure_is_loss(&e, self.stdout.is_some(), stdout_failed) {
                 failed(e);
             }
         }
@@ -404,33 +458,42 @@ impl Stream {
     }
 }
 
-/// Save the original handle for a stream into a `Box<dyn Write + Send>`. On
-/// Windows in service mode `STD_*_HANDLE` is null/invalid; on those returns
-/// `io::sink()` so the caller can safely write into it. The two return values
-/// are independent writers (used as the relay tee target and the stderr layer
-/// writer respectively) — for real handles they are `try_clone`'d, for sinks
-/// they are two independent sinks.
-fn save_original_pair(stream: Stream) -> (Box<dyn Write + Send>, Box<dyn Write + Send>) {
+/// A copy of the process's handle for `stream`, taken before the redirect. `None` when the process has no usable one:
+/// on Windows in service mode `STD_*_HANDLE` is null or invalid.
+fn dup_original(stream: Stream) -> Option<os_pipe::PipeWriter> {
     let dup = match stream {
         Stream::Stderr => os_pipe::dup_stderr(),
         Stream::Stdout => os_pipe::dup_stdout(),
     };
     let Ok(writer) = dup else {
         tracing::debug!(target: "hole::logging", "saved-original {stream:?} dup failed, using sink fallback");
-        return (Box::new(io::sink()), Box::new(io::sink()));
+        return None;
     };
     // Windows: `try_clone_to_owned` on a null STD_*_HANDLE (typical for a
     // service with no console) returns `Ok(OwnedHandle::from_raw_handle(null))`.
-    // Writing to such a handle silently fails. Detect and substitute sinks.
+    // Writing to such a handle silently fails.
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
         let raw = writer.as_raw_handle();
         if raw.is_null() || raw as isize == -1 {
             tracing::debug!(target: "hole::logging", "saved-original {stream:?} handle is null/invalid, using sink fallback");
-            return (Box::new(io::sink()), Box::new(io::sink()));
+            return None;
         }
     }
+    Some(writer)
+}
+
+/// Save the original handle for a stream into a `Box<dyn Write + Send>`; a
+/// stream the process does not have becomes `io::sink()`, so the caller can
+/// safely write into it. The two return values are independent writers (used
+/// as the relay tee target and the stderr layer writer respectively) — for
+/// real handles they are `try_clone`'d, for sinks they are two independent
+/// sinks.
+fn save_original_pair(stream: Stream) -> (Box<dyn Write + Send>, Box<dyn Write + Send>) {
+    let Some(writer) = dup_original(stream) else {
+        return (Box::new(io::sink()), Box::new(io::sink()));
+    };
     let Ok(clone) = writer.try_clone() else {
         tracing::debug!(target: "hole::logging", "saved-original {stream:?} try_clone failed, using sink fallback for layer writer");
         return (Box::new(writer), Box::new(io::sink()));
@@ -438,24 +501,43 @@ fn save_original_pair(stream: Stream) -> (Box<dyn Write + Send>, Box<dyn Write +
     (Box::new(writer), Box::new(clone))
 }
 
-/// Redirect a single stdio stream to a pipe and spawn a reader thread that
-/// tees each line to (a) a tracing event and (b) the saved-original handle.
-/// Returns the relay and the second saved-original copy intended for the
-/// tracing stderr layer (caller can drop it for stdout where there's no layer).
-fn redirect_one(stream: Stream) -> io::Result<(Relay, Box<dyn Write + Send>)> {
-    // Save the original BEFORE the redirect — once dup2/SetStdHandle runs,
-    // io::stdout/stderr point at the pipe.
-    let (tee_target, layer_writer) = save_original_pair(stream);
-    Ok((redirect_one_with(stream, tee_target)?, layer_writer))
+/// Where the redirect put the process's own stderr. Unset while stderr is not redirected.
+static ORIGINAL_STDERR: std::sync::OnceLock<SavedStream> = std::sync::OnceLock::new();
+
+enum SavedStream {
+    Handle(os_pipe::PipeWriter),
+    /// The process has no such stream (a service without a console).
+    Absent,
 }
 
-/// [`redirect_one`] for a caller-chosen tee target.
-fn redirect_one_with(stream: Stream, tee_target: Box<dyn Write + Send>) -> io::Result<Relay> {
-    // Wrap the tee writer in a lossy non-blocking writer so a slow downstream
-    // consumer of the saved-original cannot back up the relay reader thread.
-    let (tee, tee_guard) = NonBlockingBuilder::default()
-        .lossy(true)
-        .finish(util::redact::RedactingWriter::new(tee_target));
+/// The process's stderr as its caller gave it: the saved handle once stderr is redirected, `io::stderr()` until then.
+/// Redacts what it is given. A write depends on no thread of this process, so a writer thread and the exit report use
+/// it where a queue or `io::stderr()` could wait for the thread that is writing.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OriginalStderr;
+
+impl Write for OriginalStderr {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let redacted = util::redact::redact_bytes(buf);
+        match ORIGINAL_STDERR.get() {
+            Some(SavedStream::Handle(handle)) => (&*handle).write_all(&redacted)?,
+            Some(SavedStream::Absent) => {}
+            None => io::stderr().write_all(&redacted)?,
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Redirect a single stdio stream to a pipe and spawn a reader thread that tees each line to (a) a tracing event and
+/// (b) `tee_target`, through a queue that does `overflow` when it is full.
+fn redirect_one_with(stream: Stream, tee_target: Box<dyn Write + Send>, overflow: Overflow) -> io::Result<Relay> {
+    // The tee has a writer thread of its own: nothing its destination does (a panic, a notice, a wait for a slow
+    // reader) runs on the relay thread.
+    let (tee, tee_guard) = queued(util::redact::RedactingWriter::new(tee_target), overflow);
 
     let (read_end, write_end) = os_pipe::pipe()?;
 
@@ -513,7 +595,7 @@ fn redirect_fd(stream: Stream, write_end: &os_pipe::PipeWriter) -> io::Result<()
 ///
 /// Tracing's `event!` macro takes a literal target string, so we dispatch on
 /// the `Stream` enum to one of the two known emit_* helpers.
-fn relay_loop(reader: os_pipe::PipeReader, mut tee: NonBlocking, stream: Stream, drain: &Drain) {
+fn relay_loop(reader: os_pipe::PipeReader, mut tee: Queued, stream: Stream, drain: &Drain) {
     use std::io::{BufRead, BufReader};
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::with_capacity(4096);
@@ -529,9 +611,12 @@ fn relay_loop(reader: os_pipe::PipeReader, mut tee: NonBlocking, stream: Stream,
                 };
                 if !output.is_empty() {
                     // Tee raw bytes to the saved-original first so script-visible
-                    // output ordering is preserved.
+                    // output ordering is preserved. A write the tee's destination
+                    // refuses is counted by the tee's queue and reported at `flush`.
+                    // This write fails once the tee's writer thread has ended: after a
+                    // panic of the destination, which `flush` reports, or after `flush`
+                    // itself, when the line reaches the log file only.
                     let _ = tee.write_all(output);
-                    let _ = tee.flush();
                     // Emit a tracing event with the trimmed text for the file log.
                     let line = String::from_utf8_lossy(output);
                     let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -571,38 +656,33 @@ fn emit_stdout_relay(msg: &str) {
     tracing::event!(target: "hole::stdout_relay", tracing::Level::INFO, "{}", msg);
 }
 
-/// Set up the FD-level redirect for both stderr and stdout. Returns the relay
-/// thread handles + the saved-original-stderr writer for the tracing stderr
-/// layer. The saved-original-stdout writer is dropped (no stdout tracing
-/// layer) — the relay's tee already preserves CLI script visibility.
-fn redirect_stdio_to_tracing() -> io::Result<(StdioRelayHandles, Box<dyn Write + Send>)> {
-    let (stderr, stderr_layer_writer) = redirect_one(Stream::Stderr)?;
-    let (stdout, _stdout_layer_writer) = redirect_one(Stream::Stdout)?;
-    let relays = StdioRelayHandles {
-        stderr: Some(stderr),
-        stdout: Some(stdout),
-    };
-    Ok((relays, stderr_layer_writer))
+/// Set up the FD-level redirect for both stderr and stdout, each teed to its
+/// saved-original handle. Returns the relays + the saved-original-stderr writer
+/// for the tracing stderr layer. There is no stdout tracing layer — the relay's
+/// tee already preserves CLI script visibility.
+pub(crate) fn redirect_stdio_to_tracing(terminal: Overflow) -> io::Result<(StdioRelayHandles, Box<dyn Write + Send>)> {
+    // Save the originals BEFORE the redirect — once dup2/SetStdHandle runs,
+    // io::stdout/stderr point at the pipes.
+    let (stderr_tee, stderr_layer_writer) = save_original_pair(Stream::Stderr);
+    let (stdout_tee, _) = save_original_pair(Stream::Stdout);
+    Ok((
+        redirect_stdio_with(stderr_tee, stdout_tee, terminal)?,
+        stderr_layer_writer,
+    ))
 }
 
-/// Test-only re-export of `redirect_stdio_to_tracing` so child-side test
-/// scenarios can drive the redirect without going through `init()`.
-#[cfg(test)]
-pub(crate) fn redirect_stdio_to_tracing_for_tests() -> io::Result<(StdioRelayHandles, Box<dyn Write + Send>)> {
-    redirect_stdio_to_tracing()
-}
-
-/// Test-only variant that lets the caller supply explicit tee target writers
-/// for stderr and stdout, instead of using `os_pipe::dup_stderr/stdout`. Used
-/// by the `redirect_tee` scenario to verify the tee path receives bytes.
-#[cfg(test)]
-pub(crate) fn redirect_stdio_to_tracing_with_writers_for_tests(
+/// Redirect stderr and stdout, each teed to the writer given for it through a queue that does `terminal` when it is
+/// full. From here [`OriginalStderr`] is the stderr the process had before the call.
+pub(crate) fn redirect_stdio_with(
     stderr_tee: Box<dyn Write + Send>,
     stdout_tee: Box<dyn Write + Send>,
+    terminal: Overflow,
 ) -> io::Result<StdioRelayHandles> {
+    // The first redirect of the process saves it; there is no second (`init_dual` runs once).
+    ORIGINAL_STDERR.get_or_init(|| dup_original(Stream::Stderr).map_or(SavedStream::Absent, SavedStream::Handle));
     Ok(StdioRelayHandles {
-        stderr: Some(redirect_one_with(Stream::Stderr, stderr_tee)?),
-        stdout: Some(redirect_one_with(Stream::Stdout, stdout_tee)?),
+        stderr: Some(redirect_one_with(Stream::Stderr, stderr_tee, terminal)?),
+        stdout: Some(redirect_one_with(Stream::Stdout, stdout_tee, terminal)?),
     })
 }
 
@@ -630,22 +710,45 @@ fn disable_redirect_for_tests() -> bool {
 /// leaks across tests. Use this flag to skip subsequent installs.
 static PANIC_HOOK_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-// Set on the stdio relay threads. The previous hook (the default printer) writes to stderr, which on a relay thread is
-// the pipe that thread alone reads: a panic text longer than the pipe holds would make the thread wait for itself, and
-// the drain at exit with it. The panic hook therefore does not chain on such a thread. Its own record goes through the
-// layers, which write the original stderr and the file. If the writer or formatter that ended the thread panics on that
-// record too, that is a panic inside the hook, and std aborts the process.
-std::thread_local! {
-    static ON_RELAY_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// A thread that the delivery of the process's output depends on. Such a thread must not wait for the delivery
+/// itself: it would be waiting for itself, directly or through another of these threads.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DeliveryThread {
+    /// Reads a redirected stream and hands each line to the stream's tee and to the layers.
+    Relay,
+    /// Owns the destination of a [`queued::Queued`].
+    Writer,
 }
 
-// Per-thread re-entry guard for the panic hook. If `tracing::error!` inside
-// the hook itself panics (e.g. a writer panics or a format impl misbehaves),
-// the global panic dispatcher calls our hook again. Without this guard we'd
-// recurse until the thread's stack overflows. When re-entry is detected we
-// fall through to the previous hook only, skipping the tracing emit.
+impl DeliveryThread {
+    /// Whether a write to a `Queued` made on this thread goes into the queue.
+    fn queues(self) -> bool {
+        match self {
+            // Handing lines to the queues is this thread's work, and no writer waits for it.
+            DeliveryThread::Relay => true,
+            // The queue may be this thread's own, which it alone empties.
+            DeliveryThread::Writer => false,
+        }
+    }
+
+    /// Whether the panic hook chains to the previous hook on this thread. The default one prints to stderr, a
+    /// redirected stream.
+    fn chains_panic_hook(self) -> bool {
+        match self {
+            // Stderr is the pipe this thread alone reads: a text longer than the pipe holds would never be read.
+            DeliveryThread::Relay => false,
+            // The pipe's reader may be waiting for room in this thread's queue.
+            DeliveryThread::Writer => false,
+        }
+    }
+}
+
+// What the current thread is to the delivery, if anything. On a delivery thread the panic hook's own record still goes
+// through the layers: from a relay thread into their queues, from a writer thread straight to the original stderr. If
+// the writer or formatter that ended a relay thread panics on that record too, that is a panic inside the hook, and std
+// aborts the process.
 std::thread_local! {
-    static PANIC_HOOK_ENTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DELIVERY_THREAD: std::cell::Cell<Option<DeliveryThread>> = const { std::cell::Cell::new(None) };
 }
 
 /// Test-only variant that ignores the idempotency guard. Tests that
@@ -675,16 +778,7 @@ pub fn install_panic_hook() {
 fn install_panic_hook_inner() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Re-entry guard. If the tracing emit itself panics, skip the emit
-        // and fall through to the previous hook directly.
-        let reentered = PANIC_HOOK_ENTERED.with(|c| c.replace(true));
-        let chain = !ON_RELAY_THREAD.with(|on| on.get());
-        if reentered {
-            if chain {
-                prev(info);
-            }
-            return;
-        }
+        let chain = DELIVERY_THREAD.get().is_none_or(DeliveryThread::chains_panic_hook);
         let backtrace = std::backtrace::Backtrace::force_capture();
         let location = info
             .location()
@@ -703,7 +797,6 @@ fn install_panic_hook_inner() {
             "panic: {}",
             payload,
         );
-        PANIC_HOOK_ENTERED.with(|c| c.set(false));
         if chain {
             prev(info);
         }
@@ -731,7 +824,7 @@ fn build_filter(directives: &[String]) -> EnvFilter {
 
 /// Compose the two filtered fmt layers over a registry. Generic over the
 /// writers so unit tests can supply capturing buffers and the production
-/// caller supplies non-blocking writers. The stderr layer additionally drops
+/// caller supplies queues. The stderr layer additionally drops
 /// the relay-target events; the file layer keeps them.
 fn compose_subscriber<FW, SW>(
     file_writer: FW,
@@ -750,15 +843,20 @@ where
         !m.target().starts_with("hole::stderr_relay") && !m.target().starts_with("hole::stdout_relay")
     });
 
+    // `log_internal_errors(false)`, the value `fmt::layer()` already has: a layer told to log them prints a failed
+    // write to stderr, the redirected stream, on whichever thread logged. On a relay thread the line would come back
+    // as an event that fails again. A layer's write fails once its queue's writer thread has ended.
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(file_writer)
         .with_ansi(false)
+        .log_internal_errors(false)
         .event_format(yaml_format::YamlFormat)
         .with_filter(build_filter(file_directives));
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(stderr_writer)
         .with_ansi(true)
+        .log_internal_errors(false)
         .event_format(yaml_format::YamlFormat)
         .with_filter(no_relay)
         .with_filter(build_filter(stderr_directives));
@@ -853,8 +951,8 @@ pub fn init_dual(
         }
     };
 
-    // Order matters: redirect BEFORE constructing the non-blocking stderr
-    // writer so the writer targets the saved-original handle, not the pipe.
+    // Order matters: redirect BEFORE constructing the stderr layer's writer
+    // so the writer targets the saved-original handle, not the pipe.
     // `HOLE_LOGGING_DISABLE_REDIRECT` is honored only in dev/test builds; in
     // release the FD safety net is non-negotiable (the env var is a no-op).
     let (relays, original_stderr) = if disable_redirect_for_tests() {
@@ -866,44 +964,43 @@ pub fn init_dual(
             Box::new(io::stderr()) as Box<dyn Write + Send>,
         )
     } else {
-        redirect_stdio_to_tracing().expect("stdio redirect failed")
+        redirect_stdio_to_tracing(kind.terminal()).expect("stdio redirect failed")
     };
 
     // Each rotation hands the fresh root-owned active file back to the real user
-    // (`owner`; `None` leaves it alone).
+    // (`owner`; `None` leaves it alone). The rotator runs on the file's writer
+    // thread, so its notice goes to the original stderr.
     let owned: Box<dyn Write + Send> = match dir {
-        Some(dir) => Box::new(DirRotate::new(dir, log_filename.as_ref(), MAX_LOG_BYTES, owner)),
+        Some(dir) => Box::new(DirRotate::new(
+            dir,
+            log_filename.as_ref(),
+            MAX_LOG_BYTES,
+            owner,
+            OriginalStderr,
+        )),
         None => Box::new(io::sink()),
     };
-    // The redaction wrap sits under the appender, so every formatted event
+    // The redaction wrap sits under the queue, so every formatted event
     // passes through it whoever authored it — a Hole site, a dependency at
     // the default global `info`, an OS command's argv, or a relayed plugin
     // line. This is the writer that is a log file; wrapping it is what closes
     // the leak, and it is the only redaction between any crate's `info!` and
     // the file.
     //
-    // The FILE appender is `lossy(false)`: the proxy-stop teardown burst
+    // The FILE queue waits when it is full: the proxy-stop teardown burst
     // (SystemRoutes::drop sequence: route commands, state-file clear,
     // Remove-NetAdapter) must never be silently truncated, or `bridge.log`
     // loses the diagnostic for a teardown that broke the user's network.
     // Trade-off: a wedged disk (full filesystem, OneDrive sync stall, AV scan)
-    // blocks every thread that logs, with no limit, once the writer's default
-    // `buffered_lines_limit` is full.
-    let (file_nb, file_guard) = NonBlockingBuilder::default()
-        .lossy(false)
-        .finish(util::redact::RedactingWriter::new(owned));
-    // The STDERR non-blocking writer keeps `lossy(true)`: a wedged terminal
-    // (Ctrl+S on a console session) MUST NOT block the bridge.
-    let (stderr_nb, stderr_guard) = NonBlockingBuilder::default()
-        .lossy(true)
-        .finish(util::redact::RedactingWriter::new(original_stderr));
-    let report = stderr_nb.clone();
+    // holds every thread that logs, with no limit, once the queue is full.
+    let (file, file_guard) = queued(util::redact::RedactingWriter::new(owned), Overflow::Wait);
+    let (stderr, stderr_guard) = queued(util::redact::RedactingWriter::new(original_stderr), kind.terminal());
 
     use tracing_subscriber::util::SubscriberInitExt;
     // Sanctioned by clippy.toml `disallowed_methods`: the ONE
     // production `try_init` workspace-wide. Tests use `register!()`.
     #[allow(clippy::disallowed_methods)]
-    if let Err(e) = compose_subscriber(file_nb, stderr_nb, file_directives, stderr_directives).try_init() {
+    if let Err(e) = compose_subscriber(file.clone(), stderr, file_directives, stderr_directives).try_init() {
         // Subscriber not yet active; write directly to FD 2. Goes through the
         // redirect → relay → file layer once installed elsewhere.
         let _ = writeln!(io::stderr(), "hole: tracing subscriber init failed: {e}");
@@ -924,17 +1021,17 @@ pub fn init_dual(
     tombstone::attach(kind.label(), log_dir);
 
     LogGuard {
-        _file: file_guard,
-        _stderr: stderr_guard,
-        _relays: relays,
-        report,
+        relays,
+        stderr: Some(stderr_guard),
+        file,
+        file_guard: Some(file_guard),
     }
 }
 
 // Legacy cleanup ======================================================================================================
 
-/// Remove legacy `<log_filename>.YYYY-MM-DD` files left behind by the prior
-/// `tracing_appender::rolling::daily` scheme.
+/// Remove legacy `<log_filename>.YYYY-MM-DD` files left behind by the old
+/// daily-rotation scheme.
 ///
 /// Silent best-effort: never panics, never returns an error, ignores anything
 /// it can't delete (missing dir, permission denied, file vanished between
@@ -1001,6 +1098,7 @@ fn is_legacy_daily_suffix(candidate: &str, stem: &str) -> bool {
 }
 
 pub mod dir_rotate;
+pub(crate) mod queued;
 
 /// Arming the redaction registry from a server entry.
 pub mod redact_arm;

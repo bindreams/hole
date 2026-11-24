@@ -20,16 +20,21 @@ const STATUS_LINES: [&str; 5] = [
     "installed (being changed)",
 ];
 
-/// Reads `CARGO_BIN_EXE_hole` at run time first: a nextest archive run remaps it.
-fn hole(log_dir: &Path, args: &[&str]) -> Output {
+/// `hole` with `args`, logging to `log_dir`, not yet started. Reads `CARGO_BIN_EXE_hole` at run time first: a nextest
+/// archive run remaps it.
+fn hole_command(log_dir: &Path, args: &[&str]) -> Command {
     let exe = std::env::var_os("CARGO_BIN_EXE_hole").unwrap_or_else(|| env!("CARGO_BIN_EXE_hole").into());
-    Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .args(args)
         .env("HOLE_LOG_DIR", log_dir)
         // The debug-only switch that turns the stdio relay off: the shipped build has no such switch.
-        .env_remove("HOLE_LOGGING_DISABLE_REDIRECT")
-        .output()
-        .expect("run hole")
+        .env_remove("HOLE_LOGGING_DISABLE_REDIRECT");
+    command
+}
+
+fn hole(log_dir: &Path, args: &[&str]) -> Output {
+    hole_command(log_dir, args).output().expect("run hole")
 }
 
 #[skuld::test]
@@ -67,6 +72,30 @@ fn an_error_reaches_stderr_and_the_log() {
     assert!(
         log.contains("failed to read") && log.contains("absent.json"),
         "gui-cli.log is {log:?}, which does not record that the config file could not be read"
+    );
+}
+
+/// A caller that closed stdout before the command wrote to it (`hole bridge status | true`) is told of no loss: the
+/// command printed, the caller chose not to read. The log shows that the line was printed.
+#[skuld::test]
+fn a_command_whose_stdout_the_caller_closed_reports_no_loss() {
+    let log_dir = tempfile::tempdir().expect("log dir");
+    let (reader, writer) = std::io::pipe().expect("a pipe");
+    drop(reader);
+    let out = hole_command(log_dir.path(), &["bridge", "status"])
+        .stdout(writer)
+        .output()
+        .expect("run hole");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let log = std::fs::read_to_string(log_dir.path().join("gui-cli.log")).unwrap_or_default();
+    assert!(
+        STATUS_LINES.iter().any(|line| log.contains(line)),
+        "gui-cli.log is {log:?}, which does not show that the status line was printed (stderr {stderr:?})"
+    );
+    assert!(
+        !stderr.contains("could not be fully delivered"),
+        "a closed stdout was reported as a loss: {stderr:?}"
     );
 }
 

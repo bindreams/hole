@@ -36,11 +36,19 @@ pub struct DirRotate {
 
 impl DirRotate {
     /// `owner` is given the active file each time it is created, so the user can read it without elevating, and is
-    /// the only owner an existing active file may have.
-    pub fn new(dir: Dir, name: &std::ffi::OsStr, limit: usize, owner: Option<(u32, u32)>) -> Self {
-        Self::with_notice(dir, name, limit, owner, |err| {
+    /// the only owner an existing active file may have. `notices` is told, once, that the file could not be opened.
+    /// Behind a queue this runs on the queue's writer thread, where `notices` must not be the process's stderr or a
+    /// log sink (see `Queued`).
+    pub fn new(
+        dir: Dir,
+        name: &std::ffi::OsStr,
+        limit: usize,
+        owner: Option<(u32, u32)>,
+        mut notices: impl Write + Send + 'static,
+    ) -> Self {
+        Self::with_notice(dir, name, limit, owner, move |err| {
             // No subscriber can carry this: the file is the log. The error carries no path.
-            let _ = writeln!(io::stderr(), "hole: the log file is disabled, it was not opened: {err}");
+            let _ = writeln!(notices, "hole: the log file is disabled, it was not opened: {err}");
         })
     }
 

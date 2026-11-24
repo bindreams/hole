@@ -323,8 +323,8 @@ impl<W: io::Write> io::Write for RedactingWriter<W> {
     /// Returns the count of **input** bytes consumed, never of output bytes
     /// emitted. Redaction changes length, and reporting the output count
     /// would make [`io::Write::write_all`]'s default loop slice `&buf[n..]`
-    /// out of range and panic — on `tracing_appender`'s worker thread,
-    /// silently ending all file logging.
+    /// out of range and panic — on the log's writer thread, ending all
+    /// file logging.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.write_all(&redact_bytes(buf))?;
         Ok(buf.len())
