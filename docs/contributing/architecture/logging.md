@@ -105,9 +105,10 @@ queue. Four rules follow:
 
 - The panic hook skips the previous hook, the default printer that writes to stderr, on both kinds of thread. The hook's
   own record is still logged.
-- A write to a queue made on a writer thread goes straight to the original stderr instead of the queue. A record that a
-  writer thread logs lands there: the panic hook's record of a destination that panicked, or the warning of a failed
-  `chown` during a rotation. Each sink that would have taken the record writes it, so it appears there once per sink.
+- A write to a queue made on a writer thread is offered to the queue without waiting, and goes to the original stderr
+  when the queue is full or has ended. A record that a writer thread logs, such as the warning of a failed `chown`
+  during a rotation, reaches the sinks that would have taken it. The panic record of a writer whose own destination
+  panicked is lost with that writer's queue.
 - `DirRotate` writes its notice that the file could not be opened to the original stderr.
 - The two `tracing` layers are built with `log_internal_errors(false)`. A layer told to log its internal errors prints
   a failed write to stderr, the redirected stream, on the thread that logged the event; printed on a relay thread, the
