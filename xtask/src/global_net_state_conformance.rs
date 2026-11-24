@@ -359,15 +359,15 @@ pub(crate) fn verify_with(
 /// map key (e.g. `hole-bridge::cutover_leak_privileged`), confirmed against
 /// nextest-runner's own JUnit writer — the set of `name`s that appear as
 /// EXECUTED: present in the report and carrying no `<skipped>` child. A
-/// `<failure>` child still counts as executed; only `<skipped>` does not. On
-/// the nextest version pinned by this repo, a test that did not run is simply
-/// ABSENT from the report rather than present with a `<skipped>` child —
-/// confirmed for both filter exclusion and fail-fast cancellation, so absence
-/// is the signal [`set_missing`] actually keys on. The `<skipped>`-child
-/// branch below is not reachable today; it is kept forward-defensive against
-/// a JUnit producer that does emit them, not attributed to any nextest
-/// config key — `[profile.default.junit].report-skipped` is not one; nextest
-/// rejects it as an unrecognized key.
+/// `<failure>` child still counts as executed; only `<skipped>` does not.
+///
+/// Two producers feed this. On the nextest version pinned by this repo, a test
+/// that did not run is simply ABSENT from the report rather than present with
+/// a `<skipped>` child — confirmed for both filter exclusion and fail-fast
+/// cancellation, so absence is the signal [`set_missing`] keys on, and the
+/// `<skipped>` branch below never fires for it. pytest, which the installed
+/// lanes' `verify-journeys` reads, does write `<skipped>` for a skipped case,
+/// and that branch is what makes such a case count as not run.
 pub(crate) fn junit_executed_tests(xml: &str) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let doc = Document::parse(xml).context("parsing JUnit XML report")?;
 
@@ -423,6 +423,19 @@ pub(crate) fn merge_executed(reports: &[BTreeMap<String, BTreeSet<String>>]) -> 
         }
     }
     out
+}
+
+/// What every JUnit file in `paths` shows as executed, merged ([`junit_executed_tests`], [`merge_executed`]). An error
+/// names the file it came from.
+pub(crate) fn read_executed(paths: &[PathBuf]) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut reports = Vec::new();
+    for path in paths {
+        let xml =
+            std::fs::read_to_string(path).with_context(|| format!("reading JUnit report at {}", path.display()))?;
+        reports
+            .push(junit_executed_tests(&xml).with_context(|| format!("reading JUnit report at {}", path.display()))?);
+    }
+    Ok(merge_executed(&reports))
 }
 
 // Recorded expectation ================================================================================================
@@ -494,14 +507,8 @@ pub fn verify_executed(repo_root: &Path, expected_path: &Path, junit_paths: &[Pa
          actually ran, which defeats it as surely as a real execution gap would (bindreams/hole#999)"
     );
 
-    let mut reports = Vec::new();
-    for junit_path in junit_paths {
-        let junit_abs = absolutize(repo_root, junit_path);
-        let junit_xml = std::fs::read_to_string(&junit_abs)
-            .with_context(|| format!("reading JUnit report at {}", junit_abs.display()))?;
-        reports.push(junit_executed_tests(&junit_xml)?);
-    }
-    let executed = merge_executed(&reports);
+    let junit_abs: Vec<PathBuf> = junit_paths.iter().map(|path| absolutize(repo_root, path)).collect();
+    let executed = read_executed(&junit_abs)?;
 
     let missing = set_missing(&expectation.tests, &executed);
     if missing.is_empty() {
