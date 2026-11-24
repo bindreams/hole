@@ -227,5 +227,6 @@ person can do what the product is for, against the files a release would publish
 proxy through the installed service, once as the elevated test process and once as the installing user, not elevated.
 Its full-tunnel case starts the default `hole proxy start`, as that user, and fetches a page from outside the machine
 by address and by name, asks the operating system whether DNS points at the tunnel, and compares the machine's routes,
-adapters and DNS settings before the start and after the stop. [The installers](installers.md#the-install-e2e-and-uninstall-run)
-links the journey table, which names each case and the journeys no test runs yet.
+adapters and DNS settings before the start and after the stop. [The installers page](installers.md#the-install-e2e-and-uninstall-run)
+describes the cases and links the journey table, which names the cases behind each journey and the journeys no test
+runs yet.
