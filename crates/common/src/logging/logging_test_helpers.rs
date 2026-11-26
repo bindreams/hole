@@ -199,6 +199,7 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_writer_thread_panics" => scenario_writer_thread_panics(),
         "writer_panic_reaches_the_other_sink" => scenario_writer_panic_reaches_the_other_sink(),
         "writer_panic_record_cannot_be_logged" => scenario_writer_panic_record_cannot_be_logged(),
+        "writer_logs_each_of_its_panics_on_its_own" => scenario_writer_logs_each_of_its_panics_on_its_own(),
         "layer_writers_fail" => scenario_layer_writers_fail(),
         "redirect_no_loop" => scenario_no_loop(),
         "echo_stderr" => scenario_echo_stderr(),
@@ -907,21 +908,7 @@ fn scenario_writer_panic_reaches_the_other_sink() {
     let stderr_finished = describe(stderr_guard.finish());
     let file_finished = describe(file_guard.finish());
 
-    let took = String::from_utf8_lossy(&file_took.snapshot()).into_owned();
-    let lines: Vec<&str> = took.lines().collect();
-    let mut messages = Vec::new();
-    let mut located_here = Vec::new();
-    for (at, line) in lines.iter().enumerate() {
-        let Some((_, message)) = line.split_once("hole::panic: panic: ") else {
-            continue;
-        };
-        messages.push(message.trim_end_matches(':').to_string());
-        let location = lines[at + 1..]
-            .iter()
-            .take_while(|field| field.starts_with("  "))
-            .find_map(|field| field.strip_prefix("  location: "));
-        located_here.push(location.is_some_and(|location| location.contains("logging_test_helpers.rs:")));
-    }
+    let (messages, located_here) = panic_records(&file_took.snapshot());
     write_result(&ChildResult {
         observed: vec![
             format!("the panic records the log file took: {messages:?}"),
@@ -999,6 +986,105 @@ fn scenario_writer_panic_record_cannot_be_logged() {
         observed: vec![format!("finishing the queue returned: {finished}")],
         ..ChildResult::default()
     });
+}
+
+/// The production layers over the log file's queue, whose destination panics in its first write and again when it is
+/// dropped, and over a stderr writer that panics on the first record of a panic and keeps the ones after it. The
+/// result holds the panic records that writer kept, whether each names its location in this file, and what finishing
+/// the queue returned.
+fn scenario_writer_logs_each_of_its_panics_on_its_own() {
+    struct PanicsInWriteAndInDrop;
+    impl Write for PanicsInWriteAndInDrop {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            panic!("the destination panics in a write");
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Drop for PanicsInWriteAndInDrop {
+        fn drop(&mut self) {
+            panic!("the destination panics when it is dropped");
+        }
+    }
+
+    struct PanicWriter;
+    impl Write for PanicWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            panic!("a tracing writer panics on the first record of a panic");
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The first of the panic hook's records goes to a writer that panics, the later ones to `kept`, the rest nowhere.
+    struct PanicsOnTheFirstPanicRecord {
+        seen: AtomicUsize,
+        kept: VecWriter,
+    }
+    impl<'a> MakeWriter<'a> for PanicsOnTheFirstPanicRecord {
+        type Writer = Box<dyn Write>;
+        fn make_writer(&'a self) -> Self::Writer {
+            Box::new(std::io::sink())
+        }
+        fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+            if meta.target() != "hole::panic" {
+                return Box::new(std::io::sink());
+            }
+            match self.seen.fetch_add(1, Ordering::SeqCst) {
+                0 => Box::new(PanicWriter),
+                _ => Box::new(self.kept.clone()),
+            }
+        }
+    }
+
+    // Off the writer threads the production hook chains to the default one, so a failing step here still says why.
+    crate::logging::install_panic_hook_for_tests();
+
+    let kept = VecWriter::new();
+    let (file, file_guard) = queued(PanicsInWriteAndInDrop, Overflow::Wait);
+    let stderr = PanicsOnTheFirstPanicRecord {
+        seen: AtomicUsize::new(0),
+        kept: kept.clone(),
+    };
+    let directives = ["info".to_string()];
+    let subscriber = crate::logging::compose_subscriber(file, stderr, &directives, &directives);
+    tracing::subscriber::set_global_default(subscriber).expect("set_global_default in child");
+
+    tracing::info!(target: "some_dependency", "an event the destination panics on");
+    // Joins the writer thread: it has logged its panics, or failed to, by the time this returns.
+    let finished = without_locations_here(&describe(file_guard.finish()));
+
+    let (messages, located_here) = panic_records(&kept.snapshot());
+    write_result(&ChildResult {
+        observed: vec![
+            format!("the panic records the stderr writer kept: {messages:?}"),
+            format!("each names its location in this file: {located_here:?}"),
+            format!("finishing the queue returned: {finished}"),
+        ],
+        ..ChildResult::default()
+    });
+}
+
+/// The message of each panic record in `took`, a layer's output, and whether each names a location in this file.
+fn panic_records(took: &[u8]) -> (Vec<String>, Vec<bool>) {
+    let took = String::from_utf8_lossy(took);
+    let lines: Vec<&str> = took.lines().collect();
+    let mut messages = Vec::new();
+    let mut located_here = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let Some((_, message)) = line.split_once("hole::panic: panic: ") else {
+            continue;
+        };
+        messages.push(message.trim_end_matches(':').to_string());
+        let location = lines[at + 1..]
+            .iter()
+            .take_while(|field| field.starts_with("  "))
+            .find_map(|field| field.strip_prefix("  location: "));
+        located_here.push(location.is_some_and(|location| location.contains("logging_test_helpers.rs:")));
+    }
+    (messages, located_here)
 }
 
 /// What `finish` returned, as text.

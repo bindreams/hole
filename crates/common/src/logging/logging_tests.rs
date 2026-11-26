@@ -405,6 +405,27 @@ fn a_writer_whose_panic_record_cannot_be_logged_still_reports_what_it_did(#[fixt
     assert_eq!(stderr, "", "the child's stderr");
 }
 
+/// A destination that panics in a write and again when it is dropped leaves two panics for its writer thread to log.
+/// A `tracing` writer that panics on the first record does not keep the second from the sinks, and `finish` returns
+/// the destination's first panic and the panic that logging raised. Nothing goes to the process's stderr.
+#[skuld::test]
+fn a_panic_while_a_writer_logs_one_of_its_panics_does_not_keep_the_next_from_the_sinks(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    let (result, stderr) = run_child_reading_stderr("writer_logs_each_of_its_panics_on_its_own", dir);
+    assert_eq!(
+        result.observed,
+        [
+            "the panic records the stderr writer kept: [\"the destination panics when it is dropped\"]",
+            "each names its location in this file: [true]",
+            "finishing the queue returned: writes refused: 0, messages dropped: 0, the writer thread panicked: the \
+             destination panics in a write, at <here>, logging the writer thread's panics panicked: a tracing writer \
+             panics on the first record of a panic, at <here>",
+        ]
+    );
+    assert_eq!(stderr, "", "the child's stderr");
+}
+
 /// A layer whose writer refuses an event prints nothing to stderr. A `tracing-subscriber` layer that logs its
 /// internal errors prints such a failure, and stderr is the redirected pipe: printed on a relay thread, the line would
 /// come back as an event that fails again, without end. `fmt::layer()` does not log them today, though its

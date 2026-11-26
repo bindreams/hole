@@ -64,8 +64,9 @@ enum Message {
 /// thread breaks this contract (debug assertion). A destination reports its own events into itself. A writer whose
 /// destination panicked logs the panic, once its queue has ended, into the sinks still open, and `finish` returns the
 /// panic's message and location. A panic raised by logging it is caught and not logged, and `finish` returns that one
-/// too. A writer thread writes no redirected stream. Its one write elsewhere is `DirRotate`'s notice that the file
-/// could not be opened, to the original stderr.
+/// too; where the writer has two panics to log, such a panic does not stop the logging of the second. A writer thread
+/// writes no redirected stream. Its one write elsewhere is `DirRotate`'s notice that the file could not be opened, to
+/// the original stderr.
 ///
 /// No destination in Hole catches its own panic. If one did, the panic's record would wait on the writer thread until
 /// its queue ends and then go to the sinks still open; for the log file, which `LogGuard` finishes last, that is none.
@@ -99,8 +100,8 @@ pub(crate) struct QueueError {
     pub dropped: u64,
     /// The destination panicked, which ended the writer thread; senders failed from then on instead of waiting.
     pub panic: Option<PanicReport>,
-    /// Logging the panics of the writer thread, once its queue had ended, panicked: their records may have reached no
-    /// sink.
+    /// The first panic raised while the writer thread, its queue ended, logged its panics: the record being logged
+    /// may have reached no sink.
     pub logging_panic: Option<PanicReport>,
 }
 

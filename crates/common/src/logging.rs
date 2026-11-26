@@ -779,17 +779,19 @@ pub(crate) fn writer_panic_report(payload: &(dyn std::any::Any + Send)) -> Panic
         .unwrap_or_else(|| PanicReport::from_payload(payload))
 }
 
-/// The writer thread's queue has ended: the thread logs the panics the hook kept on it into the sinks still open.
-/// Returns the panic that logging them raised, if one did; the hook keeps that one without logging it.
+/// The writer thread's queue has ended: the thread logs each panic the hook kept on it into the sinks still open. A
+/// panic raised while one is logged does not stop the ones after it; the hook keeps that panic without logging it.
+/// Returns the first panic that the logging raised.
 pub(crate) fn leave_writer_thread() -> Option<PanicReport> {
     DELIVERY_THREAD.set(Some(DeliveryThread::EndedWriter));
-    let records = STORED_PANICS.take();
-    let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        for record in &records {
-            record.log();
+    let mut first = None;
+    for record in STORED_PANICS.take() {
+        let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| record.log()));
+        if let Err(payload) = logged {
+            first.get_or_insert_with(|| writer_panic_report(&*payload));
         }
-    }));
-    logged.err().map(|payload| writer_panic_report(&*payload))
+    }
+    first
 }
 
 /// What a panic said, and where.
