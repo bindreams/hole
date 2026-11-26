@@ -522,6 +522,9 @@ def full_tunnel_journey(
     does not succeed, and then for each of these that does not hold: a page by address and one by name arrive through
     the far side (`page_problems`), the system holds the tunnel's resolver (`dns_problems`) and its device and routes
     (`device_problems`), and after the stop the machine is as it was (`stop_problems`).
+
+    `server` is on loopback, for which the product installs no route that keeps its connection to the server out of the
+    tunnel: the journey does not see that route installed, used or removed.
     """
     case = plugin or "a server with no plugin"
     config = tmp_path / "server.json"

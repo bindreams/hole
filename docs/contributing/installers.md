@@ -38,15 +38,15 @@ under test whose version is not lower than the tree's.
 
 Between the two, the lane installs once more and connects ({src}`msi-installer/tests/installed/test_connect.py`): the
 installed `hole.exe` asks the `HoleBridge` service the MSI registered to start a SOCKS-only proxy for a server behind
-`galoshes`, one behind `v2ray-plugin` and one with no plugin, and `curl` fetches a page through each. This is the
-only test in which the service the service manager started runs a plugin; the bridge's own end-to-end tests start it
-as a child of the test. A failure prints what `C:\ProgramData\hole\logs\bridge.log` gained during the case. It runs
+`galoshes`, one behind `v2ray-plugin` and one with no plugin, and `curl` fetches a page through each. Here the
+service manager started the service that runs the plugin; the bridge's own end-to-end tests start it as a child of the
+test. A failure prints what `C:\ProgramData\hole\logs\bridge.log` gained during the case. It runs
 against any MSI too, a published release included. The server is the `ss_plugin_server` example of
 {src}`crates/plugin-e2e/`, with the working tree's `galoshes` and `ex-ray` builds on its side, so the plugins of the
 MSI under test must still speak to the tree's.
 
 A third install connects as the user the installer granted
-({src}`msi-installer/tests/installed/test_member_access.py`). Every other case reaches the bridge from the elevated
+({src}`msi-installer/tests/installed/test_member_access.py`). The connect case reaches the bridge from the elevated
 test process, which the socket's Administrators entry admits whatever the bridge granted anyone else. This one runs the
 installed `hole.exe` from a child that `gsudo` de-elevated, whose token was made before the install and so carries no
 `hole` group. It connects to the server with no plugin, restarts the `HoleBridge` service, connects again, and does
@@ -54,19 +54,30 @@ both once more. A second test takes the user out of the group, restarts the serv
 refused, runs an elevated `hole bridge grant-access` and connects with no further restart. Each fails before its first
 connect when the child still holds Administrators, already carries the group,
 or is not the user the installer added. The child cannot read pytest's own temporary folder, so its files are in
-`member-access\` under the log folder. A failure also says how the child's own connect to the bridge's socket went:
+`member\<test name>\` under the log folder. A failure also says how the child's own connect to the bridge's socket went:
 `hole` can exit before its own error text reaches a pipe.
 
 A fourth install starts a full tunnel, the default of `hole proxy start`, as that same user
 ({src}`msi-installer/tests/installed/test_full_tunnel.py`), once for a server behind each bundled plugin and once for a
 server with no plugin. The server runs on the test machine, so it dials out of the machine's default interface instead of
-the routing table, which the tunnel now owns; that is the one thing the example is told. `curl`, run by the de-elevated
-child, requests `http://1.1.1.1/` and, over IPv4, `http://one.one.one.one/`, and each must answer `301` with a
-`Location` for the host the request named. The case then asks the operating system for the IPv4 DNS servers of each
-adapter (`Get-DnsClientServerAddress`) and fails unless an adapter that did not exist before the start lists one, as the
-tunnel's own adapter does. After `hole proxy stop` the machine's routes, adapters, addresses and DNS settings must equal
-those taken before the start. The case needs the internet, and the machine's routes and DNS belong to the tunnel for a
-few seconds.
+the routing table, which the tunnel now owns. After a start that succeeded the case checks four things, and a failure
+lists each one that did not hold:
+
+| Check   | What must hold                                                                                                                                                                                                                                                                                                         |
+| ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pages   | `curl`, run by the de-elevated child, requests `http://1.1.1.1/` and, over IPv4, `http://one.one.one.one/`. Each answers `301` with a `Location` for the host the request named, and the server opened a relay to that address while the page was fetched. The answer alone arrives from a machine with no tunnel too. |
+| DNS     | While the tunnel is up, Windows lists exactly one set of DNS servers it did not list before: `1.1.1.1` and `1.0.0.1`, the defaults of `hole proxy start`, on the tunnel's adapter.                                                                                                                                     |
+| Device  | While the tunnel is up, the machine has exactly one adapter it did not have before, and `0.0.0.0/1` and `128.0.0.0/1` are routed into it.                                                                                                                                                                              |
+| Restore | After `hole proxy stop`, the adapters, routes, addresses and DNS servers equal those read before the start. Temporary IPv6 addresses are left out: Windows replaces them on its own timer.                                                                                                                             |
+
+The DNS check reads what Windows was told. Nothing in the case shows that a lookup goes to those servers: the request by
+name is answered through the tunnel when the machine's earlier resolver is asked, too.
+
+The server listens on loopback, and for a loopback server Hole installs no route that keeps its own connection to the
+server out of the tunnel. A tunnel to a remote server needs that route and a stop must remove it; this case does not
+install, use or compare it ([#1412](https://github.com/bindreams/hole/issues/1412)).
+
+The case needs the internet, and the machine's routes and DNS belong to the tunnel for a few seconds.
 
 ```{warning}
 This installs Hole system-wide on the machine you run it on. Use a throwaway machine or virtual machine, not the one you
@@ -150,8 +161,10 @@ cargo xtask run hole-dmg-install-e2e
 
 installs the built app's bridge as root, connects with `hole proxy start` to a server behind each bundled plugin and to
 one with no plugin, fetches a page through each, and uninstalls. It then starts a full tunnel for each of the three and
-fetches pages from outside the machine by address and by name, as the Windows lane does; in that case `hole` runs as
-root, as in the cases above, and `curl` runs as the user of the test. The connections are the same code the Windows lane
-runs ({src}`tests/installed/connect_journey.py`).
+makes the four checks of [the Windows lane's full-tunnel case](#the-install-e2e-and-uninstall-run). On macOS the DNS
+servers are those of the one resolver `scutil --dns` gained, read after configd has posted that it rebuilt the
+configuration; the device is the new `utun` interface; and the comparison after the stop leaves out neighbour and cloned
+routes and temporary IPv6 addresses. `hole` runs as root, as in the cases above, and `curl` runs as the user of the
+test. The connections are the same code the Windows lane runs ({src}`tests/installed/connect_journey.py`).
 It is meant for CI: it needs passwordless `sudo`, refuses to run over an existing install, and expects `hole-dmg` to
 have built the app and `cargo build -p plugin-e2e --example ss_plugin_server` to have built the test's server.

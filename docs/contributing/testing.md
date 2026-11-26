@@ -222,10 +222,6 @@ The **elevated lane** (`SKULD_LABELS=tun`) is the only one that touches the oper
 the OS routing packets into it and accepting packets written out of it; adapter-handle lifetime; and real egress from
 the proxy and bypass paths. Those tests are the `*_privileged_tests.rs` files and `tests/*_privileged.rs`.
 
-The **installed lane** runs the product a user installs: the MSI on Windows, the app's bridge on macOS. It proves that a
-person can do what the product is for, against the files a release would publish. Its connect cases start a SOCKS-only
-proxy through the installed service, once as the elevated test process and once as the installing user, not elevated.
-Its full-tunnel case starts the default `hole proxy start`, as that user, and fetches a page from outside the machine
-by address and by name, asks the operating system whether DNS points at the tunnel, and compares the machine's routes,
-adapters and DNS settings before the start and after the stop. [The installers](installers.md#the-install-e2e-and-uninstall-run)
-lists the cases.
+The **installed lane** runs the product a user installs (the MSI on Windows, the app's bridge on macOS), connecting both
+SOCKS-only and with a full tunnel. It proves that a person can do what the product is for, against the files a release
+would publish. [The installers](installers.md#the-install-e2e-and-uninstall-run) lists the cases and what each checks.

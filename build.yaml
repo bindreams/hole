@@ -224,9 +224,10 @@ targets:
 
   hole-dmg-install-e2e:
     # Installs the built Hole.app's bridge as root and connects through each
-    # bundled plugin and without one, on the layout a user's machine has. It mutates the
-    # host (root daemon, launchd job) and needs passwordless sudo, so it is its
-    # own target: `hole-dmg-tests` stays safe to run locally.
+    # bundled plugin and without one, SOCKS-only and as a full tunnel, on the layout a
+    # user's machine has. It mutates the host (root daemon, launchd job; routes and DNS
+    # during a tunnel), needs the internet and passwordless sudo, so it is its own
+    # target: `hole-dmg-tests` stays safe to run locally.
     #
     # Run-only, no `depends:`: it consumes the app, `galoshes` and `ex-ray` that
     # `hole-dmg` built in the same job, so a second cascade here would roll the
