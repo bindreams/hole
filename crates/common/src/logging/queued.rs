@@ -67,6 +67,10 @@ enum Message {
 /// too. A writer thread writes no redirected stream. Its one write elsewhere is `DirRotate`'s notice that the file
 /// could not be opened, to the original stderr.
 ///
+/// No destination in Hole catches its own panic. If one did, the panic's record would wait on the writer thread until
+/// its queue ends and then go to the sinks still open; for the log file, which `LogGuard` finishes last, that is none.
+/// `finish` reports a panic that unwound out of the destination, the first if there were two.
+///
 /// A writer that waited for a queue or for a redirected stream could be waiting for itself, directly or through the
 /// relay thread that reads the stream.
 #[derive(Clone)]

@@ -25,18 +25,20 @@ commands](../bridge-cli.md)).
 **Rotation.** The active file holds up to `MAX_LOG_BYTES`, then is renamed over `<name>.1`, the one backup. If
 `<name>.1` cannot take the rename (a directory at that name, or a handle without delete sharing on it), the full file
 goes to `<name>.1.fallback`, replacing the one before it, and the fallback is removed the next time `<name>.1` can take
-a rotation. When neither name can, no line is lost: the active file keeps being appended past the limit until a rotation
-succeeds. Only a file that cannot be opened loses lines, and it says so once per outage, on the real stderr.
+a rotation. When neither name can, the active file keeps being appended past the limit until a rotation succeeds. While
+a file cannot be opened its lines are dropped, and it says so once per outage, on the real stderr.
 
 **The directory is the user's.** When the bridge runs elevated on a user's behalf, its log directory sits in the user's
 profile, so `init_dual` opens it once as a `util::dir::Dir` (a link is followed only under [the ownership-transition
 rule](privileged-folders.md#the-ownership-transition-rule), the final name never; created if missing, handed to the
 user). `DirRotate` ({src}`crates/common/src/logging/dir_rotate.rs`) does the open, the rotation rename and the `chown` of
 each fresh file, and `init_dual` removes the files of the old daily-rotation scheme, each by a single name inside that
-handle. A path-based rotator would follow
-whatever the user swapped in for a component of the path, as root. A fresh file that the operating system does not let
-the process give to the user (a bridge run without root) starts with one line that says so. A directory the walk refuses disables the file sink,
-with one line on the real stderr that carries no path; the bridge keeps running.
+handle. A path-based rotator would follow whatever the user swapped in for a component of the path, as root. When the
+file system refuses the elevated bridge's `chown` of a fresh file, the file starts with one line that says so. Such a
+file is not the user's, so the next time an elevated bridge opens it (at its next start, or after a rotation that no
+name could take) the file is replaced, not appended to, and its lines are lost
+([#1409](https://github.com/bindreams/hole/issues/1409)). A directory the walk refuses disables the file sink, with one
+line on the real stderr that carries no path; the bridge keeps running.
 
 **Blocking behaviour.** Every sink is written by a thread of its own, behind a queue of 128,000 messages (`queued` in
 {src}`crates/common/src/logging/queued.rs`), so no write runs on the thread that logs. A message is one event, or one
@@ -51,8 +53,10 @@ full queue does depends on the kind of process (`ProcessKind::terminal`):
 | The bridge | Drops the message and counts it, so a paused console does not stop the datapath, with one exception.  |
 | The app    | Drops the message and counts it, so a paused console does not freeze the window, with one exception.  |
 
-The exception: a bridge or app started in a terminal whose console is paused, while its log file cannot be reopened,
-holds the file's writer on the notice that says so until the console is read. Nothing is lost.
+The exception: the file's writer thread says on the original stderr that the log file could not be opened, and that
+write waits for whoever reads the stream. A paused console or a pipe whose reader has stalled holds the file's writer
+there and, once the file's queue is full, every thread that logs. The lines written while the file cannot be opened are
+dropped.
 
 A write that a destination refuses is counted as well, and the writer thread goes on with the next message.
 
@@ -110,7 +114,8 @@ queue. Four rules follow:
 
 - The panic hook skips the previous hook, the default printer that writes to stderr, on both kinds of thread. On a relay
   thread it logs its record at once. On a writer thread it keeps the record, and the thread logs it once its own queue
-  has ended, into the sinks still open.
+  has ended, into the sinks still open. A panic raised by that logging is caught and kept as well, never logged, and
+  the report at exit gives both panics.
 - Code on a writer thread does not log through `tracing`; a debug build asserts this at every write to a queue. A
   destination reports its own events into itself: a fresh log file that could not be given to its owner says so in its
   first line.
@@ -122,7 +127,10 @@ queue. Four rules follow:
 
 A relay thread that has ended, by a panic in a tracing writer or formatter, takes no more output: the drain at exit
 reports that later output to that stream was lost. A writer thread whose destination panics ends as well; later writes
-to its queue from other threads fail, and the report at exit gives the panic's message and location. When the writer or formatter that
+to its queue from other threads fail, and the report at exit gives the panic's message and location. No destination in
+Hole catches its own panic; if one did, the panic's record would wait on the writer thread until its queue ends and
+then go to the sinks still open (for the log file, which the guard finishes last, that is none), and the report at exit
+gives only a panic that unwound out of the destination, the first if there were two. When the writer or formatter that
 ended a relay thread panics on the hook's record too, that is a panic inside the hook, and Rust aborts the process.
 
 The most visible case is WebView2 on Windows, which writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
