@@ -17,14 +17,9 @@ switch ($What) {
     $temporaryRoutes = @($temporary | ForEach-Object { "$($_.IPAddress)/128" })
     # Interfaces, routes and addresses are read from the tables `NotifyIpInterfaceChange`, `NotifyRouteChange2` and
     # `NotifyUnicastIpAddressChange` report on, so that the test can wait on their notices (`windows_machine.py`).
-    # DNS needs no notice. `Get-DnsClientServerAddress` is answered by Dnscache, which reads the interface's `NameServer`
-    # value on each call (a Process Monitor trace of the cmdlet: 24 reads by Dnscache's svchost) and is the only process
-    # that writes it. In a trace of `hole proxy start` (full tunnel) Dnscache writes the tunnel interface's `NameServer`
-    # (`1.1.1.1,1.0.0.1`) on an RPC worker thread: the stack under the write is `dnsrslvr.dll` frames on `RPCRT4.dll`
-    # dispatch frames on `ntdll` thread-pool frames (row 206469, thread 8252), and the thread goes on to the interface's
-    # `Tcpip6` key (row 208476). So the write is inside an incoming RPC call, 0.41 s before `start` returned (row 238259).
-    # On stop, NetSetupSvc deletes the interface's keys (rows 7323327 to 7324027) before `hole proxy stop` returns. A read
-    # after either command therefore sees its result; reading the registry value instead would read the same value.
+    # DNS needs no notice. Dnscache writes the interface's `NameServer` value inside the bridge's
+    # `SetInterfaceDnsSettings` call, and answers `Get-DnsClientServerAddress` by reading that value on each call
+    # (Process Monitor, with the write's stack). Stop deletes the interface's keys before it returns.
     [ordered]@{
       interfaces = @(Get-NetIPInterface | ForEach-Object { $_.InterfaceAlias })
       routes     = @(Get-NetRoute -PolicyStore ActiveStore | Where-Object { $_.DestinationPrefix -notin $temporaryRoutes } | ForEach-Object {

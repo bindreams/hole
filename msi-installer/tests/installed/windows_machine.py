@@ -43,7 +43,7 @@ class _IpChangeWatch:
     These are the tables `network-state.ps1` reads its interfaces, routes and addresses from. Windows publishes no
     notice for a change of an interface's DNS servers, and the DNS row needs no wait of its own: the write is made
     inside the call that starts the tunnel, and the interface's keys are deleted before the call that stops it returns
-    (`network-state.ps1` has the trace rows).
+    (`network-state.ps1`).
     """
 
     def __init__(self) -> None:
