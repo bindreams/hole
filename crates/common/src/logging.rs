@@ -293,7 +293,7 @@ fn terminal_failure_is_loss(error: &QueueError) -> bool {
         .first
         .as_ref()
         .is_some_and(|first| first.kind() == io::ErrorKind::BrokenPipe);
-    error.dropped > 0 || error.panic.is_some() || error.logging_panic.is_some() || !closed_by_caller
+    error.dropped > 0 || error.panic.is_some() || !closed_by_caller
 }
 
 /// The relays of the redirected streams, and the guards of their tees. A stream that is not redirected (the debug
@@ -743,9 +743,9 @@ impl DeliveryThread {
             DeliveryThread::Relay => record.log(),
             // Kept until the thread's queue has ended (`leave_writer_thread`).
             DeliveryThread::Writer => STORED_PANICS.with_borrow_mut(|stored| stored.push(record)),
-            // Kept for `leave_writer_thread` to return. Logging a record is what panicked, and a second panic inside
-            // the hook aborts the process.
-            DeliveryThread::EndedWriter => STORED_PANICS.with_borrow_mut(|stored| stored.push(record)),
+            // Not logged: this panic broke the contract of `Queued`, and logging it would run the code that panicked
+            // inside the hook, where a second panic aborts the process.
+            DeliveryThread::EndedWriter => drop(record),
         }
     }
 
@@ -779,19 +779,12 @@ pub(crate) fn writer_panic_report(payload: &(dyn std::any::Any + Send)) -> Panic
         .unwrap_or_else(|| PanicReport::from_payload(payload))
 }
 
-/// The writer thread's queue has ended: the thread logs each panic the hook kept on it into the sinks still open. A
-/// panic raised while one is logged does not stop the ones after it; the hook keeps that panic without logging it.
-/// Returns the first panic that the logging raised.
-pub(crate) fn leave_writer_thread() -> Option<PanicReport> {
+/// The writer thread's queue has ended: the thread logs each panic the hook kept on it into the sinks still open.
+pub(crate) fn leave_writer_thread() {
     DELIVERY_THREAD.set(Some(DeliveryThread::EndedWriter));
-    let mut first = None;
     for record in STORED_PANICS.take() {
-        let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| record.log()));
-        if let Err(payload) = logged {
-            first.get_or_insert_with(|| writer_panic_report(&*payload));
-        }
+        record.log();
     }
-    first
 }
 
 /// What a panic said, and where.

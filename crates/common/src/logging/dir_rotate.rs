@@ -14,9 +14,9 @@ use util::dir::{Dir, NotGiven, OwnFile};
 /// What the first line of a file that could not be given to its owner says before the OS error.
 const NOT_GIVEN: &str = "hole: this log file was not given to its owner: ";
 
-/// The smallest size limit: that line with an OS error of up to 51 bytes and its newline. The refusal a process that
-/// may not give a file away gets, `Operation not permitted (os error 1)`, is 36 bytes; a longer error than 51 fails
-/// the assertion where the line is written.
+/// The smallest size limit: larger than that line with an OS error of up to 50 bytes and its newline. The refusal a
+/// process that may not give a file away gets, `Operation not permitted (os error 1)`, is 36 bytes; a longer error than
+/// 50 fails the assertion where the line is written.
 const MIN_LIMIT: usize = NOT_GIVEN.len() + 52;
 
 /// `<name>` (current) and `<name>.1` (the previous one): the active file is renamed over `<name>.1` once it

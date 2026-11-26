@@ -386,46 +386,6 @@ fn a_writer_logs_its_destinations_panic_into_the_other_sinks_once_its_queue_has_
     assert_eq!(stderr, "", "the child's stderr");
 }
 
-/// A destination that panics on its writer thread, while a `tracing` writer panics on every record of a panic: the
-/// thread catches the second panic and the hook keeps its record instead of logging it, so the process does not
-/// abort. `finish` returns what the writer did (the write it refused, with its error, and the destination's panic) and
-/// the panic that stopped the logging. Nothing goes to the process's stderr.
-#[skuld::test]
-fn a_writer_whose_panic_record_cannot_be_logged_still_reports_what_it_did(#[fixture(temp_dir)] dir: &Path) {
-    let (result, stderr) = run_child_reading_stderr("writer_panic_record_cannot_be_logged", dir);
-    assert_eq!(
-        result.observed,
-        [format!(
-            "finishing the queue returned: the log on stderr was not fully written: writes refused: 1, messages \
-             dropped: 0, the writer thread panicked: the destination panics on its second write, at <here>, logging the \
-             writer thread's panics panicked: a tracing writer panics on the record of a panic, at <here>: {}",
-            std::io::Error::from(std::io::ErrorKind::StorageFull)
-        )]
-    );
-    assert_eq!(stderr, "", "the child's stderr");
-}
-
-/// A destination that panics in a write and again when it is dropped leaves two panics for its writer thread to log.
-/// A `tracing` writer that panics on the first record does not keep the second from the sinks, and `finish` returns
-/// the destination's first panic and the panic that logging raised. Nothing goes to the process's stderr.
-#[skuld::test]
-fn a_panic_while_a_writer_logs_one_of_its_panics_does_not_keep_the_next_from_the_sinks(
-    #[fixture(temp_dir)] dir: &Path,
-) {
-    let (result, stderr) = run_child_reading_stderr("writer_logs_each_of_its_panics_on_its_own", dir);
-    assert_eq!(
-        result.observed,
-        [
-            "the panic records the stderr writer kept: [\"the destination panics when it is dropped\"]",
-            "each names its location in this file: [true]",
-            "finishing the queue returned: writes refused: 0, messages dropped: 0, the writer thread panicked: the \
-             destination panics in a write, at <here>, logging the writer thread's panics panicked: a tracing writer \
-             panics on the first record of a panic, at <here>",
-        ]
-    );
-    assert_eq!(stderr, "", "the child's stderr");
-}
-
 /// A layer whose writer refuses an event prints nothing to stderr. A `tracing-subscriber` layer that logs its
 /// internal errors prints such a failure, and stderr is the redirected pipe: printed on a relay thread, the line would
 /// come back as an event that fails again, without end. `fmt::layer()` does not log them today, though its
@@ -458,27 +418,24 @@ fn only_a_command_waits_for_the_reader_of_its_terminal_sinks() {
 #[skuld::test]
 fn a_terminal_sink_reports_a_loss_unless_its_caller_closed_the_stream() {
     use std::io::ErrorKind::{BrokenPipe, StorageFull};
-    // (the first error's kind, messages dropped, the writer thread panicked, logging its panics panicked, is a loss)
+    // (the first error's kind, messages dropped, the writer thread panicked, is a loss)
     let table = [
-        (Some(BrokenPipe), 0, false, false, false),
-        (Some(StorageFull), 0, false, false, true),
-        (Some(BrokenPipe), 1, false, false, true),
-        (Some(BrokenPipe), 0, true, false, true),
-        (Some(BrokenPipe), 0, false, true, true),
-        (None, 1, false, false, true),
-        (None, 0, true, false, true),
+        (Some(BrokenPipe), 0, false, false),
+        (Some(StorageFull), 0, false, true),
+        (Some(BrokenPipe), 1, false, true),
+        (Some(BrokenPipe), 0, true, true),
+        (None, 1, false, true),
+        (None, 0, true, true),
     ];
-    for (first, dropped, panicked, logging_panicked, expected) in table {
-        let report = |message: &str| crate::logging::PanicReport {
-            message: message.to_string(),
-            location: None,
-        };
+    for (first, dropped, panicked, expected) in table {
         let error = crate::logging::queued::QueueError {
             first: first.map(std::io::Error::from),
             refused: u64::from(first.is_some()),
             dropped,
-            panic: panicked.then(|| report("a destination panics")),
-            logging_panic: logging_panicked.then(|| report("a tracing writer panics")),
+            panic: panicked.then(|| crate::logging::PanicReport {
+                message: "a destination panics".to_string(),
+                location: None,
+            }),
         };
         assert_eq!(super::terminal_failure_is_loss(&error), expected, "{error:?}");
     }
