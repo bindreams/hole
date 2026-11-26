@@ -15,9 +15,13 @@ proxy` CLI under sudo: a fresh `hole` group membership does not reach this
 process until its next login.
 """
 
+import json
 import re
+import socket
+import socketserver
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -31,6 +35,7 @@ from connect_journey import (
     full_tunnel_journey,
     report_teardown_failure,
     run_ss_server,
+    server_entry,
 )
 from connect_journey import ss_server, target  # noqa: F401 (fixtures)
 from macos_machine import MacMachine
@@ -187,3 +192,98 @@ def test_installed_bridge_carries_a_full_tunnel(bridge: Bridge, plugin: str | No
     machine = MacMachine()
     with run_ss_server(kind, tmp_path, machine.default_interface()) as server:
         full_tunnel_journey(bridge, server, plugin, machine, tmp_path)
+
+
+# Measurement (reverted after one CI run) ==============================================================================
+
+
+class _Forwarder:
+    """Relays TCP from `address` to a loopback port: a far side that a client reaches at the machine's own address."""
+
+    def __init__(self, address: str, target_port: int) -> None:
+        def pump(source: socket.socket, sink: socket.socket) -> None:
+            try:
+                while data := source.recv(65536):
+                    sink.sendall(data)
+            except OSError:
+                pass
+            finally:
+                for sock in (source, sink):
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                upstream = socket.create_connection(("127.0.0.1", target_port))
+                back = threading.Thread(target=pump, args=(upstream, self.request), daemon=True)
+                back.start()
+                pump(self.request, upstream)
+                back.join()
+                upstream.close()
+
+        class Server(socketserver.ThreadingTCPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+        self._server = Server((address, 0), Handler)
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self) -> "_Forwarder":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._thread.join()
+        self._server.server_close()
+
+
+def test_measure_own_address(bridge: Bridge, request: pytest.FixtureRequest, tmp_path: Path) -> None:
+    """What the machine and the product do with a server at the machine's own address.
+
+    Records `route -n get <own address>` before, during and after a full tunnel whose server entry names that address,
+    and what the bridge logged about the host route it installs for it. Measures, asserts nothing.
+    """
+    machine = MacMachine()
+    interface = machine.default_interface()
+    own = subprocess.run(
+        ["ipconfig", "getifaddr", interface], capture_output=True, text=True, check=False
+    ).stdout.strip()
+
+    def say(title: str, *command: str) -> None:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        emit(
+            request,
+            f"=== own-address measurement: {title}\n$ {' '.join(command)}  (exit {result.returncode})\n{result.stdout}{result.stderr}",
+        )
+
+    def look(when: str) -> None:
+        say(f"{when}: route lookup of the own address", "route", "-n", "get", own)
+        say(f"{when}: host routes naming the own address", "sh", "-c", f"netstat -rn -f inet | grep -F {own} || true")
+
+    emit(request, f"=== own-address measurement: default interface {interface}, own address {own!r}")
+    if not own:
+        return
+    with (
+        run_ss_server("none", tmp_path, interface) as server,
+        _Forwarder(own, server.description["server_port"]) as forwarder,
+    ):
+        config = tmp_path / "own-address.json"
+        config.write_text(
+            json.dumps(server_entry({**server.description, "server": own, "server_port": forwarder.port}, None)),
+            encoding="utf-8",
+        )
+        look("before the start")
+        try:
+            started = bridge.run("proxy", "start", "--config-file", str(config))
+            emit(request, f"=== own-address measurement: hole proxy start: {describe(started)}")
+            look("during")
+            routes = [line for line in bridge_log().splitlines() if "route" in line.lower()]
+            emit(request, "=== own-address measurement: bridge log lines about routes\n" + "\n".join(routes[-80:]))
+        finally:
+            stopped = bridge.run("proxy", "stop")
+            emit(request, f"=== own-address measurement: hole proxy stop: {describe(stopped)}")
+            look("after the stop")
