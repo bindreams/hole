@@ -25,8 +25,8 @@ trailing byte leaks and the line is not attributed to the wrong entry.
 of its four queues, and **exactly one of them is a log file**: the `DirRotate` writer
 ([logging](logging.md#where-the-logs-go)). Wrapping it closes the file leak. The other three (the stderr layer and the
 two stdio relay tees) feed a developer's terminal, which the redaction cannot reopen either way. What Hole writes
-straight to the original stderr (the report at exit, a record that a writer thread logs and finds its queue full or
-ended) passes through the same redaction. `RedactingWriter::write` returns the count of *input* bytes: a count of output bytes would panic
+straight to the original stderr (the report at exit, the notice that the log file could not be opened) passes through
+the same redaction. `RedactingWriter::write` returns the count of *input* bytes: a count of output bytes would panic
 `write_all`'s loop on the sink's writer thread, since redaction changes the length.
 
 ## What is armed

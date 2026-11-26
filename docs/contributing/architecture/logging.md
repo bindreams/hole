@@ -26,7 +26,7 @@ commands](../bridge-cli.md)).
 `<name>.1` cannot take the rename (a directory at that name, or a handle without delete sharing on it), the full file
 goes to `<name>.1.fallback`, replacing the one before it, and the fallback is removed the next time `<name>.1` can take
 a rotation. When neither name can, no line is lost: the active file keeps being appended past the limit until a rotation
-succeeds. Only a file that cannot be opened loses lines, and it says so once, on the real stderr.
+succeeds. Only a file that cannot be opened loses lines, and it says so once per outage, on the real stderr.
 
 **The directory is the user's.** When the bridge runs elevated on a user's behalf, its log directory sits in the user's
 profile, so `init_dual` opens it once as a `util::dir::Dir` (a link is followed only under [the ownership-transition
@@ -34,7 +34,8 @@ rule](privileged-folders.md#the-ownership-transition-rule), the final name never
 user). `DirRotate` ({src}`crates/common/src/logging/dir_rotate.rs`) does the open, the rotation rename and the `chown` of
 each fresh file, and `init_dual` removes the files of the old daily-rotation scheme, each by a single name inside that
 handle. A path-based rotator would follow
-whatever the user swapped in for a component of the path, as root. A directory the walk refuses disables the file sink,
+whatever the user swapped in for a component of the path, as root. A fresh file that the operating system does not let
+the process give to the user (a bridge run without root) starts with one line that says so. A directory the walk refuses disables the file sink,
 with one line on the real stderr that carries no path; the bridge keeps running.
 
 **Blocking behaviour.** Every sink is written by a thread of its own, behind a queue of 128,000 messages (`queued` in
@@ -47,8 +48,11 @@ full queue does depends on the kind of process (`ProcessKind::terminal`):
 | Process    | A terminal sink whose queue is full                                                                   |
 | ---------- | ----------------------------------------------------------------------------------------------------- |
 | A command  | Waits for room. The output is what the command is for, and a caller that reads slowly gets all of it. |
-| The bridge | Drops the message and counts it, so a paused console never stops the datapath.                        |
-| The app    | Drops the message and counts it, so a paused console never freezes the window.                        |
+| The bridge | Drops the message and counts it, so a paused console does not stop the datapath, with one exception.  |
+| The app    | Drops the message and counts it, so a paused console does not freeze the window, with one exception.  |
+
+The exception: a bridge or app started in a terminal whose console is paused, while its log file cannot be reopened,
+holds the file's writer on the notice that says so until the console is read. Nothing is lost.
 
 A write that a destination refuses is counted as well, and the writer thread goes on with the next message.
 
@@ -93,9 +97,10 @@ Dropping the `LogGuard` waits for them, in this order:
 
 No step has a time limit. A caller that does not read a command's output, a console its user paused or a stalled disk
 holds the exit until it takes the bytes. The installed service has no console; its terminal sinks write nowhere and
-never wait. What a sink did not deliver (messages a full queue dropped, writes the destination refused, a writer thread
-that panicked) is reported in one line for that sink on the original stderr, and for the terminal sinks in the log file
-as well. A caller that closed the stream is not told of a loss. `process::exit` skips destructors, so `dispatch` drops
+never wait. What a sink did not deliver (messages a full queue dropped, writes the destination refused, the panic of
+the writer's destination, with its message and location) is reported in one line for that sink on the original stderr,
+and for the terminal sinks in the log file as well. A process with no console (the installed service, the Windows app)
+has nowhere to say that its log file failed ([#1408](https://github.com/bindreams/hole/issues/1408)). A caller that closed the stream is not told of a loss. `process::exit` skips destructors, so `dispatch` drops
 the CLI's guard before it exits. The GUI leaves through the event loop's own `process::exit` and does not drain.
 
 A relay thread and a writer thread must not wait for the delivery themselves. A relay thread that wrote its own stream
@@ -103,34 +108,21 @@ would be filling the pipe that it alone empties. A writer thread that waited for
 itself, and one that wrote a redirected stream would wait for a relay thread that may be waiting for that writer's
 queue. Four rules follow:
 
-- The panic hook skips the previous hook, the default printer that writes to stderr, on both kinds of thread. The hook's
-  own record is still logged.
-- A write to a queue made on a writer thread is offered to the queue without waiting. A record that a writer thread
-  logs, such as the warning of a failed `chown` during a rotation, reaches the sinks that would have taken it. The
-  panic record of a writer whose own destination panicked is lost with that writer's queue.
-- `DirRotate` writes its notice that the file could not be opened to the original stderr.
+- The panic hook skips the previous hook, the default printer that writes to stderr, on both kinds of thread. On a relay
+  thread it logs its record at once. On a writer thread it keeps the record, and the thread logs it once its own queue
+  has ended, into the sinks still open.
+- Code on a writer thread does not log through `tracing`; a debug build asserts this at every write to a queue. A
+  destination reports its own events into itself: a fresh log file that could not be given to its owner says so in its
+  first line.
+- `DirRotate` writes its notice that the file could not be opened to the original stderr, the one write a writer
+  thread makes elsewhere.
 - The two `tracing` layers are built with `log_internal_errors(false)`. A layer told to log its internal errors prints
   a failed write to stderr, the redirected stream, on the thread that logged the event; printed on a relay thread, the
   line would return as an event whose write fails again.
 
-What a write made on a writer thread does depends on the state of the queue it is offered to:
-
-| The queue                                       | A write made on a writer thread                 |
-| ----------------------------------------------- | ----------------------------------------------- |
-| Has room                                        | Is queued.                                      |
-| Is full, and drops when full                    | Is dropped and counted, as on any other thread. |
-| Is full, and waits when full                    | Goes to the original stderr.                    |
-| Has a writer that panicked, and drops when full | Is dropped and counted.                         |
-| Has a writer that panicked, and waits when full | Goes to the original stderr.                    |
-| Has been finished, whichever it does when full  | Goes to the original stderr.                    |
-
-A record offered before the queue was finished is written. The original stderr is a destination like any other: a
-bridge or app started in a terminal whose console is paused, while the log file's queue is full, waits until the console
-is read again, and nothing is lost.
-
 A relay thread that has ended, by a panic in a tracing writer or formatter, takes no more output: the drain at exit
 reports that later output to that stream was lost. A writer thread whose destination panics ends as well; later writes
-to its queue from other threads fail, and the report at exit says that it panicked. When the writer or formatter that
+to its queue from other threads fail, and the report at exit gives the panic's message and location. When the writer or formatter that
 ended a relay thread panics on the hook's record too, that is a panic inside the hook, and Rust aborts the process.
 
 The most visible case is WebView2 on Windows, which writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
