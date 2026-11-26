@@ -6,22 +6,24 @@ The Windows and macOS installer suites install the product their own way (`msi-i
 - `connect_and_fetch` starts the proxy in SOCKS-only mode, so no TUN device, route or DNS setting is involved, and the
   server and the target are on this host.
 - `full_tunnel_journey` starts it as `hole proxy start` does by default, a full tunnel, and fetches pages from outside
-  the machine by address and by name. The platform suite hands it a `MachineView`: what the operating system says of
-  its routes, adapters and DNS, and a `curl` run as the person.
+  the machine by address and by name. The far side says what it relayed, and the platform suite hands the journey a
+  `MachineView`: what the operating system says of its routes, adapters and DNS, and a `curl` run as the person.
 """
 
 import difflib
 import http.server
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections import Counter
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 import pytest
 
@@ -33,14 +35,25 @@ SOCKS_PORT = 4073
 # Failure bound on one curl through the tunnel.
 CURL_MAX_SECONDS = 60
 
-# What a full tunnel is asked for, from outside the machine. Cloudflare answers its resolver's own address, and the name
-# `one.one.one.one` that points at it, over plain HTTP with a redirect to HTTPS: one outside party, a stable status, and
-# a `Location` that echoes the host the request named. `one.one.one.one` has AAAA records and the machine of this
-# test may have no IPv6 route out, so the request by name asks for IPv4.
+# What a full tunnel is asked for, from outside the machine. Cloudflare answers `http://1.1.1.1/` and
+# `http://one.one.one.one/` with a stable redirect to HTTPS on the same host. `one.one.one.one` has AAAA records and the
+# machine of this test may have no IPv6 route out, so the request by name asks for IPv4.
 ADDRESS_URL = "http://1.1.1.1/"
 ADDRESS_REDIRECT = "https://1.1.1.1/"
+ADDRESS_TARGETS = ("1.1.1.1:80",)
 NAME_URL = "http://one.one.one.one/"
 NAME_REDIRECT = "https://one.one.one.one/"
+# The A records of `one.one.one.one`.
+NAME_TARGETS = ("1.1.1.1:80", "1.0.0.1:80")
+
+# The DNS servers a start is given when its config names none (`DnsConfig::default()`), in their order.
+DNS_SERVERS = ("1.1.1.1", "1.0.0.1")
+# The two halves of IPv4 that a full tunnel routes into its device (`tun_engine::routing`).
+SPLIT_ROUTES = frozenset({"0.0.0.0/1", "128.0.0.0/1"})
+
+# Turns on the far side's line for each relay it opens (`shadowsocks_service::server::tcprelay`, at `debug`).
+RELAY_LOG = "shadowsocks_service::server::tcprelay=debug"
+_RELAY = re.compile(r"established tcp tunnel \S+ <-> (\S+) with ")
 
 # (plugin named in the server entry, or None for plain Shadowsocks; the `ss_plugin_server` argument that serves it)
 SERVERS: list[tuple[str | None, str]] = [("v2ray-plugin", "ex-ray"), ("galoshes", "galoshes"), (None, "none")]
@@ -100,14 +113,31 @@ def target() -> Iterator[tuple[int, str]]:
         server.server_close()
 
 
+@dataclass(frozen=True)
+class SsServer:
+    """A running `ss_plugin_server`."""
+
+    # The fields of a server entry, `plugin_opts` among them only for a plugin.
+    description: dict
+    # Where the server's stderr goes while it runs.
+    stderr: Path
+
+    def relayed(self) -> list[str]:
+        """The target (`host:port`) of every relay the server has opened so far, in order.
+
+        The server writes the line once its own connection to the target is up and before it carries a byte, so a
+        response that came through the server has its line here by the time it arrives.
+        """
+        return _RELAY.findall(self.stderr.read_text(encoding="utf-8", errors="replace"))
+
+
 @contextmanager
-def run_ss_server(kind: str, tmp_path: Path, outbound_interface: str | None = None) -> Iterator[dict]:
+def run_ss_server(kind: str, tmp_path: Path, outbound_interface: str | None = None) -> Iterator[SsServer]:
     """A shadowsocks server, plain or fronted by a server-mode plugin, via the plugin-e2e fixture.
 
     `kind` is the `ss_plugin_server` argument. With `outbound_interface`, the server's own dials leave through that
     interface, not the routing table: a server on the machine of a full tunnel needs it, or its dials loop back into
-    the tunnel. Yields the server's description: the fields of a server entry, `plugin_opts` among them only for a
-    plugin.
+    the tunnel.
     """
     # Cargo reads a relative `CARGO_TARGET_DIR` from where it ran, the repo root; pytest runs in the suite's folder.
     target_dir = REPO_ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
@@ -116,47 +146,50 @@ def run_ss_server(kind: str, tmp_path: Path, outbound_interface: str | None = No
     )
     assert exe.is_file(), f"{exe} missing - run `cargo build -p plugin-e2e --example ss_plugin_server`"
 
-    # The fixture and its plugins write UTF-8; a Windows runner's default is its ANSI code page.
-    stderr = (tmp_path / "ss_plugin_server.stderr").open("w+", encoding="utf-8", errors="replace")
-    proc = subprocess.Popen(
-        [str(exe), kind, *([outbound_interface] if outbound_interface else [])],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=stderr,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    stderr_path = tmp_path / "ss_plugin_server.stderr"
+    with stderr_path.open("wb") as stderr:
+        proc = subprocess.Popen(
+            [str(exe), kind, *([outbound_interface] if outbound_interface else [])],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            env={**os.environ, "HOLE_TEST_LOG": RELAY_LOG},
+            text=True,
+            # The fixture and its plugins write UTF-8; a Windows runner's default is its ANSI code page.
+            encoding="utf-8",
+            errors="replace",
+        )
     assert proc.stdin is not None and proc.stdout is not None
+
+    def stderr_text() -> str:
+        return stderr_path.read_text(encoding="utf-8", errors="replace")
+
     try:
         # One JSON line once the server is serving; EOF if the fixture died first.
         line = proc.stdout.readline()
         if not line:
             proc.wait()
-            stderr.seek(0)
-            pytest.fail(f"ss_plugin_server {kind} exited before serving:\n{stderr.read()}", pytrace=False)
-        yield json.loads(line)
+            pytest.fail(f"ss_plugin_server {kind} exited before serving:\n{stderr_text()}", pytrace=False)
+        yield SsServer(json.loads(line), stderr_path)
     finally:
         proc.stdin.close()
         proc.wait()
         # pytest shows captured output only for a failed test.
-        stderr.seek(0)
-        print(f"=== ss_plugin_server {kind} stderr ===\n{stderr.read()}")
-        stderr.close()
+        print(f"=== ss_plugin_server {kind} stderr ===\n{stderr_text()}")
 
 
 @pytest.fixture
 def ss_server(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[dict]:
-    """`run_ss_server`, parametrized indirectly with the `ss_plugin_server` argument."""
+    """The description of a `run_ss_server`, parametrized indirectly with the `ss_plugin_server` argument."""
     with run_ss_server(request.param, tmp_path) as server:
-        yield server
+        yield server.description
 
 
 # The journey ==========================================================================================================
 
 
 def server_entry(server: dict, plugin: str | None) -> dict:
-    """The server entry a `hole proxy start --config-file` reads, for `server` as `run_ss_server` describes it.
+    """The server entry a `hole proxy start --config-file` reads, for `server`, an `SsServer.description`.
 
     `plugin` is the plugin the entry names, `None` for plain Shadowsocks.
     """
@@ -241,7 +274,93 @@ def connect_and_fetch(
             report_teardown_failure(hole.report("hole proxy stop failed", stopped), primary_ok=fetched_ok)
 
 
-# Full tunnel ==========================================================================================================
+# The machine of a full tunnel =========================================================================================
+
+
+T = TypeVar("T")
+
+
+class MachineReadError(Exception):
+    """The operating system could not be asked about the machine's network: a command failed or printed nothing usable."""
+
+
+@dataclass(frozen=True, order=True)
+class Route:
+    # An IPv4 network as `a.b.c.d/len`; anything else as the platform prints it.
+    destination: str
+    gateway: str
+    interface: str
+    # What else the platform says of the route and a tunnel must leave as it was: its metric, its flags.
+    detail: str = ""
+
+
+@dataclass(frozen=True, order=True)
+class Resolver:
+    """One place the operating system keeps DNS servers: an adapter's list for one address family on Windows, a
+    resolver of `scutil --dns` on macOS."""
+
+    # What tells it from the others, its servers aside.
+    scope: str
+    # In the system's order. Empty when the system has none of its own choosing there.
+    servers: tuple[str, ...]
+    # Empty for a resolver the system ties to no interface.
+    interface: str
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """What the operating system says of the machine's network at one moment, each part sorted.
+
+    It leaves out what changes with no tunnel involved: neighbour and cloned routes, temporary IPv6 addresses, the
+    reachability and query flags of a resolver.
+    """
+
+    interfaces: tuple[str, ...]
+    routes: tuple[Route, ...]
+    # `<interface> <address>/<prefix length>`, or the platform's own words for the same.
+    addresses: tuple[str, ...]
+    resolvers: tuple[Resolver, ...]
+
+    def lines(self) -> list[str]:
+        return [
+            *(f"interface {name}" for name in self.interfaces),
+            *(f"route {r.destination} via {r.gateway} on {r.interface} {r.detail}".rstrip() for r in self.routes),
+            *(f"address {address}" for address in self.addresses),
+            *(f"resolver {r.scope}: {', '.join(r.servers) or 'no server'}" for r in self.resolvers),
+        ]
+
+
+class DnsWatch(Protocol):
+    """A wait for the operating system's DNS configuration to take in a change, begun before the change was made."""
+
+    def settle(self, read: Callable[[], T], settled: Callable[[T], bool]) -> T:
+        """`read()` once the configuration has settled: the first reading for which `settled` holds.
+
+        Where the system recomputes its configuration after the call that changed it returns, each further reading
+        waits for the system's own notice of a change. When no notice comes within the platform's failure bound, the
+        last reading is returned as it is, for the caller's check to fail on.
+        """
+        ...
+
+
+class MachineView(Protocol):
+    """What one platform tells a full-tunnel journey about the machine, and the `curl` of the person using it."""
+
+    def default_interface(self) -> str:
+        """The interface the machine's default route leaves by: where the far side's own dials must leave from."""
+        ...
+
+    def snapshot(self) -> Snapshot:
+        """The machine's interfaces, routes, addresses and DNS servers now. Raises `MachineReadError`."""
+        ...
+
+    def watch_dns(self) -> AbstractContextManager[DnsWatch]:
+        """Entered before a start or a stop, so that no change the command makes is missed."""
+        ...
+
+    def run_curl(self, *args: str) -> subprocess.CompletedProcess[str]:
+        """Run the system's `curl` as the person whose journey this is."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -254,27 +373,6 @@ class Page:
     status: int | None
     redirect: str
     body: str
-
-
-class MachineView(Protocol):
-    """What one platform tells a full-tunnel journey about the machine, and the `curl` of the person using it."""
-
-    def default_interface(self) -> str:
-        """The interface the machine's default route leaves by: where the far side's own dials must leave from."""
-        ...
-
-    def snapshot(self) -> str:
-        """The machine's routes, adapters and DNS settings as text, equal before a start and after its stop."""
-        ...
-
-    def dns_servers(self) -> Mapping[str, frozenset[str]]:
-        """The DNS servers the operating system itself reports, by the scope it reports them under (an adapter, a
-        resolver): a name that stays the same for the same scope from one call to the next."""
-        ...
-
-    def run_curl(self, *args: str) -> subprocess.CompletedProcess[str]:
-        """Run the system's `curl` as the person whose journey this is."""
-        ...
 
 
 def fetch(machine: MachineView, url: str, folder: Path, *, ipv4_only: bool) -> Page:
@@ -299,77 +397,158 @@ def fetch(machine: MachineView, url: str, folder: Path, *, ipv4_only: bool) -> P
     return Page(result, status, redirect, body)
 
 
-def dns_servers_gained(
-    before: Mapping[str, frozenset[str]], during: Mapping[str, frozenset[str]]
-) -> dict[str, frozenset[str]]:
-    """The DNS servers of the scopes that exist now and did not exist before: what a tunnel adds, not what a lease
-    renewal or a reconfiguration of the machine's own adapters changes. Any new scope with a server counts, the
-    tunnel's own or one that comes up beside it."""
-    return {scope: servers for scope, servers in during.items() if scope not in before and servers}
+# The checks of a full tunnel ==========================================================================================
+# Each returns the problems it found, as text, and none stops the others: a failure names every check that is red.
+
+
+def page_problems(
+    machine: MachineView,
+    server: SsServer,
+    how: str,
+    url: str,
+    redirect: str,
+    targets: tuple[str, ...],
+    folder: Path,
+    *,
+    ipv4_only: bool,
+) -> list[str]:
+    """Fetch `url` as the person; the page must arrive, and the far side must have opened a relay to one of `targets`
+    for it.
+
+    The answer alone shows nothing: the same page arrives from a machine with no tunnel. The relay shows that the
+    request went into the tunnel's device, through the proxy and its plugin, and out of the far side.
+    """
+
+    def relays() -> int:
+        return sum(1 for target in server.relayed() if target in targets)
+
+    relays_before = relays()
+    page = fetch(machine, url, folder, ipv4_only=ipv4_only)
+    opened = relays() - relays_before
+    if page.result.returncode != 0 or page.status != 301 or page.redirect != redirect:
+        return [
+            f"the page requested {how} ({url}) did not arrive: expected status 301 redirecting to {redirect}, got "
+            f"status {page.status} redirecting to {page.redirect!r}, body starting {page.body[:200]!r}; curl exited "
+            f"{page.result.returncode}: {page.result.stderr.strip()} (the far side opened {opened} relay(s) to "
+            f"{' or '.join(targets)} meanwhile)"
+        ]
+    if opened < 1:
+        return [
+            f"the page requested {how} ({url}) arrived, but not through the tunnel: the far side opened no relay to "
+            f"{' or '.join(targets)} while it was fetched (every relay it has opened so far: {server.relayed()})"
+        ]
+    return []
+
+
+def interfaces_gained(before: Snapshot, during: Snapshot) -> list[str]:
+    return sorted(set(during.interfaces) - set(before.interfaces))
+
+
+def resolvers_gained(before: Snapshot, during: Snapshot) -> list[Resolver]:
+    """The resolvers with a server that `during` has and `before` had not. One whose servers changed counts: it is
+    not the resolver it was."""
+    return sorted(r for r in (Counter(during.resolvers) - Counter(before.resolvers)).elements() if r.servers)
+
+
+def dns_problems(before: Snapshot, during: Snapshot) -> list[str]:
+    """While the tunnel is up the operating system holds exactly one resolver it had not before, with the servers the
+    start was given, on the tunnel's interface where the system ties resolvers to one.
+
+    This reads what the system was told. Whether its lookups then go to that resolver is not seen here.
+    """
+    gained = resolvers_gained(before, during)
+    tunnel = interfaces_gained(before, during)
+    if len(gained) != 1:
+        return [
+            f"the operating system gained {len(gained)} resolver(s) with a server while the tunnel is up, expected "
+            f"exactly one, holding {list(DNS_SERVERS)}: {gained}"
+        ]
+    (resolver,) = gained
+    problems = []
+    if resolver.servers != DNS_SERVERS:
+        problems.append(
+            f"the resolver the tunnel added ({resolver.scope}) holds {list(resolver.servers)}, not the servers the "
+            f"start was given, {list(DNS_SERVERS)}"
+        )
+    if resolver.interface and [resolver.interface] != tunnel:
+        problems.append(
+            f"the resolver the tunnel added is on {resolver.interface}, not on the one interface the tunnel added "
+            f"({tunnel})"
+        )
+    return problems
+
+
+def device_problems(before: Snapshot, during: Snapshot) -> list[str]:
+    """While the tunnel is up the machine has exactly one interface it had not before, and both halves of IPv4 are
+    routed into it.
+
+    It also shows that a snapshot can see a tunnel at all, without which a snapshot after the stop that equals the
+    one before the start says nothing.
+    """
+    tunnel = interfaces_gained(before, during)
+    if len(tunnel) != 1:
+        return [f"the machine gained {len(tunnel)} interface(s) while the tunnel is up, expected exactly one: {tunnel}"]
+    routed = {route.destination for route in during.routes if route.interface == tunnel[0]}
+    if not SPLIT_ROUTES <= routed:
+        return [
+            f"the routes into the tunnel's interface {tunnel[0]} do not hold both halves of IPv4 "
+            f"({sorted(SPLIT_ROUTES)}): {sorted(routed)}"
+        ]
+    return []
+
+
+def stop_problems(hole: InstalledHole, machine: MachineView, before: Snapshot) -> list[str]:
+    """Stop the proxy; the machine's interfaces, routes, addresses and DNS servers must then be those of `before`."""
+    with machine.watch_dns() as watch:
+        stopped = hole.run("proxy", "stop")
+        if stopped.returncode != 0:
+            return [f"hole proxy stop exited {stopped.returncode}: {stopped.stdout.strip()} {stopped.stderr.strip()}"]
+        try:
+            after = watch.settle(machine.snapshot, lambda snapshot: snapshot.resolvers == before.resolvers)
+        except MachineReadError as e:
+            return [f"the machine could not be read after the stop: {e}"]
+    if after == before:
+        return []
+    changes = difflib.unified_diff(before.lines(), after.lines(), "before the start", "after the stop", lineterm="")
+    return ["the machine after the stop is not as it was before the start:\n" + "\n".join(changes)]
 
 
 def full_tunnel_journey(
-    hole: InstalledHole, server: dict, plugin: str | None, machine: MachineView, tmp_path: Path
+    hole: InstalledHole, server: SsServer, plugin: str | None, machine: MachineView, tmp_path: Path
 ) -> None:
     """Start the proxy as a person does, a full tunnel, fetch pages from outside the machine, and stop it.
 
     `server` must have been started with `machine.default_interface()` as its outbound interface. Fails if the start
-    does not succeed, a page by address or by name does not arrive, the operating system reports no DNS server pointed
-    at the tunnel, or the machine's routes, adapters and DNS settings after the stop are not those before the start.
+    does not succeed, and then for each of these that does not hold: a page by address and one by name arrive through
+    the far side (`page_problems`), the system holds the tunnel's resolver (`dns_problems`) and its device and routes
+    (`device_problems`), and after the stop the machine is as it was (`stop_problems`).
     """
     case = plugin or "a server with no plugin"
     config = tmp_path / "server.json"
-    config.write_text(json.dumps(server_entry(server, plugin)), encoding="utf-8")
+    config.write_text(json.dumps(server_entry(server.description, plugin)), encoding="utf-8")
 
     before = machine.snapshot()
-    dns_before = machine.dns_servers()
-    primary_ok = False
     # The stop runs whatever the start did, so no case leaves a tunnel up for the next one to find.
     try:
-        # No `--tunnel-mode`: a full tunnel is the default.
-        started = hole.run("proxy", "start", "--config-file", str(config))
-        fail_unless_started(hole, started, f"a full tunnel through {case}")
-
-        for how, url, redirect, ipv4_only in (
-            ("by address", ADDRESS_URL, ADDRESS_REDIRECT, False),
-            ("by name", NAME_URL, NAME_REDIRECT, True),
-        ):
-            page = fetch(machine, url, tmp_path, ipv4_only=ipv4_only)
-            if page.result.returncode != 0 or page.status != 301 or page.redirect != redirect:
-                pytest.fail(
-                    hole.report(
-                        f"a page requested {how} ({url}) through the full tunnel of {case} did not arrive: expected "
-                        f"status 301 redirecting to {redirect}, got status {page.status} redirecting to {page.redirect!r}, "
-                        f"body starting {page.body[:200]!r}",
-                        page.result,
-                    ),
-                    pytrace=False,
-                )
-
-        if not dns_servers_gained(dns_before, machine.dns_servers()):
-            pytest.fail(
-                hole.report(
-                    f"the full tunnel of {case} is up, but the operating system reports no DNS server under "
-                    f"a scope it did not report before the start: nothing points the machine's lookups at the tunnel "
-                    f"(before the start: {dict(dns_before)})",
-                    started,
-                ),
-                pytrace=False,
-            )
-        primary_ok = True
-    finally:
-        stopped = hole.run("proxy", "stop")
-        if stopped.returncode != 0:
-            report_teardown_failure(hole.report("hole proxy stop failed", stopped), primary_ok=primary_ok)
-        elif (after := machine.snapshot()) != before:
-            changes = "\n".join(
-                difflib.unified_diff(
-                    before.splitlines(), after.splitlines(), "before the start", "after the stop", lineterm=""
-                )
-            )
-            report_teardown_failure(
-                hole.report(
-                    f"the machine after the stop of {case} is not as it was before the start:\n{changes}", stopped
-                ),
-                primary_ok=primary_ok,
-            )
+        with machine.watch_dns() as watch:
+            # No `--tunnel-mode`: a full tunnel is the default.
+            started = hole.run("proxy", "start", "--config-file", str(config))
+            fail_unless_started(hole, started, f"a full tunnel through {case}")
+            during = watch.settle(machine.snapshot, lambda snapshot: not dns_problems(before, snapshot))
+        problems = [
+            *page_problems(
+                machine, server, "by address", ADDRESS_URL, ADDRESS_REDIRECT, ADDRESS_TARGETS, tmp_path, ipv4_only=False
+            ),
+            *page_problems(machine, server, "by name", NAME_URL, NAME_REDIRECT, NAME_TARGETS, tmp_path, ipv4_only=True),
+            *dns_problems(before, during),
+            *device_problems(before, during),
+        ]
+    except BaseException:
+        # That failure stays the reported one.
+        for problem in stop_problems(hole, machine, before):
+            print(f"teardown after an earlier failure:\n{problem}", file=sys.stderr)
+        raise
+    problems += stop_problems(hole, machine, before)
+    if problems:
+        numbered = "\n".join(f"{n}. {problem}" for n, problem in enumerate(problems, 1))
+        pytest.fail(hole.report(f"the full tunnel through {case} is not right:\n{numbered}", started), pytrace=False)

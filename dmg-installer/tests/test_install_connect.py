@@ -33,6 +33,7 @@ from connect_journey import (
     run_ss_server,
 )
 from connect_journey import ss_server, target  # noqa: F401 (fixtures)
+from macos_machine import MacMachine
 
 from dmg_installer.installed_bridge import (
     HELPER_PATH,
@@ -46,7 +47,6 @@ from dmg_installer.installed_bridge import (
     sudo,
     tear_down,
 )
-from dmg_installer.macos_machine import MacMachine
 
 pytestmark = pytest.mark.install_e2e
 
@@ -182,7 +182,7 @@ def test_installed_bridge_carries_a_full_tunnel(bridge: Bridge, plugin: str | No
     """The default of `hole proxy start`: every route in the tunnel, DNS pointed at Hole, pages from outside the machine.
 
     The far side runs on this machine, so its own dials leave through the default interface, not the routing table the
-    tunnel now owns. It needs the internet, as the Windows case does.
+    tunnel now owns. It needs the internet.
     """
     machine = MacMachine()
     with run_ss_server(kind, tmp_path, machine.default_interface()) as server:

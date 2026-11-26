@@ -1,7 +1,7 @@
 """The user the installer granted reaches the installed bridge as themselves, before and after the bridge restarts.
 
-Every other installed case talks to the bridge from this elevated process, which the socket's Administrators entry
-admits whatever the bridge granted anyone else. Here the requests come from a child that is not elevated and whose
+The connect case talks to the bridge from this elevated process, which the socket's Administrators entry admits
+whatever the bridge granted anyone else. Here the requests come from a child that is not elevated and whose
 token was made before the install. Windows adds a new group membership to a token only at the next sign-in, so that
 token has no `hole` group in it, and the child is admitted only by what the bridge wrote into the socket's access list
 for the user. The bridge writes that list at every start, so the test restarts the service twice: an in-app update, a

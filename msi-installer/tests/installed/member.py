@@ -1,12 +1,12 @@
 """The person the installer granted: a member of `hole` whose token predates the membership, and who is not elevated.
 
-The installed cases that are about a permission, or about what a person does with the product, run their commands as
-this user. Windows adds a new group membership to a token only at the next sign-in, so the child's token has no `hole`
-group in it: it is admitted only by what the bridge wrote into the socket's access list for the user. The child is
-de-elevated with `gsudo`, as the dashboard E2E is.
+Windows adds a new group membership to a token only at the next sign-in, so the child's token has no `hole` group in
+it: it is admitted only by what the bridge wrote into the socket's access list for the user. The child is de-elevated
+with `gsudo`, as the dashboard E2E is.
 """
 
 import json
+import re
 import shutil
 import subprocess
 from collections.abc import Mapping
@@ -36,12 +36,12 @@ ADMINISTRATORS_SID = "S-1-5-32-544"
 
 @dataclass
 class UnelevatedMember:
-    """A command run by a child of this process that `gsudo` de-elevated; `hole.exe` unless a case names another."""
+    """Runs commands in a child of this process that `gsudo` de-elevated."""
 
     # The service's log as the test found it: a failure shows what the log gained since.
     bridge_log: LogBaseline
     environment: Mapping[str, str]
-    # A folder the child can read and write: the specs and results of the runs, and the journey's server entry.
+    # A folder the child can read and write.
     scratch: Path
     # Where the test is, for a failure's text.
     phase: str = "before any restart"
@@ -97,20 +97,21 @@ class UnelevatedMember:
         connect = "accepted" if self.socket_refusal is None else f"refused: {self.socket_refusal}"
         return hole_command_report(
             f"{self.phase}, as the user, not elevated: {what}\n"
-            f"the same user's own connect to {BRIDGE_SOCKET} after its last `hole` command was {connect}",
+            f"the same user's own connect to {BRIDGE_SOCKET} after its last command was {connect}",
             result,
             self.bridge_log,
         )
 
 
 @pytest.fixture
-def member(installed_hole: Path, gsudo_environment: dict[str, str]) -> UnelevatedMember:
+def member(request: pytest.FixtureRequest, installed_hole: Path, gsudo_environment: dict[str, str]) -> UnelevatedMember:
     # Not `tmp_path`: pytest makes it with mode 0o700, which on Windows admits only its owner, and a folder this
     # elevated process makes is owned by Administrators. A folder made without a mode inherits its parent's access.
-    scratch = log_dir() / "member-access"
+    # One per test, so no test removes what another left for a reader of its failure.
+    scratch = log_dir() / "member" / re.sub(r"[^\w.-]+", "_", request.node.name)
     # Emptied, so a result read below is one this run wrote.
     shutil.rmtree(scratch, ignore_errors=True)
-    scratch.mkdir()
+    scratch.mkdir(parents=True)
     return UnelevatedMember(take_log_baseline(BRIDGE_LOG), gsudo_environment, scratch)
 
 

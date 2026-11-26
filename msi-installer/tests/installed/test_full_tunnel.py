@@ -6,14 +6,13 @@ Hole, and a page from outside the machine arrives by address and by name. The pe
 needs rights.
 
 The far side is the `ss_plugin_server` example, behind each bundled plugin and with none. It runs on this machine, so
-its own dials leave through the machine's default interface, not the routing table, which the tunnel now owns: the
-only thing the far side is told. It needs the example built (`cargo build -p plugin-e2e --example ss_plugin_server`),
-the working tree's `galoshes` and `ex-ray` builds, and the internet: `1.1.1.1` is the address asked for, the name
-asked for is `one.one.one.one`, and the product's own default DNS is DoH to `1.1.1.1`.
+its own dials leave through the machine's default interface, not the routing table, which the tunnel now owns. It needs
+the example built (`cargo build -p plugin-e2e --example ss_plugin_server`), the working tree's `galoshes` and `ex-ray`
+builds, and the internet: `1.1.1.1` is the address asked for, the name asked for is `one.one.one.one`, and the
+product's own default DNS is DoH to `1.1.1.1`.
 
 A separate file with its own install and its own `msiexec` logs, as `test_connect.py` is: a failed full tunnel then
-cannot change what the other cases meet. The journey is `connect_journey.full_tunnel_journey`, shared with the macOS
-installer suite.
+cannot change what the other cases meet.
 """
 
 from pathlib import Path
