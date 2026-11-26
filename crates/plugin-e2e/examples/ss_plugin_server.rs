@@ -15,7 +15,8 @@ use std::io::{Read, Write};
 
 use plugin_e2e::locators::{locate_built_galoshes, locate_ex_ray};
 use plugin_e2e::ssserver::{
-    start_real_ss_server_via, start_real_ss_server_with_plugin_ws_via, TEST_METHOD, TEST_METHOD_STR, TEST_PASSWORD,
+    route_logs, start_real_ss_server_via, start_real_ss_server_with_plugin_ws_via, LevelFilter, TEST_METHOD,
+    TEST_METHOD_STR, TEST_PASSWORD,
 };
 use plugin_e2e::util::{require_binary, rt};
 
@@ -25,6 +26,9 @@ const WS_CLIENT_OPTS: &str = "host=cloudfront.com;path=/";
 fn main() {
     // Relays the plugin chain's output to stderr, which the pytest fixture prints on failure.
     hole_test_observability::install();
+    // The ss server's records too, down to `debug`: its line for each relay it opens is what the full-tunnel journey
+    // counts. The fixture turns that target on (`HOLE_TEST_LOG`); the default filter writes `info` and above.
+    route_logs(LevelFilter::Debug);
 
     let kind = std::env::args().nth(1).unwrap_or_default();
     let outbound_interface = std::env::args().nth(2);

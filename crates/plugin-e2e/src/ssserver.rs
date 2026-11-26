@@ -24,6 +24,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+/// The levels [`route_logs`] takes.
+pub use tracing_log::log::LevelFilter;
 use util::port_alloc::{self, Protocols};
 
 pub const TEST_METHOD_STR: &str = "aes-256-gcm";
@@ -48,6 +50,21 @@ pub fn random_password_for(method: CipherKind) -> String {
     } else {
         hex::encode(&bytes)
     }
+}
+
+/// Route this process's `log` records at `max_level` and above into `tracing`. The ss server logs through `log`, and
+/// the test subscriber installs no `LogTracer`, so without this its relay lines and errors go nowhere. Records below
+/// `max_level` are never allocated; the subscriber's filter still decides which of the rest are written.
+///
+/// The first call decides the level. If another `log` logger is already installed, the records are not routed and
+/// stderr says so (`eprintln!`, which no log filter can drop).
+pub fn route_logs(max_level: LevelFilter) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Err(e) = tracing_log::LogTracer::builder().with_max_level(max_level).init() {
+            eprintln!("[ss-server-logs] not routed into tracing: {e}");
+        }
+    });
 }
 
 /// Spin up a real shadowsocks server on a freshly-allocated loopback

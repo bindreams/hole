@@ -21,6 +21,8 @@ shadowsocks-service = { version = "1", features = ["server", "local", "aead-ciph
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "time", "process"] }
 tokio-util = "0.7"
 tracing = "0.1"
+# `ssserver::route_logs`: the ss server logs through `log`. Same version `hole-common` already resolves.
+tracing-log = "0.2"
 rcgen = "0.14"
 tempfile = "3"
 rand = "0.10"

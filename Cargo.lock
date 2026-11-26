@@ -3387,7 +3387,6 @@ dependencies = [
  "tombstone",
  "tower",
  "tracing",
- "tracing-log",
  "tracing-subscriber",
  "tun-engine",
  "url",
@@ -5727,6 +5726,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-log",
  "util",
  "xtask",
 ]
