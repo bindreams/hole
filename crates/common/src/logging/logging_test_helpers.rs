@@ -11,7 +11,7 @@
 #![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
 use crate::logging::logging_tests::{CapturedEvent, ChildResult};
-use crate::logging::{redirect_stdio_to_tracing_for_tests, StdioRelayHandles};
+use crate::logging::{redirect_stdio_to_tracing_for_tests, ProcessKind, StdioRelayHandles, Stream};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -166,14 +166,13 @@ fn finish(harness: &mut ChildHarness) -> ChildResult {
     // stderr/stdout, block on the reader's ack, then drain the
     // NonBlocking tee writers' WorkerGuards. No sleep.
     if let Some(relays) = harness.relays.as_mut() {
-        relays.flush().expect("relay flush");
+        relays.flush(|e| panic!("relay flush: {e}"));
     }
     let mut events = parse_lines("file", &harness.file_writer.snapshot());
     events.extend(parse_lines("stderr", &harness.stderr_writer.snapshot()));
     ChildResult {
         events,
-        tee_stderr: String::new(),
-        tee_stdout: String::new(),
+        ..ChildResult::default()
     }
 }
 
@@ -187,6 +186,12 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_grandchild_stdout" => scenario_grandchild_stdout(),
         "redirect_tee" => scenario_tee(),
         "redirect_multiline" => scenario_multiline(),
+        "redirect_open_line_stderr" => scenario_open_line(Stream::Stderr),
+        "redirect_open_line_stdout" => scenario_open_line(Stream::Stdout),
+        "redirect_relay_thread_ended_stderr" => scenario_relay_thread_ended(Stream::Stderr),
+        "redirect_relay_thread_ended_stdout" => scenario_relay_thread_ended(Stream::Stdout),
+        "redirect_slow_stderr_relay" => scenario_slow_relay("hole::stderr_relay"),
+        "redirect_slow_stdout_relay" => scenario_slow_relay("hole::stdout_relay"),
         "redirect_no_loop" => scenario_no_loop(),
         "lossy_backpressure" => scenario_lossy_backpressure(),
         "echo_stderr" => scenario_echo_stderr(),
@@ -212,7 +217,7 @@ fn scenario_log_bridge_to_file() {
     // The redirect would eat the libtest-mimic per-test result lines; we
     // need its diagnostics if the child fails.
     unsafe { std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1") };
-    let guard = super::init(log_dir, "test", "test.log", "info", None);
+    let guard = super::init(log_dir, ProcessKind::Command, "test.log", "info", None);
     log::info!("from-log-crate-bridge-test");
     // Drop the guard explicitly so the `tracing_appender::NonBlocking`
     // worker thread flushes its in-flight events to disk before the
@@ -371,6 +376,262 @@ fn scenario_multiline() {
     write_result(&result);
 }
 
+/// A complete line that looks like a drain marker, and a line still open when the drain marker is written that holds
+/// marker-like text of its own, on `stream`. The first is output, and must not answer a drain request that is waiting
+/// (the process cannot know the request's nonce); the real marker lands at the end of the second, and the text before
+/// it must still be relayed whole.
+fn scenario_open_line(stream: Stream) {
+    let mut harness = install_child_subscriber();
+    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    let relay = match stream {
+        Stream::Stderr => relays.stderr.as_ref(),
+        Stream::Stdout => relays.stdout.as_ref(),
+    };
+    let (_nonce, waiting) = relay
+        .expect("the relay")
+        .drain
+        .request()
+        .expect("the relay thread is alive");
+    harness.relays = Some(relays);
+    let text = b"__hole_relay_flush__00000000000000000000000000000000\nopen-line__hole_relay_flush__abc";
+    match stream {
+        Stream::Stderr => {
+            let _ = std::io::stderr().write_all(text);
+            let _ = std::io::stderr().flush();
+        }
+        Stream::Stdout => {
+            let _ = std::io::stdout().write_all(text);
+            let _ = std::io::stdout().flush();
+        }
+    }
+    let mut result = finish(&mut harness);
+    result.observed = vec![format!("answered by the line: {:?}", waiting.try_recv())];
+    write_result(&result);
+}
+
+/// The relay thread of `ended` ends, by a panic in a tracing writer, while a drain request is registered, with the
+/// production panic hook installed over a previous hook that records the threads it runs on. The result lists what the
+/// hook and each drain branch did once the thread has been joined; nothing here blocks, so a branch that is wrong shows
+/// as a different line, not as a hang.
+fn scenario_relay_thread_ended(ended: Stream) {
+    struct PanicWriter;
+    impl Write for PanicWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            panic!("a tracing writer panics on the relay thread");
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The events of the relay with `target` go to a writer that panics, the panic hook's records to `records`, the
+    /// rest nowhere.
+    struct PanicOnRelay {
+        target: &'static str,
+        records: VecWriter,
+    }
+    impl<'a> MakeWriter<'a> for PanicOnRelay {
+        type Writer = Box<dyn Write>;
+        fn make_writer(&'a self) -> Self::Writer {
+            Box::new(std::io::sink())
+        }
+        fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+            match meta.target() {
+                target if target == self.target => Box::new(PanicWriter),
+                "hole::panic" => Box::new(self.records.clone()),
+                _ => Box::new(std::io::sink()),
+            }
+        }
+    }
+
+    // The previous hook of the production hook. The default one writes the panic to stderr, which on the relay thread is
+    // the pipe that thread alone reads; with `RUST_BACKTRACE` set the text is longer than the pipe holds, and the thread
+    // waits for itself.
+    let chained = Arc::new(Mutex::new(Vec::<String>::new()));
+    std::panic::set_hook(Box::new({
+        let chained = Arc::clone(&chained);
+        move |_| {
+            let thread = std::thread::current();
+            chained
+                .lock()
+                .unwrap()
+                .push(thread.name().unwrap_or("<unnamed>").to_string());
+        }
+    }));
+    crate::logging::install_panic_hook_for_tests();
+
+    let records = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(PanicOnRelay {
+                target: match ended {
+                    Stream::Stderr => "hole::stderr_relay",
+                    Stream::Stdout => "hole::stdout_relay",
+                },
+                records: records.clone(),
+            })
+            .with_ansi(false),
+    );
+    tracing::subscriber::set_global_default(subscriber).expect("set_global_default in child");
+
+    let (stderr_tee, stdout_tee) = (VecWriter::new(), VecWriter::new());
+    let mut relays = crate::logging::redirect_stdio_to_tracing_with_writers_for_tests(
+        Box::new(stderr_tee.clone()),
+        Box::new(stdout_tee.clone()),
+    )
+    .expect("redirect with custom writers");
+    fn relay(relays: &mut StdioRelayHandles, ended: Stream) -> &mut crate::logging::Relay {
+        match ended {
+            Stream::Stderr => relays.stderr.as_mut().expect("the stderr relay"),
+            Stream::Stdout => relays.stdout.as_mut().expect("the stdout relay"),
+        }
+    }
+
+    // A request registered while the thread is alive: the thread ends before it answers.
+    let (_nonce, answered) = relay(&mut relays, ended)
+        .drain
+        .request()
+        .expect("the relay thread is alive");
+
+    // The other stream keeps its relay: its lines must all reach its tee.
+    for i in 0..5 {
+        match ended {
+            Stream::Stderr => writeln!(std::io::stdout(), "other-line-{i}"),
+            Stream::Stdout => writeln!(std::io::stderr(), "other-line-{i}"),
+        }
+        .expect("a line to the other stream");
+    }
+    match ended {
+        Stream::Stderr => writeln!(std::io::stderr(), "boom"),
+        Stream::Stdout => writeln!(std::io::stdout(), "boom"),
+    }
+    .expect("the line that ends the relay thread");
+
+    // The thread has ended once it is joined: after this the drain's state does not change.
+    let thread = std::mem::replace(&mut relay(&mut relays, ended)._thread, std::thread::spawn(|| {}));
+    thread.join().expect("the relay thread catches the panic");
+
+    // Rust's stdout holds a line that is not complete. A flush writes it into the pipe that nobody reads any more and
+    // fails, and the line stays buffered, so the flush in `StdioRelayHandles::flush` below meets the same failure. The
+    // result lists what two flushes here do, to show that the buffer still holds the line.
+    let unfinished = match ended {
+        Stream::Stdout => {
+            write!(std::io::stdout(), "a line that is not complete").expect("buffered");
+            let flushes = [std::io::stdout().flush(), std::io::stdout().flush()];
+            Some(format!(
+                "unfinished line flushes: {:?}",
+                flushes.map(|r| r.err().map(|e| e.kind()))
+            ))
+        }
+        Stream::Stderr => None,
+    };
+
+    // The same hook on a thread that is not a relay: the previous hook must run there, or the check above proves nothing.
+    std::thread::Builder::new()
+        .name("not-a-relay".into())
+        .spawn(|| panic!("a panic off the relay thread"))
+        .expect("spawn")
+        .join()
+        .expect_err("the thread panics");
+
+    let mut observed = Vec::new();
+    observed.push(format!("registered request: {:?}", answered.try_recv()));
+    observed.push(format!(
+        "new request: {}",
+        relay(&mut relays, ended).drain.request().is_some()
+    ));
+    let mut errors = Vec::new();
+    relays.flush(|e| errors.push(e.to_string()));
+    observed.push(format!("flush errors: {errors:?}"));
+    observed.push(format!("previous hook ran on: {:?}", chained.lock().unwrap()));
+    let records = String::from_utf8_lossy(&records.snapshot()).into_owned();
+    let messages: Vec<&str> = records
+        .lines()
+        .filter_map(|line| line.split_once("hole::panic: panic: "))
+        .map(|(_, rest)| rest.split(" location=").next().unwrap_or(rest))
+        .collect();
+    observed.push(format!("panic records: {messages:?}"));
+    observed.extend(unfinished);
+    let other_tee = match ended {
+        Stream::Stderr => &stdout_tee,
+        Stream::Stdout => &stderr_tee,
+    };
+    write_result(&ChildResult {
+        observed,
+        tee_stdout: String::from_utf8_lossy(&other_tee.snapshot()).into_owned(),
+        ..ChildResult::default()
+    });
+}
+
+/// Lines keep arriving on both streams while the relay threads are held up (each tracing event takes a delay, a fault
+/// injected to widen the window). The relay of `slow_target` is held up longer than the other, so a
+/// `flush` that waits for the other stream alone still returns while this one is behind. `flush` must return only once
+/// every line of each stream has gone through its tee.
+fn scenario_slow_relay(slow_target: &'static str) {
+    use std::fs::OpenOptions;
+    const LINES: usize = 15;
+
+    struct SlowWriter(std::time::Duration);
+    impl Write for SlowWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.0);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct SlowRelays(&'static str);
+    impl<'a> MakeWriter<'a> for SlowRelays {
+        type Writer = SlowWriter;
+        fn make_writer(&'a self) -> SlowWriter {
+            SlowWriter(std::time::Duration::ZERO)
+        }
+        fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> SlowWriter {
+            let millis = if meta.target() == self.0 { 40 } else { 5 };
+            SlowWriter(std::time::Duration::from_millis(millis))
+        }
+    }
+
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(SlowRelays(slow_target))
+            .with_ansi(false),
+    );
+    tracing::subscriber::set_global_default(subscriber).expect("set_global_default in child");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tee_file = |name: &str| {
+        let path = dir.path().join(name);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .expect("open tee file");
+        (path, file)
+    };
+    let (stderr_path, stderr_file) = tee_file("tee-stderr.bin");
+    let (stdout_path, stdout_file) = tee_file("tee-stdout.bin");
+    let mut relays =
+        crate::logging::redirect_stdio_to_tracing_with_writers_for_tests(Box::new(stderr_file), Box::new(stdout_file))
+            .expect("redirect with custom writers");
+
+    for i in 0..LINES {
+        let _ = writeln!(std::io::stdout(), "slow-line-{i}");
+        let _ = writeln!(std::io::stderr(), "slow-line-{i}");
+    }
+    relays.flush(|e| panic!("relay flush: {e}"));
+
+    let result = ChildResult {
+        tee_stderr: std::fs::read_to_string(&stderr_path).unwrap_or_default(),
+        tee_stdout: std::fs::read_to_string(&stdout_path).unwrap_or_default(),
+        ..ChildResult::default()
+    };
+    write_result(&result);
+}
+
 fn scenario_no_loop() {
     let mut harness = install_child_subscriber();
     let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
@@ -443,7 +704,7 @@ fn scenario_redact_file() {
         let (uid, gid) = v.split_once(':').expect("uid:gid");
         (uid.parse().expect("uid"), gid.parse().expect("gid"))
     });
-    let guard = super::init(log_dir, "test", "test.log", "info", owner);
+    let guard = super::init(log_dir, ProcessKind::Command, "test.log", "info", owner);
     util::redact::arm(REDACT_TOKEN, [REDACT_ADDR.to_string()]);
     // A third-party-shaped line: no Hole site authored it, nothing about it
     // is `ServerAddress`-typed, and it still must not reach the file.

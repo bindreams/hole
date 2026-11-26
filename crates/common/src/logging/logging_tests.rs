@@ -19,11 +19,12 @@ use util::dir::Dir;
 
 /// Exact type of [`crate::logging::init`]. A regression to a different arity
 /// (e.g. dropping `kind` or the trailing `owner`) fails the assertion below.
-type InitFn = fn(&std::path::Path, &'static str, &str, &str, Option<(u32, u32)>) -> crate::logging::LogGuard;
+type InitFn =
+    fn(&std::path::Path, crate::logging::ProcessKind, &str, &str, Option<(u32, u32)>) -> crate::logging::LogGuard;
 
 #[skuld::test]
 fn init_signature_takes_kind() {
-    // Compile-time guard: init's signature includes a &'static str kind
+    // Compile-time guard: init's signature includes a process kind
     // between log_dir and log_filename, and a trailing owner. A regression to
     // the old form fails to compile here.
     let _f: InitFn = crate::logging::init;
@@ -49,6 +50,8 @@ pub struct ChildResult {
     /// preserved CLI script visibility).
     pub tee_stderr: String,
     pub tee_stdout: String,
+    /// What a scenario saw, one fact per line, in the order it saw them.
+    pub observed: Vec<String>,
 }
 
 // Parent-side helpers =================================================================================================
@@ -204,6 +207,99 @@ fn redirect_handles_multiline(#[fixture(temp_dir)] dir: &Path) {
     assert_eq!(count_a, 1, "expected 1 'multiline-a', got {count_a} in {relay_msgs:?}");
     assert_eq!(count_b, 1, "expected 1 'multiline-b', got {count_b} in {relay_msgs:?}");
     assert_eq!(count_c, 1, "expected 1 'multiline-c', got {count_c} in {relay_msgs:?}");
+}
+
+/// On each stream: a drain that meets a line with no newline yet still delivers the text before the marker, and
+/// nothing of the marker. A complete line that looks like a marker is output too and answers no waiting request, since
+/// the process cannot know a request's nonce.
+#[skuld::test]
+fn redirect_delivers_an_open_line_at_a_drain(#[fixture(temp_dir)] dir: &Path) {
+    for (scenario, target) in [
+        ("redirect_open_line_stderr", "hole::stderr_relay"),
+        ("redirect_open_line_stdout", "hole::stdout_relay"),
+    ] {
+        let result = run_child(scenario, dir);
+        let relayed: Vec<&str> = result
+            .events
+            .iter()
+            .filter(|e| e.target == target)
+            .map(|e| e.message.as_str())
+            .collect();
+        assert_eq!(
+            relayed,
+            [
+                "__hole_relay_flush__00000000000000000000000000000000",
+                "open-line__hole_relay_flush__abc"
+            ],
+            "{scenario}: relayed lines: {relayed:?}"
+        );
+        assert_eq!(
+            result.observed,
+            ["answered by the line: Err(Empty)"],
+            "{scenario}: a waiting drain request must not be answered by a line of the process's own"
+        );
+    }
+}
+
+/// The drain after a relay thread has ended, on each stream, which only a panic in a tracing writer, the redaction
+/// writer or a formatter brings about. After the join: a request registered earlier is released, a new request finds
+/// the drain ended, `flush` reports once that later output to the stream was lost (though Rust's stdout also holds an
+/// unfinished line that can no longer be written), and the other stream's lines all reached their tee. The production
+/// panic hook, installed over a recording previous hook, still logs the panic but does not chain to that hook on the
+/// relay thread, which would write the panic into the pipe the thread alone reads; on any other thread it chains.
+///
+/// Not reached: a drain that registers after the thread dropped the pipe's read end and before it called `end`, where a
+/// broken pipe becomes the same error and the request is cancelled. That window is a few instructions wide, and no test
+/// reaches it without a hook.
+#[skuld::test]
+fn drain_after_the_relay_thread_ended_releases_and_completes(#[fixture(temp_dir)] dir: &Path) {
+    for ended in ["stderr", "stdout"] {
+        let result = run_child(&format!("redirect_relay_thread_ended_{ended}"), dir);
+        let mut expected = vec![
+            "registered request: Err(Disconnected)".to_string(),
+            "new request: false".to_string(),
+            format!("flush errors: [\"the {ended} relay thread has ended; later output to {ended} was lost\"]"),
+            "previous hook ran on: [\"not-a-relay\"]".to_string(),
+            "panic records: [\"a tracing writer panics on the relay thread\", \"a panic off the relay thread\"]"
+                .to_string(),
+        ];
+        if ended == "stdout" {
+            expected.push("unfinished line flushes: [Some(BrokenPipe), Some(BrokenPipe)]".to_string());
+        }
+        assert_eq!(result.observed, expected, "{ended} relay ended");
+        // `tee_stdout` holds the tee of the stream that kept its relay.
+        let other_lines: Vec<String> = (0..5).map(|i| format!("other-line-{i}")).collect();
+        assert_eq!(
+            result.tee_stdout.lines().collect::<Vec<_>>(),
+            other_lines,
+            "{ended} relay ended"
+        );
+    }
+}
+
+/// `flush` waits for relays that are behind: every line written to either stream before it has gone through that
+/// stream's tee when it returns. Each stream is the slower one in turn, so a drain of one stream that is missing is
+/// not hidden by the time the other's takes.
+#[skuld::test]
+fn redirect_flush_waits_for_a_slow_relay(#[fixture(temp_dir)] dir: &Path) {
+    let expected: Vec<String> = (0..15).map(|i| format!("slow-line-{i}")).collect();
+    for slow in ["redirect_slow_stderr_relay", "redirect_slow_stdout_relay"] {
+        let result = run_child(slow, dir);
+        let stdout: Vec<&str> = result.tee_stdout.lines().collect();
+        let stderr: Vec<&str> = result.tee_stderr.lines().collect();
+        assert_eq!(
+            stdout,
+            expected,
+            "{slow}: the stdout tee holds {} of 15 lines",
+            stdout.len()
+        );
+        assert_eq!(
+            stderr,
+            expected,
+            "{slow}: the stderr tee holds {} of 15 lines",
+            stderr.len()
+        );
+    }
 }
 
 #[skuld::test]
@@ -872,4 +968,28 @@ fn init_dual_hands_the_log_dir_and_file_to_the_owner_when_the_os_allows(#[fixtur
         allowed,
         "the file"
     );
+}
+
+/// A failed flush of Rust's stdout buffer is reported as a loss unless the relay already reports it (redirected) or the
+/// caller closed the stream (not redirected).
+#[skuld::test]
+fn a_stdout_buffer_flush_failure_is_a_loss_unless_it_is_reported_elsewhere() {
+    use std::io::ErrorKind::{BrokenPipe, StorageFull};
+    // (redirected, the relay's own flush failed, the error's kind, is a loss)
+    let table = [
+        (true, true, BrokenPipe, false),
+        (true, true, StorageFull, true),
+        (true, false, BrokenPipe, true),
+        (true, false, StorageFull, true),
+        (false, false, BrokenPipe, false),
+        (false, false, StorageFull, true),
+    ];
+    for (redirected, relay_failed, kind, expected) in table {
+        let error = std::io::Error::from(kind);
+        assert_eq!(
+            super::buffer_flush_failure_is_loss(&error, redirected, relay_failed),
+            expected,
+            "redirected {redirected}, relay failed {relay_failed}, {kind:?}"
+        );
+    }
 }

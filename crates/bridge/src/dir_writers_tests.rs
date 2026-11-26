@@ -2097,7 +2097,7 @@ const BY_NAME_ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "crates/common/src/logging/logging_test_helpers.rs",
         "OpenOptions::new",
-        3,
+        4,
         "test helpers: creates the tee files of a child test process",
     ),
     (

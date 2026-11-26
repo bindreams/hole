@@ -153,3 +153,8 @@ png = "0.18"
 ico = "0.5"
 icns = "0.4"
 serde_json = "1"
+
+[[test]]
+name = "cli_output"
+path = "tests/cli_output.rs"
+harness = false

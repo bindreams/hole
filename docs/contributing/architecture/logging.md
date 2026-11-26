@@ -71,7 +71,24 @@ pipe tees every line to the original handle, so a terminal still sees it, and em
 `hole::stdout_relay` or `hole::stderr_relay`, so the file sees it too. The stderr layer drops those two targets, or it
 would write each line twice. The net catches whatever bypasses `tracing`: the Go runtime of a plugin, a native library, the
 default panic printer. A panic hook emits an error event with a backtrace under `hole::panic` and then calls the previous
-hook.
+hook, except on a relay thread (below).
+
+The relay and the writers are asynchronous, so whatever ends the process before they finish loses the last lines.
+Dropping the `LogGuard` waits for them: it writes a marker line, carrying a random nonce, to each redirected stream,
+blocks until that stream's reader thread has read it, and then drops the guards of the tees and the writers. This first
+wait has no limit, like the file writer's: a stalled disk that blocks the relay thread holds the exit too. Each guard
+then waits up to 100 ms to send its worker the shutdown message and up to 1000 ms for the worker to finish (the bounds are
+inside `tracing-appender`), and the four guards, two tees, the stderr writer and the file writer, drop one after another.
+Output that its reader or disk has not taken by then is lost, and the exit goes on. `process::exit` skips destructors, so
+`dispatch` drops the CLI's guard before it exits. The GUI leaves through the event loop's own `process::exit` and does
+not drain.
+
+A relay thread that has ended, by a panic in a tracing writer or formatter, takes no more output: the drain at exit
+reports that later output to that stream was lost, and `LogGuard` writes the report to the original stderr. The relay
+thread never writes the stream it reads, since that stream is the pipe it alone empties. For that reason the panic hook
+skips the previous hook, the default printer that writes to stderr, on a relay thread; the hook's own record is logged
+as on any other thread, to the sinks whose directives let it through. When the writer or formatter that ended the thread
+panics on that record too, that is a panic inside the hook, and Rust aborts the process.
 
 The most visible case is WebView2 on Windows, which writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
 straight to the inherited stderr. They land in `gui.log` through the relay. **A Chromium line is a real log record:

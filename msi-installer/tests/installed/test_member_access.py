@@ -119,7 +119,7 @@ class UnelevatedMember:
         return subprocess.CompletedProcess(command, record["exit_code"], record["stdout"], record["stderr"])
 
     def report(self, what: str, result: subprocess.CompletedProcess[str]) -> str:
-        # `hole` can exit ahead of its own stderr, so the child's own connect is what says why a command failed.
+        # The child's own connect names the socket error, which `hole`'s "permission denied" does not.
         connect = "accepted" if self.socket_refusal is None else f"refused: {self.socket_refusal}"
         return hole_command_report(
             f"{self.phase}, as the user, not elevated: {what}\n"
@@ -199,7 +199,12 @@ def test_grant_access_admits_a_user_while_the_bridge_runs(
     assert_only_the_bridges_grant_admits(before)
     remove_from_hole_group(before["user_sid"])
     restart_service()
-    outside = member.recorded("version")
+    outside = member.recorded("proxy", "stop")
+    assert outside["exit_code"] != 0 and "permission denied" in outside["stderr"], (
+        f"`hole proxy stop` by the user after leaving `hole` and a bridge restart was not refused, so this run cannot "
+        f"show that `grant-access` is what admits them: {outside}"
+    )
+    # The same fact from the socket itself, which also names the error.
     assert outside["socket_refusal"] is not None, (
         f"the user still connects to {BRIDGE_SOCKET} after leaving `hole` and a bridge restart, so this run cannot "
         "show that `grant-access` is what admits them"
