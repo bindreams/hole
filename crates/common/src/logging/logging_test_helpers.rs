@@ -197,23 +197,7 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_tee_refuses" => scenario_tee_refuses(),
         "redirect_tee_overflows" => scenario_tee_overflows(),
         "redirect_writer_thread_panics" => scenario_writer_thread_panics(),
-        "writer_thread_write_to_a_queue_with_room" => scenario_writer_thread_write(OtherQueue::HasRoom),
-        "writer_thread_write_to_a_closed_waiting_queue" => {
-            scenario_writer_thread_write(OtherQueue::Closed(Overflow::Wait))
-        }
-        "writer_thread_write_to_a_closed_dropping_queue" => {
-            scenario_writer_thread_write(OtherQueue::Closed(Overflow::Drop))
-        }
-        "writer_thread_write_to_a_panicked_waiting_queue" => {
-            scenario_writer_thread_write(OtherQueue::Panicked(Overflow::Wait))
-        }
-        "writer_thread_write_to_a_panicked_dropping_queue" => {
-            scenario_writer_thread_write(OtherQueue::Panicked(Overflow::Drop))
-        }
-        "writer_thread_write_to_a_full_waiting_queue" => scenario_writer_thread_write(OtherQueue::Full(Overflow::Wait)),
-        "writer_thread_write_to_a_full_dropping_queue" => {
-            scenario_writer_thread_write(OtherQueue::Full(Overflow::Drop))
-        }
+        "writer_panic_reaches_the_other_sink" => scenario_writer_panic_reaches_the_other_sink(),
         "layer_writers_fail" => scenario_layer_writers_fail(),
         "redirect_no_loop" => scenario_no_loop(),
         "echo_stderr" => scenario_echo_stderr(),
@@ -708,6 +692,7 @@ struct Held {
     entered: Option<mpsc::Sender<()>>,
     release: mpsc::Receiver<()>,
     writes: Arc<AtomicUsize>,
+    took: VecWriter,
 }
 
 impl Write for Held {
@@ -717,7 +702,7 @@ impl Write for Held {
             self.release.recv().expect("the scenario releases the first write");
         }
         self.writes.fetch_add(1, Ordering::SeqCst);
-        Ok(buf.len())
+        self.took.write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
@@ -740,6 +725,7 @@ fn scenario_tee_overflows() {
             entered: Some(entered),
             release: released,
             writes: Arc::clone(&writes),
+            took: VecWriter::new(),
         }),
         Box::new(std::io::sink()),
         Overflow::Drop,
@@ -770,6 +756,31 @@ fn scenario_tee_overflows() {
         ],
         ..ChildResult::default()
     });
+}
+
+/// `text` with each `file:line:column` location in this file replaced by `<here>`.
+fn without_locations_here(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(file!()) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + file!().len()..];
+        // `:line:column`
+        let mut end = 0;
+        for _ in 0..2 {
+            let digits = after[end..].strip_prefix(':').map_or(0, |s| {
+                s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len()
+            });
+            if digits == 0 {
+                break;
+            }
+            end += 1 + digits;
+        }
+        out.push_str("<here>");
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The stderr tee's destination panics on its writer thread, with the production panic hook installed over a previous
@@ -828,7 +839,7 @@ fn scenario_writer_thread_panics() {
 
     // `flush` finishes the tee, which joins its writer thread: the hook has run there by the time it returns.
     let mut errors = Vec::new();
-    relays.flush(|e| errors.push(chain_text(&e)));
+    relays.flush(|e| errors.push(without_locations_here(&chain_text(&e))));
 
     // The same hook on a thread the delivery does not depend on: the previous hook must run there, or the check proves
     // nothing.
@@ -855,35 +866,74 @@ fn scenario_writer_thread_panics() {
     });
 }
 
-/// What the destination of [`scenario_writer_thread_write`] writes from its writer thread, naming `server`.
-pub(crate) fn writer_thread_text(server: &str) -> String {
-    format!("written on a writer thread for {server}\n")
-}
+/// The production layers over two queues. The stderr layer's destination panics on its first write while the log
+/// file's queue, one that waits when it is full, is full behind a destination held inside its first write. The event
+/// that sets off the panic is filtered off the file layer. The file's destination is let go once the panicked
+/// destination has been dropped, which its writer thread does after its queue has ended. The result holds the panic
+/// records the log file took, whether each names its location in this file, and what finishing each queue returned.
+fn scenario_writer_panic_reaches_the_other_sink() {
+    // Off the writer threads the production hook chains to the default one, so a failing step here still says why.
+    crate::logging::install_panic_hook_for_tests();
 
-/// The state of the queue that [`scenario_writer_thread_write`]'s destination writes to.
-#[derive(Clone, Copy)]
-enum OtherQueue {
-    /// Empty, with a destination that takes what it is given.
-    HasRoom,
-    /// Closed by `finish`: its writer thread has ended.
-    Closed(Overflow),
-    /// Its destination panicked and its writer thread has ended; `finish` has not been called.
-    Panicked(Overflow),
-    /// Full, behind a destination that is held inside its first write until the destination that writes to it is done.
-    Full(Overflow),
-}
+    let file_took = VecWriter::new();
+    let (entered, has_entered) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let (mut file, file_guard) = queued(
+        Held {
+            entered: Some(entered),
+            release: released,
+            writes: Arc::new(AtomicUsize::new(0)),
+            took: file_took.clone(),
+        },
+        Overflow::Wait,
+    );
+    // The destination holds the first message, so the queue behind it is empty and takes exactly its capacity.
+    file.write_all(b"held\n").expect("the log file's queue has room");
+    has_entered.recv().expect("the log file's first write");
+    for _ in 0..CAPACITY {
+        file.write_all(b"x\n").expect("the log file's queue has room");
+    }
 
-/// A queue in one of the states of [`OtherQueue`], and what the scenario reads afterwards.
-struct Other {
-    queue: crate::logging::queued::Queued,
-    /// `None` once finished.
-    guard: Option<crate::logging::queued::QueuedGuard>,
-    /// Lets the held destination of a full queue go.
-    release: Option<mpsc::Sender<()>>,
-    /// What the queue's destination took.
-    took: Box<dyn Fn() -> String>,
-    /// What `finish` returned, once it has.
-    finished: String,
+    let (gone_tx, gone) = mpsc::channel();
+    let (stderr, stderr_guard) = queued(PanicsOnFirstWrite(gone_tx), Overflow::Wait);
+    let subscriber =
+        crate::logging::compose_subscriber(file, stderr, &["panic_trigger=off".to_string()], &["info".to_string()]);
+    tracing::subscriber::set_global_default(subscriber).expect("set_global_default in child");
+
+    tracing::info!(target: "panic_trigger", "an event for the stderr layer only");
+    gone.recv().expect("the panicked destination is dropped");
+    release.send(()).expect("the log file's destination is waiting");
+    let stderr_finished = describe(stderr_guard.finish());
+    let file_finished = describe(file_guard.finish());
+
+    let took = String::from_utf8_lossy(&file_took.snapshot()).into_owned();
+    let lines: Vec<&str> = took.lines().collect();
+    let mut messages = Vec::new();
+    let mut located_here = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let Some((_, message)) = line.split_once("hole::panic: panic: ") else {
+            continue;
+        };
+        messages.push(message.trim_end_matches(':').to_string());
+        let location = lines[at + 1..]
+            .iter()
+            .take_while(|field| field.starts_with("  "))
+            .find_map(|field| field.strip_prefix("  location: "));
+        located_here.push(location.is_some_and(|location| location.contains("logging_test_helpers.rs:")));
+    }
+    write_result(&ChildResult {
+        observed: vec![
+            format!("the panic records the log file took: {messages:?}"),
+            format!("each names its location in this file: {located_here:?}"),
+            format!(
+                "finishing the stderr layer's queue names the panic's message: {}, and its location: {}",
+                stderr_finished.contains("the other destination panics"),
+                stderr_finished.contains(&format!("{}:", file!())),
+            ),
+            format!("finishing the log file's queue returned: {file_finished}"),
+        ],
+        ..ChildResult::default()
+    });
 }
 
 /// What `finish` returned, as text.
@@ -911,125 +961,6 @@ impl Drop for PanicsOnFirstWrite {
     fn drop(&mut self) {
         let _ = self.0.send(());
     }
-}
-
-impl OtherQueue {
-    fn build(self) -> Other {
-        let taken = VecWriter::new();
-        let bytes_took: Box<dyn Fn() -> String> = {
-            let taken = taken.clone();
-            Box::new(move || format!("{:?}", String::from_utf8_lossy(&taken.snapshot())))
-        };
-        match self {
-            OtherQueue::HasRoom => {
-                let (queue, guard) = queued(taken, Overflow::Wait);
-                Other {
-                    queue,
-                    guard: Some(guard),
-                    release: None,
-                    took: bytes_took,
-                    finished: String::new(),
-                }
-            }
-            OtherQueue::Closed(overflow) => {
-                let (queue, guard) = queued(taken, overflow);
-                Other {
-                    queue,
-                    guard: None,
-                    release: None,
-                    took: bytes_took,
-                    finished: describe(guard.finish()),
-                }
-            }
-            OtherQueue::Panicked(overflow) => {
-                // The panic is this scenario's subject; its message would reach the redirected stderr.
-                std::panic::set_hook(Box::new(|_| {}));
-                let (gone_tx, gone) = mpsc::channel();
-                let (mut queue, guard) = queued(PanicsOnFirstWrite(gone_tx), overflow);
-                queue.write_all(b"held").expect("the other queue has room");
-                gone.recv()
-                    .expect("the other destination is dropped when its writer thread ends");
-                Other {
-                    queue,
-                    guard: Some(guard),
-                    release: None,
-                    took: bytes_took,
-                    finished: String::new(),
-                }
-            }
-            OtherQueue::Full(overflow) => {
-                let writes = Arc::new(AtomicUsize::new(0));
-                let (entered, has_entered) = mpsc::channel();
-                let (release, released) = mpsc::channel();
-                let (mut queue, guard) = queued(
-                    Held {
-                        entered: Some(entered),
-                        release: released,
-                        writes: Arc::clone(&writes),
-                    },
-                    overflow,
-                );
-                // The destination holds the first message, so the queue behind it is empty and takes exactly its
-                // capacity.
-                queue.write_all(b"held").expect("the other queue has room");
-                has_entered.recv().expect("the other destination's first write");
-                for _ in 0..CAPACITY {
-                    queue.write_all(b"x").expect("the other queue has room");
-                }
-                Other {
-                    queue,
-                    guard: Some(guard),
-                    release: Some(release),
-                    took: Box::new(move || format!("{} messages", writes.load(Ordering::SeqCst))),
-                    finished: String::new(),
-                }
-            }
-        }
-    }
-}
-
-/// A destination writes a line that names the armed server address to another queue from its writer thread, with
-/// stderr redirected and teed to a buffer. The result holds what the other queue's destination took (a full queue's
-/// destination: how many messages), what `finish` returned for the other queue and what the tee took; the parent reads
-/// this process's real stderr.
-fn scenario_writer_thread_write(state: OtherQueue) {
-    struct WritesAQueue(crate::logging::queued::Queued);
-    impl Write for WritesAQueue {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.write_all(writer_thread_text(REDACT_ADDR).as_bytes())?;
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    util::redact::arm(REDACT_TOKEN, [REDACT_ADDR.to_string()]);
-    let tee = VecWriter::new();
-    let mut relays = redirect_stdio_with(Box::new(tee.clone()), Box::new(std::io::sink()), Overflow::Wait)
-        .expect("redirect with custom writers");
-    let mut other = state.build();
-    let (mut queue, guard) = queued(WritesAQueue(other.queue), Overflow::Wait);
-    queue.write_all(b"go").expect("the queue has room");
-    // In this order every place the text could have gone is complete before it is read: the writer thread has
-    // written, the other queue is written out, and the relay has teed what reached the redirected stderr.
-    guard.finish().expect("the queue whose destination writes");
-    if let Some(release) = other.release {
-        release.send(()).expect("the other destination is waiting");
-    }
-    if let Some(other_guard) = other.guard.take() {
-        other.finished = describe(other_guard.finish());
-    }
-    relays.flush(|e| panic!("relay flush: {e}"));
-
-    write_result(&ChildResult {
-        observed: vec![
-            format!("the other queue took: {}", (other.took)()),
-            format!("finishing the other queue returned: {}", other.finished),
-        ],
-        tee_stderr: String::from_utf8_lossy(&tee.snapshot()).into_owned(),
-        ..ChildResult::default()
-    });
 }
 
 /// The production subscriber over two writers that refuse every write, with stderr redirected and teed to a buffer.

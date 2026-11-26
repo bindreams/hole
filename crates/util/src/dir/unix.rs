@@ -657,17 +657,18 @@ pub(super) fn link(dir: &File, existing: &OsStr, new: &OsStr) -> io::Result<()> 
     check(unsafe { libc::linkat(dir.as_raw_fd(), existing.as_ptr(), dir.as_raw_fd(), new.as_ptr(), 0) }).map(|_| ())
 }
 
-/// `fchown`; a failure is logged and swallowed (see [`super::Dir::secure`]).
-fn chown_best_effort(file: &File, owner: Option<(u32, u32)>) {
-    let Some((uid, gid)) = owner else { return };
+/// `fchown` to `owner`; nothing to do without one.
+pub(super) fn chown(file: &File, owner: Option<(u32, u32)>) -> io::Result<()> {
+    let Some((uid, gid)) = owner else { return Ok(()) };
     // SAFETY: the descriptor is open for the call.
-    if let Err(err) = check(unsafe { libc::fchown(file.as_raw_fd(), uid, gid) }) {
-        tracing::warn!(error = &err as &dyn std::error::Error, "chown failed");
-    }
+    check(unsafe { libc::fchown(file.as_raw_fd(), uid, gid) }).map(|_| ())
 }
 
-pub(super) fn give_file(file: &File, owner: Option<(u32, u32)>) {
-    chown_best_effort(file, owner);
+/// [`chown`]; a failure is logged and swallowed (see [`super::Dir::secure`]).
+fn chown_best_effort(file: &File, owner: Option<(u32, u32)>) {
+    if let Err(err) = chown(file, owner) {
+        tracing::warn!(error = &err as &dyn std::error::Error, "chown failed");
+    }
 }
 
 /// The rest of `file`.

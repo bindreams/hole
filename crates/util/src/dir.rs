@@ -359,10 +359,11 @@ impl Dir {
     /// `owner`, and a link count of 1; Windows: a regular file with no other name, as the system makes one).
     /// Anything else at the name (another name of a file, a link, a FIFO) is unlinked and replaced by a fresh file:
     /// it is never written to, and never changed. A directory at the name is an error. An existing file's mode and
-    /// owner are left as they are.
+    /// owner are left as they are. A created file that the OS does not let this process give to `owner` is still
+    /// returned, with the failure in [`OwnFile::not_given`]; this call logs nothing.
     /// For a log in a folder a user may own, where a name the user planted must not make a privileged writer
     /// change a file it did not make.
-    pub fn append_own_file(&self, name: &OsStr, mode: u32, owner: Option<(u32, u32)>) -> io::Result<File> {
+    pub fn append_own_file(&self, name: &OsStr, mode: u32, owner: Option<(u32, u32)>) -> io::Result<OwnFile> {
         self.append_own_file_with(name, mode, owner, || {})
     }
 
@@ -374,13 +375,13 @@ impl Dir {
         mode: u32,
         owner: Option<(u32, u32)>,
         mut before_append: impl FnMut(),
-    ) -> io::Result<File> {
+    ) -> io::Result<OwnFile> {
         // Each pass after the first means the user changed the name since the last one; the loop ends once they stop.
         loop {
             match self.open_file(name, OpenFile::CreateAppend { mode }) {
                 Ok(file) => {
-                    give_file(&file, owner);
-                    return Ok(file);
+                    let not_given = platform::chown(&file, owner).err().map(NotGiven);
+                    return Ok(OwnFile { file, not_given });
                 }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(err) => return Err(err),
@@ -400,7 +401,7 @@ impl Dir {
                 },
             };
             if platform::is_own_file(&file, owner)? {
-                return Ok(file);
+                return Ok(OwnFile { file, not_given: None });
             }
             // Closed first: Windows does not delete a name while a handle without delete sharing is open.
             drop(file);
@@ -556,11 +557,19 @@ impl Drop for Staged<'_> {
     }
 }
 
-/// Hands the open file to `owner` (unix `fchown`; Windows has no unix ids). A failure is logged and not returned: an
-/// unprivileged run cannot give a file away and is no worse off for it.
-pub fn give_file(file: &File, owner: Option<(u32, u32)>) {
-    platform::give_file(file, owner);
+/// A file [`Dir::append_own_file`] opened.
+#[derive(Debug)]
+pub struct OwnFile {
+    pub file: File,
+    /// Set when the call created the file and could not give it to its owner: the file is still this process's.
+    pub not_given: Option<NotGiven>,
 }
+
+/// The `fchown` of a file to its owner failed (unix; Windows has no unix ids). An unprivileged run cannot give a file
+/// away.
+#[derive(Debug, thiserror::Error)]
+#[error("the file was not given to its owner")]
+pub struct NotGiven(#[source] pub io::Error);
 
 /// Makes `dir` (and the folders above it) if missing and frees `name` in it, for a privileged step about to create
 /// `name` itself by path, as a socket bind does, in a folder the interactive user may own. Both go through a handle

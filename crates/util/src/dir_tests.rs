@@ -787,6 +787,7 @@ fn this_owner() -> Option<(u32, u32)> {
 
 fn append_line(dir: &Dir, owner: Option<(u32, u32)>, line: &str) -> io::Result<()> {
     dir.append_own_file(&name(LOG), 0o644, owner)?
+        .file
         .write_all(line.as_bytes())
 }
 
@@ -925,6 +926,7 @@ fn append_while_the_name_changes(dir: &Dir, swap: impl FnOnce()) -> io::Result<(
             swap();
         }
     })?
+    .file
     .write_all(
         b"log
 ",

@@ -212,7 +212,12 @@ fn a_full_queue_that_drops_counts_what_it_dropped() {
     let error = guard.finish().expect_err("three messages were dropped");
 
     assert_eq!(
-        (error.dropped, error.refused, error.first.is_some(), error.panicked),
+        (
+            error.dropped,
+            error.refused,
+            error.first.is_some(),
+            error.panic.is_some()
+        ),
         (3, 0, false, false),
         "{error:?}"
     );
@@ -250,7 +255,7 @@ fn a_refused_write_does_not_stop_the_writer_and_is_counted() {
 
     assert_eq!(*taken.lock().unwrap(), ["first", "third", "fifth"]);
     assert_eq!(
-        (error.refused, error.dropped, error.panicked),
+        (error.refused, error.dropped, error.panic.is_some()),
         (2, 0, false),
         "{error:?}"
     );
@@ -291,6 +296,14 @@ fn a_destination_that_panics_fails_a_waiting_writer_and_finish_reports_it() {
 
     std::panic::set_hook(previous_hook);
     assert!(waited.is_err(), "the write that waited for room returned {waited:?}");
-    assert!(error.panicked, "{error:?}");
+    // The hook here is not Hole's, so only the payload is known.
+    assert_eq!(
+        error.panic,
+        Some(crate::logging::PanicReport {
+            message: "the destination panics".to_string(),
+            location: None
+        }),
+        "{error:?}"
+    );
     assert!(late.is_err(), "a write after the writer thread ended returned {late:?}");
 }

@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Write};
 
-use util::dir::Dir;
+use util::dir::{Dir, NotGiven, OwnFile};
 
 /// `<name>` (current) and `<name>.1` (the previous one): the active file is renamed over `<name>.1` once it
 /// reaches `limit` bytes, and a write that straddles the limit is split exactly there.
@@ -29,14 +29,16 @@ pub struct DirRotate {
     file: Option<File>,
     /// Bytes in the active file.
     count: usize,
-    /// Told why the file could not be opened, the first time it cannot.
+    /// Told why the file could not be opened, at the first failure of each outage.
     notice: Box<dyn FnMut(&io::Error) + Send>,
+    /// The current outage has been said.
     noticed: bool,
 }
 
 impl DirRotate {
     /// `owner` is given the active file each time it is created, so the user can read it without elevating, and is
-    /// the only owner an existing active file may have. `notices` is told, once, that the file could not be opened.
+    /// the only owner an existing active file may have. `notices` is told, once per outage, that the file could not
+    /// be opened.
     /// Behind a queue this runs on the queue's writer thread, where `notices` must not be the process's stderr or a
     /// redirected stream (see `Queued`).
     pub fn new(
@@ -82,10 +84,19 @@ impl DirRotate {
 
     /// Opens the active file (see [`Dir::append_own_file`]: a file at the name that is not the owner's, or has
     /// another name, is replaced, never written to), and counts what it already holds. A new file is given to
-    /// `owner`. The first failure to open is said once; later ones, and the retry at every write, are silent.
+    /// `owner`; one that could not be says so in its first line, which counts toward the limit. The first failure to
+    /// open in each outage is said; the retries at every write are silent.
     fn open_active(&mut self) {
         match self.dir.append_own_file(&self.name, 0o644, self.owner) {
-            Ok(file) => self.file = Some(file),
+            Ok(OwnFile { mut file, not_given }) => {
+                self.noticed = false;
+                if let Some(NotGiven(err)) = not_given {
+                    // Into the file itself: behind a queue this runs on a writer thread, which does not log. The
+                    // error carries no path.
+                    let _ = writeln!(file, "hole: this log file was not given to its owner: {err}");
+                }
+                self.file = Some(file);
+            }
             Err(err) => {
                 self.file = None;
                 if !std::mem::replace(&mut self.noticed, true) {

@@ -182,17 +182,30 @@ fn a_command_whose_log_file_refuses_writes_says_so_on_stderr() {
     let out = hole(log_dir.path(), &["bridge", "status"]);
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // How many writes the file refused is every event it was given, which depends on `RUST_LOG` and on the machine.
     let report = "hole: the output could not be fully delivered: the log file was not fully written: writes refused: ";
     assert_eq!(
         log.metadata().expect("the log file's size").len(),
         0,
         "the file took bytes, so nothing was refused"
     );
-    assert!(
-        stderr.contains(report),
-        "stderr is {stderr:?}, which does not say that the log file was not written"
+    let (_, counts) = stderr
+        .split_once(report)
+        .unwrap_or_else(|| panic!("stderr is {stderr:?}, which does not say that the log file was not written"));
+    let line = counts.lines().next().unwrap_or_default();
+    let (refused, rest) = line
+        .split_once(", messages dropped: ")
+        .unwrap_or_else(|| panic!("the report {line:?} has no count of dropped messages"));
+    // How many writes the file refused is every event it was given, which depends on `RUST_LOG` and on the machine.
+    let refused: u64 = refused
+        .parse()
+        .unwrap_or_else(|e| panic!("the report {line:?} has no count of refused writes: {e}"));
+    assert!(refused >= 1, "the report {line:?} counts no refused write");
+    let dropped = rest.split(|c: char| !c.is_ascii_digit()).next().unwrap_or_default();
+    assert_eq!(
+        dropped, "0",
+        "the report {line:?}: the file's queue waits, it drops nothing"
     );
+    assert!(!line.contains("panicked"), "the report {line:?}");
 }
 
 fn main() {

@@ -18,7 +18,8 @@
 //
 // 3. **Custom panic hook.** Emits an ERROR-level event with backtrace under
 //    target `hole::panic`, then chains the previous hook so the default printer
-//    still runs in dev mode.
+//    still runs in dev mode. On a writer thread the event waits until the
+//    thread's queue has ended.
 //
 // Every sink is written by a thread of its own, behind a queue (`queued`):
 // - **The file** waits when its queue is full: the teardown burst MUST land on disk for diagnostics. A wedged disk
@@ -27,7 +28,7 @@
 //   command waits for its reader; the bridge and the GUI drop and count, so a wedged terminal (Ctrl+S, a pipe
 //   consumer that hangs) never holds them.
 
-use queued::{queued, Handover, Overflow, QueueError, Queued, QueuedGuard};
+use queued::{queued, Overflow, QueueError, Queued, QueuedGuard};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
@@ -292,7 +293,7 @@ fn terminal_failure_is_loss(error: &QueueError) -> bool {
         .first
         .as_ref()
         .is_some_and(|first| first.kind() == io::ErrorKind::BrokenPipe);
-    error.dropped > 0 || error.panicked || !closed_by_caller
+    error.dropped > 0 || error.panic.is_some() || !closed_by_caller
 }
 
 /// The relays of the redirected streams, and the guards of their tees. A stream that is not redirected (the debug
@@ -511,9 +512,8 @@ enum SavedStream {
 }
 
 /// The process's stderr as its caller gave it: the saved handle once stderr is redirected, `io::stderr()` until then.
-/// Redacts what it is given. A write depends on no thread of this process, so the exit report, and a writer thread's
-/// record that a queue could not take or that found its queue closed, use it where a queue or `io::stderr()` could wait
-/// for the thread that is writing.
+/// Redacts what it is given. A write depends on no thread of this process, so the exit report and `DirRotate`'s notice
+/// on a writer thread use it where a queue or `io::stderr()` could wait for the thread that is writing.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OriginalStderr;
 
@@ -722,13 +722,23 @@ pub(crate) enum DeliveryThread {
 }
 
 impl DeliveryThread {
-    /// How a write to a `Queued` made on this thread is handed over.
-    fn handover(self) -> Handover {
+    /// Whether code on this thread may write a `Queued`.
+    fn writes_queues(self) -> bool {
         match self {
             // Handing lines to the queues is this thread's work, and no writer waits for it.
-            DeliveryThread::Relay => Handover::Queue,
+            DeliveryThread::Relay => true,
             // The queue may be this thread's own, which it alone empties: a wait for room could be a wait for itself.
-            DeliveryThread::Writer => Handover::Offer,
+            DeliveryThread::Writer => false,
+        }
+    }
+
+    /// What the panic hook does with its record on this thread.
+    fn take_panic(self, record: PanicRecord) {
+        match self {
+            // Into the layers' queues, as any other line this thread hands over.
+            DeliveryThread::Relay => record.log(),
+            // Kept until the thread's queue has ended (`leave_writer_thread`).
+            DeliveryThread::Writer => STORED_PANICS.with_borrow_mut(|stored| stored.push(record)),
         }
     }
 
@@ -744,11 +754,96 @@ impl DeliveryThread {
     }
 }
 
-// What the current thread is to the delivery, if anything. On a delivery thread the panic hook's own record still goes
-// through the layers, into their queues from either kind of thread. If the writer or formatter that ended a relay
-// thread panics on that record too, that is a panic inside the hook, and std aborts the process.
+// What the current thread is to the delivery, if anything, and the panic records the hook kept on a writer thread. If
+// the writer or formatter that ended a relay thread panics on the hook's record too, that is a panic inside the hook,
+// and std aborts the process.
 std::thread_local! {
     static DELIVERY_THREAD: std::cell::Cell<Option<DeliveryThread>> = const { std::cell::Cell::new(None) };
+    static STORED_PANICS: std::cell::RefCell<Vec<PanicRecord>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What `finish` reports of a panic that unwound out of a writer thread's destination: the hook's record of it, the
+/// last one kept on this thread, or the payload's message where the hook did not see it.
+pub(crate) fn writer_panic_report(payload: &(dyn std::any::Any + Send)) -> PanicReport {
+    STORED_PANICS
+        .with_borrow(|stored| stored.last().map(|record| record.report.clone()))
+        .unwrap_or_else(|| PanicReport::from_payload(payload))
+}
+
+/// The writer thread's queue has ended: the thread is no longer a writer thread, and logs the panics the hook kept on
+/// it into the sinks still open.
+pub(crate) fn leave_writer_thread() {
+    DELIVERY_THREAD.set(None);
+    for record in STORED_PANICS.take() {
+        record.log();
+    }
+}
+
+/// What a panic said, and where.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PanicReport {
+    pub message: String,
+    /// `file:line:column`. `None` where only the payload is known.
+    pub location: Option<String>,
+}
+
+impl PanicReport {
+    fn from_payload(payload: &(dyn std::any::Any + Send)) -> Self {
+        PanicReport {
+            message: payload_message(payload).to_string(),
+            location: None,
+        }
+    }
+}
+
+impl std::fmt::Display for PanicReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)?;
+        match &self.location {
+            Some(location) => write!(f, ", at {location}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The text of a panic's payload.
+fn payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>")
+}
+
+/// A panic as the hook logs it.
+struct PanicRecord {
+    report: PanicReport,
+    backtrace: std::backtrace::Backtrace,
+}
+
+impl PanicRecord {
+    fn new(info: &std::panic::PanicHookInfo<'_>) -> Self {
+        PanicRecord {
+            report: PanicReport {
+                message: payload_message(info.payload()).to_string(),
+                location: info
+                    .location()
+                    .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())),
+            },
+            backtrace: std::backtrace::Backtrace::force_capture(),
+        }
+    }
+
+    /// The one place a panic is logged: by the hook, or by a writer thread once its queue has ended.
+    fn log(&self) {
+        tracing::error!(
+            target: "hole::panic",
+            location = %self.report.location.as_deref().unwrap_or("unknown"),
+            backtrace = %self.backtrace,
+            "panic: {}",
+            self.report.message,
+        );
+    }
 }
 
 /// Test-only variant that ignores the idempotency guard. Tests that
@@ -778,26 +873,13 @@ pub fn install_panic_hook() {
 fn install_panic_hook_inner() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let chain = DELIVERY_THREAD.get().is_none_or(DeliveryThread::chains_panic_hook);
-        let backtrace = std::backtrace::Backtrace::force_capture();
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "unknown".into());
-        let payload = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("<non-string panic payload>");
-        tracing::error!(
-            target: "hole::panic",
-            location = %location,
-            backtrace = %backtrace,
-            "panic: {}",
-            payload,
-        );
-        if chain {
+        let thread = DELIVERY_THREAD.get();
+        let record = PanicRecord::new(info);
+        match thread {
+            Some(thread) => thread.take_panic(record),
+            None => record.log(),
+        }
+        if thread.is_none_or(DeliveryThread::chains_panic_hook) {
             prev(info);
         }
     }));
