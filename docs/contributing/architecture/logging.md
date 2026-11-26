@@ -117,9 +117,10 @@ queue. Four rules follow:
 
 - The panic hook skips the previous hook, the default printer that writes to stderr, on both kinds of thread. On a relay
   thread it logs its record at once. On a writer thread it keeps the record, and the thread logs it once its own queue
-  has ended, into the sinks still open. Hole's layers and formatters do not panic. If one did while the thread logs a
-  kept record, the records not yet logged would be lost and the report at exit would give only that panic, as a relay
-  thread in the same case aborts the process.
+  has ended, into the sinks still open. Hole's layers and formatters do not panic. A relay thread still catches such a
+  panic, because a relay that ended without telling its drain would hold the exit forever. If one panicked while a
+  writer thread logs a kept record, the records not yet logged would be lost and the report at exit would give only
+  that panic's message, as a relay thread in the same case aborts the process.
 - Code on a writer thread does not log through `tracing`; a debug build asserts this at every write to a queue. A
   destination reports its own events into itself: a fresh log file that could not be given to its owner says so in its
   first line.

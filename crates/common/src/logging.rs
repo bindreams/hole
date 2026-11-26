@@ -743,8 +743,8 @@ impl DeliveryThread {
             DeliveryThread::Relay => record.log(),
             // Kept until the thread's queue has ended (`leave_writer_thread`).
             DeliveryThread::Writer => STORED_PANICS.with_borrow_mut(|stored| stored.push(record)),
-            // Not logged: this panic broke the contract of `Queued`, and logging it would run the code that panicked
-            // inside the hook, where a second panic aborts the process.
+            // Not logged: a panic while this thread logs a kept record, which the contract of `Queued` rules out;
+            // logging it would run the code that panicked inside the hook, where a second panic aborts the process.
             DeliveryThread::EndedWriter => drop(record),
         }
     }

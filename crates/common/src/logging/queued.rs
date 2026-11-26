@@ -65,7 +65,8 @@ enum Message {
 /// destination panicked logs the panic, once its queue has ended, into the sinks still open, and `finish` returns the
 /// panic's message and location. The layers and formatters a record passes through do not panic, and a panic's payload
 /// is a string. If logging a kept record panicked anyway, the records not yet logged would be lost, and `finish` would
-/// return only that panic's message. A writer thread writes no redirected stream. Its one write elsewhere is
+/// return that panic's message without its location, the drop count, and none of the destination's errors or its own
+/// panic. A writer thread writes no redirected stream. Its one write elsewhere is
 /// `DirRotate`'s notice that the file could not be opened, to the original stderr.
 ///
 /// No destination in Hole catches its own panic. If one did, the panic's record would wait on the writer thread until
