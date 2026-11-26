@@ -135,13 +135,14 @@ fn the_active_file_goes_to_the_owner_when_opened_and_after_each_rotation(#[fixtu
     let mut w = DirRotate::new(
         Dir::open(dir, false, None).unwrap(),
         "bridge.log".as_ref(),
-        64,
+        // More than the line a file that could not be given away starts with.
+        200,
         Some((foreign, foreign)),
         std::io::sink(),
     );
     assert_eq!(owner_of("bridge.log") == foreign, allowed, "at open");
 
-    w.write_all(&stream(100)).unwrap();
+    w.write_all(&stream(300)).unwrap();
     w.flush().unwrap();
     assert_eq!(owner_of("bridge.log") == foreign, allowed, "after the rotation");
     assert!(dir.join("bridge.log.1").exists());

@@ -37,8 +37,9 @@ pub struct DirRotate {
 
 impl DirRotate {
     /// `owner` is given the active file each time it is created, so the user can read it without elevating, and is
-    /// the only owner an existing active file may have. `notices` is told, once per outage, that the file could not
-    /// be opened.
+    /// the only owner an existing active file may have. `limit` is larger than the line a file that could not be given
+    /// to `owner` starts with (debug assertion where the line is written: its length depends on the OS error).
+    /// `notices` is told, once per outage, that the file could not be opened.
     /// Behind a queue this runs on the queue's writer thread, where `notices` must not be the process's stderr or a
     /// redirected stream (see `Queued`).
     pub fn new(
@@ -93,7 +94,12 @@ impl DirRotate {
                 if let Some(NotGiven(err)) = not_given {
                     // Into the file itself: behind a queue this runs on a writer thread, which does not log. The
                     // error carries no path.
-                    let _ = writeln!(file, "hole: this log file was not given to its owner: {err}");
+                    let line = format!("hole: this log file was not given to its owner: {err}\n");
+                    debug_assert!(
+                        line.len() < self.limit,
+                        "a log file whose first line reaches its size limit is rotated at every write"
+                    );
+                    let _ = file.write_all(line.as_bytes());
                 }
                 self.file = Some(file);
             }
