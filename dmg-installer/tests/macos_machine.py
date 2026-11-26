@@ -9,12 +9,19 @@ import os
 import re
 import select
 import subprocess
-import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import TypeVar
 
-from connect_journey import DnsWatch, MachineReadError, Resolver, Route, Snapshot
+from connect_journey import (
+    ChangeWatch,
+    MachineReadError,
+    Resolver,
+    Route,
+    Settled,
+    Snapshot,
+    settle_on_notices,
+)
 
 # `scutil --dns` prints the resolvers of two sections; the second, for scoped queries, is the per-interface view of the
 # same configuration and is left out.
@@ -23,17 +30,52 @@ _SCOPED_SECTION = "DNS configuration (for scoped queries)"
 # configd posts this each time it has rebuilt the DNS configuration `scutil --dns` prints, which it does on its own
 # run loop, after the call that changed a setting has returned.
 _DNS_CHANGED = b"com.apple.system.SystemConfiguration.dns_configuration"
-# Failure bound on that post. configd is not ours; when it never posts, the journey's own check fails on what was read.
-DNS_SETTLE_SECONDS = 30
+
+# What a full tunnel is asked to reach from outside the machine; a route lookup for it says which way it would leave.
+_PROBE_ADDRESS = "1.1.1.1"
 
 T = TypeVar("T")
 
+Read = Callable[..., str]
 
-def _output(*command: str) -> str:
-    result = subprocess.run(command, capture_output=True, text=True, errors="replace")
-    if result.returncode != 0:
-        raise MachineReadError(f"`{' '.join(command)}` exited {result.returncode}:\n{result.stdout}\n{result.stderr}")
-    return result.stdout
+
+class _Transcript:
+    """The commands one snapshot ran, each with what it printed in full: the text its parsers read."""
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+
+    def _run(self, command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(command, capture_output=True, text=True, errors="replace")
+        self._parts.append(f"$ {' '.join(command)}    (exit {result.returncode})\n{result.stdout}{result.stderr}")
+        return result
+
+    def output(self, *command: str) -> str:
+        """The output of `command`; a failure raises."""
+        result = self._run(command)
+        if result.returncode != 0:
+            raise MachineReadError(
+                f"`{' '.join(command)}` exited {result.returncode}:\n{result.stdout}\n{result.stderr}"
+            )
+        return result.stdout
+
+    def record(self, *command: str) -> None:
+        """Run `command` for the transcript alone: what it says is not parsed, and a failure is part of what it says."""
+        self._run(command)
+
+    def note(self, text: str) -> None:
+        self._parts.append(text)
+
+    def text(self) -> str:
+        return "\n".join(self._parts)
+
+
+def _default_interface(read: Read) -> str:
+    """`interface: en0` in `route -n get default`."""
+    match = re.search(r"^\s*interface:\s*(\S+)", read("route", "-n", "get", "default"), re.MULTILINE)
+    if match is None:
+        raise MachineReadError("`route -n get default` names no interface: the machine has no default route")
+    return match.group(1)
 
 
 def _ipv4_network(destination: str) -> str:
@@ -46,12 +88,12 @@ def _ipv4_network(destination: str) -> str:
     return ".".join(octets + ["0"] * (4 - len(octets))) + "/" + length
 
 
-def _routes() -> list[Route]:
+def _routes(read: Read) -> list[Route]:
     """The rows of `netstat -rn`, without the neighbour entries (flag `L`) and the routes cloned for one destination
     (flag `W`), which the system adds and expires by itself. Static host routes stay."""
     routes = []
     for family in ("inet", "inet6"):
-        for line in _output("netstat", "-rn", "-f", family).splitlines():
+        for line in read("netstat", "-rn", "-f", family).splitlines():
             columns = line.split()
             # The title lines have fewer columns.
             if len(columns) < 4 or columns[0] == "Destination":
@@ -65,12 +107,12 @@ def _routes() -> list[Route]:
     return routes
 
 
-def _interfaces() -> tuple[list[str], list[str]]:
+def _interfaces(read: Read) -> tuple[list[str], list[str]]:
     """The interfaces of `ifconfig -a` and their addresses, without the temporary IPv6 ones, which the system replaces
     on its own timer."""
     interfaces: list[str] = []
     addresses = []
-    for line in _output("ifconfig", "-a").splitlines():
+    for line in read("ifconfig", "-a").splitlines():
         if (heading := re.match(r"(\S+): flags=", line)) is not None:
             interfaces.append(heading.group(1))
         elif re.match(r"\s+inet6? ", line) is not None:
@@ -83,14 +125,14 @@ def _interfaces() -> tuple[list[str], list[str]]:
     return interfaces, addresses
 
 
-def _resolvers() -> list[Resolver]:
+def _resolvers(read: Read) -> list[Resolver]:
     """The resolvers of `scutil --dns`.
 
     A resolver's scope is its lines other than the nameservers. Three more are left out: the `resolver #N` heading,
     which follows the order and so changes when a resolver is added, and `flags` and `reach`, which say what the
     network can do now.
     """
-    section = _output("scutil", "--dns").split(_SCOPED_SECTION)[0]
+    section = read("scutil", "--dns").split(_SCOPED_SECTION)[0]
     resolvers = []
     for block in re.split(r"^resolver #\d+\s*$", section, flags=re.MULTILINE)[1:]:
         fields = [
@@ -125,45 +167,45 @@ class _ConfigdWatch:
     def close(self) -> None:
         self._notify.notify_cancel(ctypes.c_int(self._token))
 
-    def _posted(self, deadline: float) -> bool:
-        """Wait for one post; `False` when none came by `deadline`."""
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or not select.select([self._descriptor], [], [], remaining)[0]:
+    def _wait(self, seconds: float) -> bool:
+        """Wait for one post; `False` when none came within `seconds`."""
+        if not select.select([self._descriptor], [], [], seconds)[0]:
             return False
         # Each post writes the 4-byte token.
         os.read(self._descriptor, 4)
         return True
 
-    def settle(self, read: Callable[[], T], settled: Callable[[T], bool]) -> T:
-        deadline = time.monotonic() + DNS_SETTLE_SECONDS
-        while True:
-            # Read first: a change that landed before this call needs no post.
-            reading = read()
-            if settled(reading):
-                return reading
-            if not self._posted(deadline):
-                return read()
+    def settle(self, read: Callable[[], T], settled: Callable[[T], bool]) -> Settled[T]:
+        # A post waits in the descriptor until it is read, so none is lost between a reading and the wait.
+        return settle_on_notices(read, settled, arm=lambda: None, wait=self._wait, source="configd (a DNS change)")
 
 
 class MacMachine:
     def default_interface(self) -> str:
-        """`interface: en0` in `route -n get default`."""
-        match = re.search(r"^\s*interface:\s*(\S+)", _output("route", "-n", "get", "default"), re.MULTILINE)
-        if match is None:
-            raise MachineReadError("`route -n get default` names no interface: the machine has no default route")
-        return match.group(1)
+        return _default_interface(_Transcript().output)
 
     def snapshot(self) -> Snapshot:
-        interfaces, addresses = _interfaces()
+        transcript = _Transcript()
+        interfaces, addresses = _interfaces(transcript.output)
+        routes = _routes(transcript.output)
+        resolvers = _resolvers(transcript.output)
+        # Not parsed: where the system would send a packet for an address, by the default interface's own scope and by
+        # the whole table, which the split routes of a tunnel answer differently.
+        try:
+            transcript.record("route", "-n", "get", "-ifscope", _default_interface(transcript.output), _PROBE_ADDRESS)
+        except MachineReadError as e:
+            transcript.note(f"no scoped route lookup: {e}")
+        transcript.record("route", "-n", "get", _PROBE_ADDRESS)
         return Snapshot(
             interfaces=tuple(sorted(interfaces)),
-            routes=tuple(sorted(_routes())),
+            routes=tuple(sorted(routes)),
             addresses=tuple(sorted(addresses)),
-            resolvers=tuple(sorted(_resolvers())),
+            resolvers=tuple(sorted(resolvers)),
+            raw=transcript.text(),
         )
 
     @contextmanager
-    def watch_dns(self) -> Iterator[DnsWatch]:
+    def watch_changes(self) -> Iterator[ChangeWatch]:
         watch = _ConfigdWatch()
         try:
             yield watch

@@ -67,11 +67,17 @@ lists each one that did not hold:
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Pages   | `curl`, run by the de-elevated child, requests `http://1.1.1.1/` and, over IPv4, `http://one.one.one.one/`. Each answers `301` with a `Location` for the host the request named, and the server opened a relay to that address while the page was fetched. The answer alone arrives from a machine with no tunnel too. |
 | DNS     | While the tunnel is up, Windows lists exactly one set of DNS servers it did not list before: `1.1.1.1` and `1.0.0.1`, the defaults of `hole proxy start`, on the tunnel's adapter.                                                                                                                                     |
-| Device  | While the tunnel is up, the machine has exactly one adapter it did not have before, and `0.0.0.0/1` and `128.0.0.0/1` are routed into it.                                                                                                                                                                              |
-| Restore | After `hole proxy stop`, the adapters, routes, addresses and DNS servers equal those read before the start. Temporary IPv6 addresses are left out: Windows replaces them on its own timer.                                                                                                                             |
+| Device  | While the tunnel is up, the machine has exactly one IP interface it did not have before, and `0.0.0.0/1` and `128.0.0.0/1` are routed into it.                                                                                                                                                                         |
+| Restore | After `hole proxy stop`, the IP interfaces, routes, addresses and DNS servers equal those read before the start. Temporary IPv6 addresses are left out: Windows replaces them on its own timer.                                                                                                                        |
 
 The DNS check reads what Windows was told. Nothing in the case shows that a lookup goes to those servers: the request by
 name is answered through the tunnel when the machine's earlier resolver is asked, too.
+
+The case reads the machine after a command returns, so for each read it waits until the system has taken the change in.
+It registers for IP Helper's notices of a change to an interface, a route or an address before it runs the command
+(`NotifyIpInterfaceChange`, `NotifyRouteChange2`, `NotifyUnicastIpAddressChange`), and reads again on each one until the
+state it expects holds. A notice that does not come within 30 seconds fails the case, and the failure says so. IP Helper
+has no notice for a change of an adapter's DNS servers: the DNS read waits only on the notices of the changes around it.
 
 The server listens on loopback, and for a loopback server Hole installs no route that keeps its own connection to the
 server out of the tunnel. A tunnel to a remote server needs that route and a stop must remove it; this case does not
@@ -164,7 +170,9 @@ one with no plugin, fetches a page through each, and uninstalls. It then starts 
 makes the four checks of [the Windows lane's full-tunnel case](#the-install-e2e-and-uninstall-run). On macOS the DNS
 servers are those of the one resolver `scutil --dns` gained, read after configd has posted that it rebuilt the
 configuration; the device is the new `utun` interface; and the comparison after the stop leaves out neighbour and cloned
-routes and temporary IPv6 addresses. `hole` runs as root, as in the cases above, and `curl` runs as the user of the
+routes and temporary IPv6 addresses. Each case prints, before the start and while the tunnel is up, everything the
+commands it read printed (`netstat -rn`, `ifconfig -a`, `scutil --dns`, and `route -n get 1.1.1.1` unscoped and in the
+default interface's scope), passing or failing. `hole` runs as root, as in the cases above, and `curl` runs as the user of the
 test. The connections are the same code the Windows lane runs ({src}`tests/installed/connect_journey.py`).
 It is meant for CI: it needs passwordless `sudo`, refuses to run over an existing install, and expects `hole-dmg` to
 have built the app and `cargo build -p plugin-e2e --example ss_plugin_server` to have built the test's server.

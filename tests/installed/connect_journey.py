@@ -18,12 +18,13 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, TypeVar
+from typing import Generic, Protocol, TypeVar
 
 import pytest
 
@@ -34,6 +35,8 @@ SOCKS_PORT = 4073
 
 # Failure bound on one curl through the tunnel.
 CURL_MAX_SECONDS = 60
+# Failure bound on the operating system's notice that a change it was asked for has taken effect (`settle_on_notices`).
+SETTLE_SECONDS = 30
 
 # What a full tunnel is asked for, from outside the machine. Cloudflare answers `http://1.1.1.1/` and
 # `http://one.one.one.one/` with a stable redirect to HTTPS on the same host. `one.one.one.one` has AAAA records and the
@@ -139,6 +142,12 @@ def run_ss_server(kind: str, tmp_path: Path, outbound_interface: str | None = No
     interface, not the routing table: a server on the machine of a full tunnel needs it, or its dials loop back into
     the tunnel.
     """
+    if outbound_interface is not None and not outbound_interface.strip():
+        pytest.fail(
+            f"the outbound interface asked for for the far side is empty ({outbound_interface!r}), which would send its "
+            "dials through the routing table, back into the tunnel: the machine named no default interface",
+            pytrace=False,
+        )
     # Cargo reads a relative `CARGO_TARGET_DIR` from where it ran, the repo root; pytest runs in the suite's folder.
     target_dir = REPO_ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
     exe = (
@@ -149,11 +158,12 @@ def run_ss_server(kind: str, tmp_path: Path, outbound_interface: str | None = No
     stderr_path = tmp_path / "ss_plugin_server.stderr"
     with stderr_path.open("wb") as stderr:
         proc = subprocess.Popen(
-            [str(exe), kind, *([outbound_interface] if outbound_interface else [])],
+            [str(exe), kind, *([outbound_interface] if outbound_interface is not None else [])],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,
-            env={**os.environ, "HOLE_TEST_LOG": RELAY_LOG},
+            # Added to a developer's own directives, which the fixture reads as a comma-separated list.
+            env={**os.environ, "HOLE_TEST_LOG": ",".join(filter(None, [os.environ.get("HOLE_TEST_LOG"), RELAY_LOG]))},
             text=True,
             # The fixture and its plugins write UTF-8; a Windows runner's default is its ANSI code page.
             encoding="utf-8",
@@ -320,6 +330,9 @@ class Snapshot:
     # `<interface> <address>/<prefix length>`, or the platform's own words for the same.
     addresses: tuple[str, ...]
     resolvers: tuple[Resolver, ...]
+    # What the commands that made this reading printed, in full, as the parsers read it. Printed by the journey; two
+    # readings of the same state are equal whatever they printed.
+    raw: str = field(default="", compare=False, repr=False)
 
     def lines(self) -> list[str]:
         return [
@@ -330,15 +343,57 @@ class Snapshot:
         ]
 
 
-class DnsWatch(Protocol):
-    """A wait for the operating system's DNS configuration to take in a change, begun before the change was made."""
+@dataclass(frozen=True)
+class Settled(Generic[T]):
+    """What `ChangeWatch.settle` read."""
 
-    def settle(self, read: Callable[[], T], settled: Callable[[T], bool]) -> T:
-        """`read()` once the configuration has settled: the first reading for which `settled` holds.
+    reading: T
+    # Empty when `reading` is one for which `settled` held; otherwise what ran out, for the report.
+    unsettled: str = ""
 
-        Where the system recomputes its configuration after the call that changed it returns, each further reading
-        waits for the system's own notice of a change. When no notice comes within the platform's failure bound, the
-        last reading is returned as it is, for the caller's check to fail on.
+
+def settle_on_notices(
+    read: Callable[[], T],
+    settled: Callable[[T], bool],
+    *,
+    arm: Callable[[], None],
+    wait: Callable[[float], bool],
+    source: str,
+) -> Settled[T]:
+    """`read()` until `settled` holds, reading again on each notice from the system that something changed.
+
+    `arm()` is called before each reading, so a notice that arrives after it is not lost; `wait(seconds)` returns
+    when a notice has arrived (`True`) or the time is up (`False`). The system is not ours, so a notice that never
+    comes ends the wait after `SETTLE_SECONDS`: the last reading is then returned with the bound named in
+    `unsettled`, for the caller to fail on. `source` names the notice, for that text.
+    """
+    deadline = time.monotonic() + SETTLE_SECONDS
+    while True:
+        arm()
+        reading = read()
+        if settled(reading):
+            return Settled(reading)
+        remaining = deadline - time.monotonic()
+        if remaining > 0 and wait(remaining):
+            continue
+        # A change whose notice never came is still a change.
+        reading = read()
+        if settled(reading):
+            return Settled(reading)
+        return Settled(
+            reading,
+            f"no notice of a change from {source} in the {SETTLE_SECONDS} s allowed, and the reading still did not hold",
+        )
+
+
+class ChangeWatch(Protocol):
+    """A wait for the operating system to take in a change a command made, begun before the command ran."""
+
+    def settle(self, read: Callable[[], T], settled: Callable[[T], bool]) -> Settled[T]:
+        """`read()` once the system has settled: the first reading for which `settled` holds.
+
+        Where the system finishes a change after the call that made it returns, each further reading waits for the
+        system's own notice of a change (`settle_on_notices`).
         """
         ...
 
@@ -354,7 +409,7 @@ class MachineView(Protocol):
         """The machine's interfaces, routes, addresses and DNS servers now. Raises `MachineReadError`."""
         ...
 
-    def watch_dns(self) -> AbstractContextManager[DnsWatch]:
+    def watch_changes(self) -> AbstractContextManager[ChangeWatch]:
         """Entered before a start or a stop, so that no change the command makes is missed."""
         ...
 
@@ -497,20 +552,28 @@ def device_problems(before: Snapshot, during: Snapshot) -> list[str]:
     return []
 
 
+def show_machine(when: str, snapshot: Snapshot) -> None:
+    """Print what the commands behind `snapshot` said, in full, whether the case passes or fails."""
+    if snapshot.raw:
+        print(f"=== what the machine's commands printed {when} ===\n{snapshot.raw}", flush=True)
+
+
 def stop_problems(hole: InstalledHole, machine: MachineView, before: Snapshot) -> list[str]:
     """Stop the proxy; the machine's interfaces, routes, addresses and DNS servers must then be those of `before`."""
-    with machine.watch_dns() as watch:
+    with machine.watch_changes() as watch:
         stopped = hole.run("proxy", "stop")
         if stopped.returncode != 0:
             return [f"hole proxy stop exited {stopped.returncode}: {stopped.stdout.strip()} {stopped.stderr.strip()}"]
         try:
-            after = watch.settle(machine.snapshot, lambda snapshot: snapshot.resolvers == before.resolvers)
+            settled = watch.settle(machine.snapshot, lambda snapshot: snapshot == before)
         except MachineReadError as e:
             return [f"the machine could not be read after the stop: {e}"]
+    after = settled.reading
     if after == before:
         return []
     changes = difflib.unified_diff(before.lines(), after.lines(), "before the start", "after the stop", lineterm="")
-    return ["the machine after the stop is not as it was before the start:\n" + "\n".join(changes)]
+    problems = ["the machine after the stop is not as it was before the start:\n" + "\n".join(changes)]
+    return [settled.unsettled, *problems] if settled.unsettled else problems
 
 
 def full_tunnel_journey(
@@ -531,14 +594,18 @@ def full_tunnel_journey(
     config.write_text(json.dumps(server_entry(server.description, plugin)), encoding="utf-8")
 
     before = machine.snapshot()
+    show_machine("before the start", before)
     # The stop runs whatever the start did, so no case leaves a tunnel up for the next one to find.
     try:
-        with machine.watch_dns() as watch:
+        with machine.watch_changes() as watch:
             # No `--tunnel-mode`: a full tunnel is the default.
             started = hole.run("proxy", "start", "--config-file", str(config))
             fail_unless_started(hole, started, f"a full tunnel through {case}")
-            during = watch.settle(machine.snapshot, lambda snapshot: not dns_problems(before, snapshot))
+            settled = watch.settle(machine.snapshot, lambda snapshot: not dns_problems(before, snapshot))
+        during = settled.reading
+        show_machine("while the tunnel is up", during)
         problems = [
+            *([settled.unsettled] if settled.unsettled else []),
             *page_problems(
                 machine, server, "by address", ADDRESS_URL, ADDRESS_REDIRECT, ADDRESS_TARGETS, tmp_path, ipv4_only=False
             ),

@@ -722,10 +722,15 @@ jobs:
       #
       # Last-resort kill: the harness bounds each phase itself (msiexec 3 min; gsudo self-test,
       # dashboard E2E and each diagnostics dump 5 min; each `hole` command of the connect,
-      # member-access and full-tunnel cases, and each `curl` of the last, 2 min), so a wedged phase
-      # fails by name and the fixture still uninstalls first. The step's 75 leaves margin over those
-      # bounds for the unbounded phases (tool provisioning, the build, process listing, those cases'
-      # own server, the full-tunnel case's reads of the machine's network).
+      # member-access and full-tunnel cases, and each `curl` of the last, 2 min; the full-tunnel case
+      # also waits at most 30 s each after a start and after a stop for the system to take the change
+      # in), so a wedged phase fails by name and the fixture still uninstalls first. Those bounds add
+      # up to far more than the step's 75: the full-tunnel module alone is 39 min (per case the
+      # version check, start, two curls and stop, 2 min each, and 1 min of waits, three cases, and
+      # 6 min of msiexec), the connect module 21. A run in which many phases reach their bound is cut by
+      # the step, and `installer-cleanup` then uninstalls. The 75 also covers the unbounded phases (tool
+      # provisioning, the build, process listing, those cases' own server, the full-tunnel case's reads
+      # of the machine's network).
       - id: installer-tests
         name: Install, E2E and uninstall the MSI
         if: ${{ !cancelled() && steps.installer-build-msi.outcome == 'success' }}

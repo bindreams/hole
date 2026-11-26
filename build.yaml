@@ -232,8 +232,10 @@ targets:
     # Run-only, no `depends:`: it consumes the app, `galoshes` and `ex-ray` that
     # `hole-dmg` built in the same job, so a second cascade here would roll the
     # flaky bundle_dmg.sh/hdiutil pipeline twice.
+    #
+    # `-s`: each full-tunnel case prints the machine's raw state into the log, passing or failing.
     platforms: [darwin/amd64, darwin/arm64]
-    run: uv run --directory dmg-installer pytest -v -m install_e2e
+    run: uv run --directory dmg-installer pytest -v -s -m install_e2e
 
   npm-install:
     # `node_modules/` from `package-lock.json`, and nothing built. `frontend-build` (the Vite bundle) and
