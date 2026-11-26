@@ -63,8 +63,9 @@ enum Message {
 /// Contract: Code on a writer thread does not log through `tracing`, and a write to a `Queued` made on a live writer
 /// thread breaks this contract (debug assertion). A destination reports its own events into itself. A writer whose
 /// destination panicked logs the panic, once its queue has ended, into the sinks still open, and `finish` returns the
-/// panic's message and location. A writer thread writes no redirected stream. Its one write elsewhere is
-/// `DirRotate`'s notice that the file could not be opened, to the original stderr.
+/// panic's message and location. A panic raised by logging it is caught and not logged, and `finish` returns that one
+/// too. A writer thread writes no redirected stream. Its one write elsewhere is `DirRotate`'s notice that the file
+/// could not be opened, to the original stderr.
 ///
 /// A writer that waited for a queue or for a redirected stream could be waiting for itself, directly or through the
 /// relay thread that reads the stream.
@@ -94,6 +95,9 @@ pub(crate) struct QueueError {
     pub dropped: u64,
     /// The destination panicked, which ended the writer thread; senders failed from then on instead of waiting.
     pub panic: Option<PanicReport>,
+    /// Logging the panics of the writer thread, once its queue had ended, panicked: their records may have reached no
+    /// sink.
+    pub logging_panic: Option<PanicReport>,
 }
 
 impl std::fmt::Display for QueueError {
@@ -105,6 +109,9 @@ impl std::fmt::Display for QueueError {
         )?;
         if let Some(panic) = &self.panic {
             write!(f, ", the writer thread panicked: {panic}")?;
+        }
+        if let Some(panic) = &self.logging_panic {
+            write!(f, ", logging the writer thread's panics panicked: {panic}")?;
         }
         Ok(())
     }
@@ -122,6 +129,7 @@ struct Written {
     first: Option<io::Error>,
     refused: u64,
     panic: Option<PanicReport>,
+    logging_panic: Option<PanicReport>,
 }
 
 impl Written {
@@ -159,7 +167,7 @@ pub(crate) fn queued<W: Write + Send + 'static>(destination: W, overflow: Overfl
             let dropped = std::panic::catch_unwind(AssertUnwindSafe(move || drop(destination)));
             let dropped = dropped.err().map(|payload| super::writer_panic_report(&*payload));
             // The queue has ended, so the panics logged from here wait for no queue that waits for this thread.
-            super::leave_writer_thread();
+            written.logging_panic = super::leave_writer_thread();
             written.panic = wrote.or(dropped);
             written
         })
@@ -232,7 +240,7 @@ impl QueuedGuard {
     pub(crate) fn finish(self) -> Result<(), QueueError> {
         // Waits for room in a full queue; fails when the writer thread has already ended, which the join reports.
         let _ = self.sender.send(Message::Finish);
-        // The thread catches its destination's panics, so a join error is a panic outside the destination.
+        // The thread catches its destination's panics and a panic of logging them: a join error is one outside both.
         let written = self.thread.join().unwrap_or_else(|payload| Written {
             panic: Some(PanicReport::from_payload(&*payload)),
             ..Written::default()
@@ -242,8 +250,9 @@ impl QueuedGuard {
             refused: written.refused,
             dropped: self.dropped.load(Ordering::Relaxed),
             panic: written.panic,
+            logging_panic: written.logging_panic,
         };
-        if error.first.is_none() && error.dropped == 0 && error.panic.is_none() {
+        if error.first.is_none() && error.dropped == 0 && error.panic.is_none() && error.logging_panic.is_none() {
             Ok(())
         } else {
             Err(error)

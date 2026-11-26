@@ -293,7 +293,7 @@ fn terminal_failure_is_loss(error: &QueueError) -> bool {
         .first
         .as_ref()
         .is_some_and(|first| first.kind() == io::ErrorKind::BrokenPipe);
-    error.dropped > 0 || error.panic.is_some() || !closed_by_caller
+    error.dropped > 0 || error.panic.is_some() || error.logging_panic.is_some() || !closed_by_caller
 }
 
 /// The relays of the redirected streams, and the guards of their tees. A stream that is not redirected (the debug
@@ -719,6 +719,8 @@ pub(crate) enum DeliveryThread {
     Relay,
     /// Owns the destination of a [`queued::Queued`].
     Writer,
+    /// Was a `Writer`: its queue has ended, and it is logging the panics the hook kept on it.
+    EndedWriter,
 }
 
 impl DeliveryThread {
@@ -729,6 +731,8 @@ impl DeliveryThread {
             DeliveryThread::Relay => true,
             // The queue may be this thread's own, which it alone empties: a wait for room could be a wait for itself.
             DeliveryThread::Writer => false,
+            // Its own queue has ended: a wait for room is a wait for another thread.
+            DeliveryThread::EndedWriter => true,
         }
     }
 
@@ -739,6 +743,9 @@ impl DeliveryThread {
             DeliveryThread::Relay => record.log(),
             // Kept until the thread's queue has ended (`leave_writer_thread`).
             DeliveryThread::Writer => STORED_PANICS.with_borrow_mut(|stored| stored.push(record)),
+            // Kept for `leave_writer_thread` to return. Logging a record is what panicked, and a second panic inside
+            // the hook aborts the process.
+            DeliveryThread::EndedWriter => STORED_PANICS.with_borrow_mut(|stored| stored.push(record)),
         }
     }
 
@@ -750,6 +757,8 @@ impl DeliveryThread {
             DeliveryThread::Relay => false,
             // The pipe's reader may be waiting for room in this thread's queue.
             DeliveryThread::Writer => false,
+            // The pipe's reader hands the text to the layers, where a record has just panicked.
+            DeliveryThread::EndedWriter => false,
         }
     }
 }
@@ -762,21 +771,25 @@ std::thread_local! {
     static STORED_PANICS: std::cell::RefCell<Vec<PanicRecord>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// What `finish` reports of a panic that unwound out of a writer thread's destination: the hook's record of it, the
-/// last one kept on this thread, or the payload's message where the hook did not see it.
+/// What `finish` reports of a panic that a writer thread caught: the hook's record of it, the last one kept on this
+/// thread, or the payload's message where the hook did not see it.
 pub(crate) fn writer_panic_report(payload: &(dyn std::any::Any + Send)) -> PanicReport {
     STORED_PANICS
         .with_borrow(|stored| stored.last().map(|record| record.report.clone()))
         .unwrap_or_else(|| PanicReport::from_payload(payload))
 }
 
-/// The writer thread's queue has ended: the thread is no longer a writer thread, and logs the panics the hook kept on
-/// it into the sinks still open.
-pub(crate) fn leave_writer_thread() {
-    DELIVERY_THREAD.set(None);
-    for record in STORED_PANICS.take() {
-        record.log();
-    }
+/// The writer thread's queue has ended: the thread logs the panics the hook kept on it into the sinks still open.
+/// Returns the panic that logging them raised, if one did; the hook keeps that one without logging it.
+pub(crate) fn leave_writer_thread() -> Option<PanicReport> {
+    DELIVERY_THREAD.set(Some(DeliveryThread::EndedWriter));
+    let records = STORED_PANICS.take();
+    let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for record in &records {
+            record.log();
+        }
+    }));
+    logged.err().map(|payload| writer_panic_report(&*payload))
 }
 
 /// What a panic said, and where.

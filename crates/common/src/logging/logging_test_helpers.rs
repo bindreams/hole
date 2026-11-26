@@ -198,6 +198,7 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_tee_overflows" => scenario_tee_overflows(),
         "redirect_writer_thread_panics" => scenario_writer_thread_panics(),
         "writer_panic_reaches_the_other_sink" => scenario_writer_panic_reaches_the_other_sink(),
+        "writer_panic_record_cannot_be_logged" => scenario_writer_panic_record_cannot_be_logged(),
         "layer_writers_fail" => scenario_layer_writers_fail(),
         "redirect_no_loop" => scenario_no_loop(),
         "echo_stderr" => scenario_echo_stderr(),
@@ -932,6 +933,70 @@ fn scenario_writer_panic_reaches_the_other_sink() {
             ),
             format!("finishing the log file's queue returned: {file_finished}"),
         ],
+        ..ChildResult::default()
+    });
+}
+
+/// The production layers over a queue whose destination refuses its first write and panics on its second, and over a
+/// `tracing` writer that panics on every record of a panic. The result holds what finishing the queue returned, as the
+/// exit report prints it.
+fn scenario_writer_panic_record_cannot_be_logged() {
+    struct RefusesThenPanics(usize);
+    impl Write for RefusesThenPanics {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            self.0 += 1;
+            match self.0 {
+                1 => Err(std::io::ErrorKind::StorageFull.into()),
+                _ => panic!("the destination panics on its second write"),
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PanicWriter;
+    impl Write for PanicWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            panic!("a tracing writer panics on the record of a panic");
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The panic hook's records go to a writer that panics, the rest nowhere.
+    struct PanicOnPanicRecords;
+    impl<'a> MakeWriter<'a> for PanicOnPanicRecords {
+        type Writer = Box<dyn Write>;
+        fn make_writer(&'a self) -> Self::Writer {
+            Box::new(std::io::sink())
+        }
+        fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+            match meta.target() {
+                "hole::panic" => Box::new(PanicWriter),
+                _ => Box::new(std::io::sink()),
+            }
+        }
+    }
+
+    // Off the writer threads the production hook chains to the default one, so a failing step here still says why.
+    crate::logging::install_panic_hook_for_tests();
+
+    let (stderr, stderr_guard) = queued(RefusesThenPanics(0), Overflow::Wait);
+    let directives = ["info".to_string()];
+    let subscriber = crate::logging::compose_subscriber(PanicOnPanicRecords, stderr, &directives, &directives);
+    tracing::subscriber::set_global_default(subscriber).expect("set_global_default in child");
+
+    tracing::info!(target: "some_dependency", "an event the destination refuses");
+    tracing::info!(target: "some_dependency", "an event the destination panics on");
+    // Joins the writer thread: it has logged its panic, or failed to, by the time this returns.
+    let finished = match stderr_guard.finish() {
+        Ok(()) => "ok".to_string(),
+        Err(error) => without_locations_here(&chain_text(&crate::logging::undelivered("the log on stderr", error))),
+    };
+    write_result(&ChildResult {
+        observed: vec![format!("finishing the queue returned: {finished}")],
         ..ChildResult::default()
     });
 }
