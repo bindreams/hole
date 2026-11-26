@@ -116,7 +116,8 @@ struct RawCases {
 }
 
 /// The reader's policy: a key written twice anywhere in the file is an error, and so are the YAML features the table
-/// has no use for (a tag, a merge key), which would take the reader down paths that resolve keys before it checks them.
+/// has no use for (a custom tag, a merge key). The core tags (`!!str` and the like) pass; a repeated key is refused on
+/// every path.
 fn reader_config() -> noyalib::ParserConfig {
     noyalib::ParserConfig::new()
         .duplicate_key_policy(noyalib::DuplicateKeyPolicy::Error)

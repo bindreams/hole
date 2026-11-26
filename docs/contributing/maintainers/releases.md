@@ -110,7 +110,7 @@ to do when it fails.
 shortfalls that ship on purpose. Read it before running a `hole` draft.
 
 A draft of `hole` fails while a journey in {src}`tests/installed/journeys.yaml` has a `none` cell, a platform on which
-no test runs it; [the installers page](../installers.md#the-install-e2e-and-uninstall-run) describes the table.
+no test runs it; [the installers page](../installers.md#the-journey-table) describes the table.
 
 The release's milestone has no open issues: a ship blocker is an open issue in it. List the open milestones with their
 counts:

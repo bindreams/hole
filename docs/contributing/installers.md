@@ -27,8 +27,9 @@ the service anyway and the uninstall completes with the app left running.
 
 CI's installer lane installs the MSI, drives the installed app through WebDriver, uninstalls it and checks nothing is
 left; the [journey table](#the-journey-table) says which of its cases prove which journey. It also upgrades over a
-second MSI linked from the same staged files. Both uninstall paths meet a running `HoleBridge` service, so the harness passes `MSIRESTARTMANAGERCONTROL=Disable` (under `/quiet`, Restart Manager would
-otherwise stop the service first); for the upgrade's nested removal it writes the property into the second MSI itself,
+second MSI linked from the same staged files. Both uninstall paths meet a running `HoleBridge` service, so the
+harness passes `MSIRESTARTMANAGERCONTROL=Disable` (under `/quiet`, Restart Manager would otherwise stop the service
+first); for the upgrade's nested removal it writes the property into the second MSI itself,
 because the removal ignores the outer command line. The proof is a `stop wait: sending Stop` record with a `Running`
 look in `C:\ProgramData\hole\logs\gui-cli.log`, gained during the `msiexec` call and, for the upgrade, written by
 the old product's uninstall, not the new product's install. The upgrade then uninstalls on the shipped default and
@@ -53,9 +54,9 @@ installed `hole.exe` from a child that `gsudo` de-elevated, whose token was made
 both once more. A second test takes the user out of the group, restarts the service, checks that the user is now
 refused, runs an elevated `hole bridge grant-access` and connects with no further restart. A third puts a member into
 `hole` whose account does not exist, as a deleted domain account leaves one, restarts the service, and checks that the
-bridge's log lists that member and that the user still connects. Each fails before its first
-connect when the child still holds Administrators, already carries the group,
-or is not the user the installer added. The child cannot read pytest's own temporary folder, so its files are in
+bridge's log lists that member and that the user still connects. Each fails before its first connect when the child
+still holds Administrators, already carries the group, or is not the user the installer added. The child cannot read
+pytest's own temporary folder, so its files are in
 `member-access\` under the log folder. A failure also says how the child's own connect to the bridge's socket went:
 `hole` can exit before its own error text reaches a pipe.
 
