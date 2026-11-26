@@ -47,16 +47,19 @@ reach the disk, at the price that a stalled disk holds every thread that emits a
 with no limit, once the queue is full. The stderr layer and the two stdio tees write to the terminal, and what their
 full queue does depends on the kind of process (`ProcessKind::terminal`):
 
-| Process    | A terminal sink whose queue is full                                                                   |
-| ---------- | ----------------------------------------------------------------------------------------------------- |
-| A command  | Waits for room. The output is what the command is for, and a caller that reads slowly gets all of it. |
-| The bridge | Drops the message and counts it, so a paused console does not stop the datapath, with one exception.  |
-| The app    | Drops the message and counts it, so a paused console does not freeze the window, with one exception.  |
+| Process    | A terminal sink whose queue is full                                                                                                                      |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A command  | Waits for room. The output is what the command is for, and a caller that reads slowly gets all of it.                                                    |
+| The bridge | Drops the message and counts it, so a paused console does not stop the datapath, except [when the log file cannot be opened](#paused-console-exception). |
+| The app    | Drops the message and counts it, so a paused console does not freeze the window, except [when the log file cannot be opened](#paused-console-exception). |
 
-The exception: the file's writer thread says on the original stderr that the log file could not be opened, and that
-write waits for whoever reads the stream. A paused console or a pipe whose reader has stalled holds the file's writer
-there and, once the file's queue is full, every thread that logs. The lines written while the file cannot be opened are
-dropped.
+(paused-console-exception)=
+
+When the log file cannot be opened, a paused console can stop the bridge's datapath and freeze the app's window. The
+file's writer thread says on the original stderr that the log file could not be opened, once per outage, and that write
+waits for whoever reads the stream. A paused console or a pipe whose reader has stalled holds the file's writer there
+until the stream is read and, once the file's queue is full, every thread that logs. The lines written while the file
+cannot be opened are dropped.
 
 A write that a destination refuses is counted as well, and the writer thread goes on with the next message.
 
@@ -115,7 +118,8 @@ queue. Four rules follow:
 - The panic hook skips the previous hook, the default printer that writes to stderr, on both kinds of thread. On a relay
   thread it logs its record at once. On a writer thread it keeps the record, and the thread logs it once its own queue
   has ended, into the sinks still open. A panic raised by that logging is caught and kept as well, never logged, and
-  the report at exit gives both panics.
+  the report at exit gives both panics. Such a panic in one layer keeps the record from the layers after it (`tracing`
+  calls the layers in order, the file's first), and does not stop the thread from logging a second record it kept.
 - Code on a writer thread does not log through `tracing`; a debug build asserts this at every write to a queue. A
   destination reports its own events into itself: a fresh log file that could not be given to its owner says so in its
   first line.

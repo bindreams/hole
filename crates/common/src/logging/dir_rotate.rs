@@ -25,7 +25,11 @@ const MIN_LIMIT: usize = NOT_GIVEN.len() + 52;
 /// A name the user holds (a directory at `<name>.1`, a handle without delete sharing) cannot take the rotation, so
 /// the file goes to `<name>.1.fallback` instead, replacing the one before it: at most one such file exists. When no
 /// name can take it, every line is still appended and the file grows past `limit` while the holder keeps it; the
-/// next rotation that succeeds restores the limit. A line is lost only while the file cannot be opened.
+/// next rotation that succeeds restores the limit.
+///
+/// Lines are dropped while the file cannot be opened. A file that could not be given to its owner is not the owner's,
+/// so the next open of its name, at the next start or after a rotation that no name could take, replaces it and its
+/// lines are lost (bindreams/hole#1409).
 pub struct DirRotate {
     dir: Dir,
     name: OsString,
@@ -132,7 +136,8 @@ impl DirRotate {
 
     /// Renames the active file over `<name>.1` and opens a fresh active file. If `<name>.1` cannot take it, the
     /// fallback does; once `<name>.1` can again, the fallback, which holds older lines, is removed. If neither can,
-    /// the same file is reopened, over the limit, and the next write tries again.
+    /// the name is opened again, which gives the same file, over the limit, unless it is one `open_active` replaces, and
+    /// the next write tries again.
     fn rotate(&mut self) {
         // Closed first: Windows does not rename a file that a handle without delete sharing has open, and no
         // other handle of ours does.
