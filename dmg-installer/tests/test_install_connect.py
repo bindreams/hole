@@ -30,7 +30,7 @@ from connect_journey import (
     connect_and_fetch,
     full_tunnel_journey,
     report_teardown_failure,
-    run_ss_server,
+    run_far_side,
 )
 from connect_journey import ss_server, target  # noqa: F401 (fixtures)
 from macos_machine import MacMachine
@@ -182,8 +182,15 @@ def test_installed_bridge_carries_a_full_tunnel(bridge: Bridge, plugin: str | No
     """The default of `hole proxy start`: every route in the tunnel, DNS pointed at Hole, pages from outside the machine.
 
     The far side runs on this machine, so its own dials leave through the default interface, not the routing table the
-    tunnel now owns. It needs the internet.
+    tunnel now owns. It is reached at the interface's own address, so the product installs the host route that keeps its
+    connection to the server out of the tunnel, and the case checks that it is installed and removed. The system
+    delivers to an address of its own locally, so nothing crosses that route.
+
+    The far side's dials are bound to `en0`, and a runner has no default route in that scope: the case adds one for its
+    duration and deletes it after, if it added it (`MacMachine.scoped_default_route`). That route also changes what the
+    product's own interface-bound sockets see (bindreams/hole#1414), so a macOS journey of a Bypass rule runs without
+    it. The case needs the internet.
     """
     machine = MacMachine()
-    with run_ss_server(kind, tmp_path, machine.default_interface()) as server:
+    with machine.scoped_default_route(), run_far_side(kind, tmp_path, machine) as server:
         full_tunnel_journey(bridge, server, plugin, machine, tmp_path)

@@ -12,9 +12,12 @@ The Windows and macOS installer suites install the product their own way (`msi-i
 
 import difflib
 import http.server
+import ipaddress
 import json
 import os
 import re
+import socket
+import socketserver
 import subprocess
 import sys
 import threading
@@ -22,7 +25,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Generic, Protocol, TypeVar
 
@@ -53,6 +56,8 @@ NAME_TARGETS = ("1.1.1.1:80", "1.0.0.1:80")
 DNS_SERVERS = ("1.1.1.1", "1.0.0.1")
 # The two halves of IPv4 that a full tunnel routes into its device (`tun_engine::routing`).
 SPLIT_ROUTES = frozenset({"0.0.0.0/1", "128.0.0.0/1"})
+# The IPv4 default route, as a `Route` destination.
+DEFAULT_ROUTE = "0.0.0.0/0"
 
 # Turns on the far side's line for each relay it opens (`shadowsocks_service::server::tcprelay`, at `debug`).
 RELAY_LOG = "shadowsocks_service::server::tcprelay=debug"
@@ -186,6 +191,73 @@ def run_ss_server(kind: str, tmp_path: Path, outbound_interface: str | None = No
         proc.wait()
         # pytest shows captured output only for a failed test.
         print(f"=== ss_plugin_server {kind} stderr ===\n{stderr_text()}")
+
+
+def _shutdown(sock: socket.socket, how: int) -> None:
+    try:
+        sock.shutdown(how)
+    except OSError:
+        pass
+
+
+def _pump(source: socket.socket, sink: socket.socket) -> None:
+    """Copy `source` to `sink`. When `source` ends, `sink` is half-closed; on an error both are closed."""
+    try:
+        while data := source.recv(65536):
+            sink.sendall(data)
+    except OSError:
+        _shutdown(source, socket.SHUT_RDWR)
+        _shutdown(sink, socket.SHUT_RDWR)
+    else:
+        _shutdown(sink, socket.SHUT_WR)
+
+
+class _Forwarder:
+    """Relays TCP from `address` (any free port) to `target`: a far side that is reached at an address other than the
+    one it listens on."""
+
+    def __init__(self, address: str, target: tuple[str, int]) -> None:
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                with socket.create_connection(target) as upstream:
+                    back = threading.Thread(target=_pump, args=(upstream, self.request), daemon=True)
+                    back.start()
+                    _pump(self.request, upstream)
+                    back.join()
+
+        class Server(socketserver.ThreadingTCPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+        self._server = Server((address, 0), Handler)
+        self.port: int = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self) -> "_Forwarder":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._thread.join()
+        self._server.server_close()
+
+
+@contextmanager
+def run_far_side(kind: str, tmp_path: Path, machine: "MachineView") -> Iterator[SsServer]:
+    """`run_ss_server` for a full tunnel, as the machine says it is reached.
+
+    The server's own dials leave through the machine's default interface. Where `machine.far_side_address()` names an
+    address, the description names it and a relay from it to the server; `relayed()` still reads the server's own log.
+    """
+    with run_ss_server(kind, tmp_path, machine.default_interface()) as server:
+        address = machine.far_side_address()
+        if address is None:
+            yield server
+            return
+        target = (server.description["server"], server.description["server_port"])
+        with _Forwarder(address, target) as forwarder:
+            yield replace(server, description={**server.description, "server": address, "server_port": forwarder.port})
 
 
 @pytest.fixture
@@ -405,6 +477,14 @@ class MachineView(Protocol):
         """The interface the machine's default route leaves by: where the far side's own dials must leave from."""
         ...
 
+    def far_side_address(self) -> str | None:
+        """The address a far side on this machine is reached at, or `None` for loopback.
+
+        An address of the machine's own makes the product install the host route that keeps its connection to the
+        server out of the tunnel (`bypass_problems` reads it). `None` where the system refuses that route.
+        """
+        ...
+
     def snapshot(self) -> Snapshot:
         """The machine's interfaces, routes, addresses and DNS servers now. Raises `MachineReadError`."""
         ...
@@ -552,6 +632,33 @@ def device_problems(before: Snapshot, during: Snapshot) -> list[str]:
     return []
 
 
+def bypass_problems(before: Snapshot, during: Snapshot, address: str) -> list[str]:
+    """While the tunnel is up the route table holds a host route to the server at `address` through the gateway the
+    default route had before the start, which the product installs to keep its own connection to the server out of the
+    tunnel.
+
+    It is read from the table. Where the server is an address of this machine the system delivers to it locally, so the
+    route is installed and removed (the comparison after the stop sees it gone) but carries nothing.
+    """
+    host_routes = {address, f"{address}/32"}
+    gateways = {route.gateway for route in before.routes if route.destination == DEFAULT_ROUTE}
+    if not gateways:
+        return [
+            f"the machine had no default route before the start, so the route for the server {address} cannot be told"
+        ]
+    if any(route.destination in host_routes and route.gateway in gateways for route in before.routes):
+        return [
+            f"the route for the server {address} through {sorted(gateways)} was already in the table before the start"
+        ]
+    if any(route.destination in host_routes and route.gateway in gateways for route in during.routes):
+        return []
+    named = [route for route in during.routes if route.destination in host_routes]
+    return [
+        f"no host route for the server {address} through the gateway of the default route before the start "
+        f"({sorted(gateways)}) while the tunnel is up; the routes naming the server: {named}"
+    ]
+
+
 def show_machine(when: str, snapshot: Snapshot) -> None:
     """Print what the commands behind `snapshot` said, in full, whether the case passes or fails."""
     if snapshot.raw:
@@ -581,15 +688,18 @@ def full_tunnel_journey(
 ) -> None:
     """Start the proxy as a person does, a full tunnel, fetch pages from outside the machine, and stop it.
 
-    `server` must have been started with `machine.default_interface()` as its outbound interface. Fails if the start
-    does not succeed, and then for each of these that does not hold: a page by address and one by name arrive through
-    the far side (`page_problems`), the system holds the tunnel's resolver (`dns_problems`) and its device and routes
+    `server` must come from `run_far_side`, whose own dials leave by the machine's default interface; where that
+    interface is `en0` of a Mac, `MacMachine.scoped_default_route` must be held too, or the far side's dials, bound to
+    the interface, get `ENETUNREACH` once the tunnel's routes win the table. Fails if the start does not succeed, and
+    then for each of these that does not hold: a page by address and one by name arrive through the far side
+    (`page_problems`), the system holds the tunnel's resolver (`dns_problems`) and its device and routes
     (`device_problems`), and after the stop the machine is as it was (`stop_problems`).
 
-    `server` is on loopback, for which the product installs no route that keeps its connection to the server out of the
-    tunnel: the journey does not see that route installed, used or removed.
+    For a server that is not on loopback it also checks the route that keeps the product's connection to the server out
+    of the tunnel (`bypass_problems`). On loopback the product installs none, and the journey does not see that route.
     """
     case = plugin or "a server with no plugin"
+    address = server.description["server"]
     config = tmp_path / "server.json"
     config.write_text(json.dumps(server_entry(server.description, plugin)), encoding="utf-8")
 
@@ -612,6 +722,7 @@ def full_tunnel_journey(
             *page_problems(machine, server, "by name", NAME_URL, NAME_REDIRECT, NAME_TARGETS, tmp_path, ipv4_only=True),
             *dns_problems(before, during),
             *device_problems(before, during),
+            *([] if ipaddress.ip_address(address).is_loopback else bypass_problems(before, during, address)),
         ]
     except BaseException:
         # That failure stays the reported one.

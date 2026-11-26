@@ -81,7 +81,8 @@ has no notice for a change of an adapter's DNS servers: the DNS read waits only 
 
 The server listens on loopback, and for a loopback server Hole installs no route that keeps its own connection to the
 server out of the tunnel. A tunnel to a remote server needs that route and a stop must remove it; this case does not
-install, use or compare it ([#1412](https://github.com/bindreams/hole/issues/1412)).
+install, use or compare it ([#1412](https://github.com/bindreams/hole/issues/1412)). The case cannot put the server at the
+machine's own address instead: Windows refuses the host route for it, so `hole proxy start` fails with `route setup failed`.
 
 The case needs the internet, and the machine's routes and DNS belong to the tunnel for a few seconds.
 
@@ -174,5 +175,18 @@ routes and temporary IPv6 addresses. Each case prints, before the start and whil
 commands it read printed (`netstat -rn`, `ifconfig -a`, `scutil --dns`, and `route -n get 1.1.1.1` unscoped and in the
 default interface's scope), passing or failing. `hole` runs as root, as in the cases above, and `curl` runs as the user of the
 test. The connections are the same code the Windows lane runs ({src}`tests/installed/connect_journey.py`).
+
+The macOS server is reached at the default interface's own address, through a relay in the test, so the product
+installs the host route that keeps its connection to the server out of the tunnel (`UGHS en0` through the gateway the
+default route had). A fifth check reads that route from the route table while the tunnel is up; the comparison after
+the stop sees it gone (the cloned row the system keeps for the address, flags `L` and `W`, is left out like the other
+cloned routes). The route carries nothing: the system delivers to an address of the machine locally (the lookup answers
+`lo0` once the system has cloned a local entry, `en0` before), so the case does not see the route used.
+
+The server's own dials are bound to `en0`, and a runner has no default route in that interface's scope, so once the
+tunnel's routes win the table those dials fail with `ENETUNREACH`. The case adds
+`route -n add -ifscope en0 default <gateway>` before it reads the machine, when none exists, and deletes it after only
+if it added it. That route also changes what the product's own interface-bound sockets see
+([#1414](https://github.com/bindreams/hole/issues/1414)); a macOS journey of a Bypass rule must run without it.
 It is meant for CI: it needs passwordless `sudo`, refuses to run over an existing install, and expects `hole-dmg` to
 have built the app and `cargo build -p plugin-e2e --example ss_plugin_server` to have built the test's server.

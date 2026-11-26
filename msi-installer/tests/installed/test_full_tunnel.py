@@ -6,7 +6,9 @@ Hole, and a page from outside the machine arrives by address and by name. The pe
 needs rights.
 
 The far side is the `ss_plugin_server` example, behind each bundled plugin and with none. It runs on this machine, so
-its own dials leave through the machine's default interface, not the routing table, which the tunnel now owns. It needs
+its own dials leave through the machine's default interface, not the routing table, which the tunnel now owns. It
+listens on loopback: Windows refuses the host route for the machine's own address (`WindowsMachine.far_side_address`).
+It needs
 the example built (`cargo build -p plugin-e2e --example ss_plugin_server`), the working tree's `galoshes` and `ex-ray`
 builds, and the internet: `1.1.1.1` is the address asked for, the name asked for is `one.one.one.one`, and the
 product's own default DNS is DoH to `1.1.1.1`.
@@ -18,7 +20,7 @@ cannot change what the other cases meet.
 from pathlib import Path
 
 import pytest
-from connect_journey import SERVER_IDS, SERVERS, full_tunnel_journey, run_ss_server
+from connect_journey import SERVER_IDS, SERVERS, full_tunnel_journey, run_far_side
 from member import UnelevatedMember, assert_only_the_bridges_grant_admits
 from member import member  # noqa: F401 (fixture)
 from support import gsudo_environment, installed_hole, msi_path  # noqa: F401 (fixtures)
@@ -36,5 +38,5 @@ def test_installed_full_tunnel_carries_a_page(member: UnelevatedMember, plugin: 
     machine = WindowsMachine(member)
     member.phase = "in the full tunnel"
     scratch: Path = member.scratch
-    with run_ss_server(kind, scratch, machine.default_interface()) as server:
+    with run_far_side(kind, scratch, machine) as server:
         full_tunnel_journey(member, server, plugin, machine, scratch)

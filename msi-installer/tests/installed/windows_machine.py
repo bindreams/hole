@@ -120,6 +120,14 @@ class WindowsMachine:
     def default_interface(self) -> str:
         return self._state("default-interface").strip()
 
+    def far_side_address(self) -> None:
+        """Loopback: Windows refuses the host route for the machine's own address.
+
+        It holds `<address>/32 via 0.0.0.0` on the default interface for it, and the bridge's `netsh interface ip add
+        route <address>/32 <interface> store=active` exits 1 (`hole proxy start` fails with `route setup failed`).
+        """
+        return None
+
     def snapshot(self) -> Snapshot:
         text = self._state("snapshot")
         try:

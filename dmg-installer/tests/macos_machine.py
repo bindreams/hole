@@ -14,14 +14,18 @@ from contextlib import contextmanager
 from typing import TypeVar
 
 from connect_journey import (
+    DEFAULT_ROUTE,
     ChangeWatch,
     MachineReadError,
     Resolver,
     Route,
     Settled,
     Snapshot,
+    report_teardown_failure,
     settle_on_notices,
 )
+
+from dmg_installer.installed_bridge import describe, sudo
 
 # `scutil --dns` prints the resolvers of two sections; the second, for scoped queries, is the per-interface view of the
 # same configuration and is left out.
@@ -78,9 +82,19 @@ def _default_interface(read: Read) -> str:
     return match.group(1)
 
 
+def _default_gateway(read: Read) -> str:
+    """`gateway: 192.168.64.1` in `route -n get default`."""
+    match = re.search(r"^\s*gateway:\s*(\S+)", read("route", "-n", "get", "default"), re.MULTILINE)
+    if match is None:
+        raise MachineReadError("`route -n get default` names no gateway: the default route is not through one")
+    return match.group(1)
+
+
 def _ipv4_network(destination: str) -> str:
-    """`netstat` leaves the trailing zero octets of a network out (`128.0/1`); written in full it is the text every
-    platform has for it."""
+    """`netstat` leaves the trailing zero octets of a network out (`128.0/1`) and calls the whole of IPv4 `default`;
+    written in full it is the text every platform has for it."""
+    if destination == "default":
+        return DEFAULT_ROUTE
     address, slash, length = destination.partition("/")
     octets = address.split(".")
     if not slash or not all(octet.isdigit() for octet in octets):
@@ -185,9 +199,60 @@ class _ConfigdWatch:
         return settle_on_notices(read, settled, arm=lambda: None, wait=self._wait, source="configd (a DNS change)")
 
 
+def _has_scoped_default(read: Read, interface: str) -> bool:
+    """Whether `netstat -rn -f inet` lists a default route bound to `interface` (flag `I`)."""
+    return any(
+        route.destination == DEFAULT_ROUTE and route.interface == interface and "I" in route.detail
+        for route in _routes(read)
+    )
+
+
 class MacMachine:
     def default_interface(self) -> str:
         return _default_interface(_Transcript().output)
+
+    def far_side_address(self) -> str:
+        """The default interface's own IPv4 address.
+
+        For an address of its own the system delivers locally whatever the host route for it says, and the product
+        installs and removes that route all the same.
+        """
+        address = _Transcript().output("ipconfig", "getifaddr", self.default_interface()).strip()
+        if not address:
+            raise MachineReadError("`ipconfig getifaddr` printed no address for the default interface")
+        return address
+
+    @contextmanager
+    def scoped_default_route(self) -> Iterator[None]:
+        """Hold a default route in the default interface's scope, for a far side whose sockets are bound to it.
+
+        Such a socket (`IP_BOUND_IF`) looks routes up in the interface's scope only. A runner has none there, so once a
+        tunnel's split routes win the unscoped table, the lookup finds nothing and `connect` returns `ENETUNREACH`.
+        The route is added when the interface has no scoped default, through the gateway of the unscoped one, and
+        deleted on exit only if this added it. It also changes what the product's own interface-bound sockets see
+        (bindreams/hole#1414), so a journey of a Bypass rule must not hold it.
+        """
+        transcript = _Transcript()
+        interface = _default_interface(transcript.output)
+        if _has_scoped_default(transcript.output, interface):
+            yield
+            return
+        gateway = _default_gateway(transcript.output)
+        add = ("route", "-n", "add", "-ifscope", interface, "default", gateway)
+        added = sudo(*add)
+        print(f"=== scoped default route: $ {' '.join(add)}\n{describe(added)}", flush=True)
+        if added.returncode != 0:
+            raise MachineReadError(f"`{' '.join(add)}` failed:\n{describe(added)}")
+        ok = False
+        try:
+            yield
+            ok = True
+        finally:
+            delete = ("route", "-n", "delete", "-ifscope", interface, "default")
+            deleted = sudo(*delete)
+            print(f"=== scoped default route: $ {' '.join(delete)}\n{describe(deleted)}", flush=True)
+            if deleted.returncode != 0:
+                report_teardown_failure(f"`{' '.join(delete)}` failed:\n{describe(deleted)}", primary_ok=ok)
 
     def snapshot(self) -> Snapshot:
         transcript = _Transcript()
