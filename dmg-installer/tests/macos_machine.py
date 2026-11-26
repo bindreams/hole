@@ -128,9 +128,10 @@ def _interfaces(read: Read) -> tuple[list[str], list[str]]:
 def _resolvers(read: Read) -> list[Resolver]:
     """The resolvers of `scutil --dns`.
 
-    A resolver's scope is its lines other than the nameservers. Three more are left out: the `resolver #N` heading,
-    which follows the order and so changes when a resolver is added, and `flags` and `reach`, which say what the
-    network can do now.
+    A resolver's scope is its lines other than the nameservers. Four more are left out: the `resolver #N` heading and
+    the `order` line, which place it among the others and so change when a resolver is added (the en0 resolver has no
+    `order` before a tunnel and `order : 200000` while it is up), and `flags` and `reach`, which say what the network
+    can do now.
     """
     section = read("scutil", "--dns").split(_SCOPED_SECTION)[0]
     resolvers = []
@@ -138,7 +139,11 @@ def _resolvers(read: Read) -> list[Resolver]:
         fields = [
             (key.strip(), value.strip()) for key, _, value in (line.partition(":") for line in block.splitlines())
         ]
-        scope = [f"{key}: {value}" for key, value in fields if key and not re.match(r"nameserver\[|flags$|reach$", key)]
+        scope = [
+            f"{key}: {value}"
+            for key, value in fields
+            if key and not re.match(r"nameserver\[|flags$|reach$|order$", key)
+        ]
         interface = next((re.search(r"\((\S+)\)", value) for key, value in fields if key == "if_index"), None)
         resolvers.append(
             Resolver(
