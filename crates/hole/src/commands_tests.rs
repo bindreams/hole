@@ -20,21 +20,6 @@ fn test_entry(id: &str) -> ServerEntry {
 }
 
 #[skuld::test]
-fn build_proxy_config_with_selected_server() {
-    let config = AppConfig {
-        servers: vec![test_entry("a"), test_entry("b")],
-        selected_server: Some("b".to_string()),
-        local_port: 4073,
-        enabled: false,
-        ..Default::default()
-    };
-
-    let pc = build_proxy_config(&config).expect("should return Some");
-    assert_eq!(pc.server.id, "b");
-    assert_eq!(pc.local_port, 4073);
-}
-
-#[skuld::test]
 fn build_proxy_config_no_selection() {
     let config = AppConfig {
         servers: vec![test_entry("a")],
@@ -61,42 +46,9 @@ fn build_proxy_config_invalid_selection() {
 }
 
 #[skuld::test]
-fn build_proxy_config_master_toggle_off_disables_listeners() {
-    let config = AppConfig {
-        servers: vec![test_entry("a")],
-        selected_server: Some("a".to_string()),
-        proxy_server_enabled: false,
-        proxy_socks5: true,
-        proxy_http: true,
-        ..Default::default()
-    };
-
-    let pc = build_proxy_config(&config).expect("should return Some");
-    assert!(!pc.proxy_socks5, "master toggle off must disable the SOCKS5 listener");
-    assert!(!pc.proxy_http, "master toggle off must disable the HTTP listener");
-}
-
-#[skuld::test]
-fn build_proxy_config_master_toggle_on_passes_listener_flags() {
-    let config = AppConfig {
-        servers: vec![test_entry("a")],
-        selected_server: Some("a".to_string()),
-        proxy_server_enabled: true,
-        proxy_socks5: true,
-        proxy_http: true,
-        ..Default::default()
-    };
-
-    let pc = build_proxy_config(&config).expect("should return Some");
-    assert!(pc.proxy_socks5);
-    assert!(pc.proxy_http);
-}
-
-#[skuld::test]
 fn build_proxy_config_carries_the_filters_and_dns_of_the_config() {
-    // The rows give each copied value different values, each away from `AppConfig::default()` in at least one row, so a
-    // field the function stops copying, or takes from a neighbour, shows up in some row. `tunnel_mode` is not a
-    // person's setting: the window always asks for the full tunnel.
+    // Each copied field varies across the rows and is away from its default in at least one, so a dropped or swapped
+    // field fails.
     let chosen = ServerEntry {
         plugin: Some("v2ray-plugin".to_string()),
         plugin_opts: Some("tls;host=example.com".to_string()),
@@ -104,7 +56,7 @@ fn build_proxy_config_carries_the_filters_and_dns_of_the_config() {
     };
     let rows = [
         (
-            "all on, TLS DNS, a plugin server chosen among two",
+            "both listeners on, TLS DNS, a plugin server chosen among two",
             AppConfig {
                 servers: vec![test_entry("a"), chosen.clone()],
                 selected_server: Some("b".to_string()),
@@ -131,7 +83,7 @@ fn build_proxy_config_carries_the_filters_and_dns_of_the_config() {
                     allow_insecure_bootstrap: true,
                 },
                 local_port_http: 5002,
-                diagnostic_plugin_tap: true,
+                diagnostic_plugin_tap: false,
                 ..Default::default()
             },
             ProxyConfig {
@@ -159,11 +111,11 @@ fn build_proxy_config_carries_the_filters_and_dns_of_the_config() {
                 proxy_socks5: true,
                 proxy_http: true,
                 local_port_http: 5002,
-                diagnostic_plugin_tap: true,
+                diagnostic_plugin_tap: false,
             },
         ),
         (
-            "DNS forwarder off, SOCKS5 only",
+            "plain UDP DNS, forwarder off, SOCKS5 only",
             AppConfig {
                 servers: vec![test_entry("a")],
                 selected_server: Some("a".to_string()),
@@ -183,7 +135,7 @@ fn build_proxy_config_carries_the_filters_and_dns_of_the_config() {
                     allow_insecure_bootstrap: false,
                 },
                 local_port_http: 6002,
-                diagnostic_plugin_tap: false,
+                diagnostic_plugin_tap: true,
                 ..Default::default()
             },
             ProxyConfig {
@@ -204,11 +156,11 @@ fn build_proxy_config_carries_the_filters_and_dns_of_the_config() {
                 proxy_socks5: true,
                 proxy_http: false,
                 local_port_http: 6002,
-                diagnostic_plugin_tap: false,
+                diagnostic_plugin_tap: true,
             },
         ),
         (
-            "both listeners off with the master toggle on, plain TCP DNS over IPv6",
+            "plain TCP DNS over IPv6, both listeners off with the master toggle on",
             AppConfig {
                 servers: vec![test_entry("a")],
                 selected_server: Some("a".to_string()),
@@ -228,7 +180,7 @@ fn build_proxy_config_carries_the_filters_and_dns_of_the_config() {
                     allow_insecure_bootstrap: false,
                 },
                 local_port_http: 7002,
-                diagnostic_plugin_tap: true,
+                diagnostic_plugin_tap: false,
                 ..Default::default()
             },
             ProxyConfig {
@@ -249,13 +201,105 @@ fn build_proxy_config_carries_the_filters_and_dns_of_the_config() {
                 proxy_socks5: false,
                 proxy_http: false,
                 local_port_http: 7002,
+                diagnostic_plugin_tap: false,
+            },
+        ),
+        (
+            "DoH, HTTP only",
+            AppConfig {
+                servers: vec![test_entry("a")],
+                selected_server: Some("a".to_string()),
+                local_port: 8001,
+                filters: vec![FilterRule {
+                    address: "blocked.example".into(),
+                    matching: MatchType::Exactly,
+                    action: FilterAction::Block,
+                }],
+                proxy_server_enabled: true,
+                proxy_socks5: false,
+                proxy_http: true,
+                dns: DnsConfig {
+                    enabled: false,
+                    servers: vec!["94.140.14.14".parse().unwrap()],
+                    protocol: DnsProtocol::Https,
+                    allow_insecure_bootstrap: false,
+                },
+                local_port_http: 8002,
+                diagnostic_plugin_tap: true,
+                ..Default::default()
+            },
+            ProxyConfig {
+                server: test_entry("a"),
+                local_port: 8001,
+                tunnel_mode: TunnelMode::Full,
+                filters: vec![FilterRule {
+                    address: "blocked.example".into(),
+                    matching: MatchType::Exactly,
+                    action: FilterAction::Block,
+                }],
+                dns: DnsConfig {
+                    enabled: false,
+                    servers: vec!["94.140.14.14".parse().unwrap()],
+                    protocol: DnsProtocol::Https,
+                    allow_insecure_bootstrap: false,
+                },
+                proxy_socks5: false,
+                proxy_http: true,
+                local_port_http: 8002,
+                diagnostic_plugin_tap: true,
+            },
+        ),
+        (
+            "master toggle off with both listeners asked for, so both are off",
+            AppConfig {
+                servers: vec![test_entry("a")],
+                selected_server: Some("a".to_string()),
+                local_port: 9001,
+                filters: vec![FilterRule {
+                    address: "lan.example".into(),
+                    matching: MatchType::WithSubdomains,
+                    action: FilterAction::Bypass,
+                }],
+                proxy_server_enabled: false,
+                proxy_socks5: true,
+                proxy_http: true,
+                dns: DnsConfig {
+                    enabled: true,
+                    servers: vec!["1.1.1.1".parse().unwrap()],
+                    protocol: DnsProtocol::Tls,
+                    allow_insecure_bootstrap: true,
+                },
+                local_port_http: 9002,
+                diagnostic_plugin_tap: true,
+                ..Default::default()
+            },
+            ProxyConfig {
+                server: test_entry("a"),
+                local_port: 9001,
+                tunnel_mode: TunnelMode::Full,
+                filters: vec![FilterRule {
+                    address: "lan.example".into(),
+                    matching: MatchType::WithSubdomains,
+                    action: FilterAction::Bypass,
+                }],
+                dns: DnsConfig {
+                    enabled: true,
+                    servers: vec!["1.1.1.1".parse().unwrap()],
+                    protocol: DnsProtocol::Tls,
+                    allow_insecure_bootstrap: true,
+                },
+                proxy_socks5: false,
+                proxy_http: false,
+                local_port_http: 9002,
                 diagnostic_plugin_tap: true,
             },
         ),
     ];
 
     for (row, config, expected) in rows {
-        let pc = build_proxy_config(&config).expect("should return Some");
+        let pc = build_proxy_config(&config).unwrap_or_else(|| {
+            panic!("row `{row}`: build_proxy_config returned None for a config with a server selected")
+        });
         assert_eq!(
             pc, expected,
             "row `{row}`: the window must send what the person configured"
