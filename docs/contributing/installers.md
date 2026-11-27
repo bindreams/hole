@@ -38,15 +38,15 @@ under test whose version is not lower than the tree's.
 
 Between the two, the lane installs once more and connects ({src}`msi-installer/tests/installed/test_connect.py`): the
 installed `hole.exe` asks the `HoleBridge` service the MSI registered to start a SOCKS-only proxy for a server behind
-`galoshes`, one behind `v2ray-plugin` and one with no plugin, and `curl` fetches a page through each. This is the
-only test in which the service the service manager started runs a plugin; the bridge's own end-to-end tests start it
-as a child of the test. A failure prints what `C:\ProgramData\hole\logs\bridge.log` gained during the case. It runs
+`galoshes`, one behind `v2ray-plugin` and one with no plugin, and `curl` fetches a page through each. Here the
+service manager started the service that runs the plugin; the bridge's own end-to-end tests start it as a child of the
+test. A failure prints what `C:\ProgramData\hole\logs\bridge.log` gained during the case. It runs
 against any MSI too, a published release included. The server is the `ss_plugin_server` example of
 {src}`crates/plugin-e2e/`, with the working tree's `galoshes` and `ex-ray` builds on its side, so the plugins of the
 MSI under test must still speak to the tree's.
 
 A third install connects as the user the installer granted
-({src}`msi-installer/tests/installed/test_member_access.py`). Every other case reaches the bridge from the elevated
+({src}`msi-installer/tests/installed/test_member_access.py`). The connect case reaches the bridge from the elevated
 test process, which the socket's Administrators entry admits whatever the bridge granted anyone else. This one runs the
 installed `hole.exe` from a child that `gsudo` de-elevated, whose token was made before the install and so carries no
 `hole` group. It connects to the server with no plugin, restarts the `HoleBridge` service, connects again, and does
@@ -54,8 +54,80 @@ both once more. A second test takes the user out of the group, restarts the serv
 refused, runs an elevated `hole bridge grant-access` and connects with no further restart. Each fails before its first
 connect when the child still holds Administrators, already carries the group,
 or is not the user the installer added. The child cannot read pytest's own temporary folder, so its files are in
-`member-access\` under the log folder. A failure also says how the child's own connect to the bridge's socket went:
+`member\<test name>\` under the log folder. A failure also says how the child's own connect to the bridge's socket went:
 `hole` can exit before its own error text reaches a pipe.
+
+Another install starts a full tunnel, the default of `hole proxy start`, as that same user
+({src}`msi-installer/tests/installed/test_full_tunnel.py`), once for a server behind each bundled plugin and once for a
+server with no plugin. The server runs on the test machine, so it dials out of the machine's default interface instead of
+the routing table, which the tunnel now owns, and its sockets are bound to that interface's own IPv4 address. While the
+module runs, the `HoleBridge` service's `Environment` value holds `RUST_LOG=info,yamux=debug` and the service is
+restarted with it; both are put back afterwards. After a start that succeeded the case checks these things, and a
+failure lists each one that did not hold:
+
+| Check   | What must hold                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pages   | `curl`, run by the de-elevated child, requests `http://1.1.1.1/` and, over IPv4, `http://one.one.one.one/`. Each answers `301` with a `Location` for the host the request named, and the server opened a relay to that address while the page was fetched. The answer alone arrives from a machine with no tunnel too.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| DNS     | While the tunnel is up, Windows lists exactly one set of DNS servers it did not list before: `1.1.1.1` and `1.0.0.1`, the defaults of `hole proxy start`, on the tunnel's adapter.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Device  | While the tunnel is up, the machine has exactly one IP interface it did not have before, and `0.0.0.0/1`, `128.0.0.0/1`, `::/1` and `8000::/1` are routed into it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| UDP     | For a plugin that carries UDP (`galoshes`, and none), the de-elevated child sends a QUIC packet of 1237 bytes to `8.8.4.4:443`, again every second until it is answered or 60 seconds have passed: a long header with a reserved version, which a server answers with Version Negotiation. Its reply reaches the child's socket, is Version Negotiation (version 0), and carries the packet's own connection IDs, swapped; the server relayed the datagram at least once, from one client address. Under the two contracts below, a second client address is the server's own relay coming back through the tunnel, which draws no reply. The `v2ray-plugin` case sends none: the product drops UDP for a plugin without it, and the case does not see the drop. |
+| Restore | After `hole proxy stop`, the IP interfaces, routes, addresses and DNS servers equal those read before the start, and the de-elevated child looks up a name made up for the case under `github.io`, which no cache holds and which resolves, and gets an answer. Temporary IPv6 addresses are left out: Windows replaces them on its own timer.                                                                                                                                                                                                                                                                                                                                                                                                                   |
+
+The server's sockets are bound to the interface's address because an IPv4 UDP relay of the server is sent on an IPv6
+socket, which the interface alone does not hold on Windows: without the bind one datagram became 256 relays through the
+tunnel. The bind makes the server IPv4-only, so a dial to an IPv6 target fails; the case asks for none. Only the Windows
+server is bound to an address: on macOS the same bind makes every UDP relay fail with `EINVAL`.
+
+The packet is 1237 bytes because a server answers with Version Negotiation only to a datagram of at least 1200. The
+case reads the server's relay lines for that target and size, once, after the child exits. It rests on two contracts.
+Nothing else on the runners sends to `8.8.4.4:443` during a case: the server's logs from the CI runs of the full-tunnel
+cases on macOS (arm64 and amd64) and Windows show no relay to it but the case's own, and the size is a second
+distinction only, since a QUIC connection sends packets of any size after its handshake. And the product keeps one UDP
+association per source socket for the life of the child, so every send reaches the server from one client address (CI
+runs 45953182365 and 45962345199, Windows, with `galoshes` and with no plugin: 60 resends, one address each, in runs
+where the server was changed to make no address bind and so sent its own relay back through the tunnel, each pass of
+the loop reaching it from a new address; the change was to the server only, not the product; macOS has been seen with
+single sends only). The server (shadowsocks-service 1.24.0) keeps one outbound socket per address family per
+association (`UdpAssociationContext` in `server/udprelay.rs`; on the runners an IPv4 target goes out on the IPv6 one,
+and its replies arrive from `[::ffff:8.8.4.4]:443`), so a datagram that comes back to the server draws no reply: a second
+client address names the cause of a case with no reply, and the case reports it, with the addresses printed. The child
+resends the same packet, with the same connection IDs, so that a lost datagram or a rate-limited answer does not fail
+the case, and a socket error does not end it. Because of the resends, a datagram the product relays twice from the one
+address looks like another send, and the case does not see it; nor does it see a line the server writes after its one
+read of the lines. The target answered on `macos-26-arm64`,
+`macos-15`, `ubuntu-26.04` and `windows-2025`.
+
+The lookup after the stop uses a name under `github.io` because Windows reports an unknown name by the same error
+(`WSAHOST_NOT_FOUND`, Python's `[Errno 11001]`) that tells nothing about whether a resolver answered; every name under
+`github.io` resolves to GitHub Pages, so an answer is required. A stop that leaves the port-53 confinement of the tunnel
+engaged (a Windows filter set that the interface and route comparison cannot see) leaves the child's lookups with no
+resolver, and the case fails on it. The lookup asks for IPv4 addresses only, and has 60 seconds to get its answer. It is
+made once the comparison matches, so that it finds the resolver the system holds and not one still being restored, and
+it is not made when the comparison does not match.
+
+The DNS check reads what Windows was told. Nothing in the case shows that a lookup goes to those servers.
+
+The case reads the machine after a command returns, so for each read it waits until the system has taken the change in.
+It registers for IP Helper's notices of a change to an interface, a route or an address before it runs the command
+(`NotifyIpInterfaceChange`, `NotifyRouteChange2`, `NotifyUnicastIpAddressChange`), and reads again on each one until the
+state it expects holds: after the start, every check of the tunnel's DNS, interface and routes; after the stop, the
+machine as it was. The 30 seconds are the failure bound on a notice the system never sends: when they run out the case
+fails, giving how many readings it made and whether no notice came since the last reading began, a notice came at the
+bound, too late for another reading, or the last reading and its check ended past the bound. A reading is begun only
+while the bound has not passed. IP Helper has no notice for a change of an adapter's DNS servers, and the DNS read needs
+none: Dnscache writes the adapter's servers inside the bridge's call that sets them, and the read reads them on each
+call ({src}`.github/scripts/network-state.ps1`). Each case prints the machine's state, as `network-state.ps1` reports
+it, before the start and while the tunnel is up.
+
+The server listens on loopback, and for a loopback server Hole installs no route that keeps its own connection to the
+server out of the tunnel. A tunnel to a remote server needs that route and a stop must remove it; this case does not
+install, use or compare it ([#1412](https://github.com/bindreams/hole/issues/1412)). The case cannot put the server at the
+machine's own address instead: Windows refuses the host route for it, so `hole proxy start` fails with `route setup failed`.
+
+The case needs the internet, and the machine's routes and DNS belong to the tunnel while each case runs: seconds when
+everything answers, minutes when a wait or a command runs to its bound.
+The machine must bind IPv6 on the tunnel's adapter: where it does not, the product makes the IPv6 split routes non-fatal,
+and the case fails on its route check.
 
 ```{warning}
 This installs Hole system-wide on the machine you run it on. Use a throwaway machine or virtual machine, not the one you
@@ -69,7 +141,7 @@ cargo xtask run hole-msi-cleanup          # after an interrupted run
 ```
 
 It needs the MSI built beforehand (`cargo xtask build hole-msi`, or the one `MSI_UNDER_TEST` names), the repo's
-`node_modules`, and for the connect and member-access cases `cargo build -p plugin-e2e --example ss_plugin_server` plus
+`node_modules`, and for the connect, member-access and full-tunnel cases `cargo build -p plugin-e2e --example ss_plugin_server` plus
 the `galoshes` and `ex-ray` builds `hole-msi` leaves (`cargo xtask build galoshes` alone builds both). The target builds none of these, so
 run `cargo xtask build frontend-build` once if `hole-msi` has not left `node_modules`. The run refuses to start, before
 it changes anything, when:
@@ -86,10 +158,11 @@ records both of its ProductCodes, so the cleanup removes whichever of the two an
 
 The tools the E2E needs (`tauri-driver`, `msedgedriver`, `gsudo`) download into `.cache/installer-e2e/`; nothing is added
 to `PATH` outside the test's child processes. Each phase that starts child processes has a failure bound
-(`GSUDO_SELFTEST_TIMEOUT_SECONDS`, `DASHBOARD_E2E_TIMEOUT_SECONDS` and, for each `hole` command of the connect and
-member-access cases, `HOLE_CLI_TIMEOUT_SECONDS` in {src}`msi-installer/tests/installed/support.py`), so a wedged phase
-fails by name and the uninstall still runs. The server of those two cases has none: it is the tree's code, and one that never reports
-ready ends at the CI step's limit. Install
+(`GSUDO_SELFTEST_TIMEOUT_SECONDS`, `DASHBOARD_E2E_TIMEOUT_SECONDS` and, for each `hole` command of the connect,
+member-access and full-tunnel cases, and for each `curl`, Python probe and `network-state.ps1` read of the last,
+`HOLE_CLI_TIMEOUT_SECONDS` in {src}`msi-installer/tests/installed/support.py`), so a wedged phase fails by name and the
+uninstall still runs. The server of those cases is the tree's code: one behind a plugin panics when the plugin is not
+ready within 60 seconds, and one with no plugin that never reports ready ends at the CI step's limit. Install
 and uninstall logs go to `target\msi-test-logs\`, or to `MSI_TEST_LOG_DIR`. Nothing asserts what remains in
 `C:\ProgramData\hole` after the uninstall.
 
@@ -138,7 +211,30 @@ cargo xtask run hole-dmg-install-e2e
 ```
 
 installs the built app's bridge as root, connects with `hole proxy start` to a server behind each bundled plugin and to
-one with no plugin, fetches a page through each, and uninstalls. The connection is the same code the Windows lane runs
-({src}`tests/installed/connect_journey.py`).
+one with no plugin, and fetches a page through each. Under the same install it then starts a full tunnel for each of the
+three and makes the checks of [the Windows lane's full-tunnel case](#the-install-e2e-and-uninstall-run), and uninstalls
+last. On macOS the DNS servers are those of the one resolver `scutil --dns` gained. The case reads the machine again
+after each post from configd that it rebuilt the DNS configuration and each routing-socket message about a route, an
+interface or an address (`RTM_ADD`, `RTM_DELETE`, `RTM_CHANGE`, `RTM_IFINFO`, `RTM_NEWADDR`, `RTM_DELADDR`; not the
+`RTM_GET` that the snapshot's own `route -n get` makes), the other tables the snapshot reads. Those values are from
+XNU's `net/route.h`; the message type is the fourth byte of every routing message (`rt_msghdr` there, `if_msghdr` and
+`ifa_msghdr` in `net/if.h`). The wait and its 30-second bound are those of the Windows lane. The
+device is the new `utun` interface, and the comparison after the stop leaves out neighbour and cloned routes and
+temporary IPv6 addresses. Each case prints, before the start and while the tunnel is up, everything the commands it
+read printed (`netstat -rn -f inet`, `netstat -rn -f inet6`, `ifconfig -a`, `scutil --dns`, `route -n get default`,
+and `route -n get 1.1.1.1` unscoped and in the default interface's scope), passing or failing. `hole` runs as root, as in the cases above, and `curl` runs as the user of the
+test. The connections are the same code the Windows lane runs ({src}`tests/installed/connect_journey.py`).
+
+The macOS server listens at the default interface's own address, so the product installs the host route that keeps its
+connection to the server out of the tunnel (`UGHS en0` through the gateway the default route had). A further check reads
+that route from the route table while the tunnel is up; the comparison after the stop sees it gone (the cloned row the
+system keeps for the address, flags `L` and `W`, is left out like the other cloned routes). The route carries nothing:
+the system delivers to an address of the machine locally, so the case does not see the route used.
+
+The server's own dials are bound to `en0`, and a runner has no default route in that interface's scope, so once the
+tunnel's routes win the table those dials fail with `ENETUNREACH`. The case adds
+`route -n add -ifscope en0 default <gateway>` before it reads the machine, when none exists, and deletes it after only
+if it added it. That route also changes what the product's own interface-bound sockets see
+([#1414](https://github.com/bindreams/hole/issues/1414)); a macOS journey of a Bypass rule must run without it.
 It is meant for CI: it needs passwordless `sudo`, refuses to run over an existing install, and expects `hole-dmg` to
 have built the app and `cargo build -p plugin-e2e --example ss_plugin_server` to have built the test's server.

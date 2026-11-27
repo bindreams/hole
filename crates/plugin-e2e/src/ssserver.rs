@@ -18,12 +18,18 @@ use base64::Engine as _;
 use garter::{BinaryPlugin, ChainRunner, Mode, PluginEnv, ReadinessMode, StartError};
 use shadowsocks::config::{Mode as SsMode, ServerConfig};
 use shadowsocks::crypto::CipherKind;
+use shadowsocks::net::ConnectOpts;
 use shadowsocks_service::server::ServerBuilder as SsServerBuilder;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+/// The levels [`route_logs`] takes.
+pub use tracing_log::log::LevelFilter;
 use util::port_alloc::{self, Protocols};
+
+/// Where a fixture server listens unless it is told otherwise.
+const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 pub const TEST_METHOD_STR: &str = "aes-256-gcm";
 pub const TEST_METHOD: CipherKind = CipherKind::AES_256_GCM;
@@ -49,6 +55,21 @@ pub fn random_password_for(method: CipherKind) -> String {
     }
 }
 
+/// Route this process's `log` records at `max_level` and above into `tracing`. The ss server logs through `log`, and
+/// the test subscriber installs no `LogTracer`, so without this its relay lines and errors go nowhere. Records below
+/// `max_level` are never allocated; the subscriber's filter still decides which of the rest are written.
+///
+/// The first call decides the level. If another `log` logger is already installed, the records are not routed and
+/// stderr says so (`eprintln!`, which no log filter can drop).
+pub fn route_logs(max_level: LevelFilter) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Err(e) = tracing_log::LogTracer::builder().with_max_level(max_level).init() {
+            eprintln!("[ss-server-logs] not routed into tracing: {e}");
+        }
+    });
+}
+
 /// Spin up a real shadowsocks server on a freshly-allocated loopback
 /// port with the given cipher/password. Returns the bound TCP address
 /// and a handle to the running server task. The server relays anything
@@ -63,26 +84,63 @@ pub fn random_password_for(method: CipherKind) -> String {
 /// passing port 0 would hand the two sockets distinct kernel-allocated
 /// ports — the explicit allocation here keeps them on the same port.
 pub async fn start_real_ss_server(method: CipherKind, password: &str) -> (SocketAddr, JoinHandle<()>) {
-    let (port, server) = port_alloc::bind_ephemeral(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        Protocols::TCP | Protocols::UDP,
-        |port| {
-            let password = password.to_string();
-            async move {
-                let mut svr_cfg = ServerConfig::new(("127.0.0.1", port), password, method).unwrap();
-                svr_cfg.set_mode(SsMode::TcpAndUdp);
-                SsServerBuilder::new(svr_cfg).build().await
+    start_real_ss_server_via(method, password, LOOPBACK, None).await
+}
+
+/// A network interface of the machine and its own IPv4 address: where a server's dials leave from.
+#[derive(Clone, Debug)]
+pub struct OutboundInterface {
+    /// Its friendly name on Windows, its device name elsewhere.
+    pub name: String,
+    pub ipv4: Ipv4Addr,
+}
+
+/// [`start_real_ss_server`] listening on `listen` (TCP and UDP, one port), whose own dials to its targets leave through
+/// `outbound`, not through the routing table. Loopback and `None` are
+/// [`start_real_ss_server`].
+///
+/// A server on the machine a full tunnel runs on needs this: dialing through the routing table sends its dials back
+/// into the tunnel, which hands them to the server again. Naming the interface (`bind_interface`) is not enough:
+/// shadowsocks-service 1.24.0 sends an IPv4 UDP relay on an IPv6 socket, and on Windows that socket is held to the
+/// interface only by `IPV6_UNICAST_IF`. A datagram on it followed the tunnel's split route into the TUN. On Windows the
+/// server also binds to the interface's own address (`bind_local_addr`), which holds that socket. TCP is held by the
+/// interface alone, an IPv4 socket with `IP_UNICAST_IF`.
+///
+/// Binding the IPv4 address makes the server's sockets IPv4-only: on Windows a dial to a native IPv6 target fails, TCP
+/// with `WSAENETUNREACH` and UDP with `WSAEADDRNOTAVAIL`. The bind is made on Windows only. On macOS shadowsocks sets
+/// `IPV6_BOUND_IF` after binding the mapped address, and that fails with `EINVAL` on every UDP relay.
+pub async fn start_real_ss_server_via(
+    method: CipherKind,
+    password: &str,
+    listen: IpAddr,
+    outbound: Option<&OutboundInterface>,
+) -> (SocketAddr, JoinHandle<()>) {
+    let (port, server) = port_alloc::bind_ephemeral(listen, Protocols::TCP | Protocols::UDP, |port| {
+        let password = password.to_string();
+        let outbound = outbound.cloned();
+        async move {
+            let mut svr_cfg = ServerConfig::new(SocketAddr::new(listen, port), password, method).unwrap();
+            svr_cfg.set_mode(SsMode::TcpAndUdp);
+            let mut builder = SsServerBuilder::new(svr_cfg);
+            if let Some(outbound) = outbound {
+                builder.set_connect_opts(ConnectOpts {
+                    bind_interface: Some(outbound.name),
+                    bind_local_addr: cfg!(windows).then(|| SocketAddr::new(IpAddr::V4(outbound.ipv4), 0)),
+                    ..ConnectOpts::default()
+                });
             }
-        },
-    )
+            builder.build().await
+        }
+    })
     .await
     .expect("start_real_ss_server: bind/build failed");
 
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let addr = SocketAddr::new(listen, port);
     let handle = tokio::spawn(async move {
-        // Server::run consumes self and only ever returns Err on teardown
-        // ("server exited unexpectedly"). The test ignores the error.
-        let _ = server.run().await;
+        // `run` returns only when a serving task has ended, which is an error ("server exited unexpectedly").
+        if let Err(e) = server.run().await {
+            tracing::error!(error = %e, "the shadowsocks server stopped serving");
+        }
     });
 
     (addr, handle)
@@ -101,7 +159,29 @@ pub async fn start_real_ss_server_with_plugin_ws(
     password: &str,
     plugin_path: &str,
 ) -> (SocketAddr, PluginServer) {
-    start_real_ss_server_with_plugin_ws_opts(method, password, plugin_path, WS_SERVER_OPTS).await
+    start_real_ss_server_with_plugin_ws_via(method, password, plugin_path, LOOPBACK, None).await
+}
+
+/// [`start_real_ss_server_with_plugin_ws`] whose plugin listens on `listen` and whose ss-server dials its targets out
+/// of `outbound`, as [`start_real_ss_server_via`] does; the ss-server itself stays on loopback behind the plugin.
+/// Loopback and `None` are [`start_real_ss_server_with_plugin_ws`].
+pub async fn start_real_ss_server_with_plugin_ws_via(
+    method: CipherKind,
+    password: &str,
+    plugin_path: &str,
+    listen: IpAddr,
+    outbound: Option<&OutboundInterface>,
+) -> (SocketAddr, PluginServer) {
+    spawn_ss_with_plugin(
+        method,
+        password,
+        Protocols::TCP,
+        plugin_path,
+        WS_SERVER_OPTS,
+        listen,
+        outbound,
+    )
+    .await
 }
 
 /// [`start_real_ss_server_with_plugin_ws`] with the server-mode options string
@@ -112,7 +192,7 @@ pub async fn start_real_ss_server_with_plugin_ws_opts(
     plugin_path: &str,
     opts: &str,
 ) -> (SocketAddr, PluginServer) {
-    spawn_ss_with_plugin(method, password, Protocols::TCP, plugin_path, opts).await
+    spawn_ss_with_plugin(method, password, Protocols::TCP, plugin_path, opts, LOOPBACK, None).await
 }
 
 /// Front a held ss-server with a SERVER-mode plugin (websocket + TLS). Same
@@ -126,7 +206,7 @@ pub async fn start_real_ss_server_with_plugin_ws_tls(
     certs: &TestCerts,
 ) -> (SocketAddr, PluginServer) {
     let opts = format!("server;host=cloudfront.com;path=/;tls;{}", certs.plugin_opts_fragment());
-    spawn_ss_with_plugin(method, password, Protocols::TCP, plugin_path, &opts).await
+    spawn_ss_with_plugin(method, password, Protocols::TCP, plugin_path, &opts, LOOPBACK, None).await
 }
 
 /// Front a held ss-server with a QUIC-transport SERVER-mode plugin. QUIC
@@ -146,7 +226,7 @@ pub async fn start_real_ss_server_with_plugin_quic(
     certs: &TestCerts,
 ) -> (SocketAddr, PluginServer) {
     let opts = format!("server;host=cloudfront.com;mode=quic;{}", certs.plugin_opts_fragment());
-    spawn_ss_with_plugin(method, password, Protocols::UDP, plugin_path, &opts).await
+    spawn_ss_with_plugin(method, password, Protocols::UDP, plugin_path, &opts, LOOPBACK, None).await
 }
 
 /// Keeps a plugin-fronted ss-server alive for a test's duration. Hold it for as
@@ -178,7 +258,7 @@ impl Drop for PluginServer {
 /// ss-server with a single-plugin `ChainRunner(Mode::Server)` and return the
 /// public address. Symmetric to the client-side
 /// [`crate::roundtrip::run_roundtrip`]; readiness is inferred from the plugin's
-/// own sitrep `hello` ([`ReadinessMode::Auto`]).
+/// own sitrep `hello` ([`ReadinessMode::Auto`]). The plugin's public endpoint is on `listen`.
 ///
 /// The public port is PRE-ALLOCATED. ex-ray rejects port 0 (v2ray-core does not
 /// expose an OS-assigned bound port — see crates/ex-ray/main.go), so an ephemeral
@@ -198,11 +278,13 @@ async fn spawn_ss_with_plugin(
     public_bind_protocols: Protocols,
     plugin_path: &str,
     plugin_opts: &str,
+    listen: IpAddr,
+    outbound: Option<&OutboundInterface>,
 ) -> (SocketAddr, PluginServer) {
     // Plain ss-server on a HELD loopback port (no plugin). The plugin chain
     // forwards decapsulated traffic here; the port is held for the server's
     // lifetime, so there is no bind-and-drop rendezvous race.
-    let (ss_addr, ss_handle) = start_real_ss_server(method, password).await;
+    let (ss_addr, ss_handle) = start_real_ss_server_via(method, password, LOOPBACK, outbound).await;
 
     let mut attempt: u32 = 0;
     loop {
@@ -211,7 +293,7 @@ async fn spawn_ss_with_plugin(
         // Pre-allocate the public port through the crate's reservation seam —
         // the port must be returned to us so the plugin SUBPROCESS can bind it
         // out-of-process.
-        let public_port = ports::reserve_public(public_bind_protocols)
+        let public_port = ports::reserve_public(listen, public_bind_protocols)
             .await
             .expect("spawn_ss_with_plugin: allocate public port")
             .port();
@@ -230,9 +312,9 @@ async fn spawn_ss_with_plugin(
             .cancel_token(cancel.clone())
             .on_ready(ready_tx);
         let env = PluginEnv {
-            local_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            local_host: LOOPBACK,
             local_port: ss_addr.port(),
-            remote_host: "127.0.0.1".to_string(),
+            remote_host: listen.to_string(),
             remote_port: public_port,
             plugin_options: None, // BinaryPlugin carries its own SS_PLUGIN_OPTIONS
         };

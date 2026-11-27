@@ -221,3 +221,6 @@ The **elevated lane** (`SKULD_LABELS=tun`) is the only one that touches the oper
 {src}`crates/tun-engine/src/sim.rs` lists what only it proves: a real adapter with the requested name, MTU and address;
 the OS routing packets into it and accepting packets written out of it; adapter-handle lifetime; and real egress from
 the proxy and bypass paths. Those tests are the `*_privileged_tests.rs` files and `tests/*_privileged.rs`.
+
+The **installed lane** runs the product a user installs (the MSI on Windows, the app's bridge on macOS), connecting both
+SOCKS-only and with a full tunnel. It runs against the files a release would publish. [The installers](installers.md#the-install-e2e-and-uninstall-run) lists the cases and what each checks.

@@ -197,6 +197,10 @@ targets:
     # server as the installing user, not elevated, before and after two service
     # restarts. It de-elevates with the gsudo that `provision-e2e-tools` fetched.
     #
+    # The full-tunnel case (test_full_tunnel.py) starts a full tunnel as that same user against the same server, which
+    # dials out of the machine's real interface: it needs the internet,
+    # and the machine's routes and DNS are the tunnel's for a few seconds.
+    #
     # Run in this order: each file installs for itself, and the upgrade refuses a
     # machine with Hole on it (see test_upgrade.py).
     #
@@ -209,7 +213,7 @@ targets:
       - uv lock --check --offline --directory msi-installer
       - .github/scripts/retry.sh uv sync --directory msi-installer --group dev
       - uv run --directory msi-installer --group dev provision-e2e-tools
-    run: uv run --directory msi-installer --group dev pytest -v -s -m system_wide tests/installed/test_lifecycle.py tests/installed/test_cli_output.py tests/installed/test_connect.py tests/installed/test_member_access.py tests/installed/test_upgrade.py
+    run: uv run --directory msi-installer --group dev pytest -v -s -m system_wide tests/installed/test_lifecycle.py tests/installed/test_cli_output.py tests/installed/test_connect.py tests/installed/test_member_access.py tests/installed/test_full_tunnel.py tests/installed/test_upgrade.py
 
   hole-msi-cleanup:
     # Uninstalls what an interrupted `hole-msi-install-tests` left (a step timeout
@@ -220,15 +224,18 @@ targets:
 
   hole-dmg-install-e2e:
     # Installs the built Hole.app's bridge as root and connects through each
-    # bundled plugin and without one, on the layout a user's machine has. It mutates the
-    # host (root daemon, launchd job) and needs passwordless sudo, so it is its
-    # own target: `hole-dmg-tests` stays safe to run locally.
+    # bundled plugin and without one, SOCKS-only and as a full tunnel, on the layout a
+    # user's machine has. It mutates the host (root daemon, launchd job; routes and DNS
+    # during a tunnel), needs the internet and passwordless sudo, so it is its own
+    # target: `hole-dmg-tests` stays safe to run locally.
     #
     # Run-only, no `depends:`: it consumes the app, `galoshes` and `ex-ray` that
     # `hole-dmg` built in the same job, so a second cascade here would roll the
     # flaky bundle_dmg.sh/hdiutil pipeline twice.
+    #
+    # `-s`: each full-tunnel case prints the machine's raw state into the log, passing or failing.
     platforms: [darwin/amd64, darwin/arm64]
-    run: uv run --directory dmg-installer pytest -v -m install_e2e
+    run: uv run --directory dmg-installer pytest -v -s -m install_e2e
 
   npm-install:
     # `node_modules/` from `package-lock.json`, and nothing built. `frontend-build` (the Vite bundle) and

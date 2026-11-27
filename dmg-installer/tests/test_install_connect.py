@@ -6,7 +6,9 @@ a user's machine does: `hole bridge install` copies the `hole` binary to
 /Library/PrivilegedHelperTools and launchd runs that copy as root. A start that
 names a bundled plugin must still find it.
 
-The connection itself is `connect_journey`, shared with the Windows installer suite.
+The connection itself is `connect_journey`, shared with the Windows installer suite: a SOCKS-only start that fetches
+a local page, and a full tunnel that fetches pages from outside the machine and, for a plugin that carries UDP, sends
+a QUIC Version Negotiation probe through it.
 
 Elevation is `sudo -n`, where the GUI uses osascript; both run the same
 `hole bridge install` as root with SUDO_USER set. IPC goes through the `hole
@@ -23,8 +25,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from connect_journey import SERVER_IDS, SERVERS, connect_and_fetch, report_teardown_failure
+from connect_journey import (
+    SERVER_IDS,
+    SERVERS,
+    connect_and_fetch,
+    full_tunnel_journey,
+    report_teardown_failure,
+    run_far_side,
+)
 from connect_journey import ss_server, target  # noqa: F401 (fixtures)
+from macos_machine import MacMachine
 
 from dmg_installer.installed_bridge import (
     HELPER_PATH,
@@ -166,3 +176,19 @@ def test_installed_bridge_connects(
     bridge: Bridge, ss_server: dict, target: tuple[int, str], plugin: str | None, tmp_path: Path
 ) -> None:
     connect_and_fetch(bridge, ss_server, plugin, target, tmp_path)
+
+
+@pytest.mark.parametrize(("plugin", "kind"), SERVERS, ids=SERVER_IDS)
+def test_installed_bridge_carries_a_full_tunnel(bridge: Bridge, plugin: str | None, kind: str, tmp_path: Path) -> None:
+    """The default of `hole proxy start`: every route in the tunnel, DNS pointed at Hole, pages from outside the machine.
+
+    The far side runs on this machine, so its own dials leave through the default interface, not the routing table the
+    tunnel now owns. It is reached at the interface's own address, so the product installs the host route that keeps its
+    connection to the server out of the tunnel, and the case checks that it is installed and removed. The system
+    delivers to an address of its own locally, so nothing crosses that route.
+
+    The case holds `MacMachine.scoped_default_route` for the far side's dials. It needs the internet.
+    """
+    machine = MacMachine()
+    with machine.scoped_default_route(), run_far_side(kind, tmp_path, machine) as server:
+        full_tunnel_journey(bridge, server, plugin, machine, tmp_path)

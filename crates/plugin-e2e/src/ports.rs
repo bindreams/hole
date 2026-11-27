@@ -36,8 +36,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use util::port_alloc::{free_port, Protocols};
 
-async fn reserve(protocols: Protocols) -> io::Result<SocketAddr> {
-    let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+async fn reserve(ip: IpAddr, protocols: Protocols) -> io::Result<SocketAddr> {
     let port = free_port(ip, protocols).await?;
     Ok(SocketAddr::new(ip, port))
 }
@@ -45,19 +44,19 @@ async fn reserve(protocols: Protocols) -> io::Result<SocketAddr> {
 /// Reserve the SIP003 client plugin's local endpoint (`SS_LOCAL_*`). TCP+UDP
 /// — see the module doc for why.
 pub async fn reserve_ss_local() -> io::Result<SocketAddr> {
-    reserve(Protocols::TCP | Protocols::UDP).await
+    reserve(IpAddr::V4(Ipv4Addr::LOCALHOST), Protocols::TCP | Protocols::UDP).await
 }
 
 /// Reserve an endpoint that nothing in the test binds. TCP+UDP — see the
 /// module doc for why.
 pub async fn reserve_unbound() -> io::Result<SocketAddr> {
-    reserve(Protocols::TCP | Protocols::UDP).await
+    reserve(IpAddr::V4(Ipv4Addr::LOCALHOST), Protocols::TCP | Protocols::UDP).await
 }
 
-/// Reserve a plugin's public endpoint for exactly the protocols it will
+/// Reserve a plugin's public endpoint on `ip` for exactly the protocols it will
 /// bind there.
-pub async fn reserve_public(protocols: Protocols) -> io::Result<SocketAddr> {
-    reserve(protocols).await
+pub async fn reserve_public(ip: IpAddr, protocols: Protocols) -> io::Result<SocketAddr> {
+    reserve(ip, protocols).await
 }
 
 #[cfg(test)]
