@@ -930,9 +930,12 @@ def full_tunnel_journey(
             if not ipaddress.ip_address(address).is_loopback:
                 problems += bypass_problems(before, during, address)
     except BaseException:
-        # That failure stays the reported one.
-        for problem in [*problems, *stop_problems(hole, machine, before)]:
-            print(f"teardown after an earlier failure:\n{problem}", file=sys.stderr)
+        # That failure stays the reported one. What the checks found prints first, so that it is out even if the stop
+        # itself raises.
+        for problem in problems:
+            print(f"a check found, before that failure:\n{problem}", file=sys.stderr)
+        for problem in stop_problems(hole, machine, before):
+            report_teardown_failure(problem, primary_ok=False)
         raise
     problems += stop_problems(hole, machine, before)
     if problems:
