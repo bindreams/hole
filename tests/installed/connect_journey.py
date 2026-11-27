@@ -434,8 +434,8 @@ class Settled(Generic[T]):
     """What `ChangeWatch.settle` read."""
 
     reading: T
-    # Empty when `reading` is one for which `settled` held; otherwise what ran out, for the report. The reading is then
-    # the last one made, begun inside the bound, whatever a later one would say.
+    # Empty when `reading` is one for which `settled` held; otherwise why it did not, for the report. The reading is
+    # then the last one made, whatever a later one would say.
     unsettled: str = ""
 
 
@@ -613,8 +613,9 @@ def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
     The relay check reads the lines this case added, once, after the sender exits. The far side writes its line before
     it forwards, so a reply that came through it has its line already: no line is a red whatever the reply was. A line
     from a second client address names the cause of a no-reply red. shadowsocks-service 1.24.0 keeps one outbound
-    socket per address family per association (`UdpAssociationContext`, `server/udprelay.rs`), so a datagram that comes back to the far side
-    through the tunnel (a looping egress) arrives from a new address and draws no reply. Under the contracts at
+    socket per address family per association (`UdpAssociationContext`, `server/udprelay.rs`), so a datagram that
+    comes back to the far side through the tunnel (a looping egress) arrives from a new address and draws no reply.
+    Under the contracts at
     `UDP_TARGET`, a second address is such a datagram. The check does not see a datagram the product relays more than
     once from the one address, or a line the far side writes after the read.
     """

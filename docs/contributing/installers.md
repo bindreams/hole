@@ -88,8 +88,8 @@ runs 45953182365 and 45962345199, Windows, with `galoshes` and with no plugin: 6
 where the server was changed to make no address bind and so sent its own relay back through the tunnel, each pass of
 the loop reaching it from a new address; the change was to the server only, not the product; macOS has been seen with
 single sends only). The server (shadowsocks-service 1.24.0) keeps one outbound socket per address family per
-association (`UdpAssociationContext` in `server/udprelay.rs`; an IPv4 target goes out on the IPv6 one, as an
-IPv4-mapped address), so a datagram that comes back to the server draws no reply: a second
+association (`UdpAssociationContext` in `server/udprelay.rs`; on the runners an IPv4 target goes out on the IPv6 one,
+and its replies arrive from `[::ffff:8.8.4.4]:443`), so a datagram that comes back to the server draws no reply: a second
 client address names the cause of a case with no reply, and the case reports it, with the addresses printed. The child
 resends the same packet, with the same connection IDs, so that a lost datagram or a rate-limited answer does not fail
 the case, and a socket error does not end it. Because of the resends, a datagram the product relays twice from the one
@@ -124,8 +124,8 @@ server out of the tunnel. A tunnel to a remote server needs that route and a sto
 install, use or compare it ([#1412](https://github.com/bindreams/hole/issues/1412)). The case cannot put the server at the
 machine's own address instead: Windows refuses the host route for it, so `hole proxy start` fails with `route setup failed`.
 
-The case needs the internet, and the machine's routes and DNS belong to the tunnel while each case runs (4 to 14 seconds
-each in CI, and longer when a wait runs to its bound).
+The case needs the internet, and the machine's routes and DNS belong to the tunnel while each case runs: seconds when
+everything answers, minutes when a wait or a command runs to its bound.
 The machine must bind IPv6 on the tunnel's adapter: where it does not, the product makes the IPv6 split routes non-fatal,
 and the case fails on its route check.
 
