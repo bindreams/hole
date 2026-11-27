@@ -15,9 +15,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-latest, macos-15-intel, ubuntu-latest]
+        runner: [windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - run: python3 .github/udp-egress-probe.py
+      - run: python .github/udp-egress-probe.py
       - if: ${{ startsWith(matrix.runner, 'macos') }}
         run: sntp time.apple.com || true
