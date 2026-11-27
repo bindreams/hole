@@ -172,9 +172,9 @@ def run_ss_server(
 ) -> Iterator[SsServer]:
     """A shadowsocks server, plain or fronted by a server-mode plugin, via the plugin-e2e fixture.
 
-    `kind` is the `ss_plugin_server` argument. With `outbound`, the server's own dials leave through that interface and
-    its sockets are bound to the address, not left to the routing table: a server on the machine of a full tunnel needs
-    both, or its dials loop back into the tunnel. `listen` is the address the server, or the plugin in front of it,
+    `kind` is the `ss_plugin_server` argument. With `outbound`, the server's own dials leave through that interface, not
+    the routing table, or they loop back into the tunnel of the machine it runs on; on Windows its sockets are also bound
+    to the address. `listen` is the address the server, or the plugin in front of it,
     listens on: loopback when `None`. It needs an `outbound`.
     """
     assert outbound is not None or listen is None, "a listen address comes with an outbound interface"
@@ -239,8 +239,9 @@ def run_ss_server(
 def run_far_side(kind: str, tmp_path: Path, machine: "MachineView") -> Iterator[SsServer]:
     """`run_ss_server` for a full tunnel, as the machine says it is reached.
 
-    The server's own dials leave through the machine's default interface, bound to its address. It listens where the
-    machine says it is reached (`machine.far_side_address()`), TCP and UDP both, and its description names that address.
+    The server's own dials leave through the machine's default interface (on Windows, bound to its address). It listens
+    where the machine says it is reached (`machine.far_side_address()`), TCP and UDP both, and its description names
+    that address.
     """
     outbound = Outbound(machine.default_interface(), machine.default_interface_address())
     with run_ss_server(kind, tmp_path, outbound, machine.far_side_address()) as server:
@@ -465,7 +466,7 @@ class MachineView(Protocol):
         ...
 
     def default_interface_address(self) -> str:
-        """The IPv4 address of `default_interface()`, which the far side's sockets are bound to."""
+        """The IPv4 address of `default_interface()`, which the far side's sockets are bound to on Windows."""
         ...
 
     def far_side_address(self) -> str | None:

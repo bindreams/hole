@@ -109,8 +109,8 @@ pub struct OutboundInterface {
 ///
 /// Binding the IPv4 address makes the server's sockets IPv4-only: on Windows a dial to a native IPv6 target fails, TCP
 /// with `WSAENETUNREACH` and UDP with `WSAEADDRNOTAVAIL` (measured with a socket bound to a mapped address, as
-/// shadowsocks binds it). macOS gets no such bind: there shadowsocks sets `IPV6_BOUND_IF` after binding the mapped
-/// address, and that fails with `EINVAL` on every UDP relay (measured on a CI runner).
+/// shadowsocks binds it). The bind is made on Windows only. On macOS shadowsocks sets `IPV6_BOUND_IF` after binding the
+/// mapped address, and that fails with `EINVAL` on every UDP relay (measured on a CI runner).
 pub async fn start_real_ss_server_via(
     method: CipherKind,
     password: &str,

@@ -6,10 +6,9 @@
 //! plugin) and then serves until stdin reaches EOF, so the parent's exit ends the server.
 //!
 //! Usage: `ss_plugin_server <ex-ray|galoshes|none> [<outbound-interface> <its-ipv4-address> [<listen-address>]]`.
-//! With an interface, the server's own dials to its targets leave through it, not through the routing table, and its
-//! sockets are bound to the address: a server on the machine of a full tunnel needs both, or its dials loop back into
-//! the tunnel. TCP needs only the interface; an IPv4 UDP relay of the server is held by the address
-//! (`ssserver::start_real_ss_server_via`). The server, or the plugin in front of it, listens on the listen address
+//! With an interface, the server's own dials to its targets leave through it, not through the routing table, or they
+//! loop back into the tunnel of the machine it runs on. On Windows its sockets are also bound to the address, which
+//! holds an IPv4 UDP relay there (`ssserver::start_real_ss_server_via`). The server, or the plugin in front of it, listens on the listen address
 //! (loopback when none is given) and the description names it.
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged

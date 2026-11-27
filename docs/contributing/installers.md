@@ -73,8 +73,8 @@ start that succeeded the case checks these things, and a failure lists each one 
 
 The server's sockets are bound to the interface's address because an IPv4 UDP relay of the server is sent on an IPv6
 socket, which the interface alone does not hold on Windows: without the bind one datagram became 256 relays through the
-tunnel. The bind makes the server IPv4-only, so a dial to an IPv6 target fails; the case asks for none. The macOS server
-is not bound to an address: there the same bind makes every UDP relay fail with `EINVAL`.
+tunnel. The bind makes the server IPv4-only, so a dial to an IPv6 target fails; the case asks for none. Only the Windows
+server is bound to an address: on macOS the same bind makes every UDP relay fail with `EINVAL`.
 
 The DNS check reads what Windows was told. Nothing in the case shows that a lookup goes to those servers: the request by
 name is answered through the tunnel when the machine's earlier resolver is asked, too.

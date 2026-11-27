@@ -43,16 +43,17 @@ ACK_WAIT = "streams waiting for ACK"
 @pytest.fixture(scope="module", autouse=True)
 def yamux_debug_environment(installed_hole: Path, request: pytest.FixtureRequest) -> Iterator[None]:
     """The `HoleBridge` service's `Environment` value holds `SERVICE_ENVIRONMENT` while this module runs, in place of
-    any entry of the same names."""
+    any entry of the same names (compared as Windows does, ignoring case)."""
     import winreg  # Windows only
 
+    failed_before = request.session.testsfailed
     with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, SERVICE_KEY, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
         try:
             previous = winreg.QueryValueEx(key, "Environment")[0]
         except FileNotFoundError:
             previous = None
-        names = {entry.partition("=")[0] for entry in SERVICE_ENVIRONMENT}
-        kept = [entry for entry in previous or [] if entry.partition("=")[0] not in names]
+        names = {entry.partition("=")[0].casefold() for entry in SERVICE_ENVIRONMENT}
+        kept = [entry for entry in previous or [] if entry.partition("=")[0].casefold() not in names]
         winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, [*kept, *SERVICE_ENVIRONMENT])
         try:
             restart_service()
@@ -66,7 +67,7 @@ def yamux_debug_environment(installed_hole: Path, request: pytest.FixtureRequest
                 restart_service()
             except AssertionError as e:
                 # A bridge that died during a case cannot be stopped; that case's failure is the one to report.
-                report_teardown_failure(str(e), primary_ok=request.session.testsfailed == 0)
+                report_teardown_failure(str(e), primary_ok=request.session.testsfailed == failed_before)
 
 
 def show_ack_waits(member: UnelevatedMember) -> None:
