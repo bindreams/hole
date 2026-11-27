@@ -18,7 +18,7 @@ from typing import TypeVar
 
 from connect_journey import ChangeWatch, MachineReadError, Resolver, Route, Settled, Snapshot, settle_on_notices
 from member import UnelevatedMember
-from support import SCRIPTS
+from support import HOLE_CLI_TIMEOUT_SECONDS, SCRIPTS
 
 NETWORK_STATE = SCRIPTS / "network-state.ps1"
 
@@ -108,23 +108,27 @@ class WindowsMachine:
     person: UnelevatedMember
 
     def _state(self, what: str) -> str:
-        result = subprocess.run(
-            [
-                "pwsh",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(NETWORK_STATE),
-                "-What",
-                what,
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "pwsh",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(NETWORK_STATE),
+                    "-What",
+                    what,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=HOLE_CLI_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise MachineReadError(f"network-state.ps1 -What {what} did not exit within {e.timeout}s") from e
         if result.returncode != 0:
             raise MachineReadError(f"network-state.ps1 -What {what} exited {result.returncode}:\n{result.stderr}")
         return result.stdout
