@@ -116,6 +116,8 @@ install, use or compare it ([#1412](https://github.com/bindreams/hole/issues/141
 machine's own address instead: Windows refuses the host route for it, so `hole proxy start` fails with `route setup failed`.
 
 The case needs the internet, and the machine's routes and DNS belong to the tunnel for a few seconds.
+The machine must bind IPv6 on the tunnel's adapter: where it does not, the product makes the IPv6 split routes non-fatal,
+and the case fails on its route check.
 
 ```{warning}
 This installs Hole system-wide on the machine you run it on. Use a throwaway machine or virtual machine, not the one you
