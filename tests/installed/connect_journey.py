@@ -784,8 +784,8 @@ def full_tunnel_journey(
     the interface, get `ENETUNREACH` once the tunnel's routes win the table. Fails if the start does not succeed, and
     then for each of these that does not hold: a page by address and one by name arrive through the far side
     (`page_problems`), for a plugin that carries UDP a datagram of the person's, resent until answered, is answered
-    through the far side (`udp_problems`), the system holds the tunnel's resolver (`dns_problems`) and its device and routes
-    (`device_problems`), and after the stop the machine is as it was (`stop_problems`).
+    through the far side (`udp_problems`), the system holds the tunnel's resolver (`dns_problems`) and its device and
+    routes (`device_problems`), and after the stop the machine is as it was (`stop_problems`).
 
     For a server that is not on loopback it also checks the route that keeps the product's connection to the server out
     of the tunnel (`bypass_problems`). On loopback the product installs none, and the journey does not see that route.

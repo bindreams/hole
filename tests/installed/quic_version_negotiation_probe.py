@@ -7,8 +7,8 @@ the same bytes each time, until a reply arrives or `seconds` have passed. Becaus
 connection IDs, any reply answers the probe. Prints one JSON line:
 `{"sent_dcid": <hex>, "sent_scid": <hex>, "sends": <int>, "reply": <bytes>, "version": <int>, "dcid": <hex>,
 "scid": <hex>}`, where `version`, `dcid` and `scid` are the reply's long-header fields (`null` for a reply that is not a
-long header or is too short to hold them). `{"reply": null, ...}` means no reply came in `seconds`; with `"error": <name>` too, the last socket error the probe
-saw. A socket error does not end the probe (Windows raises `ConnectionResetError` for the ICMP error on a connected UDP
+long header or is too short to hold them). `{"reply": null, ...}` means no reply came in `seconds`; with
+`"error": <name>` too, the last socket error the probe saw. A socket error does not end the probe (Windows raises `ConnectionResetError` for the ICMP error on a connected UDP
 socket, and an unreachable target raises `ConnectionRefusedError` elsewhere): it resends at the usual pace until a reply
 or `seconds`. `sends` counts the datagrams `send` accepted.
 
