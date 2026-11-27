@@ -450,37 +450,31 @@ def settle_on_notices(
     """`read()` until `settled` holds, reading again on each notice from the system that something changed.
 
     `arm()` is called before each reading, so a notice that arrives after it is not lost; `wait(seconds)` returns
-    when a notice has arrived (`True`) or the time is up (`False`). The system is not ours, so `SETTLE_SECONDS` is the
-    failure report on a notice it never sent: when it runs out the last reading is returned with `unsettled` saying
-    which way it ran out, and no reading begun after the bound decides a pass. `source` names the notices, for that
-    text.
+    when a notice has arrived (`True`) or the time is up (`False`). One return may stand for many notices. The system is
+    not ours, so `SETTLE_SECONDS` is the failure report on a notice it never sent: when it runs out the last reading is
+    returned with `unsettled` giving the number of readings and which way the time ran out. A reading is begun only
+    when the clock, read just before it, is inside the bound. `source` names the notices, for that text.
     """
     deadline = time.monotonic() + SETTLE_SECONDS
-    notices = 0
+    readings = 0
     while True:
         arm()
         reading = read()
+        readings += 1
         if settled(reading):
             return Settled(reading)
         remaining = deadline - time.monotonic()
-        late = False
-        if remaining > 0 and wait(remaining):
-            if time.monotonic() < deadline:
-                notices += 1
-                continue
-            late = True
-        if not notices and late:
-            return Settled(
-                reading,
-                f"no notice of a change came from {source} before the bound; one came at it, too late for a reading",
-            )
-        if not notices:
-            return Settled(reading, f"no notice of a change came from {source} in the {SETTLE_SECONDS} s allowed")
-        text = (
-            f"{notices} notice(s) of a change came from {source} in the {SETTLE_SECONDS} s allowed, and the reading "
-            "after each still did not hold"
+        if remaining <= 0:
+            ending = "the last reading ended past the bound"
+        elif not wait(remaining):
+            ending = f"no notice of a change came from {source} after the last reading"
+        elif time.monotonic() >= deadline:
+            ending = f"a notice from {source} came at the bound, too late for another reading"
+        else:
+            continue
+        return Settled(
+            reading, f"the {SETTLE_SECONDS} s bound ran out after {readings} reading(s), none of which held; {ending}"
         )
-        return Settled(reading, text + ("; one more came at the bound, too late for a reading" if late else ""))
 
 
 class ChangeWatch(Protocol):
