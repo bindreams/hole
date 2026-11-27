@@ -15,9 +15,13 @@ function Get-DefaultInterface {
 
 function Get-DefaultAddress {
   $alias = Get-DefaultInterface
-  # An interface with no IPv4 address makes `Get-NetIPAddress` itself fail, with a message about the filter and not about
-  # this interface. The lowest address, so that the choice does not depend on the order Windows lists them in.
-  $usable = @(Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  # An interface with no IPv4 address makes `Get-NetIPAddress` itself fail (category ObjectNotFound), with a message about
+  # the filter and not about this interface; that error is the "none" below and any other error is the cause. The lowest
+  # address, so that the choice does not depend on the order Windows lists them in.
+  $listed = try { Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction Stop } catch {
+    if ($_.CategoryInfo.Category -ne 'ObjectNotFound') { throw }
+  }
+  $usable = @($listed |
       Where-Object { -not $_.SkipAsSource -and $_.AddressState -eq 'Preferred' -and $_.IPAddress -notlike '169.254.*' } |
       Sort-Object { [version]$_.IPAddress })
   if (-not $usable) {
