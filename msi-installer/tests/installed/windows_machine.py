@@ -42,9 +42,7 @@ class _IpChangeWatch:
     changes they wait for runs.
 
     These are the tables `network-state.ps1` reads its interfaces, routes and addresses from. Windows publishes no
-    notice for a change of an interface's DNS servers, and the DNS row needs no wait of its own: the write is made
-    inside the call that starts the tunnel, and the interface's keys are deleted before the call that stops it returns
-    (`network-state.ps1`).
+    notice for a change of an interface's DNS servers; DNS needs no wait of its own (see `network-state.ps1`).
     """
 
     def __init__(self) -> None:
@@ -77,9 +75,9 @@ class _IpChangeWatch:
             raise
 
     def close(self) -> None:
-        for handle in self._handles:
-            self._cancel(handle)
+        statuses = [self._cancel(handle) for handle in self._handles]
         self._handles.clear()
+        assert not any(statuses), f"CancelMibChangeNotify2 returned {statuses}"
 
     def settle(self, read: Callable[[], T], settled: Callable[[T], bool]) -> Settled[T]:
         return settle_on_notices(

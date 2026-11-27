@@ -8,8 +8,11 @@ import ctypes
 import os
 import re
 import select
+import socket
+import struct
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -36,6 +39,16 @@ _SCOPED_SECTION = "DNS configuration (for scoped queries)"
 # configd posts this each time it has rebuilt the DNS configuration `scutil --dns` prints, which it does on its own
 # run loop, after the call that changed a setting has returned.
 _DNS_CHANGED = b"com.apple.system.SystemConfiguration.dns_configuration"
+
+# The routing socket (`socket(PF_ROUTE, SOCK_RAW)`) is sent a message for each change to a route, an interface or an
+# address. Each starts with the header every kind shares (`rt_msghdr`, `if_msghdr` and `ifa_msghdr`: `u_short` length,
+# `u_char` version, `u_char` type), so the type is the byte at offset 3. Values from XNU's `net/route.h` (RTM_*); a Mac
+# could not run this, CI is its measurement.
+_ROUTE_HEADER = struct.Struct("=HBB")
+_RTM_ADD, _RTM_DELETE, _RTM_CHANGE, _RTM_NEWADDR, _RTM_DELADDR, _RTM_IFINFO = 0x1, 0x2, 0x3, 0xC, 0xD, 0xE
+# What the snapshot reads: routes (`netstat`), interfaces and addresses (`ifconfig`). `route -n get`, which the snapshot
+# runs too, sends RTM_GET, which XNU delivers to every routing socket, so it is not a notice.
+_ROUTE_CHANGES = frozenset({_RTM_ADD, _RTM_DELETE, _RTM_CHANGE, _RTM_IFINFO, _RTM_NEWADDR, _RTM_DELADDR})
 
 # What a full tunnel is asked to reach from outside the machine; a route lookup for it says which way it would leave.
 _PROBE_ADDRESS = "1.1.1.1"
@@ -145,8 +158,7 @@ def _resolvers(read: Read) -> list[Resolver]:
     """The resolvers of `scutil --dns`.
 
     A resolver's scope is its lines other than the nameservers. Four more are left out: the `resolver #N` heading and
-    the `order` line, which place it among the others and so change when a resolver is added (the en0 resolver has no
-    `order` before a tunnel and `order : 200000` while it is up), and `flags` and `reach`, which say what the network
+    the `order` line, which place it among the others and so change when a resolver is added, and `flags` and `reach`, which say what the network
     can do now.
     """
     section = read("scutil", "--dns").split(_SCOPED_SECTION)[0]
@@ -171,34 +183,58 @@ def _resolvers(read: Read) -> list[Resolver]:
     return resolvers
 
 
-class _ConfigdWatch:
-    """A registration for configd's DNS-changed post (`notify(3)`), as the bridge's own macOS tests wait on it
-    (`tun_engine::test_utils::DnsConfigNotify`)."""
+class _MacChangeWatch:
+    """Registrations for configd's DNS-changed post (`notify(3)`), as the bridge's own macOS tests wait on it
+    (`tun_engine::test_utils::DnsConfigNotify`), and for the routing socket's messages about routes, interfaces and
+    addresses, the other tables a snapshot reads."""
 
     def __init__(self) -> None:
+        try:
+            self._routes = socket.socket(socket.AF_ROUTE, socket.SOCK_RAW)
+        except OSError as e:
+            raise MachineReadError(f"the routing socket could not be opened: {e}") from e
         self._notify = ctypes.CDLL(None)
         descriptor, token = ctypes.c_int(-1), ctypes.c_int(0)
         status = self._notify.notify_register_file_descriptor(
             ctypes.c_char_p(_DNS_CHANGED), ctypes.byref(descriptor), ctypes.c_int(0), ctypes.byref(token)
         )
         if status != 0:
+            self._routes.close()
             raise MachineReadError(f"notify_register_file_descriptor for configd's DNS-changed post returned {status}")
         self._descriptor, self._token = descriptor.value, token.value
 
     def close(self) -> None:
-        self._notify.notify_cancel(ctypes.c_int(self._token))
+        self._routes.close()
+        # Cancelling closes the descriptor.
+        status = self._notify.notify_cancel(ctypes.c_int(self._token))
+        assert status == 0, f"notify_cancel returned {status}"
 
     def _wait(self, seconds: float) -> bool:
-        """Wait for one post; `False` when none came within `seconds`."""
-        if not select.select([self._descriptor], [], [], seconds)[0]:
-            return False
-        # Each post writes the 4-byte token.
-        os.read(self._descriptor, 4)
-        return True
+        """Wait for a notice: configd's post, or a routing message of a kind in `_ROUTE_CHANGES`. `False` when none came
+        within `seconds`. Once one has come, everything already waiting is read too, so that a start's burst of
+        messages costs one reading and not one each."""
+        deadline = time.monotonic() + seconds
+        noticed = False
+        while True:
+            timeout = 0 if noticed else deadline - time.monotonic()
+            if timeout < 0:
+                return False
+            ready = select.select([self._descriptor, self._routes], [], [], timeout)[0]
+            if not ready:
+                return noticed
+            if self._descriptor in ready:
+                # Each post writes the 4-byte token.
+                os.read(self._descriptor, 4)
+                noticed = True
+            if self._routes in ready:
+                _, _, kind = _ROUTE_HEADER.unpack_from(self._routes.recv(65536))
+                noticed = noticed or kind in _ROUTE_CHANGES
 
     def settle(self, read: Callable[[], T], settled: Callable[[T], bool]) -> Settled[T]:
-        # A post waits in the descriptor until it is read, so none is lost between a reading and the wait.
-        return settle_on_notices(read, settled, arm=lambda: None, wait=self._wait, source="configd (a DNS change)")
+        # A message waits in its socket or descriptor until it is read, so none is lost between a reading and the wait.
+        return settle_on_notices(
+            read, settled, arm=lambda: None, wait=self._wait, source="configd (a DNS change) or the routing socket"
+        )
 
 
 def _has_scoped_default(read: Read, interface: str) -> bool:
@@ -234,8 +270,8 @@ class MacMachine:
         Such a socket (`IP_BOUND_IF`) looks routes up in the interface's scope only. A runner has none there, so once a
         tunnel's split routes win the unscoped table, the lookup finds nothing and `connect` returns `ENETUNREACH`.
         The route is added when the interface has no scoped default, through the gateway of the unscoped one, and
-        deleted on exit only if this added it. It also changes what the product's own interface-bound sockets see
-        (bindreams/hole#1414), so a journey of a Bypass rule must not hold it.
+        deleted on exit only if this added it. It also changes what the product's own interface-bound sockets see, so a
+        journey of a Bypass rule must not hold it.
         """
         transcript = _Transcript()
         interface = _default_interface(transcript.output)
@@ -281,7 +317,7 @@ class MacMachine:
 
     @contextmanager
     def watch_changes(self) -> Iterator[ChangeWatch]:
-        watch = _ConfigdWatch()
+        watch = _MacChangeWatch()
         try:
             yield watch
         finally:
