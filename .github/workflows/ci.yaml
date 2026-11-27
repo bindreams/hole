@@ -484,14 +484,14 @@ jobs:
         run: cargo build -p plugin-e2e --example ss_plugin_server
 
       # The bound on the wait for the installed bridge to answer and on each `sudo hole`: a bridge that
-      # stays up but never answers ends here, and the cleanup step prints its log. The full-tunnel cases
-      # bound their own waits (14 min when every one runs out: per case two fetches of 60 s, two waits for the system of
-      # 30 s and the lookup after the stop of 60 s, and in two of the three the UDP probe's 60 s), and the limit leaves
-      # room for all of them to fail by assertion.
+      # stays up but never answers ends here, and the cleanup step prints its log. The cases bound their own waits
+      # (17 min when every one runs out: the three SOCKS cases' fetches of 60 s; per full-tunnel case two fetches of
+      # 60 s, two waits for the system of 30 s and the lookup after the stop of 60 s, and in two of the three the UDP
+      # probe's 60 s), and the limit leaves room for all of them to fail by assertion.
       - id: dmg-install-e2e
         name: Install the bridge and connect through it
         if: ${{ !cancelled() && steps.dmg-install-server.outcome == 'success' }}
-        timeout-minutes: 15
+        timeout-minutes: 20
         shell: bash
         run: cargo xtask run hole-dmg-install-e2e
 
