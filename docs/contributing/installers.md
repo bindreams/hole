@@ -60,15 +60,20 @@ or is not the user the installer added. The child cannot read pytest's own tempo
 A fourth install starts a full tunnel, the default of `hole proxy start`, as that same user
 ({src}`msi-installer/tests/installed/test_full_tunnel.py`), once for a server behind each bundled plugin and once for a
 server with no plugin. The server runs on the test machine, so it dials out of the machine's default interface instead of
-the routing table, which the tunnel now owns. After a start that succeeded the case checks four things, and a failure
-lists each one that did not hold:
+the routing table, which the tunnel now owns, and its sockets are bound to that interface's own IPv4 address. After a
+start that succeeded the case checks these things, and a failure lists each one that did not hold:
 
-| Check   | What must hold                                                                                                                                                                                                                                                                                                         |
-| ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pages   | `curl`, run by the de-elevated child, requests `http://1.1.1.1/` and, over IPv4, `http://one.one.one.one/`. Each answers `301` with a `Location` for the host the request named, and the server opened a relay to that address while the page was fetched. The answer alone arrives from a machine with no tunnel too. |
-| DNS     | While the tunnel is up, Windows lists exactly one set of DNS servers it did not list before: `1.1.1.1` and `1.0.0.1`, the defaults of `hole proxy start`, on the tunnel's adapter.                                                                                                                                     |
-| Device  | While the tunnel is up, the machine has exactly one IP interface it did not have before, and `0.0.0.0/1` and `128.0.0.0/1` are routed into it.                                                                                                                                                                         |
-| Restore | After `hole proxy stop`, the IP interfaces, routes, addresses and DNS servers equal those read before the start. Temporary IPv6 addresses are left out: Windows replaces them on its own timer.                                                                                                                        |
+| Check   | What must hold                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Pages   | `curl`, run by the de-elevated child, requests `http://1.1.1.1/` and, over IPv4, `http://one.one.one.one/`. Each answers `301` with a `Location` for the host the request named, and the server opened a relay to that address while the page was fetched. The answer alone arrives from a machine with no tunnel too.                                                                                             |
+| DNS     | While the tunnel is up, Windows lists exactly one set of DNS servers it did not list before: `1.1.1.1` and `1.0.0.1`, the defaults of `hole proxy start`, on the tunnel's adapter.                                                                                                                                                                                                                                 |
+| Device  | While the tunnel is up, the machine has exactly one IP interface it did not have before, and `0.0.0.0/1` and `128.0.0.0/1` are routed into it.                                                                                                                                                                                                                                                                     |
+| UDP     | For a plugin that carries UDP (`galoshes`, and none), the de-elevated child sends one NTP request to `162.159.200.1:123`. Its reply reaches the child's socket, and the server relayed exactly one datagram to that address; more is the server's own relay coming back through the tunnel. The `v2ray-plugin` case sends none: the product drops UDP for a plugin without it, and the case does not see the drop. |
+| Restore | After `hole proxy stop`, the IP interfaces, routes, addresses and DNS servers equal those read before the start. Temporary IPv6 addresses are left out: Windows replaces them on its own timer.                                                                                                                                                                                                                    |
+
+The server's sockets are bound to the interface's address because an IPv4 UDP relay of the server is sent on an IPv6
+socket, which the interface alone does not hold on Windows: without the bind one datagram became 256 relays through the
+tunnel. The bind makes the server IPv4-only, so a dial to an IPv6 target fails; the case asks for none.
 
 The DNS check reads what Windows was told. Nothing in the case shows that a lookup goes to those servers: the request by
 name is answered through the tunnel when the machine's earlier resolver is asked, too.
@@ -168,7 +173,7 @@ cargo xtask run hole-dmg-install-e2e
 
 installs the built app's bridge as root, connects with `hole proxy start` to a server behind each bundled plugin and to
 one with no plugin, fetches a page through each, and uninstalls. It then starts a full tunnel for each of the three and
-makes the four checks of [the Windows lane's full-tunnel case](#the-install-e2e-and-uninstall-run). On macOS the DNS
+makes the checks of [the Windows lane's full-tunnel case](#the-install-e2e-and-uninstall-run). On macOS the DNS
 servers are those of the one resolver `scutil --dns` gained, read after configd has posted that it rebuilt the
 configuration; the device is the new `utun` interface; and the comparison after the stop leaves out neighbour and cloned
 routes and temporary IPv6 addresses. Each case prints, before the start and while the tunnel is up, everything the
@@ -178,7 +183,7 @@ test. The connections are the same code the Windows lane runs ({src}`tests/insta
 
 The macOS server is reached at the default interface's own address, through a relay in the test, so the product
 installs the host route that keeps its connection to the server out of the tunnel (`UGHS en0` through the gateway the
-default route had). A fifth check reads that route from the route table while the tunnel is up; the comparison after
+default route had). A further check reads that route from the route table while the tunnel is up; the comparison after
 the stop sees it gone (the cloned row the system keeps for the address, flags `L` and `W`, is left out like the other
 cloned routes). The route carries nothing: the system delivers to an address of the machine locally (the lookup answers
 `lo0` once the system has cloned a local entry, `en0` before), so the case does not see the route used.
