@@ -435,7 +435,7 @@ class Settled(Generic[T]):
 
     reading: T
     # Empty when `reading` is one for which `settled` held; otherwise what ran out, for the report. The reading is then
-    # the last one made before the bound ran out, whatever a later one would say.
+    # the last one made, begun inside the bound, whatever a later one would say.
     unsettled: str = ""
 
 
@@ -465,9 +465,9 @@ def settle_on_notices(
             return Settled(reading)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            ending = "the last reading ended past the bound"
+            ending = "the last reading and its check ended past the bound"
         elif not wait(remaining):
-            ending = f"no notice of a change came from {source} after the last reading"
+            ending = f"no notice of a change came from {source} since the last reading began"
         elif time.monotonic() >= deadline:
             ending = f"a notice from {source} came at the bound, too late for another reading"
         else:
