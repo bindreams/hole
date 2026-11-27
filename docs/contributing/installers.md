@@ -181,12 +181,12 @@ commands it read printed (`netstat -rn`, `ifconfig -a`, `scutil --dns`, and `rou
 default interface's scope), passing or failing. `hole` runs as root, as in the cases above, and `curl` runs as the user of the
 test. The connections are the same code the Windows lane runs ({src}`tests/installed/connect_journey.py`).
 
-The macOS server is reached at the default interface's own address, through a relay in the test, so the product
-installs the host route that keeps its connection to the server out of the tunnel (`UGHS en0` through the gateway the
-default route had). A further check reads that route from the route table while the tunnel is up; the comparison after
-the stop sees it gone (the cloned row the system keeps for the address, flags `L` and `W`, is left out like the other
-cloned routes). The route carries nothing: the system delivers to an address of the machine locally (the lookup answers
-`lo0` once the system has cloned a local entry, `en0` before), so the case does not see the route used.
+The macOS server listens at the default interface's own address, so the product installs the host route that keeps its
+connection to the server out of the tunnel (`UGHS en0` through the gateway the default route had). A further check reads
+that route from the route table while the tunnel is up; the comparison after the stop sees it gone (the cloned row the
+system keeps for the address, flags `L` and `W`, is left out like the other cloned routes). The route carries nothing:
+the system delivers to an address of the machine locally (the lookup answers `lo0` once the system has cloned a local
+entry, `en0` before), so the case does not see the route used.
 
 The server's own dials are bound to `en0`, and a runner has no default route in that interface's scope, so once the
 tunnel's routes win the table those dials fail with `ENETUNREACH`. The case adds

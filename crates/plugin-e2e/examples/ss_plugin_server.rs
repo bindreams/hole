@@ -5,14 +5,17 @@
 //! describing the server (the fields a `ServerEntry` needs; `plugin_opts` only for a
 //! plugin) and then serves until stdin reaches EOF, so the parent's exit ends the server.
 //!
-//! Usage: `ss_plugin_server <ex-ray|galoshes|none> [<outbound-interface> <its-ipv4-address>]`. With an interface, the
-//! server's own dials to its targets leave through it, not through the routing table, and its sockets are bound to the
-//! address: a server on the machine of a full tunnel needs both, or its dials loop back into the tunnel. TCP needs only
-//! the interface; an IPv4 UDP relay of the server is held by the address (`ssserver::start_real_ss_server_via`).
+//! Usage: `ss_plugin_server <ex-ray|galoshes|none> [<outbound-interface> <its-ipv4-address> [<listen-address>]]`.
+//! With an interface, the server's own dials to its targets leave through it, not through the routing table, and its
+//! sockets are bound to the address: a server on the machine of a full tunnel needs both, or its dials loop back into
+//! the tunnel. TCP needs only the interface; an IPv4 UDP relay of the server is held by the address
+//! (`ssserver::start_real_ss_server_via`). The server, or the plugin in front of it, listens on the listen address
+//! (loopback when none is given) and the description names it.
 
 #![allow(clippy::disallowed_methods)] // dev tooling, never privileged
 
 use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr};
 
 use plugin_e2e::locators::{locate_built_galoshes, locate_ex_ray};
 use plugin_e2e::ssserver::{
@@ -33,6 +36,12 @@ fn main() {
     route_logs(LevelFilter::Trace);
 
     let kind = std::env::args().nth(1).unwrap_or_default();
+    let listen = match std::env::args().nth(4) {
+        None => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        Some(listen) => listen
+            .parse()
+            .unwrap_or_else(|e| panic!("the listen address {listen:?} is not an IP address: {e}")),
+    };
     let outbound = match (std::env::args().nth(2), std::env::args().nth(3)) {
         (None, None) => None,
         (Some(name), Some(ipv4)) => Some(OutboundInterface {
@@ -49,7 +58,7 @@ fn main() {
         "galoshes" => Some((locate_built_galoshes(), "run `cargo xtask galoshes`")),
         "none" => None,
         other => panic!(
-            "usage: ss_plugin_server <ex-ray|galoshes|none> [<outbound-interface> <its-ipv4-address>], got {other:?}"
+            "usage: ss_plugin_server <ex-ray|galoshes|none> [<outbound-interface> <its-ipv4-address> [<listen-address>]], got {other:?}"
         ),
     };
 
@@ -64,13 +73,14 @@ fn main() {
                 TEST_METHOD,
                 TEST_PASSWORD,
                 plugin,
+                listen,
                 outbound,
             ));
             line["plugin_opts"] = WS_CLIENT_OPTS.into();
             (addr, Box::new(server))
         }
         None => {
-            let (addr, server) = rt.block_on(start_real_ss_server_via(TEST_METHOD, TEST_PASSWORD, outbound));
+            let (addr, server) = rt.block_on(start_real_ss_server_via(TEST_METHOD, TEST_PASSWORD, listen, outbound));
             (addr, Box::new(server))
         }
     };

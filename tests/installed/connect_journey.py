@@ -16,8 +16,6 @@ import ipaddress
 import json
 import os
 import re
-import socket
-import socketserver
 import subprocess
 import sys
 import threading
@@ -25,7 +23,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Generic, Protocol, TypeVar
 
@@ -169,13 +167,17 @@ class Outbound:
 
 
 @contextmanager
-def run_ss_server(kind: str, tmp_path: Path, outbound: Outbound | None = None) -> Iterator[SsServer]:
+def run_ss_server(
+    kind: str, tmp_path: Path, outbound: Outbound | None = None, listen: str | None = None
+) -> Iterator[SsServer]:
     """A shadowsocks server, plain or fronted by a server-mode plugin, via the plugin-e2e fixture.
 
     `kind` is the `ss_plugin_server` argument. With `outbound`, the server's own dials leave through that interface and
     its sockets are bound to the address, not left to the routing table: a server on the machine of a full tunnel needs
-    both, or its dials loop back into the tunnel.
+    both, or its dials loop back into the tunnel. `listen` is the address the server, or the plugin in front of it,
+    listens on: loopback when `None`. It needs an `outbound`.
     """
+    assert outbound is not None or listen is None, "a listen address comes with an outbound interface"
     if outbound is not None and not outbound.interface.strip():
         pytest.fail(
             f"the outbound interface asked for for the far side is empty ({outbound.interface!r}), which would send its "
@@ -198,10 +200,12 @@ def run_ss_server(kind: str, tmp_path: Path, outbound: Outbound | None = None) -
     )
     assert exe.is_file(), f"{exe} missing - run `cargo build -p plugin-e2e --example ss_plugin_server`"
 
+    # The example reads the listen address after the interface and its address.
+    server_args = [outbound.interface, outbound.address, *([listen] if listen else [])] if outbound else []
     stderr_path = tmp_path / "ss_plugin_server.stderr"
     with stderr_path.open("wb") as stderr:
         proc = subprocess.Popen(
-            [str(exe), kind, *([outbound.interface, outbound.address] if outbound is not None else [])],
+            [str(exe), kind, *server_args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,
@@ -231,73 +235,16 @@ def run_ss_server(kind: str, tmp_path: Path, outbound: Outbound | None = None) -
         print(f"=== ss_plugin_server {kind} stderr ===\n{stderr_text()}")
 
 
-def _shutdown(sock: socket.socket, how: int) -> None:
-    try:
-        sock.shutdown(how)
-    except OSError:
-        pass
-
-
-def _pump(source: socket.socket, sink: socket.socket) -> None:
-    """Copy `source` to `sink`. When `source` ends, `sink` is half-closed; on an error both are closed."""
-    try:
-        while data := source.recv(65536):
-            sink.sendall(data)
-    except OSError:
-        _shutdown(source, socket.SHUT_RDWR)
-        _shutdown(sink, socket.SHUT_RDWR)
-    else:
-        _shutdown(sink, socket.SHUT_WR)
-
-
-class _Forwarder:
-    """Relays TCP from `address` (any free port) to `target`: a far side that is reached at an address other than the
-    one it listens on."""
-
-    def __init__(self, address: str, target: tuple[str, int]) -> None:
-        class Handler(socketserver.BaseRequestHandler):
-            def handle(self) -> None:
-                with socket.create_connection(target) as upstream:
-                    back = threading.Thread(target=_pump, args=(upstream, self.request), daemon=True)
-                    back.start()
-                    _pump(self.request, upstream)
-                    back.join()
-
-        class Server(socketserver.ThreadingTCPServer):
-            daemon_threads = True
-            allow_reuse_address = True
-
-        self._server = Server((address, 0), Handler)
-        self.port: int = self._server.server_address[1]
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-
-    def __enter__(self) -> "_Forwarder":
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self._server.shutdown()
-        self._thread.join()
-        self._server.server_close()
-
-
 @contextmanager
 def run_far_side(kind: str, tmp_path: Path, machine: "MachineView") -> Iterator[SsServer]:
     """`run_ss_server` for a full tunnel, as the machine says it is reached.
 
-    The server's own dials leave through the machine's default interface, bound to its address. Where
-    `machine.far_side_address()` names an address, the description names it and a relay from it to the server;
-    `relayed()` still reads the server's own log.
+    The server's own dials leave through the machine's default interface, bound to its address. It listens where the
+    machine says it is reached (`machine.far_side_address()`), TCP and UDP both, and its description names that address.
     """
     outbound = Outbound(machine.default_interface(), machine.default_interface_address())
-    with run_ss_server(kind, tmp_path, outbound) as server:
-        address = machine.far_side_address()
-        if address is None:
-            yield server
-            return
-        target = (server.description["server"], server.description["server_port"])
-        with _Forwarder(address, target) as forwarder:
-            yield replace(server, description={**server.description, "server": address, "server_port": forwarder.port})
+    with run_ss_server(kind, tmp_path, outbound, machine.far_side_address()) as server:
+        yield server
 
 
 @pytest.fixture
@@ -522,7 +469,7 @@ class MachineView(Protocol):
         ...
 
     def far_side_address(self) -> str | None:
-        """The address a far side on this machine is reached at, or `None` for loopback.
+        """The address a far side on this machine listens on, or `None` for loopback.
 
         An address of the machine's own makes the product install the host route that keeps its connection to the
         server out of the tunnel (`bypass_problems` reads it). `None` where the system refuses that route.
