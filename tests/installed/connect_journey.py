@@ -462,11 +462,10 @@ def settle_on_notices(
         if settled(reading):
             return Settled(reading)
         remaining = deadline - time.monotonic()
-        if remaining > 0 and wait(remaining):
+        # A notice that lands just before the bound must not start a reading that decides a pass after it.
+        if remaining > 0 and wait(remaining) and time.monotonic() < deadline:
             notices += 1
-            # A wait may return on a notice at the bound itself (a drain of notices ends there).
-            if time.monotonic() < deadline:
-                continue
+            continue
         if notices == 0:
             return Settled(reading, f"no notice of a change came from {source} in the {SETTLE_SECONDS} s allowed")
         return Settled(

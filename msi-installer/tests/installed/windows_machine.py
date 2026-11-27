@@ -79,7 +79,7 @@ class _IpChangeWatch:
             except MachineReadError as e:
                 # The registration's own text stays in what `watching` gets.
                 if isinstance(registration, Exception):
-                    raise MachineReadError(f"{registration}; {e}") from registration
+                    raise MachineReadError(f"{type(registration).__name__}: {registration}; {e}") from registration
             raise
 
     def close(self) -> None:

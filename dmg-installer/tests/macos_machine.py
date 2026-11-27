@@ -225,16 +225,16 @@ class _MacChangeWatch:
             raise MachineReadError("; ".join(failures))
 
     def _wait(self, seconds: float) -> bool:
-        """Wait for a notice: configd's post, or a routing message of a kind in `_ROUTE_CHANGES`. `False` when none came
-        within `seconds`. Once one has come, what is already waiting is read too, so that a start's burst of messages
-        costs one reading and not one each; the reading of it ends at the deadline as well, whatever traffic there is."""
+        """Wait for a notice: configd's post, or a routing message of a kind in `_ROUTE_CHANGES`; other routing messages
+        are read and passed over. `False` when none came within `seconds`. Messages still queued after a notice cost at
+        most a reading each: the settle ends at the first reading that holds, however many are left."""
         deadline = time.monotonic() + seconds
-        noticed = False
         while True:
-            timeout = 0 if noticed else max(deadline - time.monotonic(), 0)
-            ready = select.select([self._descriptor, self._routes], [], [], timeout)[0]
-            if not ready:
-                return noticed
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            ready = select.select([self._descriptor, self._routes], [], [], remaining)[0]
+            noticed = False
             if self._descriptor in ready:
                 # Each post writes the 4-byte token.
                 os.read(self._descriptor, 4)
@@ -242,8 +242,8 @@ class _MacChangeWatch:
             if self._routes in ready:
                 _, _, kind = _ROUTE_HEADER.unpack_from(self._routes.recv(65536))
                 noticed = noticed or kind in _ROUTE_CHANGES
-            if time.monotonic() >= deadline:
-                return noticed
+            if noticed:
+                return True
 
     def settle(self, read: Callable[[], T], settled: Callable[[T], bool]) -> Settled[T]:
         # A message waits in its socket or descriptor until it is read, so none is lost between a reading and the wait.
