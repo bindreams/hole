@@ -452,7 +452,8 @@ def settle_on_notices(
     `arm()` is called before each reading, so a notice that arrives after it is not lost; `wait(seconds)` returns
     when a notice has arrived (`True`) or the time is up (`False`). The system is not ours, so `SETTLE_SECONDS` is the
     failure report on a notice it never sent: when it runs out the last reading is returned with `unsettled` saying
-    which way it ran out, and no reading made after the bound decides a pass. `source` names the notices, for that text.
+    which way it ran out, and no reading begun after the bound decides a pass. `source` names the notices, for that
+    text.
     """
     deadline = time.monotonic() + SETTLE_SECONDS
     notices = 0
@@ -462,17 +463,23 @@ def settle_on_notices(
         if settled(reading):
             return Settled(reading)
         remaining = deadline - time.monotonic()
-        # A notice that lands just before the bound must not start a reading that decides a pass after it.
-        if remaining > 0 and wait(remaining) and time.monotonic() < deadline:
-            notices += 1
-            continue
-        if notices == 0:
+        late = False
+        if remaining > 0 and wait(remaining):
+            if time.monotonic() < deadline:
+                notices += 1
+                continue
+            late = True
+        if not notices and late:
+            return Settled(
+                reading, f"the only notice of a change from {source} came at the bound, too late for a reading"
+            )
+        if not notices:
             return Settled(reading, f"no notice of a change came from {source} in the {SETTLE_SECONDS} s allowed")
-        return Settled(
-            reading,
+        text = (
             f"{notices} notice(s) of a change came from {source} in the {SETTLE_SECONDS} s allowed, and the reading "
-            "still did not hold",
+            "after each still did not hold"
         )
+        return Settled(reading, text + ("; one more came at the bound, too late for a reading" if late else ""))
 
 
 class ChangeWatch(Protocol):
@@ -778,6 +785,15 @@ def bypass_problems(before: Snapshot, during: Snapshot, address: str) -> list[st
     ]
 
 
+def tunnel_problems(before: Snapshot, during: Snapshot, address: str) -> list[str]:
+    """What `during` shows wrong with the tunnel the start made: its DNS, its interface and routes, and, for a far side
+    that is not on loopback, its route to the server. The start's settle waits for this to be empty."""
+    problems = dns_problems(before, during) + device_problems(before, during)
+    if not ipaddress.ip_address(address).is_loopback:
+        problems += bypass_problems(before, during, address)
+    return problems
+
+
 def show_machine(when: str, snapshot: Snapshot) -> None:
     """Print what the commands behind `snapshot` said, in full, whether the case passes or fails."""
     if snapshot.raw:
@@ -903,7 +919,7 @@ def full_tunnel_journey(
             settled = attempt(
                 problems,
                 "the reading of the machine after the start",
-                lambda: watch.settle(machine.snapshot, lambda snapshot: not dns_problems(before, snapshot)),
+                lambda: watch.settle(machine.snapshot, lambda snapshot: not tunnel_problems(before, snapshot, address)),
             )
         if settled is not None:
             show_machine("while the tunnel is up", settled.reading)
@@ -926,11 +942,7 @@ def full_tunnel_journey(
         if plugin in UDP_PLUGINS:
             run_check(problems, "the person's datagram", lambda: udp_problems(machine, server))
         if settled is not None:
-            during = settled.reading
-            problems += dns_problems(before, during)
-            problems += device_problems(before, during)
-            if not ipaddress.ip_address(address).is_loopback:
-                problems += bypass_problems(before, during, address)
+            problems += tunnel_problems(before, settled.reading, address)
     except BaseException:
         # That failure stays the reported one. What the checks found prints first, so that it is out even if the stop
         # itself raises.
