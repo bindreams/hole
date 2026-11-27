@@ -62,18 +62,19 @@ DEFAULT_ROUTE = "0.0.0.0/0"
 # `trace` (`udprelay`, which `ss_plugin_server` routes into `tracing` down to that level).
 RELAY_LOG = "shadowsocks_service::server::tcprelay=debug,shadowsocks_service::server::udprelay=trace"
 _RELAY = re.compile(r"established tcp tunnel \S+ <-> (\S+) with ")
-_UDP_RELAY = re.compile(r"udp relay \S+ -> (\S+) with (\d+) bytes, control")
+_UDP_RELAY = re.compile(r"udp relay (\S+) -> (\S+) with (\d+) bytes, control")
 
 # The datagram the person sends in each case that carries UDP: a QUIC long-header packet with a reserved version, which a
 # server answers with Version Negotiation (RFC 9000 sections 6.1 and 17.2.1). The sender builds the packet from
 # `UDP_SIZE` and the matcher counts the far side's relay lines by `UDP_TARGET` and `UDP_SIZE`, so they cannot disagree.
 #
-# The count is exact because nothing on the runners sends to `8.8.4.4` or `8.8.8.8` during a case. The far-side logs of
-# PR #1411's CI runs on darwin arm64, darwin amd64 and windows amd64 show no relay to either address but the journey's
-# own, and a bare-runner probe got Version Negotiation from `8.8.4.4:443` on macos-26-arm64, macos-15, ubuntu-26.04 and
-# windows-2025. The size is a second distinction only: it is above 1200, the smallest datagram that draws Version
-# Negotiation. A QUIC connection sends packets of any size once its handshake is done, so the contract above, not the
-# size, keeps the count exact.
+# The check rests on two contracts. Nothing else on the runners sends to `UDP_TARGET` during a case: the far-side logs of
+# PR #1411's CI runs on darwin arm64, darwin amd64 and windows amd64 show no relay to it but the journey's own, and a
+# bare-runner probe got Version Negotiation from it on macos-26-arm64, macos-15, ubuntu-26.04 and windows-2025. The size
+# is a second distinction only (above 1200, the smallest datagram that draws Version Negotiation); a QUIC connection
+# sends packets of any size once its handshake is done. And the product keeps one UDP association per source socket for
+# the life of the probe, so the far side sees every send from one client address (CI run 45953182365, Windows, galoshes
+# and no plugin: 60 resends, one address each; macOS has been seen with single sends only).
 UDP_HOST = "8.8.4.4"
 UDP_PORT = 443
 UDP_TARGET = f"{UDP_HOST}:{UDP_PORT}"
@@ -162,17 +163,14 @@ class SsServer:
         """
         return _RELAY.findall(self.stderr.read_text(encoding="utf-8", errors="replace"))
 
-    def udp_relayed(self) -> list[tuple[str, int]]:
-        """The target (`host:port`) and size in bytes of every UDP datagram the server has relayed so far, in order.
+    def udp_relayed(self) -> list[tuple[str, str, int]]:
+        """The client address (`host:port`, where the server took the datagram in from), target (`host:port`) and size in
+        bytes of every UDP datagram the server has relayed so far, in order.
 
         The server writes the line when it takes the datagram in, before it sends it on.
         """
         lines = _UDP_RELAY.findall(self.stderr.read_text(encoding="utf-8", errors="replace"))
-        return [(target, int(size)) for target, size in lines]
-
-    def udp_relayed_count(self) -> int:
-        """How many datagrams of the person's own (`UDP_TARGET`, `UDP_SIZE`) the server has relayed so far."""
-        return self.udp_relayed().count((UDP_TARGET, UDP_SIZE))
+        return [(client, target, int(size)) for client, target, size in lines]
 
 
 @dataclass(frozen=True)
@@ -590,38 +588,56 @@ def page_problems(
 
 def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
     """The person's datagram draws Version Negotiation from `UDP_TARGET`; the reply must reach the person's socket and
-    answer it, and the far side must have relayed the datagram at least once and no more often than it was sent.
+    answer it, and the far side must have relayed the datagram from one client address, at least once and no more often
+    than it was sent.
 
     The sender sends the same datagram until a reply comes, so the answer is a Version Negotiation packet whose
     connection IDs are the datagram's own, swapped (RFC 9000 section 17.2.1), whichever send it answers. The reply alone
-    shows nothing: it needs the far side's relay to have carried the datagram. The count is read once, after the sender
-    exits, and the healthy range is `1 <= relays <= sends`: sends made after the one that was answered can still be in
-    the tunnel, and the far side writes its relay line before it forwards. More relays than sends is a datagram that came
-    back to the far side: its own relay re-entering the tunnel.
+    shows nothing: it needs the far side's relay to have carried the datagram.
+
+    The relay check reads the lines this case added, once, after the sender exits. It rests on the contract that the
+    product keeps one UDP association per source socket for the life of the probe, so every send reaches the far side
+    from one client address, and that nothing else sends to `UDP_TARGET` meanwhile (see `UDP_TARGET`). Then a line from
+    a second client address is a datagram that came back to the far side, re-entering the tunnel, whatever the counts.
+    The one address's lines number `1 <= n <= sends`: sends made after the answered one can still be in the tunnel, and
+    the far side writes its relay line before it forwards. More than `sends` is the product relaying a datagram more
+    often than it was sent. If the contract ever fails, the check reports a second address, with the addresses printed.
     """
-    relays_before = server.udp_relayed_count()
+    seen = len(server.udp_relayed())
     sent = machine.run_python(UDP_SENDER, UDP_HOST, str(UDP_PORT), str(UDP_SIZE), str(UDP_REPLY_SECONDS))
-    relays = server.udp_relayed_count() - relays_before
+    added = server.udp_relayed()[seen:]
+    clients = Counter(client for client, target, size in added if (target, size) == (UDP_TARGET, UDP_SIZE))
+    relays = clients.total()
+    # The first address with its count, then at most three others: a loop makes thousands.
+    ranked = list(clients.items())
+    shown = ", ".join(f"{client} with {n}" for client, n in ranked[:4])
+    more = f" and {len(ranked) - 4} more" if len(ranked) > 4 else ""
+    relayed = f"the far side relayed {relays} from {len(ranked)} client address(es)" + (
+        f": {shown}{more}" if ranked else ""
+    )
     what = f"{UDP_SIZE} bytes to {UDP_TARGET}"
     try:
         answer = json.loads(sent.stdout)
     except json.JSONDecodeError:
         return [
             f"the person's datagram of {what} did not run: exit {sent.returncode}, stdout {sent.stdout!r}, "
-            f"stderr {sent.stderr.strip()!r} (the far side relayed {relays} such datagram(s) meanwhile)"
+            f"stderr {sent.stderr.strip()!r} ({relayed})"
         ]
     sends = answer["sends"]
-    counts = f"the person sent {sends} such datagram(s) and the far side relayed {relays}"
-    if answer.get("error"):
-        return [
-            f"the person's datagram of {what} drew {answer['error']}: the target was unreachable from their socket; "
-            f"{counts}"
-        ]
+    counts = f"the person sent {sends} such datagram(s); {relayed}"
     problems = []
     if answer["reply"] is None:
         problems.append(
-            f"no reply to the person's datagram of {what} reached their socket in {UDP_REPLY_SECONDS} s; {counts}"
-            + (" (the datagram never reached the far side)" if relays == 0 else "")
+            f"no reply to the person's datagram of {what} reached their socket in {UDP_REPLY_SECONDS} s"
+            + (f", the last socket error was {answer['error']}" if answer.get("error") else "")
+            + f"; {counts}"
+            + (
+                " (the datagram never reached the far side)"
+                if relays == 0
+                else " (the datagram re-entered the tunnel)"
+                if len(ranked) > 1
+                else ""
+            )
         )
     elif (answer["version"], answer["dcid"], answer["scid"]) != (
         VERSION_NEGOTIATION,
@@ -634,13 +650,18 @@ def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
         )
     elif relays == 0:
         problems.append(
-            f"the reply arrived, but the far side logged no relay for it; {counts} (the matcher does not see the far "
-            f"side's lines)"
+            f"the reply arrived, but the far side logged no relay for it; {counts} (the datagram may have left the "
+            f"machine outside the tunnel; or the matcher does not see the far side's lines)"
         )
-    if relays > sends:
+    if len(ranked) > 1:
         problems.append(
-            f"the far side relayed more such datagrams than the person sent; {counts} (the far side's own relay "
-            f"re-entering the tunnel)"
+            f"the far side took the person's datagram in from more than one client address; {counts} (a datagram "
+            f"that came back to the far side, re-entering the tunnel)"
+        )
+    if ranked and ranked[0][1] > sends:
+        problems.append(
+            f"the far side relayed the person's datagram from {ranked[0][0]} more often than it was sent; {counts} "
+            f"(the product relayed a datagram more often than it was sent)"
         )
     return problems
 
@@ -762,8 +783,8 @@ def full_tunnel_journey(
     interface is `en0` of a Mac, `MacMachine.scoped_default_route` must be held too, or the far side's dials, bound to
     the interface, get `ENETUNREACH` once the tunnel's routes win the table. Fails if the start does not succeed, and
     then for each of these that does not hold: a page by address and one by name arrive through the far side
-    (`page_problems`), for a plugin that carries UDP one datagram of the person's is answered through the far side
-    (`udp_problems`), the system holds the tunnel's resolver (`dns_problems`) and its device and routes
+    (`page_problems`), for a plugin that carries UDP a datagram of the person's, resent until answered, is answered
+    through the far side (`udp_problems`), the system holds the tunnel's resolver (`dns_problems`) and its device and routes
     (`device_problems`), and after the stop the machine is as it was (`stop_problems`).
 
     For a server that is not on loopback it also checks the route that keeps the product's connection to the server out
