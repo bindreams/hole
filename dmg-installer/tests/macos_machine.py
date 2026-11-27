@@ -226,14 +226,12 @@ class _MacChangeWatch:
 
     def _wait(self, seconds: float) -> bool:
         """Wait for a notice: configd's post, or a routing message of a kind in `_ROUTE_CHANGES`. `False` when none came
-        within `seconds`. Once one has come, everything already waiting is read too, so that a start's burst of
-        messages costs one reading and not one each."""
+        within `seconds`. Once one has come, what is already waiting is read too, so that a start's burst of messages
+        costs one reading and not one each; the reading of it ends at the deadline as well, whatever traffic there is."""
         deadline = time.monotonic() + seconds
         noticed = False
         while True:
-            timeout = 0 if noticed else deadline - time.monotonic()
-            if timeout < 0:
-                return False
+            timeout = 0 if noticed else max(deadline - time.monotonic(), 0)
             ready = select.select([self._descriptor, self._routes], [], [], timeout)[0]
             if not ready:
                 return noticed
@@ -244,6 +242,8 @@ class _MacChangeWatch:
             if self._routes in ready:
                 _, _, kind = _ROUTE_HEADER.unpack_from(self._routes.recv(65536))
                 noticed = noticed or kind in _ROUTE_CHANGES
+            if time.monotonic() >= deadline:
+                return noticed
 
     def settle(self, read: Callable[[], T], settled: Callable[[T], bool]) -> Settled[T]:
         # A message waits in its socket or descriptor until it is read, so none is lost between a reading and the wait.
