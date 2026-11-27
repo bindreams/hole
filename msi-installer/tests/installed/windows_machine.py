@@ -35,6 +35,9 @@ _AF_UNSPEC = 0
 # shape: (context, the changed row or NULL, the notification type).
 _CHANGE_CALLBACK = ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int)
 
+# Callbacks of registrations whose cancel failed: IP Helper may still call them, so they are never freed.
+_UNCANCELLED_CALLBACKS: list = []
+
 
 class _IpChangeWatch:
     """Registrations for IP Helper's notices of a change to an IP interface, a route or a unicast address
@@ -74,8 +77,8 @@ class _IpChangeWatch:
             try:
                 self.close()
             except MachineReadError as e:
-                # `watching` handles this type; the registration's own text stays in what it gets.
-                if isinstance(registration, MachineReadError):
+                # The registration's own text stays in what `watching` gets.
+                if isinstance(registration, Exception):
                     raise MachineReadError(f"{registration}; {e}") from registration
             raise
 
@@ -84,6 +87,7 @@ class _IpChangeWatch:
         statuses = [self._cancel(handle) for handle in self._handles]
         self._handles.clear()
         if any(statuses):
+            _UNCANCELLED_CALLBACKS.append(self._callback)
             raise MachineReadError(f"CancelMibChangeNotify2 returned {statuses}")
 
     def settle(self, read: Callable[[], T], settled: Callable[[T], bool]) -> Settled[T]:
