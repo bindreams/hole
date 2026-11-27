@@ -189,18 +189,25 @@ class _MacChangeWatch:
     addresses, the other tables a snapshot reads."""
 
     def __init__(self) -> None:
+        routes: socket.socket | None = None
         try:
-            self._routes = socket.socket(socket.AF_ROUTE, socket.SOCK_RAW)
-        except OSError as e:
-            raise MachineReadError(f"the routing socket could not be opened: {e}") from e
-        self._notify = ctypes.CDLL(None)
-        descriptor, token = ctypes.c_int(-1), ctypes.c_int(0)
-        status = self._notify.notify_register_file_descriptor(
-            ctypes.c_char_p(_DNS_CHANGED), ctypes.byref(descriptor), ctypes.c_int(0), ctypes.byref(token)
-        )
-        if status != 0:
-            self._routes.close()
-            raise MachineReadError(f"notify_register_file_descriptor for configd's DNS-changed post returned {status}")
+            routes = socket.socket(socket.AF_ROUTE, socket.SOCK_RAW)
+            notify = ctypes.CDLL(None)
+            descriptor, token = ctypes.c_int(-1), ctypes.c_int(0)
+            status = notify.notify_register_file_descriptor(
+                ctypes.c_char_p(_DNS_CHANGED), ctypes.byref(descriptor), ctypes.c_int(0), ctypes.byref(token)
+            )
+            if status != 0:
+                raise MachineReadError(
+                    f"notify_register_file_descriptor for configd's DNS-changed post returned {status}"
+                )
+        except Exception as e:
+            if routes is not None:
+                routes.close()
+            if isinstance(e, MachineReadError):
+                raise
+            raise MachineReadError(f"the change notices could not be set up: {type(e).__name__}: {e}") from e
+        self._routes, self._notify = routes, notify
         self._descriptor, self._token = descriptor.value, token.value
 
     def close(self) -> None:
