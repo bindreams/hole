@@ -103,14 +103,14 @@ pub struct OutboundInterface {
 /// into the tunnel, which hands them to the server again. Naming the interface (`bind_interface`) is not enough:
 /// shadowsocks-service 1.24.0 sends an IPv4 UDP relay on an IPv6 socket, and on Windows that socket is held to the
 /// interface only by `IPV6_UNICAST_IF`. A datagram on it followed the tunnel's split route into the TUN (measured: one
-/// NTP request became 256 relays and stalled the galoshes transport). The server also binds to the interface's own
-/// address (`bind_local_addr`), which holds that socket. TCP is held by the interface alone, an IPv4 socket with
-/// `IP_UNICAST_IF` (measured: the page requests of the journey leave by it).
+/// NTP request became 256 relays and stalled the galoshes transport). On Windows the server also binds to the
+/// interface's own address (`bind_local_addr`), which holds that socket. TCP is held by the interface alone, an IPv4
+/// socket with `IP_UNICAST_IF` (measured: the page requests of the journey leave by it).
 ///
 /// Binding the IPv4 address makes the server's sockets IPv4-only: on Windows a dial to a native IPv6 target fails, TCP
 /// with `WSAENETUNREACH` and UDP with `WSAEADDRNOTAVAIL` (measured with a socket bound to a mapped address, as
-/// shadowsocks binds it). Not measured on macOS, where shadowsocks makes the same bind and holds the socket with
-/// `IPV6_BOUND_IF`.
+/// shadowsocks binds it). macOS gets no such bind: there shadowsocks sets `IPV6_BOUND_IF` after binding the mapped
+/// address, and that fails with `EINVAL` on every UDP relay (measured on a CI runner).
 pub async fn start_real_ss_server_via(
     method: CipherKind,
     password: &str,
@@ -127,7 +127,7 @@ pub async fn start_real_ss_server_via(
             if let Some(outbound) = outbound {
                 builder.set_connect_opts(ConnectOpts {
                     bind_interface: Some(outbound.name),
-                    bind_local_addr: Some(SocketAddr::new(IpAddr::V4(outbound.ipv4), 0)),
+                    bind_local_addr: cfg!(windows).then(|| SocketAddr::new(IpAddr::V4(outbound.ipv4), 0)),
                     ..ConnectOpts::default()
                 });
             }
