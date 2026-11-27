@@ -8,9 +8,8 @@ needs rights.
 The far side is the `ss_plugin_server` example, behind each bundled plugin and with none. It runs on this machine, so
 its own dials leave through the machine's default interface, not the routing table, which the tunnel now owns. It
 listens on loopback: Windows refuses the host route for the machine's own address (`WindowsMachine.far_side_address`).
-It needs
-the example built (`cargo build -p plugin-e2e --example ss_plugin_server`), the working tree's `galoshes` and `ex-ray`
-builds, and the internet: `1.1.1.1` is the address asked for, the name asked for is `one.one.one.one`, and the
+It needs the example built (`cargo build -p plugin-e2e --example ss_plugin_server`), the working tree's `galoshes` and
+`ex-ray` builds, and the internet: `1.1.1.1` is the address asked for, the name asked for is `one.one.one.one`, and the
 product's own default DNS is DoH to `1.1.1.1`.
 
 A separate file with its own install and its own `msiexec` logs, as `test_connect.py` is: a failed full tunnel then
@@ -21,7 +20,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from connect_journey import SERVER_IDS, SERVERS, full_tunnel_journey, run_far_side
+from connect_journey import SERVER_IDS, SERVERS, full_tunnel_journey, report_teardown_failure, run_far_side
 from member import UnelevatedMember, assert_only_the_bridges_grant_admits
 from member import member  # noqa: F401 (fixture)
 from support import SERVICE, log_gained, restart_service
@@ -42,8 +41,9 @@ ACK_WAIT = "streams waiting for ACK"
 
 
 @pytest.fixture(scope="module", autouse=True)
-def yamux_debug_environment(installed_hole: Path) -> Iterator[None]:
-    """The `HoleBridge` service's `Environment` value holds `SERVICE_ENVIRONMENT` while this module runs."""
+def yamux_debug_environment(installed_hole: Path, request: pytest.FixtureRequest) -> Iterator[None]:
+    """The `HoleBridge` service's `Environment` value holds `SERVICE_ENVIRONMENT` while this module runs, in place of
+    any entry of the same names."""
     import winreg  # Windows only
 
     with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, SERVICE_KEY, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
@@ -51,7 +51,9 @@ def yamux_debug_environment(installed_hole: Path) -> Iterator[None]:
             previous = winreg.QueryValueEx(key, "Environment")[0]
         except FileNotFoundError:
             previous = None
-        winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, [*(previous or []), *SERVICE_ENVIRONMENT])
+        names = {entry.partition("=")[0] for entry in SERVICE_ENVIRONMENT}
+        kept = [entry for entry in previous or [] if entry.partition("=")[0] not in names]
+        winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, [*kept, *SERVICE_ENVIRONMENT])
         try:
             restart_service()
             yield
@@ -60,7 +62,11 @@ def yamux_debug_environment(installed_hole: Path) -> Iterator[None]:
                 winreg.DeleteValue(key, "Environment")
             else:
                 winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, previous)
-            restart_service()
+            try:
+                restart_service()
+            except AssertionError as e:
+                # A bridge that died during a case cannot be stopped; that case's failure is the one to report.
+                report_teardown_failure(str(e), primary_ok=request.session.testsfailed == 0)
 
 
 def show_ack_waits(member: UnelevatedMember) -> None:
