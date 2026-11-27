@@ -8,6 +8,7 @@ import ctypes
 import json
 import os
 import subprocess
+import sys
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -171,5 +172,14 @@ class WindowsMachine:
             record = self.person.recorded_command(CURL, *args)
         except TimeoutError as e:
             # Returned as a failed command, not raised: the journey reports it, with the bridge's log.
+            return subprocess.CompletedProcess(command, returncode=-1, stdout="", stderr=f"(killed: {e})")
+        return subprocess.CompletedProcess(command, record["exit_code"], record["stdout"], record["stderr"])
+
+    def run_python(self, script: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        python = Path(sys.executable)
+        command = [str(python), str(script), *args]
+        try:
+            record = self.person.recorded_command(python, str(script), *args)
+        except TimeoutError as e:
             return subprocess.CompletedProcess(command, returncode=-1, stdout="", stderr=f"(killed: {e})")
         return subprocess.CompletedProcess(command, record["exit_code"], record["stdout"], record["stderr"])

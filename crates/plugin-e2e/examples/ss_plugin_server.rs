@@ -26,9 +26,10 @@ const WS_CLIENT_OPTS: &str = "host=cloudfront.com;path=/";
 fn main() {
     // Relays the plugin chain's output to stderr, which the pytest fixture prints on failure.
     hole_test_observability::install();
-    // The ss server's records too, down to `debug`: its line for each relay it opens is what the full-tunnel journey
-    // counts. The fixture turns that target on (`HOLE_TEST_LOG`); the default filter writes `info` and above.
-    route_logs(LevelFilter::Debug);
+    // The ss server's records too, down to `trace`: its line for each TCP relay it opens (`debug`) and for each UDP
+    // datagram it relays (`trace`) is what the full-tunnel journey counts. The journey turns those targets on
+    // (`HOLE_TEST_LOG`); the default filter writes `info` and above.
+    route_logs(LevelFilter::Trace);
 
     let kind = std::env::args().nth(1).unwrap_or_default();
     let outbound_interface = std::env::args().nth(2);

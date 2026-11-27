@@ -9,8 +9,10 @@ import os
 import re
 import select
 import subprocess
+import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TypeVar
 
 from connect_journey import (
@@ -284,3 +286,7 @@ class MacMachine:
 
     def run_curl(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["curl", *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    def run_python(self, script: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        command = [sys.executable, str(script), *args]
+        return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")

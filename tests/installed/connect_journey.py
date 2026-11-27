@@ -59,9 +59,23 @@ SPLIT_ROUTES = frozenset({"0.0.0.0/1", "128.0.0.0/1"})
 # The IPv4 default route, as a `Route` destination.
 DEFAULT_ROUTE = "0.0.0.0/0"
 
-# Turns on the far side's line for each relay it opens (`shadowsocks_service::server::tcprelay`, at `debug`).
-RELAY_LOG = "shadowsocks_service::server::tcprelay=debug"
+# Turns on the far side's line for each relay it opens: a TCP connection at `debug` (`tcprelay`), a UDP datagram at
+# `trace` (`udprelay`, which `ss_plugin_server` routes into `tracing` down to that level).
+RELAY_LOG = "shadowsocks_service::server::tcprelay=debug,shadowsocks_service::server::udprelay=trace"
 _RELAY = re.compile(r"established tcp tunnel \S+ <-> (\S+) with ")
+_UDP_RELAY = re.compile(r"udp relay \S+ -> (\S+) with \d+ bytes, control")
+
+# The datagram the person sends in each case that carries UDP: one NTP request, to Cloudflare's time server.
+NTP_HOST = "162.159.200.1"
+NTP_PORT = 123
+NTP_TARGET = f"{NTP_HOST}:{NTP_PORT}"
+NTP_REQUEST = Path(__file__).with_name("ntp_request.py")
+# Failure bound on the server's answer to that datagram, set well beyond a slow runner's.
+NTP_REPLY_SECONDS = 60
+# The mode field of an NTP server's reply.
+NTP_MODE_SERVER = 4
+# The plugins whose connection carries UDP; `v2ray-plugin` is TCP-only, and the product drops a UDP flow for it.
+UDP_PLUGINS = (None, "galoshes")
 
 # (plugin named in the server entry, or None for plain Shadowsocks; the `ss_plugin_server` argument that serves it)
 SERVERS: list[tuple[str | None, str]] = [("v2ray-plugin", "ex-ray"), ("galoshes", "galoshes"), (None, "none")]
@@ -137,6 +151,13 @@ class SsServer:
         response that came through the server has its line here by the time it arrives.
         """
         return _RELAY.findall(self.stderr.read_text(encoding="utf-8", errors="replace"))
+
+    def udp_relayed(self) -> list[str]:
+        """The target (`host:port`) of every UDP datagram the server has relayed so far, in order.
+
+        The server writes the line when it takes the datagram in, before it sends it on.
+        """
+        return _UDP_RELAY.findall(self.stderr.read_text(encoding="utf-8", errors="replace"))
 
 
 @contextmanager
@@ -497,6 +518,10 @@ class MachineView(Protocol):
         """Run the system's `curl` as the person whose journey this is."""
         ...
 
+    def run_python(self, script: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        """Run `script` with the interpreter that runs this test, as the person whose journey this is."""
+        ...
+
 
 @dataclass(frozen=True)
 class Page:
@@ -573,6 +598,39 @@ def page_problems(
             f"{' or '.join(targets)} while it was fetched (every relay it has opened so far: {server.relayed()})"
         ]
     return []
+
+
+def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
+    """The person sends one NTP request (`NTP_TARGET`); its reply must reach the person's socket, and the far side must
+    have relayed that datagram exactly once.
+
+    The reply alone shows nothing: it needs the far side's relay to have carried the datagram. A count above one is a
+    datagram that came back to the far side: its own relay re-entering the tunnel.
+    """
+    relays_before = server.udp_relayed().count(NTP_TARGET)
+    sent = machine.run_python(NTP_REQUEST, NTP_HOST, str(NTP_PORT), str(NTP_REPLY_SECONDS))
+    relays = server.udp_relayed().count(NTP_TARGET) - relays_before
+    try:
+        answer = json.loads(sent.stdout)
+    except json.JSONDecodeError:
+        return [
+            f"the person's NTP request to {NTP_TARGET} did not run: exit {sent.returncode}, stdout {sent.stdout!r}, "
+            f"stderr {sent.stderr.strip()!r} (the far side relayed {relays} datagram(s) to {NTP_TARGET} meanwhile)"
+        ]
+    problems = []
+    if answer["reply"] is None:
+        problems.append(
+            f"no reply to the person's NTP request to {NTP_TARGET} reached their socket in {NTP_REPLY_SECONDS} s; the "
+            f"far side relayed {relays} datagram(s) to {NTP_TARGET} for it (1 expected; more is the far side's own "
+            f"relay coming back through the tunnel)"
+        )
+    elif answer["mode"] != NTP_MODE_SERVER:
+        problems.append(f"the datagram that reached the person's socket is not an NTP server reply: {answer}")
+    if answer["reply"] is not None and relays != 1:
+        problems.append(
+            f"the reply arrived, but the far side relayed {relays} datagram(s) to {NTP_TARGET} for it, not 1"
+        )
+    return problems
 
 
 def interfaces_gained(before: Snapshot, during: Snapshot) -> list[str]:
@@ -692,7 +750,8 @@ def full_tunnel_journey(
     interface is `en0` of a Mac, `MacMachine.scoped_default_route` must be held too, or the far side's dials, bound to
     the interface, get `ENETUNREACH` once the tunnel's routes win the table. Fails if the start does not succeed, and
     then for each of these that does not hold: a page by address and one by name arrive through the far side
-    (`page_problems`), the system holds the tunnel's resolver (`dns_problems`) and its device and routes
+    (`page_problems`), for a plugin that carries UDP one datagram of the person's is answered through the far side
+    (`udp_problems`), the system holds the tunnel's resolver (`dns_problems`) and its device and routes
     (`device_problems`), and after the stop the machine is as it was (`stop_problems`).
 
     For a server that is not on loopback it also checks the route that keeps the product's connection to the server out
@@ -720,6 +779,7 @@ def full_tunnel_journey(
                 machine, server, "by address", ADDRESS_URL, ADDRESS_REDIRECT, ADDRESS_TARGETS, tmp_path, ipv4_only=False
             ),
             *page_problems(machine, server, "by name", NAME_URL, NAME_REDIRECT, NAME_TARGETS, tmp_path, ipv4_only=True),
+            *(udp_problems(machine, server) if plugin in UDP_PLUGINS else []),
             *dns_problems(before, during),
             *device_problems(before, during),
             *([] if ipaddress.ip_address(address).is_loopback else bypass_problems(before, during, address)),
