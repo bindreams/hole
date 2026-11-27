@@ -14,8 +14,7 @@ The third puts a member into `hole` whose account does not exist (what a deleted
 the bridge, and checks that the bridge lists it among the members and still admits the user.
 
 A request is the whole connection of `connect_journey`, to a server with no plugin: it needs the `ss_plugin_server`
-example built (`cargo build -p plugin-e2e --example ss_plugin_server`). The child is de-elevated with `gsudo`, as the
-dashboard E2E is.
+example built (`cargo build -p plugin-e2e --example ss_plugin_server`).
 """
 
 import ctypes

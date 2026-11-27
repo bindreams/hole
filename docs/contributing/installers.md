@@ -63,13 +63,13 @@ server with no plugin. The server runs on the test machine, so it dials out of t
 the routing table, which the tunnel now owns, and its sockets are bound to that interface's own IPv4 address. After a
 start that succeeded the case checks these things, and a failure lists each one that did not hold:
 
-| Check   | What must hold                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Pages   | `curl`, run by the de-elevated child, requests `http://1.1.1.1/` and, over IPv4, `http://one.one.one.one/`. Each answers `301` with a `Location` for the host the request named, and the server opened a relay to that address while the page was fetched. The answer alone arrives from a machine with no tunnel too.                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| DNS     | While the tunnel is up, Windows lists exactly one set of DNS servers it did not list before: `1.1.1.1` and `1.0.0.1`, the defaults of `hole proxy start`, on the tunnel's adapter.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| Device  | While the tunnel is up, the machine has exactly one IP interface it did not have before, and `0.0.0.0/1` and `128.0.0.0/1` are routed into it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| UDP     | For a plugin that carries UDP (`galoshes`, and none), the de-elevated child sends a QUIC packet of 1237 bytes to `8.8.4.4:443`, again every second until it is answered: a long header with a reserved version, which a server answers with Version Negotiation. Its reply reaches the child's socket, is Version Negotiation (version 0), and carries the packet's own connection IDs, swapped; the server took the datagram in from one client address only, relayed it at least once and no more often than the child sent it. A second client address is the server's own relay coming back through the tunnel. The `v2ray-plugin` case sends none: the product drops UDP for a plugin without it, and the case does not see the drop. |
-| Restore | After `hole proxy stop`, the IP interfaces, routes, addresses and DNS servers equal those read before the start. Temporary IPv6 addresses are left out: Windows replaces them on its own timer.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Check   | What must hold                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pages   | `curl`, run by the de-elevated child, requests `http://1.1.1.1/` and, over IPv4, `http://one.one.one.one/`. Each answers `301` with a `Location` for the host the request named, and the server opened a relay to that address while the page was fetched. The answer alone arrives from a machine with no tunnel too.                                                                                                                                                                                                                                                                                                                                                                                  |
+| DNS     | While the tunnel is up, Windows lists exactly one set of DNS servers it did not list before: `1.1.1.1` and `1.0.0.1`, the defaults of `hole proxy start`, on the tunnel's adapter.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Device  | While the tunnel is up, the machine has exactly one IP interface it did not have before, and `0.0.0.0/1`, `128.0.0.0/1`, `::/1` and `8000::/1` are routed into it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| UDP     | For a plugin that carries UDP (`galoshes`, and none), the de-elevated child sends a QUIC packet of 1237 bytes to `8.8.4.4:443`, again every second until it is answered: a long header with a reserved version, which a server answers with Version Negotiation. Its reply reaches the child's socket, is Version Negotiation (version 0), and carries the packet's own connection IDs, swapped; the server relayed the datagram at least once, from one client address. A second client address is the server's own relay coming back through the tunnel, which draws no reply. The `v2ray-plugin` case sends none: the product drops UDP for a plugin without it, and the case does not see the drop. |
+| Restore | After `hole proxy stop`, the IP interfaces, routes, addresses and DNS servers equal those read before the start, and the de-elevated child looks up a name made up for the case under `github.io`, which no cache holds and every resolver answers, and gets an answer. Temporary IPv6 addresses are left out: Windows replaces them on its own timer.                                                                                                                                                                                                                                                                                                                                                  |
 
 The server's sockets are bound to the interface's address because an IPv4 UDP relay of the server is sent on an IPv6
 socket, which the interface alone does not hold on Windows: without the bind one datagram became 256 relays through the
@@ -78,17 +78,27 @@ server is bound to an address: on macOS the same bind makes every UDP relay fail
 
 The packet is 1237 bytes because a server answers with Version Negotiation only to a datagram of at least 1200. The
 case reads the server's relay lines for that target and size, once, after the child exits. It rests on two contracts.
-Nothing else on the runners sends to `8.8.4.4:443` during a case: the server's logs from the CI runs on macOS (arm64 and
-amd64) and Windows show no relay to it but the case's own, and the size is a second distinction only, since a QUIC
-connection sends packets of any size after its handshake. And the product keeps one UDP association per source socket
-for the life of the child, so every send reaches the server from one client address (CI runs 45953182365 and
-45962345199, Windows, with `galoshes` and with no plugin: 60 resends, one address each, in runs where the server was
-changed to make no address bind and so sent its own relay back through the tunnel; macOS has been seen with single sends
-only). If the second contract fails, the case reports a second address, with the addresses printed. The child resends
-the same packet, with the same connection IDs, so that a lost datagram or a rate-limited answer does not fail the case,
-and a socket error does not end it; later sends may still be inside the tunnel when the reply arrives, which is why the
-one address's lines number from one up to the sends. The target answered on `macos-26-arm64`, `macos-15`,
-`ubuntu-26.04` and `windows-2025`.
+Nothing else on the runners sends to `8.8.4.4:443` during a case: the server's logs from the CI runs of the full-tunnel
+cases on macOS (arm64 and amd64) and Windows show no relay to it but the case's own, and the size is a second
+distinction only, since a QUIC connection sends packets of any size after its handshake. And the product keeps one UDP
+association per source socket for the life of the child, so every send reaches the server from one client address (CI
+runs 45953182365 and 45962345199, Windows, with `galoshes` and with no plugin: 60 resends, one address each, in runs
+where the server was changed to make no address bind and so sent its own relay back through the tunnel, each pass of
+the loop reaching it from a new address; the change was to the server only, not the product; macOS has been seen with
+single sends only). The server (shadowsocks-service 1.24.0) keeps one outbound IPv4 socket per association
+(`UdpAssociationContext` in `server/udprelay.rs`), so a datagram that comes back to the server draws no reply: a second
+client address names the cause of a case with no reply, and the case reports it, with the addresses printed. The child
+resends the same packet, with the same connection IDs, so that a lost datagram or a rate-limited answer does not fail
+the case, and a socket error does not end it. The case reads the relay lines once, so it does not see a datagram the
+product relays more than once, or a line the server writes after the read. The target answered on `macos-26-arm64`,
+`macos-15`, `ubuntu-26.04` and `windows-2025`.
+
+The lookup after the stop uses a name under `github.io` because Windows reports an unknown name by the same error
+(`WSAHOST_NOT_FOUND`, Python's `[Errno 11001]`) that tells nothing about whether a resolver answered; every name under
+`github.io` resolves to GitHub Pages, so an answer is required. A stop that leaves the port-53 confinement of the tunnel
+engaged (a Windows filter set that the interface and route comparison cannot see) leaves the child's lookups with no
+resolver, and the case fails on it. The lookup is made once the comparison matches, so that it finds the resolver the
+system holds and not one still being restored.
 
 The DNS check reads what Windows was told. Nothing in the case shows that a lookup goes to those servers: the request by
 name is answered through the tunnel when the machine's earlier resolver is asked, too.
@@ -96,8 +106,9 @@ name is answered through the tunnel when the machine's earlier resolver is asked
 The case reads the machine after a command returns, so for each read it waits until the system has taken the change in.
 It registers for IP Helper's notices of a change to an interface, a route or an address before it runs the command
 (`NotifyIpInterfaceChange`, `NotifyRouteChange2`, `NotifyUnicastIpAddressChange`), and reads again on each one until the
-state it expects holds. A notice that does not come within 30 seconds fails the case, and the failure says so. IP Helper
-has no notice for a change of an adapter's DNS servers: the DNS read waits only on the notices of the changes around it.
+state it expects holds. The 30 seconds are the failure bound on a notice the system never sends: when they run out the
+case fails, saying whether no notice came or notices came and the reading still did not hold, and no reading made after
+the bound decides a pass. IP Helper has no notice for a change of an adapter's DNS servers: the DNS read waits only on the notices of the changes around it.
 
 The server listens on loopback, and for a loopback server Hole installs no route that keeps its own connection to the
 server out of the tunnel. A tunnel to a remote server needs that route and a stop must remove it; this case does not
@@ -136,7 +147,7 @@ records both of its ProductCodes, so the cleanup removes whichever of the two an
 The tools the E2E needs (`tauri-driver`, `msedgedriver`, `gsudo`) download into `.cache/installer-e2e/`; nothing is added
 to `PATH` outside the test's child processes. Each phase that starts child processes has a failure bound
 (`GSUDO_SELFTEST_TIMEOUT_SECONDS`, `DASHBOARD_E2E_TIMEOUT_SECONDS` and, for each `hole` command of the connect,
-member-access and full-tunnel cases, `HOLE_CLI_TIMEOUT_SECONDS` in {src}`msi-installer/tests/installed/support.py`), so a wedged phase
+member-access and full-tunnel cases, and for each `curl` and Python probe of the last, `HOLE_CLI_TIMEOUT_SECONDS` in {src}`msi-installer/tests/installed/support.py`), so a wedged phase
 fails by name and the uninstall still runs. The server of those cases has none: it is the tree's code, and one that never reports
 ready ends at the CI step's limit. Install
 and uninstall logs go to `target\msi-test-logs\`, or to `MSI_TEST_LOG_DIR`. Nothing asserts what remains in
@@ -190,8 +201,12 @@ installs the built app's bridge as root, connects with `hole proxy start` to a s
 one with no plugin, fetches a page through each, and uninstalls. It then starts a full tunnel for each of the three and
 makes the checks of [the Windows lane's full-tunnel case](#the-install-e2e-and-uninstall-run). On macOS the DNS
 servers are those of the one resolver `scutil --dns` gained, read after configd has posted that it rebuilt the
-configuration; the device is the new `utun` interface; and the comparison after the stop leaves out neighbour and cloned
-routes and temporary IPv6 addresses. Each case prints, before the start and while the tunnel is up, everything the
+configuration; the case also waits on the routing socket's messages about a route, an interface or an address
+(`RTM_ADD`, `RTM_DELETE`, `RTM_CHANGE`, `RTM_IFINFO`, `RTM_NEWADDR`, `RTM_DELADDR`; not the `RTM_GET` that the
+snapshot's own `route -n get` makes), the other tables the snapshot reads. Those values and the position of the message
+type in the header are from XNU's `net/route.h`; the routing-socket wait has not run on a Mac, and CI is its first
+measurement. A notice that does not come within 30 seconds fails the case. The device is the new `utun` interface, and
+the comparison after the stop leaves out neighbour and cloned routes and temporary IPv6 addresses. Each case prints, before the start and while the tunnel is up, everything the
 commands it read printed (`netstat -rn`, `ifconfig -a`, `scutil --dns`, and `route -n get 1.1.1.1` unscoped and in the
 default interface's scope), passing or failing. `hole` runs as root, as in the cases above, and `curl` runs as the user of the
 test. The connections are the same code the Windows lane runs ({src}`tests/installed/connect_journey.py`).

@@ -13,8 +13,7 @@ probe (Windows raises `ConnectionResetError` for the ICMP error on a connected U
 raises `ConnectionRefusedError` elsewhere): it resends at the usual pace until a reply or `seconds`. `sends` counts the
 datagrams `send` accepted.
 
-The journey runs this as the person, so the datagram takes the route the person's own traffic takes. It uses nothing but
-the standard library: the interpreter that runs the tests is on both platforms.
+The journey runs this as the person, so the datagram takes the route the person's own traffic takes. Standard library only.
 """
 
 import json

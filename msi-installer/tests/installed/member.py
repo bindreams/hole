@@ -2,7 +2,7 @@
 
 Windows adds a new group membership to a token only at the next sign-in, so the child's token has no `hole` group in
 it: it is admitted only by what the bridge wrote into the socket's access list for the user. The child is de-elevated
-with `gsudo`, as the dashboard E2E is.
+with `gsudo`.
 """
 
 import json

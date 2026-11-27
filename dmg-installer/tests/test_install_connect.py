@@ -187,10 +187,7 @@ def test_installed_bridge_carries_a_full_tunnel(bridge: Bridge, plugin: str | No
     connection to the server out of the tunnel, and the case checks that it is installed and removed. The system
     delivers to an address of its own locally, so nothing crosses that route.
 
-    The far side's dials are bound to `en0`, and a runner has no default route in that scope: the case adds one for its
-    duration and deletes it after, if it added it (`MacMachine.scoped_default_route`). That route also changes what the
-    product's own interface-bound sockets see (bindreams/hole#1414), so a macOS journey of a Bypass rule runs without
-    it. The case needs the internet.
+    The case holds `MacMachine.scoped_default_route` for the far side's dials. It needs the internet.
     """
     machine = MacMachine()
     with machine.scoped_default_route(), run_far_side(kind, tmp_path, machine) as server:

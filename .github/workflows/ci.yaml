@@ -485,9 +485,9 @@ jobs:
 
       # The bound on the wait for the installed bridge to answer and on each `sudo hole`: a bridge that
       # stays up but never answers ends here, and the cleanup step prints its log. The full-tunnel cases
-      # bound their own waits (two fetches of 60 s and two waits for configd of 30 s in each of three
-      # cases, 9 min when every one runs out), and the limit leaves room for all of them to fail by
-      # assertion. The step took under 1 min with those cases failing at their first fetch.
+      # bound their own waits (14 min when every one runs out: per case two fetches of 60 s, two waits for the system of
+      # 30 s and the lookup after the stop of 60 s, and in two of the three the UDP probe's 60 s), and the limit leaves
+      # room for all of them to fail by assertion.
       - id: dmg-install-e2e
         name: Install the bridge and connect through it
         if: ${{ !cancelled() && steps.dmg-install-server.outcome == 'success' }}
@@ -722,15 +722,15 @@ jobs:
       #
       # Last-resort kill: the harness bounds each phase itself (msiexec 3 min; gsudo self-test,
       # dashboard E2E and each diagnostics dump 5 min; each `hole` command of the connect,
-      # member-access and full-tunnel cases, and each `curl` of the last, 2 min; the full-tunnel case
-      # also waits at most 30 s each after a start and after a stop for the system to take the change
+      # member-access and full-tunnel cases, and each `curl` and Python probe of the last, 2 min; the full-tunnel
+      # case also waits at most 30 s each after a start and after a stop for the system to take the change
       # in), so a wedged phase fails by name and the fixture still uninstalls first. Those bounds add
-      # up to far more than the step's 75: the full-tunnel module alone is 39 min (per case the
-      # version check, start, two curls and stop, 2 min each, and 1 min of waits, three cases, and
-      # 6 min of msiexec), the connect module 21. A run in which many phases reach their bound is cut by
-      # the step, and `installer-cleanup` then uninstalls. The 75 also covers the unbounded phases (tool
-      # provisioning, the build, process listing, those cases' own server, the full-tunnel case's reads
-      # of the machine's network).
+      # up to far more than the step's 75: the full-tunnel module alone is 49 min (per case the
+      # version check, start, two curls and stop, 2 min each, and 1 min of waits, three cases; the lookup after the
+      # stop, 2 min in each, and the UDP probe, 2 min in two; and 6 min of msiexec), the connect module 21. A run in
+      # which many phases reach their bound is cut by the step, and `installer-cleanup` then uninstalls. The 75 also
+      # covers the unbounded phases (tool provisioning, the build, process listing, those cases' own server, the
+      # full-tunnel case's reads of the machine's network).
       - id: installer-tests
         name: Install, E2E and uninstall the MSI
         if: ${{ !cancelled() && steps.installer-build-msi.outcome == 'success' }}

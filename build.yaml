@@ -198,8 +198,8 @@ targets:
     # restarts. It de-elevates with the gsudo that `provision-e2e-tools` fetched.
     #
     # The full-tunnel case (test_full_tunnel.py) starts a full tunnel as that same user against the same server, which
-    # dials out of the machine's real interface, and fetches pages from 1.1.1.1 and one.one.one.one: it needs the
-    # internet, and the machine's routes and DNS are the tunnel's for a few seconds.
+    # dials out of the machine's real interface: it needs the internet,
+    # and the machine's routes and DNS are the tunnel's for a few seconds.
     #
     # Run in this order: each file installs for itself, and the upgrade refuses a
     # machine with Hole on it (see test_upgrade.py).

@@ -223,5 +223,4 @@ the OS routing packets into it and accepting packets written out of it; adapter-
 the proxy and bypass paths. Those tests are the `*_privileged_tests.rs` files and `tests/*_privileged.rs`.
 
 The **installed lane** runs the product a user installs (the MSI on Windows, the app's bridge on macOS), connecting both
-SOCKS-only and with a full tunnel. It proves that a person can do what the product is for, against the files a release
-would publish. [The installers](installers.md#the-install-e2e-and-uninstall-run) lists the cases and what each checks.
+SOCKS-only and with a full tunnel. It runs against the files a release would publish. [The installers](installers.md#the-install-e2e-and-uninstall-run) lists the cases and what each checks.
