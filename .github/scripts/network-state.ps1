@@ -1,6 +1,7 @@
 # Prints what the operating system itself says of this machine's network, for the installed full-tunnel test.
 #   -What default-interface  the alias of the interface the IPv4 default route leaves by
-#   -What default-address    the first IPv4 address of that interface that Windows may send from; nothing if it has none
+#   -What default-address    the lowest IPv4 address of that interface that Windows may send from, has finished duplicate
+#                            address detection and is not link-local; fails, saying so, if there is none
 #   -What snapshot           IP interfaces, routes, addresses and DNS servers as one JSON object, the same before a tunnel
 #                            starts and after it stops
 param([Parameter(Mandatory)][ValidateSet('default-interface', 'default-address', 'snapshot')][string]$What)
@@ -12,11 +13,22 @@ function Get-DefaultInterface {
   (Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '0.0.0.0/0' | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1).InterfaceAlias
 }
 
+function Get-DefaultAddress {
+  $alias = Get-DefaultInterface
+  # An interface with no IPv4 address makes `Get-NetIPAddress` itself fail, with a message about the filter and not about
+  # this interface. The lowest address, so that the choice does not depend on the order Windows lists them in.
+  $usable = @(Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Where-Object { -not $_.SkipAsSource -and $_.AddressState -eq 'Preferred' -and $_.IPAddress -notlike '169.254.*' } |
+      Sort-Object { [version]$_.IPAddress })
+  if (-not $usable) {
+    throw "the default interface '$alias' has no IPv4 address that Windows may send from, that has finished duplicate address detection, and that is not link-local"
+  }
+  $usable[0].IPAddress
+}
+
 switch ($What) {
   'default-interface' { Get-DefaultInterface }
-  'default-address' {
-    (Get-NetIPAddress -InterfaceAlias (Get-DefaultInterface) -AddressFamily IPv4 -SkipAsSource $false | Select-Object -First 1).IPAddress
-  }
+  'default-address' { Get-DefaultAddress }
   'snapshot' {
     # Windows replaces a temporary IPv6 address on its own timer, and each one has a host route.
     $temporary, $addresses = (Get-NetIPAddress).Where({ $_.SuffixOrigin -eq 'Random' }, 'Split')
