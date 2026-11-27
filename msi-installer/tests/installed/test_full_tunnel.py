@@ -9,8 +9,7 @@ The far side is the `ss_plugin_server` example, behind each bundled plugin and w
 its own dials leave through the machine's default interface, not the routing table, which the tunnel now owns. It
 listens on loopback: Windows refuses the host route for the machine's own address (`WindowsMachine.far_side_address`).
 It needs the example built (`cargo build -p plugin-e2e --example ss_plugin_server`), the working tree's `galoshes` and
-`ex-ray` builds, and the internet: `1.1.1.1` is the address asked for, the name asked for is `one.one.one.one`, and the
-product's own default DNS is DoH to `1.1.1.1`.
+`ex-ray` builds, and the internet (the targets are in `connect_journey`).
 
 A separate file with its own install and its own `msiexec` logs, as `test_connect.py` is: a failed full tunnel then
 cannot change what the other cases meet.
@@ -32,9 +31,8 @@ pytestmark = pytest.mark.system_wide
 # This module's install and uninstall logs (`installed_hole`).
 MSIEXEC_LOG_STEM = "msi-full-tunnel"
 
-# What the service starts with: galoshes, which the bridge starts and which inherits it, logs yamux at `debug`, so that
-# a case that stalls shows whether the transport refused new streams while 256 were unacknowledged
-# (bindreams/hole#1377). The bridge's log carries the plugin's lines.
+# What the service starts with: yamux at `debug` in galoshes, which inherits the bridge's environment, so that a stalled
+# case shows streams waiting for ACK in the bridge's log.
 SERVICE_ENVIRONMENT = ["RUST_LOG=info,yamux=debug"]
 SERVICE_KEY = rf"SYSTEM\CurrentControlSet\Services\{SERVICE}"
 ACK_WAIT = "streams waiting for ACK"
@@ -47,6 +45,7 @@ def yamux_debug_environment(installed_hole: Path, request: pytest.FixtureRequest
     import winreg  # Windows only
 
     failed_before = request.session.testsfailed
+    started = False
     with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, SERVICE_KEY, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
         try:
             previous = winreg.QueryValueEx(key, "Environment")[0]
@@ -57,6 +56,7 @@ def yamux_debug_environment(installed_hole: Path, request: pytest.FixtureRequest
         winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, [*kept, *SERVICE_ENVIRONMENT])
         try:
             restart_service()
+            started = True
             yield
         finally:
             if previous is None:
@@ -67,7 +67,8 @@ def yamux_debug_environment(installed_hole: Path, request: pytest.FixtureRequest
                 restart_service()
             except AssertionError as e:
                 # A bridge that died during a case cannot be stopped; that case's failure is the one to report.
-                report_teardown_failure(str(e), primary_ok=request.session.testsfailed == failed_before)
+                # A setup that failed to restart the service is the earlier failure too.
+                report_teardown_failure(str(e), primary_ok=started and request.session.testsfailed == failed_before)
 
 
 def show_ack_waits(member: UnelevatedMember) -> None:
