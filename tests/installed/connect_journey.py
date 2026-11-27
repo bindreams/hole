@@ -73,10 +73,10 @@ _UDP_RELAY = re.compile(r"udp relay (\S+) -> (\S+) with (\d+) bytes, control")
 # bare-runner probe got Version Negotiation from it on macos-26-arm64, macos-15, ubuntu-26.04 and windows-2025. The size
 # is a second distinction only (above 1200, the smallest datagram that draws Version Negotiation); a QUIC connection
 # sends packets of any size once its handshake is done. And the product keeps one UDP association per source socket for
-# the life of the probe, so the far side sees every send from one client address (CI run 45953182365, Windows, galoshes
-# and no plugin: 60 resends, one address each; macOS has been seen with single sends only). In the same run, with the
-# far side's own relay looping back through the tunnel, each pass of the loop reached it from a new address, with
-# galoshes and with no plugin.
+# the life of the probe, so the far side sees every send from one client address (CI runs 45953182365 and 45962345199,
+# Windows, galoshes and no plugin: 60 resends, one address each; macOS has been seen with single sends only). Those runs
+# were mutation runs: the far side made no address bind, so its own relay looped back through the tunnel, and each pass
+# of the loop reached it from a new address. The mutation changed the far side only, not the product.
 UDP_HOST = "8.8.4.4"
 UDP_PORT = 443
 UDP_TARGET = f"{UDP_HOST}:{UDP_PORT}"
@@ -610,12 +610,13 @@ def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
     added = server.udp_relayed()[seen:]
     clients = Counter(client for client, target, size in added if (target, size) == (UDP_TARGET, UDP_SIZE))
     relays = clients.total()
-    # The first address with its count, then at most three others: a loop makes thousands.
-    ranked = list(clients.items())
-    shown = ", ".join(f"{client} with {n}" for client, n in ranked[:4])
-    more = f" and {len(ranked) - 4} more" if len(ranked) > 4 else ""
-    relayed = f"the far side relayed {relays} from {len(ranked)} client address(es)" + (
-        f": {shown}{more}" if ranked else ""
+    # In the order the far side first saw them, so the person's own comes first. The message shows four: a loop makes
+    # thousands.
+    addresses = list(clients.items())
+    shown = ", ".join(f"{client} with {n}" for client, n in addresses[:4])
+    more = f" and {len(addresses) - 4} more" if len(addresses) > 4 else ""
+    relayed = f"the far side relayed {relays} from {len(addresses)} client address(es)" + (
+        f": {shown}{more}" if addresses else ""
     )
     what = f"{UDP_SIZE} bytes to {UDP_TARGET}"
     try:
@@ -632,7 +633,8 @@ def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
         problems.append(
             f"no reply to the person's datagram of {what} reached their socket in {UDP_REPLY_SECONDS} s"
             + (f", the last socket error was {answer['error']}" if answer.get("error") else "")
-            + f"; {counts}"
+            # With a second address, the re-entry problem below gives the counts.
+            + (f"; {counts}" if len(addresses) <= 1 else "")
             + (" (the datagram never reached the far side)" if relays == 0 else "")
         )
     elif (answer["version"], answer["dcid"], answer["scid"]) != (
@@ -649,14 +651,14 @@ def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
             f"the reply arrived, but the far side logged no relay for it; {counts} (the datagram may have left the "
             f"machine outside the tunnel; or the matcher does not see the far side's lines)"
         )
-    if len(ranked) > 1:
+    if len(addresses) > 1:
         problems.append(
             f"the far side took the person's datagram in from more than one client address; {counts} (a datagram "
             f"that came back to the far side, re-entering the tunnel)"
         )
-    if ranked and ranked[0][1] > sends:
+    if addresses and addresses[0][1] > sends:
         problems.append(
-            f"the far side relayed the person's datagram from {ranked[0][0]} more often than it was sent; {counts} "
+            f"the far side relayed the person's datagram from {addresses[0][0]} more often than it was sent; {counts} "
             f"(the product relayed a datagram more often than it was sent)"
         )
     return problems

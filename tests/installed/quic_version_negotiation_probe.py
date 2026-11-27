@@ -87,7 +87,7 @@ def main() -> None:
                 continue
             except OSError as e:
                 # An error that returns at once must not turn the resends into a busy loop.
-                last_error = f"{type(e).__name__}: {e}"
+                last_error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
                 time.sleep(max(0.0, min(now + RESEND_INTERVAL_SECONDS, deadline) - time.monotonic()))
                 continue
             report = {"reply": len(reply), **parse_long_header(reply)}

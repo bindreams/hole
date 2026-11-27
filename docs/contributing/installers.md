@@ -81,13 +81,14 @@ case reads the server's relay lines for that target and size, once, after the ch
 Nothing else on the runners sends to `8.8.4.4:443` during a case: the server's logs from the CI runs on macOS (arm64 and
 amd64) and Windows show no relay to it but the case's own, and the size is a second distinction only, since a QUIC
 connection sends packets of any size after its handshake. And the product keeps one UDP association per source socket
-for the life of the child, so every send reaches the server from one client address (CI run 45953182365, Windows, with
-`galoshes` and with no plugin: 60 resends, one address each; macOS has been seen with single sends only). If the second
-contract fails, the case reports a second address, with the addresses printed. The child resends the same packet, with
-the same connection IDs, so that a lost datagram or a rate-limited answer does not fail the case, and a socket error
-does not end it; later sends may still be inside the tunnel when the reply arrives, which is why the one address's lines
-number from one up to the sends. The target answered on `macos-26-arm64`, `macos-15`, `ubuntu-26.04` and
-`windows-2025`.
+for the life of the child, so every send reaches the server from one client address (CI runs 45953182365 and
+45962345199, Windows, with `galoshes` and with no plugin: 60 resends, one address each, in runs where the server was
+changed to make no address bind and so sent its own relay back through the tunnel; macOS has been seen with single sends
+only). If the second contract fails, the case reports a second address, with the addresses printed. The child resends
+the same packet, with the same connection IDs, so that a lost datagram or a rate-limited answer does not fail the case,
+and a socket error does not end it; later sends may still be inside the tunnel when the reply arrives, which is why the
+one address's lines number from one up to the sends. The target answered on `macos-26-arm64`, `macos-15`,
+`ubuntu-26.04` and `windows-2025`.
 
 The DNS check reads what Windows was told. Nothing in the case shows that a lookup goes to those servers: the request by
 name is answered through the tunnel when the machine's earlier resolver is asked, too.
