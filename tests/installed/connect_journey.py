@@ -160,20 +160,37 @@ class SsServer:
         return _UDP_RELAY.findall(self.stderr.read_text(encoding="utf-8", errors="replace"))
 
 
+@dataclass(frozen=True)
+class Outbound:
+    """Where the far side's own dials leave from: an interface and its own IPv4 address."""
+
+    interface: str
+    address: str
+
+
 @contextmanager
-def run_ss_server(kind: str, tmp_path: Path, outbound_interface: str | None = None) -> Iterator[SsServer]:
+def run_ss_server(kind: str, tmp_path: Path, outbound: Outbound | None = None) -> Iterator[SsServer]:
     """A shadowsocks server, plain or fronted by a server-mode plugin, via the plugin-e2e fixture.
 
-    `kind` is the `ss_plugin_server` argument. With `outbound_interface`, the server's own dials leave through that
-    interface, not the routing table: a server on the machine of a full tunnel needs it, or its dials loop back into
-    the tunnel.
+    `kind` is the `ss_plugin_server` argument. With `outbound`, the server's own dials leave through that interface and
+    its sockets are bound to the address, not left to the routing table: a server on the machine of a full tunnel needs
+    both, or its dials loop back into the tunnel.
     """
-    if outbound_interface is not None and not outbound_interface.strip():
+    if outbound is not None and not outbound.interface.strip():
         pytest.fail(
-            f"the outbound interface asked for for the far side is empty ({outbound_interface!r}), which would send its "
+            f"the outbound interface asked for for the far side is empty ({outbound.interface!r}), which would send its "
             "dials through the routing table, back into the tunnel: the machine named no default interface",
             pytrace=False,
         )
+    if outbound is not None:
+        try:
+            ipaddress.IPv4Address(outbound.address)
+        except ValueError:
+            pytest.fail(
+                f"the address asked for for the far side's dials ({outbound.address!r}) is not an IPv4 address of "
+                f"{outbound.interface}: the machine named none",
+                pytrace=False,
+            )
     # Cargo reads a relative `CARGO_TARGET_DIR` from where it ran, the repo root; pytest runs in the suite's folder.
     target_dir = REPO_ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
     exe = (
@@ -184,7 +201,7 @@ def run_ss_server(kind: str, tmp_path: Path, outbound_interface: str | None = No
     stderr_path = tmp_path / "ss_plugin_server.stderr"
     with stderr_path.open("wb") as stderr:
         proc = subprocess.Popen(
-            [str(exe), kind, *([outbound_interface] if outbound_interface is not None else [])],
+            [str(exe), kind, *([outbound.interface, outbound.address] if outbound is not None else [])],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,
@@ -268,10 +285,12 @@ class _Forwarder:
 def run_far_side(kind: str, tmp_path: Path, machine: "MachineView") -> Iterator[SsServer]:
     """`run_ss_server` for a full tunnel, as the machine says it is reached.
 
-    The server's own dials leave through the machine's default interface. Where `machine.far_side_address()` names an
-    address, the description names it and a relay from it to the server; `relayed()` still reads the server's own log.
+    The server's own dials leave through the machine's default interface, bound to its address. Where
+    `machine.far_side_address()` names an address, the description names it and a relay from it to the server;
+    `relayed()` still reads the server's own log.
     """
-    with run_ss_server(kind, tmp_path, machine.default_interface()) as server:
+    outbound = Outbound(machine.default_interface(), machine.default_interface_address())
+    with run_ss_server(kind, tmp_path, outbound) as server:
         address = machine.far_side_address()
         if address is None:
             yield server
@@ -496,6 +515,10 @@ class MachineView(Protocol):
 
     def default_interface(self) -> str:
         """The interface the machine's default route leaves by: where the far side's own dials must leave from."""
+        ...
+
+    def default_interface_address(self) -> str:
+        """The IPv4 address of `default_interface()`, which the far side's sockets are bound to."""
         ...
 
     def far_side_address(self) -> str | None:

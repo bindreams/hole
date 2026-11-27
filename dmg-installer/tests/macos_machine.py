@@ -213,16 +213,19 @@ class MacMachine:
     def default_interface(self) -> str:
         return _default_interface(_Transcript().output)
 
+    def default_interface_address(self) -> str:
+        address = _Transcript().output("ipconfig", "getifaddr", self.default_interface()).strip()
+        if not address:
+            raise MachineReadError("`ipconfig getifaddr` printed no address for the default interface")
+        return address
+
     def far_side_address(self) -> str:
         """The default interface's own IPv4 address.
 
         For an address of its own the system delivers locally whatever the host route for it says, and the product
         installs and removes that route all the same.
         """
-        address = _Transcript().output("ipconfig", "getifaddr", self.default_interface()).strip()
-        if not address:
-            raise MachineReadError("`ipconfig getifaddr` printed no address for the default interface")
-        return address
+        return self.default_interface_address()
 
     @contextmanager
     def scoped_default_route(self) -> Iterator[None]:

@@ -84,30 +84,48 @@ pub async fn start_real_ss_server(method: CipherKind, password: &str) -> (Socket
     start_real_ss_server_via(method, password, None).await
 }
 
-/// [`start_real_ss_server`] whose own dials to its targets leave through the network interface named
-/// `outbound_interface` (its friendly name on Windows, its device name elsewhere), not through the routing table.
+/// A network interface of the machine and its own IPv4 address: where a server's dials leave from.
+#[derive(Clone, Debug)]
+pub struct OutboundInterface {
+    /// Its friendly name on Windows, its device name elsewhere.
+    pub name: String,
+    pub ipv4: Ipv4Addr,
+}
+
+/// [`start_real_ss_server`] whose own dials to its targets leave through `outbound`, not through the routing table.
 /// `None` is [`start_real_ss_server`].
 ///
 /// A server on the machine a full tunnel runs on needs this: dialing through the routing table sends its dials back
-/// into the tunnel, which hands them to the server again.
+/// into the tunnel, which hands them to the server again. Naming the interface (`bind_interface`) is not enough:
+/// shadowsocks-service 1.24.0 sends an IPv4 UDP relay on an IPv6 socket, and on Windows that socket is held to the
+/// interface only by `IPV6_UNICAST_IF`. A datagram on it followed the tunnel's split route into the TUN (measured: one
+/// NTP request became 256 relays and stalled the galoshes transport). The server also binds to the interface's own
+/// address (`bind_local_addr`), which holds that socket. TCP is held by the interface alone, an IPv4 socket with
+/// `IP_UNICAST_IF` (measured: the page requests of the journey leave by it).
+///
+/// Binding the IPv4 address makes the server's sockets IPv4-only: on Windows a dial to a native IPv6 target fails, TCP
+/// with `WSAENETUNREACH` and UDP with `WSAEADDRNOTAVAIL` (measured with a socket bound to a mapped address, as
+/// shadowsocks binds it). Not measured on macOS, where shadowsocks makes the same bind and holds the socket with
+/// `IPV6_BOUND_IF`.
 pub async fn start_real_ss_server_via(
     method: CipherKind,
     password: &str,
-    outbound_interface: Option<&str>,
+    outbound: Option<&OutboundInterface>,
 ) -> (SocketAddr, JoinHandle<()>) {
     let (port, server) = port_alloc::bind_ephemeral(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         Protocols::TCP | Protocols::UDP,
         |port| {
             let password = password.to_string();
-            let outbound_interface = outbound_interface.map(str::to_string);
+            let outbound = outbound.cloned();
             async move {
                 let mut svr_cfg = ServerConfig::new(("127.0.0.1", port), password, method).unwrap();
                 svr_cfg.set_mode(SsMode::TcpAndUdp);
                 let mut builder = SsServerBuilder::new(svr_cfg);
-                if let Some(interface) = outbound_interface {
+                if let Some(outbound) = outbound {
                     builder.set_connect_opts(ConnectOpts {
-                        bind_interface: Some(interface),
+                        bind_interface: Some(outbound.name),
+                        bind_local_addr: Some(SocketAddr::new(IpAddr::V4(outbound.ipv4), 0)),
                         ..ConnectOpts::default()
                     });
                 }
@@ -144,23 +162,15 @@ pub async fn start_real_ss_server_with_plugin_ws(
     start_real_ss_server_with_plugin_ws_via(method, password, plugin_path, None).await
 }
 
-/// [`start_real_ss_server_with_plugin_ws`] whose ss-server dials its targets out of `outbound_interface`, as
+/// [`start_real_ss_server_with_plugin_ws`] whose ss-server dials its targets out of `outbound`, as
 /// [`start_real_ss_server_via`] does. `None` is [`start_real_ss_server_with_plugin_ws`].
 pub async fn start_real_ss_server_with_plugin_ws_via(
     method: CipherKind,
     password: &str,
     plugin_path: &str,
-    outbound_interface: Option<&str>,
+    outbound: Option<&OutboundInterface>,
 ) -> (SocketAddr, PluginServer) {
-    spawn_ss_with_plugin(
-        method,
-        password,
-        Protocols::TCP,
-        plugin_path,
-        WS_SERVER_OPTS,
-        outbound_interface,
-    )
-    .await
+    spawn_ss_with_plugin(method, password, Protocols::TCP, plugin_path, WS_SERVER_OPTS, outbound).await
 }
 
 /// [`start_real_ss_server_with_plugin_ws`] with the server-mode options string
@@ -257,12 +267,12 @@ async fn spawn_ss_with_plugin(
     public_bind_protocols: Protocols,
     plugin_path: &str,
     plugin_opts: &str,
-    outbound_interface: Option<&str>,
+    outbound: Option<&OutboundInterface>,
 ) -> (SocketAddr, PluginServer) {
     // Plain ss-server on a HELD loopback port (no plugin). The plugin chain
     // forwards decapsulated traffic here; the port is held for the server's
     // lifetime, so there is no bind-and-drop rendezvous race.
-    let (ss_addr, ss_handle) = start_real_ss_server_via(method, password, outbound_interface).await;
+    let (ss_addr, ss_handle) = start_real_ss_server_via(method, password, outbound).await;
 
     let mut attempt: u32 = 0;
     loop {

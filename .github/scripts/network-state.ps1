@@ -1,15 +1,21 @@
 # Prints what the operating system itself says of this machine's network, for the installed full-tunnel test.
 #   -What default-interface  the alias of the interface the IPv4 default route leaves by
+#   -What default-address    the first IPv4 address of that interface that Windows may send from; nothing if it has none
 #   -What snapshot           IP interfaces, routes, addresses and DNS servers as one JSON object, the same before a tunnel
 #                            starts and after it stops
-param([Parameter(Mandatory)][ValidateSet('default-interface', 'snapshot')][string]$What)
+param([Parameter(Mandatory)][ValidateSet('default-interface', 'default-address', 'snapshot')][string]$What)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
+function Get-DefaultInterface {
+  # With no default route `Get-NetRoute` itself fails, and so does this script.
+  (Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '0.0.0.0/0' | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1).InterfaceAlias
+}
+
 switch ($What) {
-  'default-interface' {
-    # With no default route `Get-NetRoute` itself fails, and so does this script.
-    (Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '0.0.0.0/0' | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1).InterfaceAlias
+  'default-interface' { Get-DefaultInterface }
+  'default-address' {
+    (Get-NetIPAddress -InterfaceAlias (Get-DefaultInterface) -AddressFamily IPv4 -SkipAsSource $false | Select-Object -First 1).IPAddress
   }
   'snapshot' {
     # Windows replaces a temporary IPv6 address on its own timer, and each one has a host route.

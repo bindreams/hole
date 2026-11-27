@@ -121,6 +121,9 @@ class WindowsMachine:
     def default_interface(self) -> str:
         return self._state("default-interface").strip()
 
+    def default_interface_address(self) -> str:
+        return self._state("default-address").strip()
+
     def far_side_address(self) -> None:
         """Loopback: Windows refuses the host route for the machine's own address.
 
