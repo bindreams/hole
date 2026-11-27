@@ -6,9 +6,10 @@ The Windows and macOS installer suites install the product their own way (`msi-i
 - `connect_and_fetch` starts the proxy in SOCKS-only mode, so no TUN device, route or DNS setting is involved, and the
   server and the target are on this host.
 - `full_tunnel_journey` starts it as `hole proxy start` does by default, a full tunnel, and fetches pages from outside
-  the machine by address and by name, and for a plugin that carries UDP sends one datagram that draws a QUIC Version
-  Negotiation reply. The far side says what it relayed, and the platform suite hands the journey a
-  `MachineView`: what the operating system says of its routes, adapters and DNS, and a `curl` run as the person.
+  the machine by address and by name, and for a plugin that carries UDP sends a datagram, resent until answered, that
+  draws a QUIC Version Negotiation reply. After the stop it looks up a name no cache holds. The far side says what it
+  relayed, and the platform suite hands the journey a `MachineView`: what the operating system says of its routes,
+  adapters and DNS, and a `curl` and a Python run as the person.
 """
 
 import difflib
@@ -21,9 +22,10 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Generic, Protocol, TypeVar
@@ -53,8 +55,9 @@ NAME_TARGETS = ("1.1.1.1:80", "1.0.0.1:80")
 
 # The DNS servers a start is given when its config names none (`DnsConfig::default()`), in their order.
 DNS_SERVERS = ("1.1.1.1", "1.0.0.1")
-# The two halves of IPv4 that a full tunnel routes into its device (`tun_engine::routing`).
-SPLIT_ROUTES = frozenset({"0.0.0.0/1", "128.0.0.0/1"})
+# The routes that capture all of IPv4 and IPv6 into a full tunnel's device (`tun_engine::routing::SPLIT_ROUTES`), as
+# each platform's snapshot prints them.
+SPLIT_ROUTES = frozenset({"0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"})
 # The IPv4 default route, as a `Route` destination.
 DEFAULT_ROUTE = "0.0.0.0/0"
 
@@ -68,15 +71,10 @@ _UDP_RELAY = re.compile(r"udp relay (\S+) -> (\S+) with (\d+) bytes, control")
 # server answers with Version Negotiation (RFC 9000 sections 6.1 and 17.2.1). The sender builds the packet from
 # `UDP_SIZE` and the matcher counts the far side's relay lines by `UDP_TARGET` and `UDP_SIZE`, so they cannot disagree.
 #
-# The check rests on two contracts. Nothing else on the runners sends to `UDP_TARGET` during a case: the far-side logs of
-# PR #1411's CI runs on darwin arm64, darwin amd64 and windows amd64 show no relay to it but the journey's own, and a
-# bare-runner probe got Version Negotiation from it on macos-26-arm64, macos-15, ubuntu-26.04 and windows-2025. The size
-# is a second distinction only (above 1200, the smallest datagram that draws Version Negotiation); a QUIC connection
-# sends packets of any size once its handshake is done. And the product keeps one UDP association per source socket for
-# the life of the probe, so the far side sees every send from one client address (CI runs 45953182365 and 45962345199,
-# Windows, galoshes and no plugin: 60 resends, one address each; macOS has been seen with single sends only). Those runs
-# were mutation runs: the far side made no address bind, so its own relay looped back through the tunnel, and each pass
-# of the loop reached it from a new address. The mutation changed the far side only, not the product.
+# The check rests on two contracts, measured in CI (docs/contributing/installers.md): nothing else on the runners sends
+# to `UDP_TARGET` during a case, and the product keeps one UDP association per source socket for the life of the probe,
+# so the far side sees every send from one client address. The size is a second distinction only (above 1200, the
+# smallest datagram that draws Version Negotiation).
 UDP_HOST = "8.8.4.4"
 UDP_PORT = 443
 UDP_TARGET = f"{UDP_HOST}:{UDP_PORT}"
@@ -87,6 +85,14 @@ UDP_SENDER = Path(__file__).with_name("quic_version_negotiation_probe.py")
 UDP_REPLY_SECONDS = 60
 # The version field of a Version Negotiation packet.
 VERSION_NEGOTIATION = 0
+# The lookup the person makes after the stop: a name made up for the case, under a domain whose every name resolves
+# (GitHub Pages answers any name under `github.io`). No cache holds a name nobody asked before, so an answer came from
+# the resolver the system holds now. A name that exists is needed: on Windows an unknown name ends in Python's
+# `[Errno 11001]` (`WSAHOST_NOT_FOUND`), an error that does not say whether a resolver answered.
+LOOKUP_DOMAIN = "github.io"
+LOOKUP_SENDER = Path(__file__).with_name("lookup_probe.py")
+# Failure bound on the answer to that lookup.
+LOOKUP_SECONDS = 60
 # The plugins whose connection carries UDP; `v2ray-plugin` is TCP-only, and the product drops a UDP flow for it.
 UDP_PLUGINS = (None, "galoshes")
 
@@ -182,6 +188,17 @@ class Outbound:
     interface: str
     address: str
 
+    def __post_init__(self) -> None:
+        # An empty interface would send the far side's dials through the routing table, back into the tunnel. Both
+        # machine readers raise before they return one, so this is a contract, not an input.
+        assert self.interface.strip(), "the machine named no default interface for the far side's dials"
+        try:
+            ipaddress.IPv4Address(self.address)
+        except ValueError:
+            raise AssertionError(
+                f"the address for the far side's dials ({self.address!r}) is not an IPv4 address of {self.interface}"
+            ) from None
+
 
 @contextmanager
 def run_ss_server(
@@ -195,21 +212,6 @@ def run_ss_server(
     listens on: loopback when `None`. It needs an `outbound`.
     """
     assert outbound is not None or listen is None, "a listen address comes with an outbound interface"
-    if outbound is not None and not outbound.interface.strip():
-        pytest.fail(
-            f"the outbound interface asked for for the far side is empty ({outbound.interface!r}), which would send its "
-            "dials through the routing table, back into the tunnel: the machine named no default interface",
-            pytrace=False,
-        )
-    if outbound is not None:
-        try:
-            ipaddress.IPv4Address(outbound.address)
-        except ValueError:
-            pytest.fail(
-                f"the address asked for for the far side's dials ({outbound.address!r}) is not an IPv4 address of "
-                f"{outbound.interface}: the machine named none",
-                pytrace=False,
-            )
     # Cargo reads a relative `CARGO_TARGET_DIR` from where it ran, the repo root; pytest runs in the suite's folder.
     target_dir = REPO_ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
     exe = (
@@ -238,6 +240,7 @@ def run_ss_server(
     def stderr_text() -> str:
         return stderr_path.read_text(encoding="utf-8", errors="replace")
 
+    ok = False
     try:
         # One JSON line once the server is serving; EOF if the fixture died first.
         line = proc.stdout.readline()
@@ -245,11 +248,17 @@ def run_ss_server(
             proc.wait()
             pytest.fail(f"ss_plugin_server {kind} exited before serving:\n{stderr_text()}", pytrace=False)
         yield SsServer(json.loads(line), stderr_path)
+        ok = True
     finally:
         proc.stdin.close()
-        proc.wait()
+        exit_code = proc.wait()
         # pytest shows captured output only for a failed test.
         print(f"=== ss_plugin_server {kind} stderr ===\n{stderr_text()}")
+        # The server serves until its stdin closes and then exits 0; another code is a crash during the case.
+        if exit_code != 0:
+            report_teardown_failure(
+                f"ss_plugin_server {kind} exited {exit_code} after its stdin closed:\n{stderr_text()}", primary_ok=ok
+            )
 
 
 @contextmanager
@@ -425,7 +434,8 @@ class Settled(Generic[T]):
     """What `ChangeWatch.settle` read."""
 
     reading: T
-    # Empty when `reading` is one for which `settled` held; otherwise what ran out, for the report.
+    # Empty when `reading` is one for which `settled` held; otherwise what ran out, for the report. The reading is then
+    # the last one made before the bound ran out, whatever a later one would say.
     unsettled: str = ""
 
 
@@ -440,11 +450,12 @@ def settle_on_notices(
     """`read()` until `settled` holds, reading again on each notice from the system that something changed.
 
     `arm()` is called before each reading, so a notice that arrives after it is not lost; `wait(seconds)` returns
-    when a notice has arrived (`True`) or the time is up (`False`). The system is not ours, so a notice that never
-    comes ends the wait after `SETTLE_SECONDS`: the last reading is then returned with the bound named in
-    `unsettled`, for the caller to fail on. `source` names the notice, for that text.
+    when a notice has arrived (`True`) or the time is up (`False`). The system is not ours, so `SETTLE_SECONDS` is the
+    failure report on a notice it never sent: when it runs out the last reading is returned with `unsettled` saying
+    which way it ran out, and no reading made after the bound decides a pass. `source` names the notices, for that text.
     """
     deadline = time.monotonic() + SETTLE_SECONDS
+    notices = 0
     while True:
         arm()
         reading = read()
@@ -452,14 +463,14 @@ def settle_on_notices(
             return Settled(reading)
         remaining = deadline - time.monotonic()
         if remaining > 0 and wait(remaining):
+            notices += 1
             continue
-        # A change whose notice never came is still a change.
-        reading = read()
-        if settled(reading):
-            return Settled(reading)
+        if notices == 0:
+            return Settled(reading, f"no notice of a change came from {source} in the {SETTLE_SECONDS} s allowed")
         return Settled(
             reading,
-            f"no notice of a change from {source} in the {SETTLE_SECONDS} s allowed, and the reading still did not hold",
+            f"{notices} notice(s) of a change came from {source} in the {SETTLE_SECONDS} s allowed, and the reading "
+            "still did not hold",
         )
 
 
@@ -590,20 +601,19 @@ def page_problems(
 
 def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
     """The person's datagram draws Version Negotiation from `UDP_TARGET`; the reply must reach the person's socket and
-    answer it, and the far side must have relayed the datagram from one client address, at least once and no more often
-    than it was sent.
+    answer it, and the far side must have relayed the datagram, from one client address.
 
     The sender sends the same datagram until a reply comes, so the answer is a Version Negotiation packet whose
     connection IDs are the datagram's own, swapped (RFC 9000 section 17.2.1), whichever send it answers. The reply alone
     shows nothing: it needs the far side's relay to have carried the datagram.
 
-    The relay check reads the lines this case added, once, after the sender exits. It rests on the contract that the
-    product keeps one UDP association per source socket for the life of the probe, so every send reaches the far side
-    from one client address, and that nothing else sends to `UDP_TARGET` meanwhile (see `UDP_TARGET`). Then a line from
-    a second client address is a datagram that came back to the far side, re-entering the tunnel, whatever the counts.
-    The one address's lines number `1 <= n <= sends`: sends made after the answered one can still be in the tunnel, and
-    the far side writes its relay line before it forwards. More than `sends` is the product relaying a datagram more
-    often than it was sent. If the contract ever fails, the check reports a second address, with the addresses printed.
+    The relay check reads the lines this case added, once, after the sender exits. The far side writes its line before
+    it forwards, so a reply that came through it has its line already: no line is a red whatever the reply was. A line
+    from a second client address names the cause of a no-reply red. shadowsocks-service 1.24.0 keeps one outbound IPv4
+    socket per association (`UdpAssociationContext`, `server/udprelay.rs`), so a datagram that comes back to the far side
+    through the tunnel (a looping egress) arrives from a new address and draws no reply. Under the contracts at
+    `UDP_TARGET`, a second address is such a datagram. The check does not see a datagram the product relays more than
+    once from the one address, or a line the far side writes after the read.
     """
     seen = len(server.udp_relayed())
     sent = machine.run_python(UDP_SENDER, UDP_HOST, str(UDP_PORT), str(UDP_SIZE), str(UDP_REPLY_SECONDS))
@@ -626,8 +636,7 @@ def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
             f"the person's datagram of {what} did not run: exit {sent.returncode}, stdout {sent.stdout!r}, "
             f"stderr {sent.stderr.strip()!r} ({relayed})"
         ]
-    sends = answer["sends"]
-    counts = f"the person sent {sends} such datagram(s); {relayed}"
+    counts = f"the person sent {answer['sends']} such datagram(s); {relayed}"
     problems = []
     if answer["reply"] is None:
         problems.append(
@@ -635,7 +644,6 @@ def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
             + (f", the last socket error was {answer['error']}" if answer.get("error") else "")
             # With a second address, the re-entry problem below gives the counts.
             + (f"; {counts}" if len(addresses) <= 1 else "")
-            + (" (the datagram never reached the far side)" if relays == 0 else "")
         )
     elif (answer["version"], answer["dcid"], answer["scid"]) != (
         VERSION_NEGOTIATION,
@@ -644,24 +652,44 @@ def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
     ):
         problems.append(
             f"the datagram that reached the person's socket is not Version Negotiation for the one they sent "
-            f"(version {VERSION_NEGOTIATION}, connection IDs swapped): {answer}"
+            f"(version {VERSION_NEGOTIATION}, connection IDs swapped): {answer}; {counts}"
         )
-    elif relays == 0:
+    if relays == 0:
         problems.append(
-            f"the reply arrived, but the far side logged no relay for it; {counts} (the datagram may have left the "
-            f"machine outside the tunnel; or the matcher does not see the far side's lines)"
+            "the far side logged no relay of the person's datagram"
+            + (", although a reply arrived" if answer["reply"] is not None else "")
+            + f"; {counts} (the datagram may have left the machine outside the tunnel, or never reached it; or the "
+            f"matcher does not see the far side's lines)"
         )
     if len(addresses) > 1:
         problems.append(
             f"the far side took the person's datagram in from more than one client address; {counts} (a datagram "
             f"that came back to the far side, re-entering the tunnel)"
         )
-    if addresses and addresses[0][1] > sends:
-        problems.append(
-            f"the far side relayed the person's datagram from {addresses[0][0]} more often than it was sent; {counts} "
-            f"(the product relayed a datagram more often than it was sent)"
-        )
     return problems
+
+
+def lookup_problems(machine: MachineView) -> list[str]:
+    """The person looks up a name nobody has asked before, through the system resolver, and gets an answer.
+
+    No cache holds the name, so the answer comes from the resolver the system holds now: a stop that left the
+    machine's DNS confined to the tunnel (Windows confines port-53 egress to it) or pointed at it gets none.
+    """
+    name = f"hole-{uuid.uuid4().hex}.{LOOKUP_DOMAIN}"
+    looked = machine.run_python(LOOKUP_SENDER, name, str(LOOKUP_SECONDS))
+    try:
+        answer = json.loads(looked.stdout)
+    except json.JSONDecodeError:
+        return [
+            f"the person's lookup of {name} did not run: exit {looked.returncode}, stdout {looked.stdout!r}, "
+            f"stderr {looked.stderr.strip()!r}"
+        ]
+    if answer["addresses"]:
+        return []
+    return [
+        f"after the stop the system resolver gave the person no answer for {name}, a name no cache holds under a "
+        f"domain whose every name resolves: {answer['error']}"
+    ]
 
 
 def interfaces_gained(before: Snapshot, during: Snapshot) -> list[str]:
@@ -703,8 +731,8 @@ def dns_problems(before: Snapshot, during: Snapshot) -> list[str]:
 
 
 def device_problems(before: Snapshot, during: Snapshot) -> list[str]:
-    """While the tunnel is up the machine has exactly one interface it had not before, and both halves of IPv4 are
-    routed into it.
+    """While the tunnel is up the machine has exactly one interface it had not before, and the `SPLIT_ROUTES` that
+    capture all of IPv4 and IPv6 are routed into it.
 
     It also shows that a snapshot can see a tunnel at all, without which a snapshot after the stop that equals the
     one before the start says nothing.
@@ -715,8 +743,8 @@ def device_problems(before: Snapshot, during: Snapshot) -> list[str]:
     routed = {route.destination for route in during.routes if route.interface == tunnel[0]}
     if not SPLIT_ROUTES <= routed:
         return [
-            f"the routes into the tunnel's interface {tunnel[0]} do not hold both halves of IPv4 "
-            f"({sorted(SPLIT_ROUTES)}): {sorted(routed)}"
+            f"the routes into the tunnel's interface {tunnel[0]} do not hold the split routes "
+            f"{sorted(SPLIT_ROUTES)}: {sorted(routed)}"
         ]
     return []
 
@@ -754,22 +782,78 @@ def show_machine(when: str, snapshot: Snapshot) -> None:
         print(f"=== what the machine's commands printed {when} ===\n{snapshot.raw}", flush=True)
 
 
-def stop_problems(hole: InstalledHole, machine: MachineView, before: Snapshot) -> list[str]:
-    """Stop the proxy; the machine's interfaces, routes, addresses and DNS servers must then be those of `before`."""
-    with machine.watch_changes() as watch:
-        stopped = hole.run("proxy", "stop")
-        if stopped.returncode != 0:
-            return [f"hole proxy stop exited {stopped.returncode}: {stopped.stdout.strip()} {stopped.stderr.strip()}"]
+class _Unwatched:
+    """The `ChangeWatch` of a machine whose notices could not be registered: one reading, no wait."""
+
+    def settle(self, read: Callable[[], T], settled: Callable[[T], bool]) -> Settled[T]:
+        reading = read()
+        if settled(reading):
+            return Settled(reading)
+        return Settled(reading, "the reading did not hold, and it was not waited on: no change notice was registered")
+
+
+@contextmanager
+def watching(machine: MachineView, problems: list[str]) -> Iterator[ChangeWatch]:
+    """`machine.watch_changes()`. When its notices cannot be registered, the problem is added to `problems` and the block
+    runs with a watch that reads once, so the command inside it still runs."""
+    with ExitStack() as stack:
         try:
-            settled = watch.settle(machine.snapshot, lambda snapshot: snapshot == before)
+            watch = stack.enter_context(machine.watch_changes())
         except MachineReadError as e:
-            return [f"the machine could not be read after the stop: {e}"]
+            problems.append(f"the machine's change notices could not be registered: {e}")
+            watch = _Unwatched()
+        yield watch
+
+
+def attempt(problems: list[str], what: str, make: Callable[[], T]) -> T | None:
+    """`make()`; when it raises (the machine could not be read, a child recorded nothing), `None` and a problem naming
+    `what` and the error, so that nothing found before is lost and the rest of the case runs."""
+    try:
+        return make()
+    except Exception as e:
+        problems.append(f"{what} could not be made: {type(e).__name__}: {e}")
+        return None
+
+
+def run_check(problems: list[str], what: str, check: Callable[[], list[str]]) -> None:
+    """Add what `check` found to `problems`; a check that cannot be made is a problem of its own (`attempt`)."""
+    problems.extend(attempt(problems, what, check) or [])
+
+
+def stop_problems(hole: InstalledHole, machine: MachineView, before: Snapshot) -> list[str]:
+    """Stop the proxy; the machine's interfaces, routes, addresses and DNS servers must then be those of `before`, and
+    the person's lookups must work.
+
+    A step that fails does not end the others: a failed stop is when the machine is most likely to be left changed.
+    The lookup is made once the machine is as it was, so that what it finds is the system's resolver and not a
+    resolver still being restored (`lookup_problems`).
+    """
+    problems: list[str] = []
+    with watching(machine, problems) as watch:
+        stopped = attempt(problems, "`hole proxy stop`", lambda: hole.run("proxy", "stop"))
+        if stopped is not None and stopped.returncode != 0:
+            problems.append(
+                f"hole proxy stop exited {stopped.returncode}: {stopped.stdout.strip()} {stopped.stderr.strip()}"
+            )
+        settled = attempt(
+            problems,
+            "the reading of the machine after the stop",
+            lambda: watch.settle(machine.snapshot, lambda snapshot: snapshot == before),
+        )
+    if settled is None:
+        return problems
     after = settled.reading
     if after == before:
-        return []
+        run_check(problems, "the person's lookup after the stop", lambda: lookup_problems(machine))
+        return problems
     changes = difflib.unified_diff(before.lines(), after.lines(), "before the start", "after the stop", lineterm="")
-    problems = ["the machine after the stop is not as it was before the start:\n" + "\n".join(changes)]
-    return [settled.unsettled, *problems] if settled.unsettled else problems
+    # `unsettled` is empty only for a reading for which the predicate held, and here it did not.
+    assert settled.unsettled
+    return [
+        *problems,
+        settled.unsettled,
+        "the machine after the stop is not as it was before the start:\n" + "\n".join(changes),
+    ]
 
 
 def full_tunnel_journey(
@@ -783,10 +867,14 @@ def full_tunnel_journey(
     then for each of these that does not hold: a page by address and one by name arrive through the far side
     (`page_problems`), for a plugin that carries UDP a datagram of the person's, resent until answered, is answered
     through the far side (`udp_problems`), the system holds the tunnel's resolver (`dns_problems`) and its device and
-    routes (`device_problems`), and after the stop the machine is as it was (`stop_problems`).
+    routes (`device_problems`), and after the stop the machine is as it was and the person's lookups work
+    (`stop_problems`).
 
     For a server that is not on loopback it also checks the route that keeps the product's connection to the server out
     of the tunnel (`bypass_problems`). On loopback the product installs none, and the journey does not see that route.
+
+    The checks add to one list of problems as they are found; a check that cannot be made is a problem in it
+    (`attempt`), and the stop and the report, which carries the installed bridge's log, run whatever the checks did.
     """
     case = plugin or "a server with no plugin"
     address = server.description["server"]
@@ -795,32 +883,52 @@ def full_tunnel_journey(
 
     before = machine.snapshot()
     show_machine("before the start", before)
+    problems: list[str] = []
+    started = None
     # The stop runs whatever the start did, so no case leaves a tunnel up for the next one to find.
     try:
-        with machine.watch_changes() as watch:
+        with watching(machine, problems) as watch:
             # No `--tunnel-mode`: a full tunnel is the default.
             started = hole.run("proxy", "start", "--config-file", str(config))
             fail_unless_started(hole, started, f"a full tunnel through {case}")
-            settled = watch.settle(machine.snapshot, lambda snapshot: not dns_problems(before, snapshot))
-        during = settled.reading
-        show_machine("while the tunnel is up", during)
-        problems = [
-            *([settled.unsettled] if settled.unsettled else []),
-            *page_problems(
+            settled = attempt(
+                problems,
+                "the reading of the machine after the start",
+                lambda: watch.settle(machine.snapshot, lambda snapshot: not dns_problems(before, snapshot)),
+            )
+        if settled is not None:
+            show_machine("while the tunnel is up", settled.reading)
+            if settled.unsettled:
+                problems.append(settled.unsettled)
+        run_check(
+            problems,
+            "the page by address",
+            lambda: page_problems(
                 machine, server, "by address", ADDRESS_URL, ADDRESS_REDIRECT, ADDRESS_TARGETS, tmp_path, ipv4_only=False
             ),
-            *page_problems(machine, server, "by name", NAME_URL, NAME_REDIRECT, NAME_TARGETS, tmp_path, ipv4_only=True),
-            *(udp_problems(machine, server) if plugin in UDP_PLUGINS else []),
-            *dns_problems(before, during),
-            *device_problems(before, during),
-            *([] if ipaddress.ip_address(address).is_loopback else bypass_problems(before, during, address)),
-        ]
+        )
+        run_check(
+            problems,
+            "the page by name",
+            lambda: page_problems(
+                machine, server, "by name", NAME_URL, NAME_REDIRECT, NAME_TARGETS, tmp_path, ipv4_only=True
+            ),
+        )
+        if plugin in UDP_PLUGINS:
+            run_check(problems, "the person's datagram", lambda: udp_problems(machine, server))
+        if settled is not None:
+            during = settled.reading
+            problems += dns_problems(before, during)
+            problems += device_problems(before, during)
+            if not ipaddress.ip_address(address).is_loopback:
+                problems += bypass_problems(before, during, address)
     except BaseException:
         # That failure stays the reported one.
-        for problem in stop_problems(hole, machine, before):
+        for problem in [*problems, *stop_problems(hole, machine, before)]:
             print(f"teardown after an earlier failure:\n{problem}", file=sys.stderr)
         raise
     problems += stop_problems(hole, machine, before)
     if problems:
+        assert started is not None  # `fail_unless_started` raised otherwise
         numbered = "\n".join(f"{n}. {problem}" for n, problem in enumerate(problems, 1))
         pytest.fail(hole.report(f"the full tunnel through {case} is not right:\n{numbered}", started), pytrace=False)
