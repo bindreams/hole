@@ -125,7 +125,7 @@ pub async fn start_real_ss_server_via(
             if let Some(outbound) = outbound {
                 builder.set_connect_opts(ConnectOpts {
                     bind_interface: Some(outbound.name),
-                    bind_local_addr: cfg!(any()).then(|| SocketAddr::new(IpAddr::V4(outbound.ipv4), 0)),
+                    bind_local_addr: cfg!(windows).then(|| SocketAddr::new(IpAddr::V4(outbound.ipv4), 0)),
                     ..ConnectOpts::default()
                 });
             }
