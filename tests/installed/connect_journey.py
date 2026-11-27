@@ -642,8 +642,6 @@ def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
         problems.append(
             f"no reply to the person's datagram of {what} reached their socket in {UDP_REPLY_SECONDS} s"
             + (f", the last socket error was {answer['error']}" if answer.get("error") else "")
-            # With a second address, the re-entry problem below gives the counts.
-            + (f"; {counts}" if len(addresses) <= 1 else "")
         )
     elif (answer["version"], answer["dcid"], answer["scid"]) != (
         VERSION_NEGOTIATION,
@@ -652,20 +650,23 @@ def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
     ):
         problems.append(
             f"the datagram that reached the person's socket is not Version Negotiation for the one they sent "
-            f"(version {VERSION_NEGOTIATION}, connection IDs swapped): {answer}; {counts}"
+            f"(version {VERSION_NEGOTIATION}, connection IDs swapped): {answer}"
         )
     if relays == 0:
         problems.append(
             "the far side logged no relay of the person's datagram"
             + (", although a reply arrived" if answer["reply"] is not None else "")
-            + f"; {counts} (the datagram may have left the machine outside the tunnel, or never reached it; or the "
-            f"matcher does not see the far side's lines)"
+            + " (the datagram may have left the machine outside the tunnel, or never reached it; or the matcher does not "
+            "see the far side's lines)"
         )
     if len(addresses) > 1:
         problems.append(
-            f"the far side took the person's datagram in from more than one client address; {counts} (a datagram "
-            f"that came back to the far side, re-entering the tunnel)"
+            "the far side took the person's datagram in from more than one client address (a datagram that came back to "
+            "the far side, re-entering the tunnel)"
         )
+    # The counts are stated once, on the first problem.
+    if problems:
+        problems[0] += f"; {counts}"
     return problems
 
 
