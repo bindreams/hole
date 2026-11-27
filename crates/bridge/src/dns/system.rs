@@ -499,7 +499,7 @@ impl DnsApplied for SystemDnsApplied {
             // Dropping the confinement is the whole disengage (see
             // `tun_engine::dns_confine`). No adapter restore: only `hole-tun`
             // was touched, and the teardown that follows removes it.
-            self.confinement.take();
+            std::mem::forget(self.confinement.take());
         }
 
         #[cfg(target_os = "macos")]
