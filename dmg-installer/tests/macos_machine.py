@@ -204,10 +204,18 @@ class _MacChangeWatch:
         self._descriptor, self._token = descriptor.value, token.value
 
     def close(self) -> None:
-        self._routes.close()
+        """Release both registrations. A failure raises `MachineReadError`, after both were tried."""
+        failures = []
+        try:
+            self._routes.close()
+        except OSError as e:
+            failures.append(f"closing the routing socket failed: {e}")
         # Cancelling closes the descriptor.
         status = self._notify.notify_cancel(ctypes.c_int(self._token))
-        assert status == 0, f"notify_cancel returned {status}"
+        if status != 0:
+            failures.append(f"notify_cancel returned {status}")
+        if failures:
+            raise MachineReadError("; ".join(failures))
 
     def _wait(self, seconds: float) -> bool:
         """Wait for a notice: configd's post, or a routing message of a kind in `_ROUTE_CHANGES`. `False` when none came

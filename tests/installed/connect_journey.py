@@ -795,14 +795,21 @@ class _Unwatched:
 @contextmanager
 def watching(machine: MachineView, problems: list[str]) -> Iterator[ChangeWatch]:
     """`machine.watch_changes()`. When its notices cannot be registered, the problem is added to `problems` and the block
-    runs with a watch that reads once, so the command inside it still runs."""
-    with ExitStack() as stack:
-        try:
-            watch = stack.enter_context(machine.watch_changes())
-        except MachineReadError as e:
-            problems.append(f"the machine's change notices could not be registered: {e}")
-            watch = _Unwatched()
+    runs with a watch that reads once, so the command inside it still runs. A release that fails is added to `problems`
+    too, and never replaces what the block raised."""
+    stack = ExitStack()
+    try:
+        watch = stack.enter_context(machine.watch_changes())
+    except MachineReadError as e:
+        problems.append(f"the machine's change notices could not be registered: {e}")
+        watch = _Unwatched()
+    try:
         yield watch
+    finally:
+        try:
+            stack.close()
+        except MachineReadError as e:
+            problems.append(f"the machine's change notices could not be released: {e}")
 
 
 def attempt(problems: list[str], what: str, make: Callable[[], T]) -> T | None:

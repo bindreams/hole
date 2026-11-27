@@ -70,14 +70,21 @@ class _IpChangeWatch:
                 if status != 0:
                     raise MachineReadError(f"{name} returned error {status}")
                 self._handles.append(handle)
-        except BaseException:
-            self.close()
+        except BaseException as registration:
+            try:
+                self.close()
+            except MachineReadError as e:
+                # `watching` handles this type; the registration's own text stays in what it gets.
+                if isinstance(registration, MachineReadError):
+                    raise MachineReadError(f"{registration}; {e}") from registration
             raise
 
     def close(self) -> None:
+        """Cancel every registration. A cancel that fails raises `MachineReadError`, after the others were tried."""
         statuses = [self._cancel(handle) for handle in self._handles]
         self._handles.clear()
-        assert not any(statuses), f"CancelMibChangeNotify2 returned {statuses}"
+        if any(statuses):
+            raise MachineReadError(f"CancelMibChangeNotify2 returned {statuses}")
 
     def settle(self, read: Callable[[], T], settled: Callable[[T], bool]) -> Settled[T]:
         return settle_on_notices(
