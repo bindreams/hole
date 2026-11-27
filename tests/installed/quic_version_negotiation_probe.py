@@ -8,9 +8,10 @@ connection IDs, any reply answers the probe. Prints one JSON line:
 `{"sent_dcid": <hex>, "sent_scid": <hex>, "sends": <int>, "reply": <bytes>, "version": <int>, "dcid": <hex>,
 "scid": <hex>}`, where `version`, `dcid` and `scid` are the reply's long-header fields (`null` for a reply that is not a
 long header or is too short to hold them). `{"reply": null, ...}` means no reply came in `seconds`; with
-`"error": <name>` too, the last socket error the probe saw. A socket error does not end the probe (Windows raises `ConnectionResetError` for the ICMP error on a connected UDP
-socket, and an unreachable target raises `ConnectionRefusedError` elsewhere): it resends at the usual pace until a reply
-or `seconds`. `sends` counts the datagrams `send` accepted.
+`"error": <text>` too, the last socket error the probe saw (its class and message). A socket error does not end the
+probe (Windows raises `ConnectionResetError` for the ICMP error on a connected UDP socket, and an unreachable target
+raises `ConnectionRefusedError` elsewhere): it resends at the usual pace until a reply or `seconds`. `sends` counts the
+datagrams `send` accepted.
 
 The journey runs this as the person, so the datagram takes the route the person's own traffic takes. It uses nothing but
 the standard library: the interpreter that runs the tests is on both platforms.
@@ -86,7 +87,7 @@ def main() -> None:
                 continue
             except OSError as e:
                 # An error that returns at once must not turn the resends into a busy loop.
-                last_error = type(e).__name__
+                last_error = f"{type(e).__name__}: {e}"
                 time.sleep(max(0.0, min(now + RESEND_INTERVAL_SECONDS, deadline) - time.monotonic()))
                 continue
             report = {"reply": len(reply), **parse_long_header(reply)}

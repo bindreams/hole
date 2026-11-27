@@ -74,7 +74,9 @@ _UDP_RELAY = re.compile(r"udp relay (\S+) -> (\S+) with (\d+) bytes, control")
 # is a second distinction only (above 1200, the smallest datagram that draws Version Negotiation); a QUIC connection
 # sends packets of any size once its handshake is done. And the product keeps one UDP association per source socket for
 # the life of the probe, so the far side sees every send from one client address (CI run 45953182365, Windows, galoshes
-# and no plugin: 60 resends, one address each; macOS has been seen with single sends only).
+# and no plugin: 60 resends, one address each; macOS has been seen with single sends only). In the same run, with the
+# far side's own relay looping back through the tunnel, each pass of the loop reached it from a new address, with
+# galoshes and with no plugin.
 UDP_HOST = "8.8.4.4"
 UDP_PORT = 443
 UDP_TARGET = f"{UDP_HOST}:{UDP_PORT}"
@@ -631,13 +633,7 @@ def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
             f"no reply to the person's datagram of {what} reached their socket in {UDP_REPLY_SECONDS} s"
             + (f", the last socket error was {answer['error']}" if answer.get("error") else "")
             + f"; {counts}"
-            + (
-                " (the datagram never reached the far side)"
-                if relays == 0
-                else " (the datagram re-entered the tunnel)"
-                if len(ranked) > 1
-                else ""
-            )
+            + (" (the datagram never reached the far side)" if relays == 0 else "")
         )
     elif (answer["version"], answer["dcid"], answer["scid"]) != (
         VERSION_NEGOTIATION,
