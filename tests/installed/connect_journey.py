@@ -67,16 +67,20 @@ _UDP_RELAY = re.compile(r"udp relay \S+ -> (\S+) with (\d+) bytes, control")
 # The datagram the person sends in each case that carries UDP: a QUIC long-header packet with a reserved version, which a
 # server answers with Version Negotiation (RFC 9000 sections 6.1 and 17.2.1). The sender builds the packet from
 # `UDP_SIZE` and the matcher counts the far side's relay lines by `UDP_TARGET` and `UDP_SIZE`, so they cannot disagree.
-# The target answered on macos-26-arm64, macos-15, ubuntu-26.04 and windows-2025.
+#
+# The count is exact because nothing on the runners sends to `8.8.4.4` or `8.8.8.8` during a case. The far-side logs of
+# PR #1411's CI runs on darwin arm64, darwin amd64 and windows amd64 show no relay to either address but the journey's
+# own, and a bare-runner probe got Version Negotiation from `8.8.4.4:443` on macos-26-arm64, macos-15, ubuntu-26.04 and
+# windows-2025. The size is a second distinction only: it is above 1200, the smallest datagram that draws Version
+# Negotiation. A QUIC connection sends packets of any size once its handshake is done, so the contract above, not the
+# size, keeps the count exact.
 UDP_HOST = "8.8.4.4"
 UDP_PORT = 443
 UDP_TARGET = f"{UDP_HOST}:{UDP_PORT}"
-# Above 1200, the smallest datagram that draws Version Negotiation, and not a size QUIC clients send: the runner's own
-# QUIC to `1.1.1.1:443` was relayed at 43, 216, 1038, 1200 and 1252 bytes, and Apple's at 1350. The far side's relay line
-# carries the size, so a datagram of this size to this target is counted apart from every other.
 UDP_SIZE = 1237
-UDP_SENDER = Path(__file__).with_name("quic_version_negotiation_trigger.py")
-# Failure bound on the server's answer to that datagram, set well beyond a slow runner's.
+UDP_SENDER = Path(__file__).with_name("quic_version_negotiation_probe.py")
+# Failure bound on the server's answer to that datagram, set well beyond a slow runner's. The sender resends the same
+# datagram until the answer comes, so the bound is the only timer that decides failure.
 UDP_REPLY_SECONDS = 60
 # The version field of a Version Negotiation packet.
 VERSION_NEGOTIATION = 0
@@ -585,12 +589,15 @@ def page_problems(
 
 
 def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
-    """The person sends one datagram that draws Version Negotiation from `UDP_TARGET`; the reply must reach the person's
-    socket and answer it, and the far side must have relayed that datagram exactly once.
+    """The person's datagram draws Version Negotiation from `UDP_TARGET`; the reply must reach the person's socket and
+    answer it, and the far side must have relayed the datagram at least once and no more often than it was sent.
 
-    The answer is a Version Negotiation packet whose connection IDs are the datagram's own, swapped (RFC 9000 section
-    17.2.1). The reply alone shows nothing: it needs the far side's relay to have carried the datagram. A count above one
-    is a datagram that came back to the far side: its own relay re-entering the tunnel.
+    The sender sends the same datagram until a reply comes, so the answer is a Version Negotiation packet whose
+    connection IDs are the datagram's own, swapped (RFC 9000 section 17.2.1), whichever send it answers. The reply alone
+    shows nothing: it needs the far side's relay to have carried the datagram. The count is read once, after the sender
+    exits, and the healthy range is `1 <= relays <= sends`: sends made after the one that was answered can still be in
+    the tunnel, and the far side writes its relay line before it forwards. More relays than sends is a datagram that came
+    back to the far side: its own relay re-entering the tunnel.
     """
     relays_before = server.udp_relayed_count()
     sent = machine.run_python(UDP_SENDER, UDP_HOST, str(UDP_PORT), str(UDP_SIZE), str(UDP_REPLY_SECONDS))
@@ -603,12 +610,18 @@ def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
             f"the person's datagram of {what} did not run: exit {sent.returncode}, stdout {sent.stdout!r}, "
             f"stderr {sent.stderr.strip()!r} (the far side relayed {relays} such datagram(s) meanwhile)"
         ]
+    sends = answer["sends"]
+    counts = f"the person sent {sends} such datagram(s) and the far side relayed {relays}"
+    if answer.get("error"):
+        return [
+            f"the person's datagram of {what} drew {answer['error']}: the target was unreachable from their socket; "
+            f"{counts}"
+        ]
     problems = []
     if answer["reply"] is None:
         problems.append(
-            f"no reply to the person's datagram of {what} reached their socket in {UDP_REPLY_SECONDS} s; the far side "
-            f"relayed {relays} such datagram(s) for it (1 expected; more is the far side's own relay coming back "
-            f"through the tunnel)"
+            f"no reply to the person's datagram of {what} reached their socket in {UDP_REPLY_SECONDS} s; {counts}"
+            + (" (the datagram never reached the far side)" if relays == 0 else "")
         )
     elif (answer["version"], answer["dcid"], answer["scid"]) != (
         VERSION_NEGOTIATION,
@@ -619,8 +632,16 @@ def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
             f"the datagram that reached the person's socket is not Version Negotiation for the one they sent "
             f"(version {VERSION_NEGOTIATION}, connection IDs swapped): {answer}"
         )
-    if answer["reply"] is not None and relays != 1:
-        problems.append(f"the reply arrived, but the far side relayed {relays} such datagram(s) for it, not 1")
+    elif relays == 0:
+        problems.append(
+            f"the reply arrived, but the far side logged no relay for it; {counts} (the matcher does not see the far "
+            f"side's lines)"
+        )
+    if relays > sends:
+        problems.append(
+            f"the far side relayed more such datagrams than the person sent; {counts} (the far side's own relay "
+            f"re-entering the tunnel)"
+        )
     return problems
 
 

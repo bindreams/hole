@@ -8,7 +8,7 @@ names a bundled plugin must still find it.
 
 The connection itself is `connect_journey`, shared with the Windows installer suite: a SOCKS-only start that fetches
 a local page, and a full tunnel that fetches pages from outside the machine and, for a plugin that carries UDP, sends
-one QUIC Version Negotiation trigger through it.
+a QUIC Version Negotiation probe through it.
 
 Elevation is `sudo -n`, where the GUI uses osascript; both run the same
 `hole bridge install` as root with SUDO_USER set. IPC goes through the `hole
