@@ -309,12 +309,8 @@ impl HoleRouter {
             dst,
             decision.rule_index.map(|i| i as u32),
         ) {
-            Dispatch::Endpoint(endpoint) => {
-                tracing::debug!(src = %meta.src, dst = %dst, endpoint = endpoint.name(), "UDP flow dispatched");
-                endpoint.serve_udp(flow, dst).await
-            }
+            Dispatch::Endpoint(endpoint) => endpoint.serve_udp(flow, dst).await,
             Dispatch::Drop(reason) => {
-                tracing::debug!(src = %meta.src, dst = %dst, "UDP flow dropped");
                 self.log_drop(reason, dst, None, L4Proto::Udp);
                 // Dropping the flow ends route_udp; any further datagrams
                 // for the 5-tuple silently fail to enqueue until the

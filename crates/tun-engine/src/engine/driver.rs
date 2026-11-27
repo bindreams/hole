@@ -445,7 +445,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
 
     fn process_udp_replies(&mut self) {
         while let Ok(reply) = self.reply_rx.try_recv() {
-            debug!(src = %reply.src, dst = %reply.dst, bytes = reply.payload.len(), "UDP reply");
             let pkt = build_udp_packet(reply.src, reply.dst, &reply.payload);
             self.pending_tun_writes.push(pkt);
         }
