@@ -102,15 +102,13 @@ pub struct OutboundInterface {
 /// A server on the machine a full tunnel runs on needs this: dialing through the routing table sends its dials back
 /// into the tunnel, which hands them to the server again. Naming the interface (`bind_interface`) is not enough:
 /// shadowsocks-service 1.24.0 sends an IPv4 UDP relay on an IPv6 socket, and on Windows that socket is held to the
-/// interface only by `IPV6_UNICAST_IF`. A datagram on it followed the tunnel's split route into the TUN (measured: one
-/// datagram became 256 relays and stalled the galoshes transport). On Windows the server also binds to the
-/// interface's own address (`bind_local_addr`), which holds that socket. TCP is held by the interface alone, an IPv4
-/// socket with `IP_UNICAST_IF` (measured: the page requests of the journey leave by it).
+/// interface only by `IPV6_UNICAST_IF`. A datagram on it followed the tunnel's split route into the TUN. On Windows the
+/// server also binds to the interface's own address (`bind_local_addr`), which holds that socket. TCP is held by the
+/// interface alone, an IPv4 socket with `IP_UNICAST_IF`.
 ///
 /// Binding the IPv4 address makes the server's sockets IPv4-only: on Windows a dial to a native IPv6 target fails, TCP
-/// with `WSAENETUNREACH` and UDP with `WSAEADDRNOTAVAIL` (measured with a socket bound to a mapped address, as
-/// shadowsocks binds it). The bind is made on Windows only. On macOS shadowsocks sets `IPV6_BOUND_IF` after binding the
-/// mapped address, and that fails with `EINVAL` on every UDP relay (measured on a CI runner).
+/// with `WSAENETUNREACH` and UDP with `WSAEADDRNOTAVAIL`. The bind is made on Windows only. On macOS shadowsocks sets
+/// `IPV6_BOUND_IF` after binding the mapped address, and that fails with `EINVAL` on every UDP relay.
 pub async fn start_real_ss_server_via(
     method: CipherKind,
     password: &str,
@@ -139,9 +137,10 @@ pub async fn start_real_ss_server_via(
 
     let addr = SocketAddr::new(listen, port);
     let handle = tokio::spawn(async move {
-        // Server::run consumes self and only ever returns Err on teardown
-        // ("server exited unexpectedly"). The test ignores the error.
-        let _ = server.run().await;
+        // `run` returns only when a serving task has ended, which is an error ("server exited unexpectedly").
+        if let Err(e) = server.run().await {
+            tracing::error!(error = %e, "the shadowsocks server stopped serving");
+        }
     });
 
     (addr, handle)
