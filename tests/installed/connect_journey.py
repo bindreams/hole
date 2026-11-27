@@ -6,7 +6,8 @@ The Windows and macOS installer suites install the product their own way (`msi-i
 - `connect_and_fetch` starts the proxy in SOCKS-only mode, so no TUN device, route or DNS setting is involved, and the
   server and the target are on this host.
 - `full_tunnel_journey` starts it as `hole proxy start` does by default, a full tunnel, and fetches pages from outside
-  the machine by address and by name. The far side says what it relayed, and the platform suite hands the journey a
+  the machine by address and by name, and for a plugin that carries UDP sends one datagram that draws a QUIC Version
+  Negotiation reply. The far side says what it relayed, and the platform suite hands the journey a
   `MachineView`: what the operating system says of its routes, adapters and DNS, and a `curl` run as the person.
 """
 
@@ -61,17 +62,24 @@ DEFAULT_ROUTE = "0.0.0.0/0"
 # `trace` (`udprelay`, which `ss_plugin_server` routes into `tracing` down to that level).
 RELAY_LOG = "shadowsocks_service::server::tcprelay=debug,shadowsocks_service::server::udprelay=trace"
 _RELAY = re.compile(r"established tcp tunnel \S+ <-> (\S+) with ")
-_UDP_RELAY = re.compile(r"udp relay \S+ -> (\S+) with \d+ bytes, control")
+_UDP_RELAY = re.compile(r"udp relay \S+ -> (\S+) with (\d+) bytes, control")
 
-# The datagram the person sends in each case that carries UDP: one NTP request, to Cloudflare's time server.
-NTP_HOST = "162.159.200.1"
-NTP_PORT = 123
-NTP_TARGET = f"{NTP_HOST}:{NTP_PORT}"
-NTP_REQUEST = Path(__file__).with_name("ntp_request.py")
+# The datagram the person sends in each case that carries UDP: a QUIC long-header packet with a reserved version, which a
+# server answers with Version Negotiation (RFC 9000 sections 6.1 and 17.2.1). The sender builds the packet from
+# `UDP_SIZE` and the matcher counts the far side's relay lines by `UDP_TARGET` and `UDP_SIZE`, so they cannot disagree.
+# The target answered on macos-26-arm64, macos-15, ubuntu-26.04 and windows-2025.
+UDP_HOST = "8.8.4.4"
+UDP_PORT = 443
+UDP_TARGET = f"{UDP_HOST}:{UDP_PORT}"
+# Above 1200, the smallest datagram that draws Version Negotiation, and not a size QUIC clients send: the runner's own
+# QUIC to `1.1.1.1:443` was relayed at 43, 216, 1038, 1200 and 1252 bytes, and Apple's at 1350. The far side's relay line
+# carries the size, so a datagram of this size to this target is counted apart from every other.
+UDP_SIZE = 1237
+UDP_SENDER = Path(__file__).with_name("quic_version_negotiation_trigger.py")
 # Failure bound on the server's answer to that datagram, set well beyond a slow runner's.
-NTP_REPLY_SECONDS = 60
-# The mode field of an NTP server's reply.
-NTP_MODE_SERVER = 4
+UDP_REPLY_SECONDS = 60
+# The version field of a Version Negotiation packet.
+VERSION_NEGOTIATION = 0
 # The plugins whose connection carries UDP; `v2ray-plugin` is TCP-only, and the product drops a UDP flow for it.
 UDP_PLUGINS = (None, "galoshes")
 
@@ -150,12 +158,17 @@ class SsServer:
         """
         return _RELAY.findall(self.stderr.read_text(encoding="utf-8", errors="replace"))
 
-    def udp_relayed(self) -> list[str]:
-        """The target (`host:port`) of every UDP datagram the server has relayed so far, in order.
+    def udp_relayed(self) -> list[tuple[str, int]]:
+        """The target (`host:port`) and size in bytes of every UDP datagram the server has relayed so far, in order.
 
         The server writes the line when it takes the datagram in, before it sends it on.
         """
-        return _UDP_RELAY.findall(self.stderr.read_text(encoding="utf-8", errors="replace"))
+        lines = _UDP_RELAY.findall(self.stderr.read_text(encoding="utf-8", errors="replace"))
+        return [(target, int(size)) for target, size in lines]
+
+    def udp_relayed_count(self) -> int:
+        """How many datagrams of the person's own (`UDP_TARGET`, `UDP_SIZE`) the server has relayed so far."""
+        return self.udp_relayed().count((UDP_TARGET, UDP_SIZE))
 
 
 @dataclass(frozen=True)
@@ -572,35 +585,42 @@ def page_problems(
 
 
 def udp_problems(machine: MachineView, server: SsServer) -> list[str]:
-    """The person sends one NTP request (`NTP_TARGET`); its reply must reach the person's socket, and the far side must
-    have relayed that datagram exactly once.
+    """The person sends one datagram that draws Version Negotiation from `UDP_TARGET`; the reply must reach the person's
+    socket and answer it, and the far side must have relayed that datagram exactly once.
 
-    The reply alone shows nothing: it needs the far side's relay to have carried the datagram. A count above one is a
-    datagram that came back to the far side: its own relay re-entering the tunnel.
+    The answer is a Version Negotiation packet whose connection IDs are the datagram's own, swapped (RFC 9000 section
+    17.2.1). The reply alone shows nothing: it needs the far side's relay to have carried the datagram. A count above one
+    is a datagram that came back to the far side: its own relay re-entering the tunnel.
     """
-    relays_before = server.udp_relayed().count(NTP_TARGET)
-    sent = machine.run_python(NTP_REQUEST, NTP_HOST, str(NTP_PORT), str(NTP_REPLY_SECONDS))
-    relays = server.udp_relayed().count(NTP_TARGET) - relays_before
+    relays_before = server.udp_relayed_count()
+    sent = machine.run_python(UDP_SENDER, UDP_HOST, str(UDP_PORT), str(UDP_SIZE), str(UDP_REPLY_SECONDS))
+    relays = server.udp_relayed_count() - relays_before
+    what = f"{UDP_SIZE} bytes to {UDP_TARGET}"
     try:
         answer = json.loads(sent.stdout)
     except json.JSONDecodeError:
         return [
-            f"the person's NTP request to {NTP_TARGET} did not run: exit {sent.returncode}, stdout {sent.stdout!r}, "
-            f"stderr {sent.stderr.strip()!r} (the far side relayed {relays} datagram(s) to {NTP_TARGET} meanwhile)"
+            f"the person's datagram of {what} did not run: exit {sent.returncode}, stdout {sent.stdout!r}, "
+            f"stderr {sent.stderr.strip()!r} (the far side relayed {relays} such datagram(s) meanwhile)"
         ]
     problems = []
     if answer["reply"] is None:
         problems.append(
-            f"no reply to the person's NTP request to {NTP_TARGET} reached their socket in {NTP_REPLY_SECONDS} s; the "
-            f"far side relayed {relays} datagram(s) to {NTP_TARGET} for it (1 expected; more is the far side's own "
-            f"relay coming back through the tunnel)"
+            f"no reply to the person's datagram of {what} reached their socket in {UDP_REPLY_SECONDS} s; the far side "
+            f"relayed {relays} such datagram(s) for it (1 expected; more is the far side's own relay coming back "
+            f"through the tunnel)"
         )
-    elif answer["mode"] != NTP_MODE_SERVER:
-        problems.append(f"the datagram that reached the person's socket is not an NTP server reply: {answer}")
-    if answer["reply"] is not None and relays != 1:
+    elif (answer["version"], answer["dcid"], answer["scid"]) != (
+        VERSION_NEGOTIATION,
+        answer["sent_scid"],
+        answer["sent_dcid"],
+    ):
         problems.append(
-            f"the reply arrived, but the far side relayed {relays} datagram(s) to {NTP_TARGET} for it, not 1"
+            f"the datagram that reached the person's socket is not Version Negotiation for the one they sent "
+            f"(version {VERSION_NEGOTIATION}, connection IDs swapped): {answer}"
         )
+    if answer["reply"] is not None and relays != 1:
+        problems.append(f"the reply arrived, but the far side relayed {relays} such datagram(s) for it, not 1")
     return problems
 
 

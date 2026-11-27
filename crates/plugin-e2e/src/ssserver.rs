@@ -103,7 +103,7 @@ pub struct OutboundInterface {
 /// into the tunnel, which hands them to the server again. Naming the interface (`bind_interface`) is not enough:
 /// shadowsocks-service 1.24.0 sends an IPv4 UDP relay on an IPv6 socket, and on Windows that socket is held to the
 /// interface only by `IPV6_UNICAST_IF`. A datagram on it followed the tunnel's split route into the TUN (measured: one
-/// NTP request became 256 relays and stalled the galoshes transport). On Windows the server also binds to the
+/// datagram became 256 relays and stalled the galoshes transport). On Windows the server also binds to the
 /// interface's own address (`bind_local_addr`), which holds that socket. TCP is held by the interface alone, an IPv4
 /// socket with `IP_UNICAST_IF` (measured: the page requests of the journey leave by it).
 ///
