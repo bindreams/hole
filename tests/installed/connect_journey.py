@@ -464,7 +464,9 @@ def settle_on_notices(
         remaining = deadline - time.monotonic()
         if remaining > 0 and wait(remaining):
             notices += 1
-            continue
+            # A wait may return on a notice at the bound itself (a drain of notices ends there).
+            if time.monotonic() < deadline:
+                continue
         if notices == 0:
             return Settled(reading, f"no notice of a change came from {source} in the {SETTLE_SECONDS} s allowed")
         return Settled(
@@ -795,22 +797,22 @@ class _Unwatched:
 
 @contextmanager
 def watching(machine: MachineView, problems: list[str]) -> Iterator[ChangeWatch]:
-    """`machine.watch_changes()`. When its notices cannot be registered, the problem is added to `problems` and the block
-    runs with a watch that reads once, so the command inside it still runs. A release that fails is added to `problems`
-    too, and never replaces what the block raised."""
+    """`machine.watch_changes()`. When its notices cannot be registered, whatever the error, the problem is added to
+    `problems` and the block runs with a watch that reads once, so the command inside it still runs. A release that
+    fails is added to `problems` too, and never replaces what the block raised."""
     stack = ExitStack()
     try:
         watch = stack.enter_context(machine.watch_changes())
-    except MachineReadError as e:
-        problems.append(f"the machine's change notices could not be registered: {e}")
+    except Exception as e:
+        problems.append(f"the machine's change notices could not be registered: {type(e).__name__}: {e}")
         watch = _Unwatched()
     try:
         yield watch
     finally:
         try:
             stack.close()
-        except MachineReadError as e:
-            problems.append(f"the machine's change notices could not be released: {e}")
+        except Exception as e:
+            problems.append(f"the machine's change notices could not be released: {type(e).__name__}: {e}")
 
 
 def attempt(problems: list[str], what: str, make: Callable[[], T]) -> T | None:
