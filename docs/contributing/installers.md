@@ -106,9 +106,11 @@ name is answered through the tunnel when the machine's earlier resolver is asked
 The case reads the machine after a command returns, so for each read it waits until the system has taken the change in.
 It registers for IP Helper's notices of a change to an interface, a route or an address before it runs the command
 (`NotifyIpInterfaceChange`, `NotifyRouteChange2`, `NotifyUnicastIpAddressChange`), and reads again on each one until the
-state it expects holds. The 30 seconds are the failure bound on a notice the system never sends: when they run out the
-case fails, saying whether no notice came or notices came and the reading still did not hold, and no reading made after
-the bound decides a pass. IP Helper has no notice for a change of an adapter's DNS servers: the DNS read waits only on the notices of the changes around it.
+state it expects holds: after the start, every check of the tunnel's DNS, interface and routes; after the stop, the
+machine as it was. The 30 seconds are the failure bound on a notice the system never sends: when they run out the case
+fails, saying whether no notice came, notices came and the reading after each still did not hold, or a notice came at
+the bound, too late for a reading. No reading begun after the bound decides a pass. IP Helper has no notice for a change
+of an adapter's DNS servers: the DNS read waits only on the notices of the changes around it.
 
 The server listens on loopback, and for a loopback server Hole installs no route that keeps its own connection to the
 server out of the tunnel. A tunnel to a remote server needs that route and a stop must remove it; this case does not
@@ -206,8 +208,7 @@ servers are those of the one resolver `scutil --dns` gained, read after configd 
 configuration; the case also waits on the routing socket's messages about a route, an interface or an address
 (`RTM_ADD`, `RTM_DELETE`, `RTM_CHANGE`, `RTM_IFINFO`, `RTM_NEWADDR`, `RTM_DELADDR`; not the `RTM_GET` that the
 snapshot's own `route -n get` makes), the other tables the snapshot reads. Those values and the position of the message
-type in the header are from XNU's `net/route.h`; the routing-socket wait has not run on a Mac, and CI is its first
-measurement. A notice that does not come within 30 seconds fails the case. The device is the new `utun` interface, and
+type in the header are from XNU's `net/route.h`. A notice that does not come within 30 seconds fails the case. The device is the new `utun` interface, and
 the comparison after the stop leaves out neighbour and cloned routes and temporary IPv6 addresses. Each case prints, before the start and while the tunnel is up, everything the
 commands it read printed (`netstat -rn`, `ifconfig -a`, `scutil --dns`, and `route -n get 1.1.1.1` unscoped and in the
 default interface's scope), passing or failing. `hole` runs as root, as in the cases above, and `curl` runs as the user of the

@@ -471,7 +471,8 @@ def settle_on_notices(
             late = True
         if not notices and late:
             return Settled(
-                reading, f"the only notice of a change from {source} came at the bound, too late for a reading"
+                reading,
+                f"no notice of a change came from {source} before the bound; one came at it, too late for a reading",
             )
         if not notices:
             return Settled(reading, f"no notice of a change came from {source} in the {SETTLE_SECONDS} s allowed")
