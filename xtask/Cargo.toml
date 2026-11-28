@@ -57,7 +57,7 @@ spdx = { version = "0.13", features = ["text"] }
 thiserror = "2" # `NoticesError`
 # The Rust standard library's copyright file is HTML: `dom_query` converts it to text and reads which licences it names.
 # Already in the graph (`tauri-utils`).
-dom_query = "0.28"
+dom_query = "0.30"
 
 # `cargo xtask pull-subrepo` shells out to `go mod edit -json` on a scratch
 # copy of a conflicted go.mod (pull_subrepo::go_mod_replace_directives) — a
@@ -87,7 +87,7 @@ roxmltree = "0.21"
 # timeout). The lockfile stays identical across platforms (Cargo.lock is
 # target-independent). Pinned: the four typst crates are one workspace and must match.
 [target.'cfg(target_os = "macos")'.dependencies]
-typst-as-lib = "=0.16.0"
+typst-as-lib = "=0.18.0"
 typst = "=0.15.1"
 typst-layout = "=0.15.1"
 typst-render = "=0.15.1"
